@@ -16,6 +16,14 @@ class ProxmoxSpoke(BaseSpoke):
         self.telemetry_cache = {}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        if command_type == "UPDATE_CONFIG":
+            logger.info(f"Updating Proxmox configuration: {data}")
+            self.config = data
+            if self.control_plane:
+                # Forward config update to the local agent
+                return await self.control_plane.send_to_agent("UPDATE_CONFIG", data)
+            return {"status": "SUCCESS", "message": "Proxmox configuration updated (no agent connected)"}
+
         if not self.control_plane:
             return {"success": False, "error": "Control plane not initialized"}
 

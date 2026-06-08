@@ -18,6 +18,7 @@ class ProxmoxAgent:
         self.agent_id = agent_id
         self.secret = secret
         self.websocket = None
+        self.config = {} # Stores API credentials: host, user, password/token
 
     def _sign(self, msg):
         data = {k: v for k, v in msg.items() if k != "signature"}
@@ -36,17 +37,69 @@ class ProxmoxAgent:
 
     async def get_vm_list(self) -> Dict[str, Any]:
         """
-        In a real environment, this would call the Proxmox API.
-        For now, we provide a realistic structure.
+        Fetches the real VM list from the Proxmox API.
         """
-        # Mocking Proxmox API response
-        return {
-            "vms": [
-                {"id": "100", "name": "web-server-01", "status": "running", "cpu": 12.5, "mem": 2048},
-                {"id": "101", "name": "db-server-01", "status": "running", "cpu": 4.2, "mem": 4096},
-                {"id": "102", "name": "test-node-01", "status": "stopped", "cpu": 0, "mem": 1024},
-            ]
-        }
+        if not self.config.get("host") or not self.config.get("user"):
+            logger.warning("Proxmox API credentials missing. Returning empty VM list.")
+            return {"vms": [], "error": "API credentials missing"}
+
+        host = self.config["host"]
+        user = self.config["user"]
+        pwd = self.config.get("password")
+
+        try:
+            async with httpx.AsyncClient(verify=False) as client:
+                # 1. Authentication (Get Ticket)
+                auth_url = f"https://{host}:8006/api2/json/access/ticket"
+                auth_resp = await client.post(auth_url, data={"username": user, "password": pwd})
+                if auth_resp.status_code != 200:
+                    return {"vms": [], "error": f"Auth failed: {auth_resp.text}"}
+
+                ticket = auth_resp.json().get("data", {}).get("ticket")
+                csrf_token = auth_resp.json().get("data", {}).get("CSRFPreventionToken")
+
+                headers = {
+                    "Cookie": f"BakeID={ticket}",
+                    "CSRFPreventionToken": csrf_token
+                }
+
+                # 2. Get Nodes
+                nodes_url = f"https://{host}:8006/api2/json/nodes"
+                nodes_resp = await client.get(nodes_url, headers=headers)
+                nodes = nodes_resp.json().get("data", {}).get("nodes", [])
+
+                all_vms = []
+                for node in nodes:
+                    # Get QEMU VMs
+                    qemu_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu"
+                    qemu_resp = await client.get(qemu_url, headers=headers)
+                    qemu_data = qemu_resp.json().get("data", {})
+                    for vmid, vm in qemu_data.items():
+                        all_vms.append({
+                            "id": vmid,
+                            "name": vm.get("name"),
+                            "status": vm.get("status"),
+                            "cpu": vm.get("cpu", 0),
+                            "mem": vm.get("maxmem", 0)
+                        })
+
+                    # Get LXC Containers
+                    lxc_url = f"https://{host}:8006/api2/json/nodes/{node}/lxc"
+                    lxc_resp = await client.get(lxc_url, headers=headers)
+                    lxc_data = lxc_resp.json().get("data", {})
+                    for vmid, vm in lxc_data.items():
+                        all_vms.append({
+                            "id": vmid,
+                            "name": vm.get("name"),
+                            "status": vm.get("status"),
+                            "cpu": vm.get("cpu", 0),
+                            "mem": vm.get("maxmem", 0)
+                        })
+
+                return {"vms": all_vms}
+        except Exception as e:
+            logger.error(f"Proxmox API error: {e}")
+            return {"vms": [], "error": str(e)}
 
     async def run(self):
         import websockets
@@ -85,7 +138,11 @@ class ProxmoxAgent:
                     logger.info(f"Received command: {cmd_type}")
 
                     result = {"status": "ERROR", "message": "Unknown command"}
-                    if cmd_type == "GET_VM_LIST":
+                    if cmd_type == "UPDATE_CONFIG":
+                        logger.info(f"Updating Agent configuration: {data}")
+                        self.config = data
+                        result = {"status": "SUCCESS", "message": "Agent configuration updated"}
+                    elif cmd_type == "GET_VM_LIST":
                         result = await self.get_vm_list()
                     elif cmd_type == "GET_SYSTEM_STATS":
                         result = await self.collect_metrics()
