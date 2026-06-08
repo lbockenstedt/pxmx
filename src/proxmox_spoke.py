@@ -8,42 +8,40 @@ logger = logging.getLogger("ProxmoxSpoke")
 class ProxmoxSpoke(BaseSpoke):
     """
     Proxmox integration spoke. Manages VMs and containers on a Proxmox cluster.
+    Now acts as a bridge between the Lab Manager Hub and the Local Proxmox Agent.
     """
+    def __init__(self, spoke_id: str, config: Dict[str, Any], control_plane=None):
+        super().__init__(spoke_id, config)
+        self.control_plane = control_plane
+        self.telemetry_cache = {}
+
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        if command_type == "CREATE_VM":
-            return await self._create_vm(data)
-        elif command_type == "DELETE_VM":
-            return await self._delete_vm(data)
-        elif command_type == "GET_VM_INFO":
-            return await self._get_vm_info(data)
-        else:
-            return {"success": False, "error": f"Unknown command: {command_type}"}
+        if not self.control_plane:
+            return {"success": False, "error": "Control plane not initialized"}
 
-    async def _create_vm(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        vm_id = data.get("vm_id")
-        name = data.get("name", "unnamed-vm")
-        self.log_info(f"Creating VM {vm_id} ({name}) on Proxmox cluster...")
+        # Map Hub commands to Agent commands
+        agent_commands = {
+            "CREATE_VM": "AGENT_CREATE_VM",
+            "DELETE_VM": "AGENT_DELETE_VM",
+            "GET_VM_INFO": "AGENT_GET_VM_INFO",
+            "GET_VM_LIST": "AGENT_GET_VM_LIST",
+            "SHELLEXEC": "AGENT_SHELLEXEC"
+        }
 
-        # Mock API Call to Proxmox
-        await asyncio.sleep(2)
+        target_cmd = agent_commands.get(command_type, command_type)
 
-        return {"success": True, "vm_id": vm_id, "status": "RUNNING"}
+        logger.info(f"Bridging command {command_type} -> {target_cmd} to local agent")
+        result = await self.control_plane.send_to_agent(target_cmd, data)
 
-    async def _delete_vm(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        vm_id = data.get("vm_id")
-        self.log_info(f"Deleting VM {vm_id} from Proxmox cluster...")
-
-        # Mock API Call to Proxmox
-        await asyncio.sleep(1)
-
-        return {"success": True}
-
-    async def _get_vm_info(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        vm_id = data.get("vm_id")
-        self.log_info(f"Fetching info for VM {vm_id}...")
-
-        # Mock API Call to Proxmox
-        return {"success": True, "vm_id": vm_id, "status": "RUNNING", "cpu": 2, "ram": 4096}
+        return result
 
     async def get_status(self) -> Dict[str, Any]:
-        return {"status": "HEALTHY", "managed_nodes": 5}
+        """Reports status based on local agent telemetry."""
+        if not self.telemetry_cache:
+            return {"status": "AGENT_OFFLINE", "managed_nodes": 0}
+
+        return {
+            "status": "HEALTHY",
+            "metrics": self.telemetry_cache,
+            "managed_nodes": self.telemetry_cache.get("nodes", 1)
+        }
