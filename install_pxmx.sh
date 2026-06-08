@@ -38,3 +38,4 @@ if [ -f "requirements.txt" ]; then
 fi
 
 echo "🎉 Proxmox Manager native installation complete!"
+echo "📦 Version: 0.01"
