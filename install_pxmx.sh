@@ -20,9 +20,9 @@ done
 # Auto-fetch secret if not provided
 if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lab-manager-secret" ]; then
     echo "🔑 No secret provided. Attempting to fetch first-secret from Hub..."
-    # Derive HTTP API URL from WebSocket URL (ws://...:8765 -> http://...:8000)
-    API_URL=$(echo "$HUB_URL" | sed 's/ws\:\/\/ /http\:\/\/ /' | sed 's/:8765//' | sed 's/ / /')
-    API_URL="http://$(echo $HUB_URL | sed 's/ws\:\/\///' | cut -d: -f1'):8000"
+    # Derive HTTP API URL from WebSocket URL (ws://host:8765 -> http://host:8000)
+    HOST=$(echo "$HUB_URL" | sed 's|^ws://||' | cut -d: -f1)
+    API_URL="http://$HOST:8000"
 
     SPOKE_SECRET=$(curl -s -X POST "$API_URL/setup/generate-secret" \
         -H "Content-Type: application/json" \
