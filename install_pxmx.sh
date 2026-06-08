@@ -10,12 +10,31 @@ SPOKE_SECRET="lab-manager-secret"
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --hub) HUB_URL="$2"; shift ;;
-        --id) SPOKE_ID="$2"; shift ;;
+        --id|--name) SPOKE_ID="$2"; shift ;;
         --secret) SPOKE_SECRET="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
+
+# Auto-fetch secret if not provided
+if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lab-manager-secret" ]; then
+    echo "🔑 No secret provided. Attempting to fetch first-secret from Hub..."
+    # Derive HTTP API URL from WebSocket URL (ws://...:8765 -> http://...:8000)
+    API_URL=$(echo "$HUB_URL" | sed 's/ws\:\/\/ /http\:\/\/ /' | sed 's/:8765//' | sed 's/ / /')
+    API_URL="http://$(echo $HUB_URL | sed 's/ws\:\/\///' | cut -d: -f1'):8000"
+
+    SPOKE_SECRET=$(curl -s -X POST "$API_URL/setup/generate-secret" \
+        -H "Content-Type: application/json" \
+        -d "{\"spoke_id\": \"$SPOKE_ID\"}" | jq -r '.secret' 2>/dev/null)
+
+    if [ "$SPOKE_SECRET" == "null" ] || [ -z "$SPOKE_SECRET" ]; then
+        echo "⚠️  Could not fetch secret from Hub. Falling back to default."
+        SPOKE_SECRET="lab-manager-secret"
+    else
+        echo "✅ Successfully fetched first-secret from Hub."
+    fi
+fi
 
 echo "🚀 Installing Proxmox Manager Module (Native)..."
 
