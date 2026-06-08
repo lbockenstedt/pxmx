@@ -7,9 +7,23 @@ import logging
 import hmac
 import hashlib
 import argparse
+import sys
+import os
+from pathlib import Path
 from typing import Dict, Any
 from fastapi import FastAPI, HTTPException
 import uvicorn
+
+# Attempt to resolve the Hub's base_spoke dependency
+try:
+    # Look for the hub source directory relative to this file
+    # Expected structure: ../../lm/hub/src/base_spoke.py
+    current_dir = Path(__file__).resolve().parent
+    hub_src = current_dir.parent.parent / "lm" / "hub" / "src"
+    if hub_src.exists():
+        sys.path.append(str(hub_src))
+except Exception as e:
+    print(f"Warning: Could not automatically resolve Hub source path: {e}")
 
 from .proxmox_spoke import ProxmoxSpoke
 
