@@ -24,7 +24,7 @@ bash install_agent.sh --spoke-url ws://<SPOKE_IP>:8766
 ## ⚙️ Configuration
 - **Port**: The agent connects to the Proxmox Spoke on port `8766`.
 - **Authentication**: Uses a shared secret (`pxmx-agent-secret` by default) for a secure handshake.
-- **Systemd**: Installed as `lm-manager-pxmx-agent.service`.
+- **Systemd**: Installed as `lm-pxmx-agent.service`.
 
 ## 📊 Collected Data
 - **System Metrics**: CPU usage, Virtual Memory usage, and Disk usage via `psutil`.

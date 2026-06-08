@@ -27,7 +27,7 @@ fi
 apt-get update
 apt-get install -y python3-pip python3-venv git curl jq
 
-INSTALL_DIR="/root/lm-manager/pxmx/agent"
+INSTALL_DIR="/root/lm/pxmx/agent"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
@@ -47,9 +47,9 @@ if [ ! -d "venv" ]; then
     python3 -m venv venv
 fi
 
-./venv/bin/python3 -m pip install --upgrade pip
+./venv/bin/python3 -m pip install --upgrade pip -q
 if [ -f "requirements.txt" ]; then
-    ./venv/bin/python3 -m pip install -r requirements.txt
+    ./venv/bin/python3 -m pip install -r requirements.txt -q
 fi
 
 echo "⚙️ Configuring Agent Identity..."
@@ -60,7 +60,7 @@ AGENT_SECRET=$AGENT_SECRET
 EOF
 
 echo "⚙️ Creating systemd service..."
-cat <<EOF > /etc/systemd/system/lm-manager-pxmx-agent.service
+cat <<EOF > /etc/systemd/system/lm-pxmx-agent.service
 [Unit]
 Description=Lab Manager - Local Proxmox Agent
 After=network.target
@@ -78,8 +78,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable lm-manager-pxmx-agent
-systemctl restart lm-manager-pxmx-agent
+systemctl enable lm-pxmx-agent
+systemctl restart lm-pxmx-agent
 
 echo "🎉 Proxmox Local Agent installation complete!"
 echo "🌐 Target Spoke: $SPOKE_URL"
