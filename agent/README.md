@@ -12,13 +12,13 @@ The agent follows a "Push-Pull" model:
 ### Local Installation (Same Host)
 If the agent is on the same machine as the Proxmox Spoke:
 ```bash
-sudo bash install_agent.sh
+bash install_agent.sh
 ```
 
 ### Remote Installation
 If the agent is on a separate host from the Spoke:
 ```bash
-sudo bash install_agent.sh --spoke-url ws://<SPOKE_IP>:8766
+bash install_agent.sh --spoke-url ws://<SPOKE_IP>:8766
 ```
 
 ## ⚙️ Configuration
