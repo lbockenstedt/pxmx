@@ -31,9 +31,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PxmxControlPlane")
 
 class PxmxControlPlane:
-    def __init__(self, spoke_id: str, secret: str, hub_url: str = None):
+    def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
         self.spoke_id = spoke_id
         self.secret = secret
+        self.hub_secret = hub_secret
         self.hub_url = hub_url
         self.agent_connection = None
         self.agent_secret = "pxmx-agent-secret" # Default agent secret
@@ -49,9 +50,45 @@ class PxmxControlPlane:
         pxmx_spoke = ProxmoxSpoke(self.spoke_id, {"proxmox_host": "localhost"}, control_plane=self)
 
         async with websockets.connect(self.hub_url) as websocket:
-            # Handshake
+            # 1. Spoke Authentication Handshake
             await websocket.send(json.dumps({"spoke_id": self.spoke_id, "secret": self.secret}))
-            logger.info(f"Connected to Lab Manager Hub as {self.spoke_id}")
+            logger.info(f"Connected to Lab Manager Hub as {self.spoke_id}. Performing mutual authentication...")
+
+            # 2. Hub Mutual Authentication (Verify Hub's identity)
+            try:
+                hub_proof_json = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                hub_proof = json.loads(hub_proof_json)
+
+                if hub_proof.get("status") == "HUB_VERIFIED":
+                    challenge = hub_proof.get("challenge")
+                    signature = hub_proof.get("signature")
+
+                    if self.hub_secret:
+                        # Verify Hub signature using hub_secret
+                        expected_sig = hmac.new(
+                            self.hub_secret.encode(),
+                            challenge.encode(),
+                            hashlib.sha256
+                        ).hexdigest()
+
+                        if hmac.compare_digest(expected_sig, signature):
+                            logger.info("Hub identity verified successfully.")
+                            await websocket.send(json.dumps({"status": "HUB_OK"}))
+                        else:
+                            logger.error("Hub identity verification failed: Invalid signature.")
+                            await websocket.close(1008, "Hub verification failed")
+                            return
+                    else:
+                        logger.warning("Hub secret not configured. Skipping Hub identity verification (Insecure).")
+                        await websocket.send(json.dumps({"status": "HUB_OK"}))
+                else:
+                    logger.error(f"Unexpected response during Hub verification: {hub_proof.get('status')}")
+                    await websocket.close(1008, "Mutual authentication failed")
+                    return
+            except Exception as e:
+                logger.error(f"Hub verification timed out or failed: {e}")
+                await websocket.close(1008, "Mutual authentication timed out")
+                return
 
             async def heartbeat():
                 while True:
@@ -216,10 +253,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--id", required=True, help="Spoke ID")
     parser.add_argument("--secret", required=True, help="Authentication secret")
+    parser.add_argument("--hub-secret", help="Hub authentication secret for mutual auth")
     parser.add_argument("--hub", help="Hub WebSocket URL (defaults to standalone mode if omitted)")
     args = parser.parse_args()
 
-    cp = PxmxControlPlane(args.id, args.secret, args.hub)
+    cp = PxmxControlPlane(args.id, args.secret, args.hub_secret, args.hub)
     if args.hub:
         asyncio.run(cp.run_hub_mode())
     else:
