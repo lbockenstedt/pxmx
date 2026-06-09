@@ -160,7 +160,7 @@ class PxmxControlPlane:
                             logger.info("Hub identity verified successfully.")
                             await websocket.send(json.dumps({"status": "HUB_OK"}))
                         else:
-                            logger.error("Hub identity verification failed.")
+                            logger.error(f"Hub identity verification failed. Expected: {expected_sig}, Got: {signature}")
                             await websocket.close(1008, "Hub verification failed")
                             return
                     else:
