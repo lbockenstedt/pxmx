@@ -93,7 +93,7 @@ class PxmxControlPlane:
                     }
                     msg["signature"] = self._sign(msg)
                     await websocket.send(json.dumps(msg))
-                    await asyncio.sleep(30)
+                    await asyncio.sleep(10)
 
             asyncio.create_task(heartbeat())
 
@@ -156,6 +156,10 @@ class PxmxControlPlane:
 
                 if msg_type == "AGENT_TELEMETRY":
                     logger.info(f"Received telemetry from agent {agent_id}")
+                    # Update the pxmx module's telemetry cache
+                    pxmx_mod = self.modules.get("pxmx")
+                    if pxmx_mod:
+                        pxmx_mod.telemetry_cache = msg_data.get("payload", {}).get("data", {})
                 elif msg_type == "AGENT_RESPONSE":
                     corr_id = msg_data.get("header", {}).get("correlation_id")
                     if corr_id:
