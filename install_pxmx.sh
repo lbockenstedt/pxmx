@@ -106,7 +106,7 @@ Type=simple
 User=svc_lm
 WorkingDirectory=$INSTALL_DIR/pxmx
 Environment="PYTHONPATH=$INSTALL_DIR/core/src:$INSTALL_DIR/pxmx/src"
-ExecStart=$INSTALL_DIR/pxmx/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --secret $SPOKE_SECRET
+ExecStart=$INSTALL_DIR/pxmx/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --secret $SPOKE_SECRET --hub $HUB_URL --hub-secret $HUB_SECRET
 Restart=on-failure
 RestartSec=10
 
