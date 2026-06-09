@@ -37,9 +37,11 @@ if [ -d ".git" ]; then
     git pull
 else
     echo "🌐 Cloning Proxmox Agent repository..."
-    # Clone the pxmx repo and move the agent folder to current directory
+    # Ensure any previous failed attempt's tmp_repo is cleaned up
+    rm -rf tmp_repo
+    # Clone to a temporary directory and copy the agent folder contents
     git clone https://github.com/lbockenstedt/pxmx.git tmp_repo
-    mv tmp_repo/agent .
+    cp -r tmp_repo/agent/. .
     rm -rf tmp_repo
 fi
 

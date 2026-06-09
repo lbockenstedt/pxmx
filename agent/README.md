@@ -9,6 +9,12 @@ The agent follows a "Push-Pull" model:
 
 ## 🚀 Installation
 
+### One-Liner Installation (Recommended)
+The fastest way to install the agent and connect it to your Spoke:
+```bash
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh | bash -s -- --spoke-url ws://<SPOKE_IP>:8766 --id pxmx-agent-1 --secret pxmx-agent-secret
+```
+
 ### Local Installation (Same Host)
 If the agent is on the same machine as the Proxmox Spoke:
 ```bash
