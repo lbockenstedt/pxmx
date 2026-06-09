@@ -104,6 +104,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR/pxmx
+Environment="PYTHONPATH=$INSTALL_DIR/core/src"
 ExecStart=$INSTALL_DIR/pxmx/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --secret $SPOKE_SECRET --hub $HUB_URL
 Restart=on-failure
 RestartSec=10

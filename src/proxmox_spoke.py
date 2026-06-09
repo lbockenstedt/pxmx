@@ -1,7 +1,12 @@
 import asyncio
 import logging
 from typing import Any, Dict
-from base_spoke import BaseSpoke
+try:
+    from base_spoke import BaseSpoke
+except ImportError:
+    from lm.hub.src.base_spoke import BaseSpoke
+
+logger = logging.getLogger("ProxmoxSpoke")
 
 logger = logging.getLogger("ProxmoxSpoke")
 
