@@ -24,7 +24,7 @@ rm -f /etc/systemd/system/lm-pxmx-agent.service
 systemctl daemon-reload
 
 # 2. Remove installation directory
-INSTALL_DIR="/root/lm/pxmx/agent"
+INSTALL_DIR="/opt/lm/pxmx/agent"
 if [ -d "$INSTALL_DIR" ]; then
     echo "Removing installation directory $INSTALL_DIR..."
     rm -rf "$INSTALL_DIR"

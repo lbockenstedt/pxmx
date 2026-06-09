@@ -47,7 +47,7 @@ apt-get update
 apt-get install -y python3-pip python3-venv git curl
 
 INSTALL_DIR="/opt/lm"
-OLD_INSTALL_DIR="/root/lm-manager"
+OLD_INSTALL_DIR="/opt/lm-manager"
 
 # Cleanup legacy installation
 if [ -d "$OLD_INSTALL_DIR" ]; then

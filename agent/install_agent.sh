@@ -27,7 +27,7 @@ fi
 apt-get update
 apt-get install -y python3-pip python3-venv git curl jq
 
-INSTALL_DIR="/root/lm/pxmx/agent"
+INSTALL_DIR="/opt/lm/pxmx/agent"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
