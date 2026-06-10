@@ -22,9 +22,6 @@ class ProxmoxAgent:
         self.config = {} # Stores API credentials: host, user, password/token
         self.signer = MessageSigner(secret)
 
-    def _sign(self, msg):
-        return self.signer.sign(msg)
-
     async def collect_metrics(self) -> Dict[str, Any]:
         """Collects local system performance metrics."""
         return {
@@ -125,7 +122,7 @@ class ProxmoxAgent:
 
                     # Verify signature if present
                     if "signature" in msg_data:
-                        if not self._verify_signature(msg_data):
+                        if not self.signer.verify(msg_data):
                             logger.warning("Received message with invalid signature. Dropping.")
                             continue
 
@@ -166,7 +163,7 @@ class ProxmoxAgent:
                         },
                         "payload": {"type": "AGENT_RESPONSE", "data": result}
                     }
-                    resp["signature"] = self._sign(resp)
+                    resp["signature"] = self.signer.sign(resp)
                     await websocket.send(json.dumps(resp))
 
             finally:
@@ -181,7 +178,7 @@ class ProxmoxAgent:
                                "sender_id": self.agent_id, "destination_id": "pxmx-spoke"},
                     "payload": {"type": "AGENT_HEARTBEAT", "data": {}}
                 }
-                msg["signature"] = self._sign(msg)
+                msg["signature"] = self.signer.sign(msg)
                 await self.websocket.send(json.dumps(msg))
                 await asyncio.sleep(30)
             except Exception as e:
@@ -199,15 +196,12 @@ class ProxmoxAgent:
                                "sender_id": self.agent_id, "destination_id": "pxmx-spoke"},
                     "payload": {"type": "AGENT_TELEMETRY", "data": {"metrics": metrics, "vms": vms}}
                 }
-                msg["signature"] = self._sign(msg)
+                msg["signature"] = self.signer.sign(msg)
                 await self.websocket.send(json.dumps(msg))
                 await asyncio.sleep(60)
             except Exception as e:
                 logger.error(f"Telemetry push failed: {e}")
                 await asyncio.sleep(10)
-
-    def _verify_signature(self, msg):
-        return self.signer.verify(msg)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
