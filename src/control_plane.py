@@ -7,6 +7,7 @@ import logging
 import hmac
 import hashlib
 import argparse
+import os
 from typing import Any, Dict, Optional
 from core.src.messaging.control_plane import BaseControlPlane
 from core.src.security.signer import MessageSigner
@@ -18,6 +19,17 @@ class PxmxControlPlane(BaseControlPlane):
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.agent_ws: Optional[websockets.WebSocketServerProtocol] = None
+
+        # Load local configuration for agent management
+        self.config = {}
+        config_path = "/etc/lm-agent/config.json"
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    self.config = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load agent config from {config_path}: {e}")
+
         # Use agent secret from config, fallback to a generated one if not present
         self.agent_secret = self.config.get("agent_secret", "pxmx-agent-default-secret")
         self.pending_responses: Dict[str, asyncio.Future] = {}
