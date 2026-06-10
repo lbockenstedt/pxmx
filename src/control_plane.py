@@ -19,7 +19,7 @@ class PxmxControlPlane(BaseControlPlane):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.agent_ws: Optional[websockets.WebSocketServerProtocol] = None
         # Use agent secret from config, fallback to a generated one if not present
-        self.agent_secret = config.get("agent_secret", "pxmx-agent-default-secret")
+        self.agent_secret = self.config.get("agent_secret", "pxmx-agent-default-secret")
         self.pending_responses: Dict[str, asyncio.Future] = {}
         self.agent_signer = MessageSigner(self.agent_secret)
 
@@ -34,7 +34,7 @@ class PxmxControlPlane(BaseControlPlane):
             logger.info(f"Proxmox Agent Server listening on port {port}")
             await asyncio.Future() # Keep server running
 
-    async def _agent_handler(self, websocket, path):
+    async def _agent_handler(self, websocket, path=None):
         """Handles the connection from the Proxmox Local Agent."""
         logger.info("Local Proxmox Agent attempting to connect...")
         try:
