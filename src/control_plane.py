@@ -18,7 +18,8 @@ class PxmxControlPlane(BaseControlPlane):
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.agent_ws: Optional[websockets.WebSocketServerProtocol] = None
-        self.agent_secret = "pxmx-agent-secret" # Default secret for agent auth
+        # Use agent secret from config, fallback to a generated one if not present
+        self.agent_secret = config.get("agent_secret", "pxmx-agent-default-secret")
         self.pending_responses: Dict[str, asyncio.Future] = {}
         self.agent_signer = MessageSigner(self.agent_secret)
 

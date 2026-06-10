@@ -10,17 +10,40 @@ import os
 from typing import Dict, Any
 from .security_utils import MessageSigner
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("/var/log/lm-pxmx-agent.log"),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger("PxmxAgent")
 
 class ProxmoxAgent:
-    def __init__(self, spoke_url: str, agent_id: str, secret: str):
+    def __init__(self, spoke_url: str, agent_id: str):
         self.spoke_url = spoke_url
         self.agent_id = agent_id
-        self.secret = secret
+
+        # Load secret from protected local config
+        self.secret = self._load_secret()
+        if not self.secret:
+            raise RuntimeError("Agent secret not found in /etc/lm-agent/config.json")
+
         self.websocket = None
         self.config = {} # Stores API credentials: host, user, password/token
-        self.signer = MessageSigner(secret)
+        self.signer = MessageSigner(self.secret)
+
+    def _load_secret(self) -> Optional[str]:
+        config_path = "/etc/lm-agent/config.json"
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                    return config.get("secret")
+        except Exception as e:
+            logger.error(f"Failed to load agent secret from {config_path}: {e}")
+        return None
 
     async def collect_metrics(self) -> Dict[str, Any]:
         """Collects local system performance metrics."""
@@ -207,8 +230,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--spoke-url", required=True, help="URL of the Proxmox Spoke WebSocket server")
     parser.add_argument("--id", default="pxmx-agent-1", help="Agent ID")
-    parser.add_argument("--secret", required=True, help="Authentication secret")
     args = parser.parse_args()
+
 
     agent = ProxmoxAgent(args.spoke_url, args.id, args.secret)
     try:
