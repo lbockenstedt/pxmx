@@ -111,7 +111,7 @@ class PxmxControlPlane(BaseControlPlane):
             fut = asyncio.get_event_loop().create_future()
             self.pending_responses[corr_id] = fut
 
-            await self.agent_ws.send(json.dumps(msg))
+            await self.agent_ws.send(json.dumps(msg, separators=(',', ':')))
 
             # Wait for response with timeout
             return await asyncio.wait_for(fut, timeout=10.0)
