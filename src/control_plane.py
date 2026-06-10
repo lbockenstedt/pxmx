@@ -130,7 +130,7 @@ class PxmxControlPlane(BaseControlPlane):
         asyncio.create_task(self.run_agent_server())
 
         # Create and register the Proxmox module
-        from .proxmox_spoke import ProxmoxSpoke
+        from proxmox_spoke import ProxmoxSpoke
         pxmx_spoke = ProxmoxSpoke(self.spoke_id, {"proxmox_host": "localhost"}, control_plane=self)
         self.register_module("pxmx", pxmx_spoke)
 
