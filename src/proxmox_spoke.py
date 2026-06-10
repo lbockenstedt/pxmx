@@ -4,7 +4,7 @@ from typing import Any, Dict
 try:
     from base_spoke import BaseSpoke
 except ImportError:
-    from lm.hub.src.base_spoke import BaseSpoke
+    from lm.core.src.base_spoke import BaseSpoke
 
 logger = logging.getLogger("ProxmoxSpoke")
 
