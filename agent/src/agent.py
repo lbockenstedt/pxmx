@@ -166,14 +166,8 @@ class ProxmoxAgent:
                     elif cmd_type == "GET_SYSTEM_STATS":
                         result = await self.collect_metrics()
                     elif cmd_type == "SHELLEXEC":
-                        # Safety check: only allow specific commands or use a restricted shell
-                        cmd = data.get("command", "ls")
-                        try:
-                            import subprocess
-                            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
-                            result = {"status": "SUCCESS", "stdout": proc.stdout, "stderr": proc.stderr}
-                        except Exception as e:
-                            result = {"status": "ERROR", "message": str(e)}
+                        # REMOVED: Generic shell execution is a critical security vulnerability (RCE)
+                        result = {"status": "ERROR", "message": "SHELLEXEC command is disabled for security reasons"}
 
                     # Send response
                     resp = {
