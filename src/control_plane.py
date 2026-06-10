@@ -8,20 +8,19 @@ import hmac
 import hashlib
 import argparse
 from typing import Any, Dict, Optional
+from lm.core.src.messaging.control_plane import BaseControlPlane
+from lm.core.src.security.signer import MessageSigner
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PxmxControlPlane")
 
-class PxmxControlPlane:
+class PxmxControlPlane(BaseControlPlane):
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
-        self.spoke_id = spoke_id
-        self.secret = secret
-        self.hub_secret = hub_secret
-        self.hub_url = hub_url
-        self.modules: Dict[str, Any] = {}
+        super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.agent_ws: Optional[websockets.WebSocketServerProtocol] = None
         self.agent_secret = "pxmx-agent-secret" # Default secret for agent auth
         self.pending_responses: Dict[str, asyncio.Future] = {}
+        self.agent_signer = MessageSigner(self.agent_secret)
 
     def register_module(self, name: str, module_instance: Any):
         self.modules[name] = module_instance
@@ -58,7 +57,7 @@ class PxmxControlPlane:
                 msg_data = json.loads(message)
 
                 # Verify signature
-                if "signature" in msg_data and not self._verify_agent_signature(msg_data):
+                if "signature" in msg_data and not self.agent_signer.verify(msg_data):
                     logger.warning("Received agent message with invalid signature. Dropping.")
                     continue
 
@@ -105,7 +104,7 @@ class PxmxControlPlane:
             },
             "payload": {"type": cmd_type, "data": data}
         }
-        msg["signature"] = self._sign_agent_msg(msg)
+        msg["signature"] = self.agent_signer.sign(msg)
 
         try:
             # Create a future to wait for the response
@@ -230,30 +229,6 @@ class PxmxControlPlane:
                     await websocket.send(json.dumps(resp))
                 except Exception as e:
                     logger.error(f"Critical error in PxmxControlPlane message loop: {e}", exc_info=True)
-
-    def _sign(self, msg):
-        data = {k: v for k, v in msg.items() if k != "signature"}
-        message_bytes = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
-        return hmac.new(self.secret.encode(), message_bytes, hashlib.sha256).hexdigest()
-
-    def _verify_signature(self, msg):
-        sig = msg.get("signature")
-        data = {k: v for k, v in msg.items() if k != "signature"}
-        message_bytes = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
-        expected = hmac.new(self.secret.encode(), message_bytes, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, sig)
-
-    def _sign_agent_msg(self, msg):
-        data = {k: v for k, v in msg.items() if k != "signature"}
-        message_bytes = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
-        return hmac.new(self.agent_secret.encode(), message_bytes, hashlib.sha256).hexdigest()
-
-    def _verify_agent_signature(self, msg):
-        sig = msg.get("signature")
-        data = {k: v for k, v in msg.items() if k != "signature"}
-        message_bytes = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
-        expected = hmac.new(self.agent_secret.encode(), message_bytes, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, sig)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

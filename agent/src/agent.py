@@ -8,6 +8,7 @@ import httpx
 import argparse
 import os
 from typing import Dict, Any
+from .security_utils import MessageSigner
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PxmxAgent")
@@ -19,12 +20,10 @@ class ProxmoxAgent:
         self.secret = secret
         self.websocket = None
         self.config = {} # Stores API credentials: host, user, password/token
+        self.signer = MessageSigner(secret)
 
     def _sign(self, msg):
-        data = {k: v for k, v in msg.items() if k != "signature"}
-        message_bytes = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
-        import hmac, hashlib
-        return hmac.new(self.secret.encode(), message_bytes, hashlib.sha256).hexdigest()
+        return self.signer.sign(msg)
 
     async def collect_metrics(self) -> Dict[str, Any]:
         """Collects local system performance metrics."""
@@ -208,12 +207,7 @@ class ProxmoxAgent:
                 await asyncio.sleep(10)
 
     def _verify_signature(self, msg):
-        sig = msg.get("signature")
-        data = {k: v for k, v in msg.items() if k != "signature"}
-        message_bytes = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
-        import hmac, hashlib
-        expected = hmac.new(self.secret.encode(), message_bytes, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, sig)
+        return self.signer.verify(msg)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
