@@ -21,7 +21,10 @@ class ProxmoxSpoke(BaseSpoke):
         self.telemetry_cache = {}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        if command_type == "UPDATE_CONFIG":
+        # Normalize command type to uppercase for case-insensitive matching
+        normalized_cmd = command_type.upper()
+
+        if normalized_cmd == "UPDATE_CONFIG":
             logger.info(f"Updating Proxmox configuration: {data}")
             self.config = data
             if self.control_plane:
