@@ -24,6 +24,9 @@ class ProxmoxSpoke(BaseSpoke):
         # Normalize command type to uppercase for case-insensitive matching
         normalized_cmd = command_type.upper()
 
+        if normalized_cmd == "GET_VERSION":
+            return {"status": "SUCCESS", "version": self.get_version()}
+
         if normalized_cmd == "UPDATE_CONFIG":
             logger.info(f"Updating Proxmox configuration: {data}")
             self.config = data
@@ -31,6 +34,7 @@ class ProxmoxSpoke(BaseSpoke):
                 # Forward config update to the local agent
                 return await self.control_plane.send_to_agent("UPDATE_CONFIG", data)
             return {"status": "SUCCESS", "message": "Proxmox configuration updated (no agent connected)"}
+
 
         if not self.control_plane:
             return {"success": False, "error": "Control plane not initialized"}
@@ -61,3 +65,7 @@ class ProxmoxSpoke(BaseSpoke):
             "metrics": self.telemetry_cache,
             "managed_nodes": self.telemetry_cache.get("nodes", 1)
         }
+
+    def get_version(self) -> str:
+        """Returns the current version of the Proxmox module."""
+        return "1.0.0"
