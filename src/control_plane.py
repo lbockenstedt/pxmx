@@ -8,8 +8,8 @@ import hmac
 import hashlib
 import argparse
 from typing import Any, Dict, Optional
-from lm.core.src.messaging.control_plane import BaseControlPlane
-from lm.core.src.security.signer import MessageSigner
+from core.src.messaging.control_plane import BaseControlPlane
+from core.src.security.signer import MessageSigner
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PxmxControlPlane")
