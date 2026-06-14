@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 from core.src.messaging.control_plane import BaseControlPlane
 from core.src.security.signer import MessageSigner
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("PxmxControlPlane")
 
 class PxmxControlPlane(BaseControlPlane):
@@ -53,6 +53,7 @@ class PxmxControlPlane(BaseControlPlane):
             # 1. Agent Authentication
             auth_msg = await websocket.recv()
             auth_data = json.loads(auth_msg)
+            logger.debug(f"Received agent auth data: {auth_data}")
 
             agent_id = auth_data.get("agent_id")
             agent_secret = auth_data.get("secret")
@@ -68,6 +69,7 @@ class PxmxControlPlane(BaseControlPlane):
             # 2. Agent Message Loop
             async for message in websocket:
                 msg_data = json.loads(message)
+                logger.debug(f"Received agent message: {msg_data}")
 
                 # Verify signature
                 if "signature" in msg_data and not self.agent_signer.verify(msg_data):
@@ -124,6 +126,7 @@ class PxmxControlPlane(BaseControlPlane):
             fut = asyncio.get_event_loop().create_future()
             self.pending_responses[corr_id] = fut
 
+            logger.debug(f"Sending command to agent: {json.dumps(msg)}")
             await self.agent_ws.send(json.dumps(msg, separators=(',', ':')))
 
             # Wait for response with timeout

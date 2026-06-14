@@ -11,10 +11,10 @@ from typing import Dict, Any
 from .security_utils import MessageSigner
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("/var/log/lm-pxmx-agent.log"),
+        logging.FileHandler("/var/log/lm/pxmx-agent.log"),
         logging.StreamHandler()
     ]
 )
@@ -132,6 +132,7 @@ class ProxmoxAgent:
                 "agent_id": self.agent_id,
                 "secret": self.secret
             }
+            logger.debug(f"Sending handshake: {auth_msg}")
             await websocket.send(json.dumps(auth_msg))
             logger.info(f"Handshake sent for agent {self.agent_id}")
 
@@ -142,6 +143,7 @@ class ProxmoxAgent:
             try:
                 async for message in websocket:
                     msg_data = json.loads(message)
+                    logger.debug(f"Received message from spoke: {msg_data}")
 
                     # Verify signature if present
                     if "signature" in msg_data:
@@ -181,6 +183,7 @@ class ProxmoxAgent:
                         "payload": {"type": "AGENT_RESPONSE", "data": result}
                     }
                     resp["signature"] = self.signer.sign(resp)
+                    logger.debug(f"Sending response to spoke: {resp}")
                     await websocket.send(json.dumps(resp))
 
             finally:
@@ -196,6 +199,7 @@ class ProxmoxAgent:
                     "payload": {"type": "AGENT_HEARTBEAT", "data": {}}
                 }
                 msg["signature"] = self.signer.sign(msg)
+                logger.debug(f"Sending heartbeat: {msg}")
                 await self.websocket.send(json.dumps(msg))
                 await asyncio.sleep(30)
             except Exception as e:
@@ -214,6 +218,7 @@ class ProxmoxAgent:
                     "payload": {"type": "AGENT_TELEMETRY", "data": {"metrics": metrics, "vms": vms}}
                 }
                 msg["signature"] = self.signer.sign(msg)
+                logger.debug(f"Sending telemetry: {msg}")
                 await self.websocket.send(json.dumps(msg))
                 await asyncio.sleep(60)
             except Exception as e:
