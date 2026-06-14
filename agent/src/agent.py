@@ -10,11 +10,25 @@ import os
 from typing import Dict, Any
 from .security_utils import MessageSigner
 
+def get_log_path():
+    primary = "/var/log/lm/pxmx-agent.log"
+    try:
+        os.makedirs(os.path.dirname(primary), exist_ok=True)
+        with open(primary, "a") as f:
+            pass
+        return primary
+    except Exception:
+        local_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(local_dir, exist_ok=True)
+        return os.path.join(local_dir, "pxmx-agent.log")
+
+log_file = get_log_path()
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("/var/log/lm-pxmx-agent.log"),
+        logging.FileHandler(log_file),
         logging.StreamHandler()
     ]
 )
