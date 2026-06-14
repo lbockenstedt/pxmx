@@ -7,7 +7,7 @@ import psutil
 import httpx
 import argparse
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .security_utils import MessageSigner
 
 def get_log_path():
