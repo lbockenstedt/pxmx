@@ -246,8 +246,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
 
-    agent = ProxmoxAgent(args.spoke_url, args.id, args.secret)
+    agent = ProxmoxAgent(args.spoke_url, args.id)
     try:
         asyncio.run(agent.run())
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        logger.exception(f"Critical failure during agent execution: {e}")
