@@ -26,11 +26,11 @@ if [ -z "$AGENT_SECRET" ]; then
     API_HOST=$(echo $SPOKE_URL | sed 's/ws\:\/\///' | cut -d: -f1)
     API_URL="http://$API_HOST:8000"
 
-    SPOKE_SECRET=$(curl -s -X POST "$API_URL/setup/generate-secret" \
+    AGENT_SECRET=$(curl -s -X POST "$API_URL/setup/generate-secret" \
         -H "Content-Type: application/json" \
         -d "{\"spoke_id\": \"$AGENT_ID\"}" | jq -r '.secret' 2>/dev/null)
 
-    if [ "$SPOKE_SECRET" == "null" ] || [ -z "$SPOKE_SECRET" ]; then
+    if [ "$AGENT_SECRET" == "null" ] || [ -z "$AGENT_SECRET" ]; then
         echo "❌ Could not fetch secret from Hub. Please provide --secret manually."
         exit 1
     else
