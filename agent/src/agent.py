@@ -7,45 +7,29 @@ import psutil
 import httpx
 import argparse
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from .security_utils import MessageSigner
-
-def get_log_path():
-    primary = "/var/log/lm-pxmx-agent.log"
-    try:
-        with open(primary, "a") as f:
-            pass
-        return primary
-    except Exception:
-        local_dir = os.path.join(os.getcwd(), "logs")
-        os.makedirs(local_dir, exist_ok=True)
-        return os.path.join(local_dir, "lm-pxmx-agent.log")
-
-log_file = get_log_path()
 
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_file),
+        logging.FileHandler("/var/log/pxmx-agent.log"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger("PxmxAgent")
 
 class ProxmoxAgent:
-    def __init__(self, spoke_url: str, agent_id: str, secret: Optional[str] = None):
+    def __init__(self, spoke_url: str, agent_id: str):
         self.spoke_url = spoke_url
         self.agent_id = agent_id
-        logger.info(f"Initializing ProxmoxAgent for ID: {agent_id} connecting to {spoke_url}")
 
-        # Prioritize secret from CLI, fallback to protected local config
-        self.secret = secret or self._load_secret()
+        # Load secret from protected local config
+        self.secret = self._load_secret()
         if not self.secret:
-            logger.error("Agent secret not provided via CLI and not found in /etc/lm-agent/config.json")
-            raise RuntimeError("Agent secret not provided via CLI and not found in /etc/lm-agent/config.json")
+            raise RuntimeError("Agent secret not found in /etc/lm-agent/config.json")
 
-        logger.info("Agent secret successfully loaded.")
         self.websocket = None
         self.config = {} # Stores API credentials: host, user, password/token
         self.signer = MessageSigner(self.secret)
@@ -143,7 +127,7 @@ class ProxmoxAgent:
         async with websockets.connect(self.spoke_url) as websocket:
             self.websocket = websocket
 
-            # 1. Handshake: Prove Agent identity to Hub/Spoke
+            # 1. Handshake
             auth_msg = {
                 "agent_id": self.agent_id,
                 "secret": self.secret
@@ -152,24 +136,7 @@ class ProxmoxAgent:
             await websocket.send(json.dumps(auth_msg))
             logger.info(f"Handshake sent for agent {self.agent_id}")
 
-            # 2. Mutual Auth: Hub/Spoke proves its identity to Agent
-            try:
-                hub_proof_json = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-                hub_proof = json.loads(hub_proof_json)
-
-                if hub_proof.get("status") == "HUB_VERIFIED":
-                    logger.info("Hub identity verified. Sending HUB_OK.")
-                    await websocket.send(json.dumps({"status": "HUB_OK"}))
-                else:
-                    logger.error(f"Hub failed to prove identity: {hub_proof}")
-                    await websocket.close(1008, "Hub identity not verified")
-                    return
-            except Exception as e:
-                logger.error(f"Mutual authentication failed during Hub proof: {e}")
-                # We don't necessarily exit here, as the Hub might not use mutual auth in all modes,
-                # but currently the Hub implementation requires it.
-
-            # 3. Start background tasks
+            # 2. Start background tasks
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             telemetry_task = asyncio.create_task(self._telemetry_loop())
 
@@ -196,12 +163,6 @@ class ProxmoxAgent:
                         logger.info(f"Updating Agent configuration: {data}")
                         self.config = data
                         result = {"status": "SUCCESS", "message": "Agent configuration updated"}
-                    elif cmd_type == "SET_LOG_LEVEL":
-                        enabled = data.get("enabled", False)
-                        level = logging.DEBUG if enabled else logging.INFO
-                        logging.getLogger().setLevel(level)
-                        logger.info(f"Log level set to {logging.getLevelName(level)}")
-                        result = {"status": "SUCCESS", "message": f"Log level set to {logging.getLevelName(level)}"}
                     elif cmd_type == "GET_VM_LIST":
                         result = await self.get_vm_list()
                     elif cmd_type == "GET_SYSTEM_STATS":
@@ -268,14 +229,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--spoke-url", required=True, help="URL of the Proxmox Spoke WebSocket server")
     parser.add_argument("--id", default="pxmx-agent-1", help="Agent ID")
-    parser.add_argument("--secret", help="Agent session secret")
-    parser.add_argument("--hub-secret", help="Hub root secret")
     args = parser.parse_args()
 
+
+    agent = ProxmoxAgent(args.spoke_url, args.id, args.secret)
     try:
-        agent = ProxmoxAgent(args.spoke_url, args.id, args.secret)
         asyncio.run(agent.run())
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        logger.exception(f"Critical failure during agent execution: {e}")
