@@ -106,6 +106,30 @@ systemctl daemon-reload
 systemctl enable lm-pxmx-agent
 systemctl restart lm-pxmx-agent
 
+echo "⏳ Verifying connection to Hub..."
+LOG_FILE="/var/log/lm-pxmx-agent.log"
+MAX_RETRIES=10
+COUNT=0
+VERIFIED=false
+
+while [ $COUNT -lt $MAX_RETRIES ]; do
+    if grep -q "Hub identity verified" "$LOG_FILE"; then
+        VERIFIED=true
+        break
+    fi
+    echo -n "."
+    sleep 1
+    ((COUNT++))
+done
+
+echo ""
+if [ "$VERIFIED" = true ]; then
+    echo "✅ Agent verified and connected successfully!"
+else
+    echo "❌ Agent failed to verify mutual authentication within ${MAX_RETRIES}s."
+    echo "👉 Please check the logs: tail -n 20 $LOG_FILE"
+fi
+
 echo "🎉 Proxmox Local Agent installation complete!"
 echo "🌐 Target Spoke: $SPOKE_URL"
 echo "🆔 Agent ID: $AGENT_ID"
