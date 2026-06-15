@@ -11,9 +11,8 @@ from typing import Dict, Any, Optional
 from .security_utils import MessageSigner
 
 def get_log_path():
-    primary = "/var/log/lm/pxmx-agent.log"
+    primary = "/var/log/pxmx-agent.log"
     try:
-        os.makedirs(os.path.dirname(primary), exist_ok=True)
         with open(primary, "a") as f:
             pass
         return primary
