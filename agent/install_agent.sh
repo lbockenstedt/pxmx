@@ -19,6 +19,15 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
+if [ "$(id -u)" -ne 0 ]; then
+    echo "⚠️  This script must be run as root."
+    exit 1
+fi
+
+echo "📦 Installing system dependencies..."
+apt-get update
+apt-get install -y python3-pip python3-venv git curl jq
+
 # Auto-fetch secret if not provided
 if [ -z "$AGENT_SECRET" ]; then
     echo "🔑 No secret provided. Attempting to fetch first-secret from Hub..."
@@ -40,13 +49,6 @@ fi
 
 echo "🚀 Installing Proxmox Local Agent (Direct from GitHub)..."
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo "⚠️  This script must be run as root."
-    exit 1
-fi
-
-apt-get update
-apt-get install -y python3-pip python3-venv git curl jq
 
 INSTALL_DIR="/opt/lm/pxmx/agent"
 mkdir -p "$INSTALL_DIR"
