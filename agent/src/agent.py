@@ -7,7 +7,7 @@ import psutil
 import httpx
 import argparse
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .security_utils import MessageSigner
 
 logging.basicConfig(
@@ -127,7 +127,7 @@ class ProxmoxAgent:
         async with websockets.connect(self.spoke_url) as websocket:
             self.websocket = websocket
 
-            # 1. Handshake
+            # 1. Handshake: Prove Agent identity to Spoke
             auth_msg = {
                 "agent_id": self.agent_id,
                 "secret": self.secret
@@ -136,7 +136,24 @@ class ProxmoxAgent:
             await websocket.send(json.dumps(auth_msg))
             logger.info(f"Handshake sent for agent {self.agent_id}")
 
-            # 2. Start background tasks
+            # 2. Mutual Auth: Spoke proves its identity to Agent
+            try:
+                hub_proof_json = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                hub_proof = json.loads(hub_proof_json)
+
+                if hub_proof.get("status") == "HUB_VERIFIED":
+                    logger.info("Spoke identity verified. Sending HUB_OK.")
+                    await websocket.send(json.dumps({"status": "HUB_OK"}))
+                else:
+                    logger.error(f"Spoke failed to prove identity: {hub_proof}")
+                    await websocket.close(1008, "Spoke identity not verified")
+                    return
+            except Exception as e:
+                logger.error(f"Mutual authentication failed during Spoke proof: {e}")
+                # If we get a 1008 here, it means the Spoke rejected us before it could prove itself
+                # We allow the exception to propagate to the critical failure handler
+
+            # 3. Start background tasks
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             telemetry_task = asyncio.create_task(self._telemetry_loop())
 
@@ -167,6 +184,11 @@ class ProxmoxAgent:
                         result = await self.get_vm_list()
                     elif cmd_type == "GET_SYSTEM_STATS":
                         result = await self.collect_metrics()
+                    elif cmd_type == "SET_LOG_LEVEL":
+                        enabled = data.get("enabled", False)
+                        level = logging.DEBUG if enabled else logging.INFO
+                        logging.getLogger().setLevel(level)
+                        result = {"status": "SUCCESS", "message": f"Log level set to {logging.getLevelName(level)}"}
                     elif cmd_type == "SHELLEXEC":
                         # REMOVED: Generic shell execution is a critical security vulnerability (RCE)
                         result = {"status": "ERROR", "message": "SHELLEXEC command is disabled for security reasons"}
