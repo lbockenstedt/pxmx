@@ -154,7 +154,7 @@ class PxmxControlPlane(BaseControlPlane):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--id", required=True, help="Spoke ID")
-    parser.add_argument("--secret", required=True, help="Authentication secret")
+    parser.add_argument("--secret", nargs='?', const="lm-secret", default="lm-secret", help="Authentication secret (default: lm-secret)")
     parser.add_argument("--hub-secret", help="Hub authentication secret for mutual auth")
     parser.add_argument("--hub", required=True, help="Hub WebSocket URL")
     args = parser.parse_args()
