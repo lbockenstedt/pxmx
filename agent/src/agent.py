@@ -176,6 +176,12 @@ class ProxmoxAgent:
                         logger.info(f"Updating Agent configuration: {data}")
                         self.config = data
                         result = {"status": "SUCCESS", "message": "Agent configuration updated"}
+                    elif cmd_type == "SET_LOG_LEVEL":
+                        enabled = data.get("enabled", False)
+                        level = logging.DEBUG if enabled else logging.INFO
+                        logging.getLogger().setLevel(level)
+                        logger.info(f"Log level set to {logging.getLevelName(level)}")
+                        result = {"status": "SUCCESS", "message": f"Log level set to {logging.getLevelName(level)}"}
                     elif cmd_type == "GET_VM_LIST":
                         result = await self.get_vm_list()
                     elif cmd_type == "GET_SYSTEM_STATS":
