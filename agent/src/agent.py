@@ -34,14 +34,14 @@ logging.basicConfig(
 logger = logging.getLogger("PxmxAgent")
 
 class ProxmoxAgent:
-    def __init__(self, spoke_url: str, agent_id: str):
+    def __init__(self, spoke_url: str, agent_id: str, secret: Optional[str] = None):
         self.spoke_url = spoke_url
         self.agent_id = agent_id
 
-        # Load secret from protected local config
-        self.secret = self._load_secret()
+        # Prioritize secret from CLI, fallback to protected local config
+        self.secret = secret or self._load_secret()
         if not self.secret:
-            raise RuntimeError("Agent secret not found in /etc/lm-agent/config.json")
+            raise RuntimeError("Agent secret not provided via CLI and not found in /etc/lm-agent/config.json")
 
         self.websocket = None
         self.config = {} # Stores API credentials: host, user, password/token
@@ -248,10 +248,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--spoke-url", required=True, help="URL of the Proxmox Spoke WebSocket server")
     parser.add_argument("--id", default="pxmx-agent-1", help="Agent ID")
+    parser.add_argument("--secret", help="Agent session secret")
+    parser.add_argument("--hub-secret", help="Hub root secret")
     args = parser.parse_args()
 
-
-    agent = ProxmoxAgent(args.spoke_url, args.id)
+    agent = ProxmoxAgent(args.spoke_url, args.id, args.secret)
     try:
         asyncio.run(agent.run())
     except KeyboardInterrupt:
