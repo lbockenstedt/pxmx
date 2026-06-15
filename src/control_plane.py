@@ -11,11 +11,15 @@ import os
 from typing import Any, Dict, Optional
 from core.src.messaging.control_plane import BaseControlPlane
 from core.src.security.signer import MessageSigner
+from core.src.messaging.protocol import Message, MessageHeader, MessagePayload
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("PxmxControlPlane")
 
 class PxmxControlPlane(BaseControlPlane):
+    def get_service_name(self) -> str:
+        return "lm-pxmx-agent"
+
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.agent_ws: Optional[websockets.WebSocketServerProtocol] = None
@@ -118,6 +122,27 @@ class PxmxControlPlane(BaseControlPlane):
                         fut = self.pending_responses.pop(corr_id)
                         if not fut.done():
                             fut.set_result(data)
+                elif msg_type == "AGENT_LOG":
+                    # Relay logs to the Hub
+                    logger.debug(f"Relaying log from agent {agent_id}: {data.get('message')}")
+                    relay_msg = Message(
+                        header=MessageHeader(
+                            message_id=str(uuid.uuid4()),
+                            timestamp=time.time(),
+                            sender_id=self.spoke_id,
+                            destination_id="hub"
+                        ),
+                        payload=MessagePayload(
+                            type="AGENT_RELAY_UP",
+                            data={
+                                "agent_id": agent_id,
+                                "agent_type": data.get("agent_type", "pxmx-agent"),
+                                "hostname": data.get("hostname", "unknown"),
+                                "original_payload": msg_data
+                            }
+                        )
+                    )
+                    await self.send_to_hub(relay_msg)
 
         except Exception as e:
             logger.error(f"Error handling Proxmox Agent connection: {e}", exc_info=True)

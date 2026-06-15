@@ -7,8 +7,24 @@ import psutil
 import httpx
 import argparse
 import os
+import socket
 from typing import Dict, Any, Optional
 from .security_utils import MessageSigner
+
+class WebSocketLogHandler(logging.Handler):
+    """Custom logging handler that relays logs over the WebSocket connection."""
+    def __init__(self, agent):
+        super().__init__()
+        self.agent = agent
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Log messages are sent asynchronously to avoid blocking the main execution
+            if self.agent.websocket:
+                asyncio.create_task(self.agent.send_log(msg, record.levelname))
+        except Exception:
+            self.handleError(record)
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -35,6 +51,8 @@ class ProxmoxAgent:
         self.websocket = None
         self.config = {} # Stores API credentials: host, user, password/token
         self.signer = MessageSigner(self.secret)
+        self.hostname = socket.gethostname()
+        self.agent_type = "pxmx-agent"
 
     def _load_secret(self) -> Optional[str]:
         config_path = "/etc/lm-agent/config.json"
@@ -122,12 +140,43 @@ class ProxmoxAgent:
             logger.error(f"Proxmox API error: {e}")
             return {"vms": [], "error": str(e)}
 
+    async def send_log(self, message: str, level: str):
+        """Sends a log message to the Spoke Gateway."""
+        try:
+            log_msg = {
+                "header": {
+                    "message_id": str(uuid.uuid4()),
+                    "timestamp": time.time(),
+                    "sender_id": self.agent_id,
+                    "destination_id": "pxmx-spoke"
+                },
+                "payload": {
+                    "type": "AGENT_LOG",
+                    "data": {
+                        "message": message,
+                        "level": level,
+                        "hostname": self.hostname,
+                        "agent_type": self.agent_type
+                    }
+                }
+            }
+            log_msg["signature"] = self.signer.sign(log_msg)
+            await self.websocket.send(json.dumps(log_msg))
+        except Exception as e:
+            # Avoid recursive logging if send_log fails
+            pass
+
     async def run(self):
         import websockets
         logger.info(f"Connecting to Proxmox Spoke at {self.spoke_url}...")
 
         async with websockets.connect(self.spoke_url) as websocket:
             self.websocket = websocket
+
+            # Attach WebSocket log handler
+            log_handler = WebSocketLogHandler(self)
+            log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            logging.getLogger().addHandler(log_handler)
 
             # 1. Handshake: Prove Agent identity to Spoke
             auth_msg = {
@@ -213,6 +262,7 @@ class ProxmoxAgent:
             finally:
                 heartbeat_task.cancel()
                 telemetry_task.cancel()
+                logging.getLogger().removeHandler(log_handler)
 
     async def _heartbeat_loop(self):
         while True:
