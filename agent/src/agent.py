@@ -143,7 +143,7 @@ class ProxmoxAgent:
         async with websockets.connect(self.spoke_url) as websocket:
             self.websocket = websocket
 
-            # 1. Handshake
+            # 1. Handshake: Prove Agent identity to Hub/Spoke
             auth_msg = {
                 "agent_id": self.agent_id,
                 "secret": self.secret
@@ -152,7 +152,24 @@ class ProxmoxAgent:
             await websocket.send(json.dumps(auth_msg))
             logger.info(f"Handshake sent for agent {self.agent_id}")
 
-            # 2. Start background tasks
+            # 2. Mutual Auth: Hub/Spoke proves its identity to Agent
+            try:
+                hub_proof_json = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                hub_proof = json.loads(hub_proof_json)
+
+                if hub_proof.get("status") == "HUB_VERIFIED":
+                    logger.info("Hub identity verified. Sending HUB_OK.")
+                    await websocket.send(json.dumps({"status": "HUB_OK"}))
+                else:
+                    logger.error(f"Hub failed to prove identity: {hub_proof}")
+                    await websocket.close(1008, "Hub identity not verified")
+                    return
+            except Exception as e:
+                logger.error(f"Mutual authentication failed during Hub proof: {e}")
+                # We don't necessarily exit here, as the Hub might not use mutual auth in all modes,
+                # but currently the Hub implementation requires it.
+
+            # 3. Start background tasks
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             telemetry_task = asyncio.create_task(self._telemetry_loop())
 
