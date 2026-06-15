@@ -70,6 +70,8 @@ Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/venv/bin/python3 -m src.agent --spoke-url $SPOKE_URL --id $AGENT_ID --secret $AGENT_SECRET
+StandardOutput=append:/var/log/lm-pxmx-agent.log
+StandardError=append:/var/log/lm-pxmx-agent.log
 Restart=on-failure
 RestartSec=10
 

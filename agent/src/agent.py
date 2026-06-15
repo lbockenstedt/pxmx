@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional
 from .security_utils import MessageSigner
 
 def get_log_path():
-    primary = "/var/log/pxmx-agent.log"
+    primary = "/var/log/lm-pxmx-agent.log"
     try:
         with open(primary, "a") as f:
             pass
@@ -19,7 +19,7 @@ def get_log_path():
     except Exception:
         local_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(local_dir, exist_ok=True)
-        return os.path.join(local_dir, "pxmx-agent.log")
+        return os.path.join(local_dir, "lm-pxmx-agent.log")
 
 log_file = get_log_path()
 
