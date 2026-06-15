@@ -4,7 +4,8 @@ set -e
 # Default Configuration
 SPOKE_URL="ws://localhost:8766"
 AGENT_ID="pxmx-agent-1"
-AGENT_SECRET="pxmx-agent-secret"
+AGENT_SECRET=""
+HUB_SECRET=""
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
@@ -12,10 +13,30 @@ while [[ "$#" -gt 0 ]]; do
         --spoke-url) SPOKE_URL="$2"; shift ;;
         --id) AGENT_ID="$2"; shift ;;
         --secret) AGENT_SECRET="$2"; shift ;;
+        --hub-secret) HUB_SECRET="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
+
+# Auto-fetch secret if not provided
+if [ -z "$AGENT_SECRET" ]; then
+    echo "🔑 No secret provided. Attempting to fetch first-secret from Hub..."
+    # Extract hostname/IP from ws://hostname:port
+    API_HOST=$(echo $SPOKE_URL | sed 's/ws\:\/\///' | cut -d: -f1)
+    API_URL="http://$API_HOST:8000"
+
+    SPOKE_SECRET=$(curl -s -X POST "$API_URL/setup/generate-secret" \
+        -H "Content-Type: application/json" \
+        -d "{\"spoke_id\": \"$AGENT_ID\"}" | jq -r '.secret' 2>/dev/null)
+
+    if [ "$SPOKE_SECRET" == "null" ] || [ -z "$SPOKE_SECRET" ]; then
+        echo "❌ Could not fetch secret from Hub. Please provide --secret manually."
+        exit 1
+    else
+        echo "✅ Successfully fetched first-secret from Hub."
+    fi
+fi
 
 echo "🚀 Installing Proxmox Local Agent (Direct from GitHub)..."
 
