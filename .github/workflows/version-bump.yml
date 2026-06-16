@@ -1,0 +1,36 @@
+name: Version Bump
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version
+        run: |
+          VERSION=$(cat VERSION)
+          echo "Current version: $VERSION"
+          # Increment patch version (X.Y.Z -> X.Y.Z+1)
+          IFS='.' read -r major minor patch <<< "$VERSION"
+          NEW_VERSION="$major.$minor.$((patch + 1))"
+          echo "New version: $NEW_VERSION"
+          echo "$NEW_VERSION" > VERSION
+
+      - name: Commit and push
+        run: |
+          git config --global user.name "version-bot[bot]"
+          git config --global user.email "version-bot@github.com"
+          git add VERSION
+          git commit -m "chore: bump version to $(cat VERSION) [skip ci]"
+          git push origin main
+          git tag "v$(cat VERSION)"
+          git push origin "v$(cat VERSION)"

@@ -8,12 +8,48 @@ import hmac
 import hashlib
 import argparse
 import os
+import threading
+import subprocess
+import git
 from typing import Any, Dict, Optional
 from core.src.messaging.control_plane import BaseControlPlane
 from core.src.security.signer import MessageSigner
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("PxmxControlPlane")
+
+def get_version():
+    try:
+        with open("VERSION", "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return "unknown"
+
+version = get_version()
+
+def check_for_updates():
+    try:
+        self_repo = git.Repo(os.getcwd())
+        old_commit = self_repo.head.commit.hexsha
+        self_repo.remotes.origin.pull()
+        new_commit = self_repo.head.commit.hexsha
+        if old_commit != new_commit:
+            logger.info(f"New version detected! {old_commit[:7]} -> {new_commit[:7]}. Triggering restart...")
+            subprocess.Popen(["sudo", "systemctl", "restart", "lm-pxmx"])
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"Self-update check failed: {e}")
+        return False
+
+def updater_worker():
+    while True:
+        try:
+            logger.info("Checking for self-updates...")
+            check_for_updates()
+        except Exception as e:
+            logger.error(f"Updater worker error: {e}")
+        time.sleep(3600)
 
 class PxmxControlPlane(BaseControlPlane):
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
@@ -140,7 +176,11 @@ class PxmxControlPlane(BaseControlPlane):
 
     async def run(self):
         """Native LM Spoke behavior."""
+        logger.info(f"Initializing module version: {version}")
         logger.info(f"Starting PXMX Module in HUB MODE -> {self.hub_url}")
+
+        # Start update worker
+        threading.Thread(target=updater_worker, daemon=True).start()
 
         # Start the Agent Server in the background
         asyncio.create_task(self.run_agent_server())

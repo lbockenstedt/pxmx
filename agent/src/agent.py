@@ -20,6 +20,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PxmxAgent")
 
+def get_version():
+    try:
+        # Try to find VERSION file in root or script dir
+        paths = ["VERSION", os.path.join(os.path.dirname(__file__), "../../VERSION"), os.path.join(os.path.dirname(__file__), "../VERSION")]
+        for p in paths:
+            if os.path.exists(p):
+                with open(p, "r") as f:
+                    return f.read().strip()
+    except Exception:
+        pass
+    return "unknown"
+
+version = get_version()
+
 class ProxmoxAgent:
     def __init__(self, spoke_url: str, agent_id: str):
         self.spoke_url = spoke_url
@@ -122,6 +136,7 @@ class ProxmoxAgent:
 
     async def run(self):
         import websockets
+        logger.info(f"Initializing module version: {version}")
         logger.info(f"Connecting to Proxmox Spoke at {self.spoke_url}...")
 
         async with websockets.connect(self.spoke_url) as websocket:
