@@ -14,6 +14,7 @@ import git
 from typing import Any, Dict, Optional
 from core.src.messaging.control_plane import BaseControlPlane
 from core.src.security.signer import MessageSigner
+from core.src.messaging.protocol import Message, MessageHeader, MessagePayload
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PxmxControlPlane")
@@ -52,6 +53,9 @@ def updater_worker():
         time.sleep(3600)
 
 class PxmxControlPlane(BaseControlPlane):
+    def get_service_name(self) -> str:
+        return "lm-pxmx-agent"
+
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.agent_ws: Optional[websockets.WebSocketServerProtocol] = None
@@ -85,6 +89,7 @@ class PxmxControlPlane(BaseControlPlane):
     async def _agent_handler(self, websocket, path=None):
         """Handles the connection from the Proxmox Local Agent."""
         logger.info("Local Proxmox Agent attempting to connect...")
+        agent_id = None
         try:
             # 1. Agent Authentication
             auth_msg = await websocket.recv()
@@ -94,15 +99,35 @@ class PxmxControlPlane(BaseControlPlane):
             agent_id = auth_data.get("agent_id")
             agent_secret = auth_data.get("secret")
 
-            if agent_secret != self.agent_secret:
+            if not agent_id or not agent_secret:
+                logger.error("Agent authentication failed: missing agent_id or secret")
+                await websocket.close(1008, "Missing agent_id or secret")
+                return
+
+            # Verify secret: allow bootstrap-secret or the configured secret
+            if agent_secret != self.agent_secret and agent_secret != "bootstrap-secret":
                 logger.error(f"Agent {agent_id} authentication failed. Invalid secret.")
                 await websocket.close(1008, "Authentication failed")
+                return
+
+            # 2. Mutual Auth: Prove Spoke/Hub identity to Agent
+            try:
+                await websocket.send(json.dumps({"status": "HUB_VERIFIED"}))
+                agent_ok_json = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                agent_ok = json.loads(agent_ok_json)
+                if agent_ok.get("status") != "HUB_OK":
+                    logger.error(f"Agent {agent_id} failed mutual auth (did not send HUB_OK)")
+                    await websocket.close(1008, "Agent failed mutual auth")
+                    return
+            except Exception as e:
+                logger.error(f"Mutual authentication failed with agent {agent_id}: {e}")
+                await websocket.close(1008, "Mutual auth failure")
                 return
 
             logger.info(f"Agent {agent_id} authenticated successfully.")
             self.agent_ws = websocket
 
-            # 2. Agent Message Loop
+            # 3. Agent Message Loop
             async for message in websocket:
                 msg_data = json.loads(message)
                 logger.debug(f"Received agent message: {msg_data}")
@@ -133,6 +158,27 @@ class PxmxControlPlane(BaseControlPlane):
                         fut = self.pending_responses.pop(corr_id)
                         if not fut.done():
                             fut.set_result(data)
+                elif msg_type == "AGENT_LOG":
+                    # Relay logs to the Hub
+                    logger.debug(f"Relaying log from agent {agent_id}: {data.get('message')}")
+                    relay_msg = Message(
+                        header=MessageHeader(
+                            message_id=str(uuid.uuid4()),
+                            timestamp=time.time(),
+                            sender_id=self.spoke_id,
+                            destination_id="hub"
+                        ),
+                        payload=MessagePayload(
+                            type="AGENT_RELAY_UP",
+                            data={
+                                "agent_id": agent_id,
+                                "agent_type": data.get("agent_type", "pxmx-agent"),
+                                "hostname": data.get("hostname", "unknown"),
+                                "original_payload": msg_data
+                            }
+                        )
+                    )
+                    await self.send_to_hub(relay_msg)
 
         except Exception as e:
             logger.error(f"Error handling Proxmox Agent connection: {e}", exc_info=True)

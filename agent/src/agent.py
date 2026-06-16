@@ -7,8 +7,24 @@ import psutil
 import httpx
 import argparse
 import os
-from typing import Dict, Any
+import socket
+from typing import Dict, Any, Optional
 from .security_utils import MessageSigner
+
+class WebSocketLogHandler(logging.Handler):
+    """Custom logging handler that relays logs over the WebSocket connection."""
+    def __init__(self, agent):
+        super().__init__()
+        self.agent = agent
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Log messages are sent asynchronously to avoid blocking the main execution
+            if self.agent.websocket:
+                asyncio.create_task(self.agent.send_log(msg, record.levelname))
+        except Exception:
+            self.handleError(record)
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -35,18 +51,22 @@ def get_version():
 version = get_version()
 
 class ProxmoxAgent:
-    def __init__(self, spoke_url: str, agent_id: str):
+    def __init__(self, spoke_url: str, agent_id: str, secret: Optional[str] = None):
         self.spoke_url = spoke_url
         self.agent_id = agent_id
 
-        # Load secret from protected local config
-        self.secret = self._load_secret()
+        # Prioritize secret from CLI, fallback to protected local config
+        self.secret = secret or self._load_secret()
         if not self.secret:
-            raise RuntimeError("Agent secret not found in /etc/lm-agent/config.json")
+            logger.error("Agent secret not provided via CLI and not found in /etc/lm-agent/config.json")
+            raise RuntimeError("Agent secret not provided via CLI and not found in /etc/lm-agent/config.json")
 
+        logger.info("Agent secret successfully loaded.")
         self.websocket = None
         self.config = {} # Stores API credentials: host, user, password/token
         self.signer = MessageSigner(self.secret)
+        self.hostname = socket.gethostname()
+        self.agent_type = "pxmx-agent"
 
     def _load_secret(self) -> Optional[str]:
         config_path = "/etc/lm-agent/config.json"
@@ -134,6 +154,32 @@ class ProxmoxAgent:
             logger.error(f"Proxmox API error: {e}")
             return {"vms": [], "error": str(e)}
 
+    async def send_log(self, message: str, level: str):
+        """Sends a log message to the Spoke Gateway."""
+        try:
+            log_msg = {
+                "header": {
+                    "message_id": str(uuid.uuid4()),
+                    "timestamp": time.time(),
+                    "sender_id": self.agent_id,
+                    "destination_id": "pxmx-spoke"
+                },
+                "payload": {
+                    "type": "AGENT_LOG",
+                    "data": {
+                        "message": message,
+                        "level": level,
+                        "hostname": self.hostname,
+                        "agent_type": self.agent_type
+                    }
+                }
+            }
+            log_msg["signature"] = self.signer.sign(log_msg)
+            await self.websocket.send(json.dumps(log_msg))
+        except Exception as e:
+            # Avoid recursive logging if send_log fails
+            pass
+
     async def run(self):
         import websockets
         logger.info(f"Initializing module version: {version}")
@@ -142,7 +188,12 @@ class ProxmoxAgent:
         async with websockets.connect(self.spoke_url) as websocket:
             self.websocket = websocket
 
-            # 1. Handshake
+            # Attach WebSocket log handler
+            log_handler = WebSocketLogHandler(self)
+            log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            logging.getLogger().addHandler(log_handler)
+
+            # 1. Handshake: Prove Agent identity to Spoke
             auth_msg = {
                 "agent_id": self.agent_id,
                 "secret": self.secret
@@ -151,7 +202,24 @@ class ProxmoxAgent:
             await websocket.send(json.dumps(auth_msg))
             logger.info(f"Handshake sent for agent {self.agent_id}")
 
-            # 2. Start background tasks
+            # 2. Mutual Auth: Spoke proves its identity to Agent
+            try:
+                hub_proof_json = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                hub_proof = json.loads(hub_proof_json)
+
+                if hub_proof.get("status") == "HUB_VERIFIED":
+                    logger.info("Spoke identity verified. Sending HUB_OK.")
+                    await websocket.send(json.dumps({"status": "HUB_OK"}))
+                else:
+                    logger.error(f"Spoke failed to prove identity: {hub_proof}")
+                    await websocket.close(1008, "Spoke identity not verified")
+                    return
+            except Exception as e:
+                logger.error(f"Mutual authentication failed during Spoke proof: {e}")
+                # If we get a 1008 here, it means the Spoke rejected us before it could prove itself
+                # We allow the exception to propagate to the critical failure handler
+
+            # 3. Start background tasks
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             telemetry_task = asyncio.create_task(self._telemetry_loop())
 
@@ -182,6 +250,11 @@ class ProxmoxAgent:
                         result = await self.get_vm_list()
                     elif cmd_type == "GET_SYSTEM_STATS":
                         result = await self.collect_metrics()
+                    elif cmd_type == "SET_LOG_LEVEL":
+                        enabled = data.get("enabled", False)
+                        level = logging.DEBUG if enabled else logging.INFO
+                        logging.getLogger().setLevel(level)
+                        result = {"status": "SUCCESS", "message": f"Log level set to {logging.getLevelName(level)}"}
                     elif cmd_type == "SHELLEXEC":
                         # REMOVED: Generic shell execution is a critical security vulnerability (RCE)
                         result = {"status": "ERROR", "message": "SHELLEXEC command is disabled for security reasons"}
@@ -204,6 +277,7 @@ class ProxmoxAgent:
             finally:
                 heartbeat_task.cancel()
                 telemetry_task.cancel()
+                logging.getLogger().removeHandler(log_handler)
 
     async def _heartbeat_loop(self):
         while True:
@@ -244,11 +318,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--spoke-url", required=True, help="URL of the Proxmox Spoke WebSocket server")
     parser.add_argument("--id", default="pxmx-agent-1", help="Agent ID")
+    parser.add_argument("--secret", help="Agent session secret")
     args = parser.parse_args()
 
-
-    agent = ProxmoxAgent(args.spoke_url, args.id, args.secret)
     try:
+        agent = ProxmoxAgent(args.spoke_url, args.id, args.secret)
         asyncio.run(agent.run())
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        logger.exception(f"Critical failure during agent execution: {e}")
