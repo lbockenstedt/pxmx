@@ -34,5 +34,5 @@ jobs:
           git add VERSION
           git commit -m "chore: bump version to $(cat VERSION) [skip ci]"
           git push origin HEAD:main
-          git tag "v$(cat VERSION)"
-          git push origin "v$(cat VERSION)"
+          git tag -f "v$(cat VERSION)"
+          git push origin "v$(cat VERSION)" --force
