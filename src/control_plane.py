@@ -34,8 +34,10 @@ class PxmxControlPlane(BaseControlPlane):
         except Exception as e:
             logger.error(f"Failed to load agent config from {config_path}: {e}")
 
-        # Use agent secret from config, fallback to a generated one if not present
-        self.agent_secret = self.config.get("agent_secret", "pxmx-agent-default-secret")
+        # Agent secret must be explicitly configured; no hardcoded default (fail-closed).
+        self.agent_secret = self.config.get("agent_secret")
+        if not self.agent_secret:
+            logger.warning("agent_secret not set in /etc/lm-agent/config.json; agent auth will fail (fail-closed).")
         self.pending_responses: Dict[str, asyncio.Future] = {}
         self.agent_signer = MessageSigner(self.agent_secret)
 
@@ -68,9 +70,9 @@ class PxmxControlPlane(BaseControlPlane):
                 await websocket.close(1008, "Missing agent_id or secret")
                 return
 
-            # Verify secret: allow bootstrap-secret or the configured secret
-            if agent_secret != self.agent_secret and agent_secret != "bootstrap-secret":
-                logger.error(f"Agent {agent_id} authentication failed. Invalid secret.")
+            # Verify the agent's secret (constant-time). No universal bootstrap bypass.
+            if not self.agent_secret or not hmac.compare_digest(str(agent_secret), str(self.agent_secret)):
+                logger.error(f"Agent {agent_id} authentication failed. Invalid or unconfigured secret.")
                 await websocket.close(1008, "Authentication failed")
                 return
 
@@ -96,9 +98,9 @@ class PxmxControlPlane(BaseControlPlane):
                 msg_data = json.loads(message)
                 logger.debug(f"Received agent message: {msg_data}")
 
-                # Verify signature
-                if "signature" in msg_data and not self.agent_signer.verify(msg_data):
-                    logger.warning("Received agent message with invalid signature. Dropping.")
+                # Verify signature (required for every message; unsigned msgs are dropped).
+                if "signature" not in msg_data or not self.agent_signer.verify(msg_data):
+                    logger.warning("Received agent message with missing/invalid signature. Dropping.")
                     continue
 
                 payload = msg_data.get("payload", {})
@@ -200,7 +202,7 @@ class PxmxControlPlane(BaseControlPlane):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--id", required=True, help="Spoke ID")
-    parser.add_argument("--secret", nargs='?', const="lm-secret", default="lm-secret", help="Authentication secret (default: lm-secret)")
+    parser.add_argument("--secret", required=True, help="Authentication secret issued by the Hub during onboarding")
     parser.add_argument("--hub-secret", help="Hub authentication secret for mutual auth")
     parser.add_argument("--hub", required=True, help="Hub WebSocket URL")
     args = parser.parse_args()

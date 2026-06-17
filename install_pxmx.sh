@@ -13,27 +13,41 @@ while [[ "$#" -gt 0 ]]; do
         --id|--name) SPOKE_ID="$2"; shift ;;
         --secret) SPOKE_SECRET="$2"; shift ;;
         --hub-secret) HUB_SECRET="$2"; shift ;;
+        --admin-token) ADMIN_TOKEN="$2"; shift ;;
+        --all-prereqs) ;;  # no-op (system prereqs are always installed); accepted so the Hub's install-module call doesn't abort
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
 
-# Auto-fetch secret if not provided
+# Admin token for auto-fetch (env fallback: LM_ADMIN_TOKEN)
+ADMIN_TOKEN="${ADMIN_TOKEN:-$LM_ADMIN_TOKEN}"
+
+# Auto-fetch secret if not provided. /setup/generate-secret is auth-protected,
+# so a Bearer admin token is required to mint a first-secret. If you cannot
+# provide one, pass --secret <first-secret> from the Hub dashboard instead.
 if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
-    echo "🔑 No secret provided. Attempting to fetch first-secret from Hub..."
+    if [ -z "$ADMIN_TOKEN" ]; then
+        echo "❌ No spoke secret provided and no admin token to fetch one."
+        echo "   Provide --secret <first-secret> (from the Hub dashboard), or"
+        echo "   --admin-token <LM_ADMIN_TOKEN> / export LM_ADMIN_TOKEN to auto-fetch."
+        exit 1
+    fi
+    echo "🔑 No secret provided. Fetching first-secret from Hub with admin token..."
     HOST=$(echo "$HUB_URL" | sed 's|^ws://||' | cut -d: -f1)
     API_URL="http://$HOST:8000"
 
     SPOKE_SECRET=$(curl -s -X POST "$API_URL/setup/generate-secret" \
         -H "Content-Type: application/json" \
-        -d "{\"spoke_id\": \"$SPOKE_ID\"}" | jq -r '.secret' 2>/dev/null)
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -d "{\"spoke_id\": \"$SPOKE_ID\"}" | jq -r '.secret' 2>/dev/null) || true
 
     if [ "$SPOKE_SECRET" == "null" ] || [ -z "$SPOKE_SECRET" ]; then
-        echo "⚠️  Could not fetch secret from Hub. Falling back to default."
-        SPOKE_SECRET="lm-secret"
-    else
-        echo "✅ Successfully fetched first-secret from Hub."
+        echo "❌ Could not fetch secret from Hub (verify LM_ADMIN_TOKEN, Hub URL, and spoke_id)."
+        echo "   Alternatively, provide --secret <first-secret> from the Hub dashboard."
+        exit 1
     fi
+    echo "✅ Successfully fetched first-secret from Hub."
 fi
 
 echo "🚀 Installing Proxmox Manager Module (Native)..."
