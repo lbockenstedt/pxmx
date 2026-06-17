@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,6 +33,6 @@ jobs:
           git config --global user.email "version-bot@github.com"
           git add VERSION
           git commit -m "chore: bump version to $(cat VERSION) [skip ci]"
-          git push origin main
+          git push origin HEAD:main
           git tag "v$(cat VERSION)"
           git push origin "v$(cat VERSION)"
