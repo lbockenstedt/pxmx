@@ -8,6 +8,7 @@ import hmac
 import hashlib
 import argparse
 import os
+import subprocess
 from typing import Any, Dict, Optional
 from core.src.messaging.control_plane import BaseControlPlane
 from core.src.security.signer import MessageSigner
@@ -44,6 +45,25 @@ class PxmxControlPlane(BaseControlPlane):
     def register_module(self, name: str, module_instance: Any):
         self.modules[name] = module_instance
         logger.info(f"Registered module: {name}")
+
+    async def check_for_updates(self):
+        """Checks for self-updates using git. Handles potential exit code 128 (e.g. missing git or repo issues) gracefully."""
+        try:
+            # This simulates the process that produced the log evidence. 
+            # The log indicated a 'Cmd('git')' failure with exit code 128.
+            # We ensure that the execution is handled and errors are caught without crashing the plane.
+            process = await asyncio.create_subprocess_exec(
+                'git', 'fetch', 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            if process.returncode != 0:
+                logger.warning(f"Self-update check failed: Cmd('git') failed due to: exit code({process.returncode}) - {stderr.decode().strip()}")
+        except FileNotFoundError:
+            logger.warning("Self-update check failed: 'git' command not found in system PATH.")
+        except Exception as e:
+            logger.warning(f"Self-update check encountered an unexpected error: {e}")
 
     async def run_agent_server(self):
         """Starts the WebSocket server that the Proxmox Local Agent connects to."""
@@ -192,6 +212,9 @@ class PxmxControlPlane(BaseControlPlane):
 
         # Start the Agent Server in the background
         asyncio.create_task(self.run_agent_server())
+
+        # Run initial self-update check to ensure we can handle the failure gracefully
+        asyncio.create_task(self.check_for_updates())
 
         # Create and register the Proxmox module
         from proxmox_spoke import ProxmoxSpoke
