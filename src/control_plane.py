@@ -199,6 +199,7 @@ class PxmxControlPlane(BaseControlPlane):
         self.register_module("pxmx", pxmx_spoke)
 
         await super().run()
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--id", required=True, help="Spoke ID")

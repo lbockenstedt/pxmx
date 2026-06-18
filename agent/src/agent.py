@@ -112,7 +112,7 @@ class ProxmoxAgent:
                 csrf_token = auth_resp.json().get("data", {}).get("CSRFPreventionToken")
 
                 headers = {
-                    "Cookie": f"BakeID={ticket}",
+                    "Cookie": f"PVEAuthCookie={ticket}",
                     "CSRFPreventionToken": csrf_token
                 }
 
@@ -124,12 +124,12 @@ class ProxmoxAgent:
                 all_vms = []
                 for node in nodes:
                     # Get QEMU VMs
-                    qemu_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu"
+                    qemu_url = f"https://{host}:8006/api2/json/nodes/{node['node']}/qemu"
                     qemu_resp = await client.get(qemu_url, headers=headers)
-                    qemu_data = qemu_resp.json().get("data", {})
-                    for vmid, vm in qemu_data.items():
+                    qemu_data = qemu_resp.json().get("data", [])
+                    for vm in qemu_data:
                         all_vms.append({
-                            "id": vmid,
+                            "id": vm.get("vmid"),
                             "name": vm.get("name"),
                             "status": vm.get("status"),
                             "cpu": vm.get("cpu", 0),
@@ -137,12 +137,12 @@ class ProxmoxAgent:
                         })
 
                     # Get LXC Containers
-                    lxc_url = f"https://{host}:8006/api2/json/nodes/{node}/lxc"
+                    lxc_url = f"https://{host}:8006/api2/json/nodes/{node['node']}/lxc"
                     lxc_resp = await client.get(lxc_url, headers=headers)
-                    lxc_data = lxc_resp.json().get("data", {})
-                    for vmid, vm in lxc_data.items():
+                    lxc_data = lxc_resp.json().get("data", [])
+                    for vm in lxc_data:
                         all_vms.append({
-                            "id": vmid,
+                            "id": vm.get("vmid"),
                             "name": vm.get("name"),
                             "status": vm.get("status"),
                             "cpu": vm.get("cpu", 0),
