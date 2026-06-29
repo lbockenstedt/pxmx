@@ -1,0 +1,15 @@
+venv/
+node_modules/
+.DS_Store
+__pycache__/
+*.pyc
+
+# Secrets and credentials — never commit these
+.env
+*.key
+*.pem
+*.p12
+*.pfx
+keys.json
+hub_secret.json
+secrets.json

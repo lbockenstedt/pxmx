@@ -1,0 +1,8 @@
+[Unit]
+Description=Lab Manager - pxmx gateway-loss reboot watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/lm-pxmx-net-watchdog
