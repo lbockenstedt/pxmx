@@ -461,7 +461,10 @@ class ProxmoxAgent:
           node       — Proxmox node name
           vmid       — integer VMID
           type       — "qemu" or "lxc"
-          name, status, cpu, mem_bytes, uptime, tags, ips
+          name, status, cpu, mem_bytes, uptime, tags, ips,
+                     vcpus, disk_gb — provisioned capacity (maxcpu / maxdisk from
+                       /cluster/resources) so the Hypervisor→NetBox VM sync can
+                       populate NetBox vCPUs/disk without a per-VM qm config call
                      — ips: best-effort guest IPv4 list ([] for stopped VMs or
                        when qemu-guest-agent is absent; LXC needs no guest agent)
 
@@ -485,6 +488,12 @@ class ProxmoxAgent:
                 "cpu":       round(r.get("cpu", 0) * 100, 1),
                 "mem_bytes": r.get("mem") or r.get("maxmem", 0),
                 "uptime":    r.get("uptime", 0),
+                # Provisioned capacity for the Hypervisor→NetBox VM sync. Both
+                # /cluster/resources and the per-node /qemu + /lxc fallback rows
+                # carry maxcpu (vCPU count) and maxdisk (bytes), so no extra
+                # qm config / pct config round-trip is needed here.
+                "vcpus":     int(r.get("maxcpu", 0) or 0),
+                "disk_gb":   round((r.get("maxdisk", 0) or 0) / 1e9, 1),
                 "tags":      _parse_tags(r.get("tags")),
                 "ips":       [],   # filled by _annotate_vm_ips for running VMs
             }
