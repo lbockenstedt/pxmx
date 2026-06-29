@@ -20,6 +20,7 @@ agent (retired in Phase G). Audience: pxmx developers; see the repo
 """
 
 import asyncio
+import base64
 import json
 import uuid
 import time
@@ -145,6 +146,16 @@ class ProxmoxAgent:
         # Long-op (Phase E) + token-provision (Phase F) tasks. Cancelled on
         # CS-disable / disconnect so a toggled-off host stops mutating VMs.
         self._cs_long_ops: set = set()
+
+        # ── VNC console (agent-terminates-WSS) ──────────────────────────────
+        # Per-session state for browser→Proxmox VNC relays. session_id →
+        # {"down_q": asyncio.Queue, "px_ws": websockets conn | None, "tasks": []}.
+        # down_q buffers browser frames until the Proxmox WSS is open, then the
+        # drain task forwards them. The console API token (root@pam!lm-vnc) is
+        # provisioned once via local pvesh and cached in memory for the agent's
+        # lifetime — its secret is NEVER logged (only its existence).
+        self._vnc_sessions: Dict[str, Dict[str, Any]] = {}
+        self._console_token: Optional[str] = None
 
     def _load_secret(self) -> Optional[str]:
         # 1. Prefer the hub-provisioned secret persisted to .env. This is the
@@ -564,6 +575,146 @@ class ProxmoxAgent:
         except Exception:
             pass
 
+    async def send_vnc_event(self, event_type: str, data: Dict[str, Any]):
+        """Emit a VNC_* frame up to the spoke for relay to the hub's browser WS.
+
+        ``event_type`` is one of VNC_FRAME_UP / VNC_READY / VNC_ERROR /
+        VNC_DISCONNECT. Best-effort and never raises — a dropped up-frame is
+        tolerable (the browser RFB reconnects or times out); the Proxmox→hub
+        relay task must not die on a transient socket blip. Mirrors
+        ``send_cs_event`` but does not inject hostname/agent_id (the spoke
+        already keys the relay by the connected agent_id)."""
+        try:
+            msg = {
+                "header": {
+                    "message_id":    str(uuid.uuid4()),
+                    "timestamp":     time.time(),
+                    "sender_id":     self.agent_id,
+                    "destination_id": "pxmx-spoke",
+                },
+                "payload": {"type": event_type, "data": data},
+            }
+            msg["signature"] = self.signer.sign(msg)
+            await self.websocket.send(json.dumps(msg))
+        except Exception:
+            pass
+
+    # ── VNC console session orchestration ─────────────────────────────────────
+    # The hub→spoke→agent VNC_START opens a Proxmox vncwebsocket HERE (local
+    # root-authed API token) and relays frames both ways over the existing
+    # agent↔spoke WS. See the plan in .claude/plans/purring-singing-breeze.md.
+
+    async def _ensure_console_token(self) -> str:
+        """Provision (once, cached) the root@pam!lm-vnc Proxmox API token used
+        to create the vncproxy AND authenticate the vncwebsocket. Proxmox never
+        reveals a token secret after creation, so we delete+create to get a
+        fresh secret on first use and cache it in memory for the agent's
+        lifetime. The secret is never logged (only its existence)."""
+        if self._console_token:
+            return self._console_token
+        TOKEN_ID = "lm-vnc"
+        USER = "root@pam"
+        try:
+            await self._pvesh_action(
+                "delete", f"/access/users/{USER}/token/{TOKEN_ID}",
+                json_out=False, timeout=10)
+        except Exception:
+            pass  # token may not exist yet — expected
+        data = await self._pvesh_action(
+            "create", f"/access/users/{USER}/token/{TOKEN_ID}",
+            "--privsep", "0", timeout=20)
+        secret = str((data or {}).get("value") or "").strip() if isinstance(data, dict) else ""
+        if not secret:
+            raise RuntimeError("pvesh returned no token value for root@pam!lm-vnc")
+        self._console_token = f"{USER}!{TOKEN_ID}={secret}"
+        logger.info("Proxmox console token root@pam!lm-vnc provisioned (value not logged)")
+        return self._console_token
+
+    async def _start_vnc_session(self, session_id: str, vmid: Any,
+                                 node: str, kind: str) -> None:
+        """Open the Proxmox WSS for a session and spawn the relay tasks.
+
+        Runs as a background task (VNC_START acks ACCEPTED immediately so the
+        dispatch loop isn't blocked on the vncproxy/WSS open). Emits VNC_READY
+        on success or VNC_ERROR on failure. Down-frames buffered in the
+        session's down_q are drained to the WSS once it's open."""
+        sess = self._vnc_sessions.get(session_id)
+        if not sess:
+            return
+        try:
+            k = (kind or "").lower()
+            if k not in ("qemu", "lxc"):
+                k = await pve_cmds.detect_guest_type(int(vmid))
+            token = await self._ensure_console_token()
+            px_ws, _ticket, _port = await pve_cmds.open_vnc_ws(vmid, node, k, token)
+        except Exception as e:
+            logger.warning(f"VNC start {session_id} failed: {e}")
+            await self.send_vnc_event("VNC_ERROR",
+                                      {"session_id": session_id, "error": str(e)[:300]})
+            self._vnc_sessions.pop(session_id, None)
+            return
+        sess["px_ws"] = px_ws
+        up_task = asyncio.create_task(self._vnc_proxmox_to_hub(session_id, px_ws))
+        drain_task = asyncio.create_task(self._vnc_drain_down(session_id, px_ws, sess["down_q"]))
+        sess["tasks"] = [up_task, drain_task]
+        await self.send_vnc_event("VNC_READY", {"session_id": session_id})
+        logger.info(f"VNC session {session_id} ready (vmid={vmid} node={node} kind={k})")
+
+    async def _vnc_proxmox_to_hub(self, session_id: str, px_ws) -> None:
+        """Relay Proxmox→browser frames. When the Proxmox WSS closes (VM
+        stopped, ticket expired, admin disconnect), the loop exits and we tear
+        the session down + tell the hub (VNC_DISCONNECT) so the browser WS closes."""
+        try:
+            async for raw in px_ws:
+                if isinstance(raw, str):
+                    raw = raw.encode()
+                await self.send_vnc_event(
+                    "VNC_FRAME_UP",
+                    {"session_id": session_id,
+                     "data": base64.b64encode(raw).decode()})
+        except Exception:
+            pass
+        finally:
+            await self._vnc_teardown(session_id, send_disconnect=True)
+
+    async def _vnc_drain_down(self, session_id: str, px_ws, down_q: asyncio.Queue) -> None:
+        """Forward buffered browser→Proxmox frames to the WSS. A ``None`` sentinel
+        (put by teardown) breaks the loop so the task exits cleanly."""
+        try:
+            while True:
+                raw = await down_q.get()
+                if raw is None:
+                    break
+                await px_ws.send(raw)
+        except Exception:
+            pass
+
+    async def _vnc_teardown(self, session_id: str, send_disconnect: bool) -> None:
+        """Close the Proxmox WSS, cancel the relay tasks, drop the session.
+        ``send_disconnect`` is False when the hub initiated the close (it
+        already knows) and True when the Proxmox side closed (the hub needs the
+        signal to close the browser WS)."""
+        sess = self._vnc_sessions.pop(session_id, None)
+        if not sess:
+            return
+        down_q = sess.get("down_q")
+        if down_q is not None:
+            try:
+                down_q.put_nowait(None)
+            except Exception:
+                pass
+        for task in sess.get("tasks", []):
+            if not task.done():
+                task.cancel()
+        px_ws = sess.get("px_ws")
+        if px_ws is not None:
+            try:
+                await px_ws.close()
+            except Exception:
+                pass
+        if send_disconnect:
+            await self.send_vnc_event("VNC_DISCONNECT", {"session_id": session_id})
+
     # ── Self-update ───────────────────────────────────────────────────────────
 
     def _git_behind_count(self, repo_dir: str) -> int:
@@ -920,6 +1071,51 @@ class ProxmoxAgent:
                             }
                         except Exception as e:
                             result = {"status": "ERROR", "message": f"vncproxy: {e}"}
+
+                    elif cmd_type == "VNC_START":
+                        # Hub→spoke→agent: open a Proxmox vncwebsocket HERE and
+                        # relay frames over the existing agent↔spoke WS (agent-
+                        # terminates-WSS model). Ack ACCEPTED immediately; the
+                        # session task opens the WSS and emits VNC_READY/
+                        # VNC_ERROR up. down_q buffers browser frames until the
+                        # WSS is open. vmid is unguarded — Hypervisors console
+                        # targets real tenant VMs, not the sim floor.
+                        session_id = data.get("session_id") or ""
+                        if session_id and session_id not in self._vnc_sessions:
+                            self._vnc_sessions[session_id] = {
+                                "down_q": asyncio.Queue(), "px_ws": None, "tasks": [],
+                            }
+                            task = asyncio.create_task(self._start_vnc_session(
+                                session_id, data.get("vmid"),
+                                data.get("node"), data.get("type")))
+                            self._cs_long_ops.add(task)
+                            task.add_done_callback(self._cs_long_ops.discard)
+                        result = {"status": "ACCEPTED", "session_id": session_id}
+
+                    elif cmd_type == "VNC_FRAME_DOWN":
+                        # Browser→Proxmox frame. Buffer onto the session's
+                        # down_q (the drain task forwards to the WSS). No ack —
+                        # high-volume; `continue` skips the AGENT_RESPONSE send
+                        # so we don't ack every keystroke.
+                        session_id = data.get("session_id") or ""
+                        sess = self._vnc_sessions.get(session_id) if session_id else None
+                        if sess is not None:
+                            try:
+                                raw = base64.b64decode(data.get("data") or "")
+                                sess["down_q"].put_nowait(raw)
+                            except Exception:
+                                pass
+                        continue
+
+                    elif cmd_type == "VNC_DISCONNECT":
+                        # Browser closed the console (or hub tore down). Close
+                        # the Proxmox WSS + drop the session. Don't re-emit
+                        # VNC_DISCONNECT up — the hub initiated this side.
+                        session_id = data.get("session_id") or ""
+                        if session_id:
+                            asyncio.create_task(
+                                self._vnc_teardown(session_id, send_disconnect=False))
+                        result = {"status": "OK", "session_id": session_id}
 
                     resp = {
                         "header": {

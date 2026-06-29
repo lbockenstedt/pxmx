@@ -570,3 +570,77 @@ async def list_all_vmids() -> List[int]:
             if parts and parts[0].isdigit():
                 ids.append(int(parts[0]))
     return ids
+
+
+# ── VNC console (agent-terminates-WSS) ──────────────────────────────────────
+#
+# The agent runs ON the Proxmox host, so localhost:8006 is the local PVE API
+# proxy (cluster-wide). We create a VNC ticket via REST using a Proxmox API
+# token, then open the vncwebsocket to localhost:8006 with the SAME
+# PVEAPIToken header that created the ticket — Proxmox's /vncwebsocket
+# requires the creating token's identity (ticket+port alone are rejected; see
+# the upstream reference .scratch-shpe/client-sim/webui-spoke/server.py:6242-
+# 6287). The returned px_ws is owned by the caller, which relays frames over
+# the existing agent↔spoke↔hub WS legs (multiplexed VNC_* JSON messages).
+
+async def open_vnc_ws(vmid: Any, node: str, kind: str, api_token: str):
+    """POST the vncproxy and open the vncwebsocket to localhost:8006.
+
+    Returns ``(px_ws, ticket, port)``. ``px_ws`` is an open websockets
+    connection the caller MUST close on teardown. Raises ``PveError`` on any
+    failure (the caller emits VNC_ERROR up)."""
+    import urllib.parse
+    import ssl
+    import websockets
+    import httpx
+
+    k = (kind or "qemu").lower()
+    if k not in ("qemu", "lxc"):
+        k = "qemu"
+    vid = int(vmid)
+    pve_node = (node or "localhost").strip() or "localhost"
+    headers = {"Authorization": f"PVEAPIToken={api_token}"}
+
+    vncproxy_url = (
+        f"https://localhost:8006/api2/json/nodes/"
+        f"{urllib.parse.quote(pve_node, safe='')}/{k}/{vid}/vncproxy"
+    )
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        resp = await client.post(vncproxy_url, headers=headers, data={"websocket": 1})
+    if resp.status_code != 200:
+        raise PveError(f"vncproxy returned {resp.status_code}: {resp.text[:200]}")
+    try:
+        body = resp.json() or {}
+    except Exception as exc:
+        raise PveError(f"vncproxy bad json: {exc}")
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, dict):
+        raise PveError("vncproxy returned no data object")
+    ticket = str(data.get("ticket") or "").strip()
+    port = data.get("port")
+    if not ticket or port is None:
+        raise PveError("vncproxy did not return ticket+port")
+
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    params = urllib.parse.urlencode({"port": port, "vncticket": ticket})
+    ws_url = (
+        f"wss://localhost:8006/api2/json/nodes/"
+        f"{urllib.parse.quote(pve_node, safe='')}/{k}/{vid}/vncwebsocket?{params}"
+    )
+
+    # websockets renamed extra_headers → additional_headers (v13+). Probe the
+    # signature so this works on either the agent's pinned or a newer lib.
+    import inspect
+    connect_kwargs: Dict[str, Any] = {
+        "ssl": ssl_ctx,
+        "open_timeout": 20,
+        "max_size": None,
+    }
+    hdr_key = "additional_headers" if "additional_headers" in inspect.signature(
+        websockets.connect).parameters else "extra_headers"
+    connect_kwargs[hdr_key] = headers
+
+    px_ws = await websockets.connect(ws_url, **connect_kwargs)
+    return px_ws, ticket, int(port)

@@ -46,6 +46,10 @@ class ProxmoxSpoke(BaseSpoke):
         self.telemetry_cache: Dict[str, Any] = {}
         # Per-agent Proxmox API config (host/user/password) — persists across reconnects
         self.agent_configs: Dict[str, Any] = {}
+        # VNC console: session_id → agent_id, so inbound VNC_FRAME_DOWN /
+        # VNC_DISCONNECT from the hub route to the agent that owns the session
+        # (recorded when VNC_START passes through). Cleared on VNC_DISCONNECT.
+        self.vnc_sessions: Dict[str, str] = {}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Route a Hub command to the right agent or handle spoke-local (GET_VERSION/UPDATE_CONFIG)."""
@@ -125,6 +129,49 @@ class ProxmoxSpoke(BaseSpoke):
         # pvesh (fast); the hub opens the authenticated WSS itself.
         if cmd == "VNC_PROXY":
             return await self._route_vm_cmd("VNC_PROXY", data, timeout=15.0)
+
+        # VNC console (agent-terminates-WSS): the hub tells the agent to open a
+        # Proxmox vncwebsocket locally and relay frames over the existing
+        # agent↔spoke↔hub WS. These are fire-and-forget (send_raw_to_agent) —
+        # high-volume VNC_FRAME_DOWN must not block the hub-facing dispatch loop
+        # awaiting an agent ack. VNC_START records session→agent so later
+        # VNC_FRAME_DOWN/VNC_DISCONNECT resolve the agent without re-parsing
+        # unique_id. Returns fast; the agent emits VNC_FRAME_UP/READY/ERROR/
+        # DISCONNECT up via AGENT_RELAY_UP.
+        if cmd == "VNC_START":
+            session_id = data.get("session_id") or ""
+            agent_id = data.get("agent_id")
+            if not agent_id and session_id:
+                agent_id = self.vnc_sessions.get(session_id)
+            if not agent_id:
+                # Resolve from the unique_id's cluster prefix
+                unique_id = data.get("unique_id") or ""
+                if "/" in unique_id and self.control_plane:
+                    cluster = unique_id.split("/")[0]
+                    for aid, info in self.control_plane.connected_agents.items():
+                        if info.get("cluster_name") == cluster:
+                            agent_id = aid
+                            break
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for VNC_START"}
+            if session_id:
+                self.vnc_sessions[session_id] = agent_id
+            await self.control_plane.send_raw_to_agent(agent_id, "VNC_START", data)
+            return {"status": "OK", "session_id": session_id}
+
+        if cmd == "VNC_FRAME_DOWN":
+            session_id = data.get("session_id") or ""
+            agent_id = self.vnc_sessions.get(session_id)
+            if agent_id:
+                await self.control_plane.send_raw_to_agent(agent_id, "VNC_FRAME_DOWN", data)
+            return {"status": "OK"}
+
+        if cmd == "VNC_DISCONNECT":
+            session_id = data.get("session_id") or ""
+            agent_id = self.vnc_sessions.pop(session_id, None)
+            if agent_id:
+                await self.control_plane.send_raw_to_agent(agent_id, "VNC_DISCONNECT", data)
+            return {"status": "OK"}
 
         if not self.control_plane:
             return {"status": "ERROR", "error": "Control plane not initialised"}

@@ -318,6 +318,14 @@ class PxmxControlPlane(BaseControlPlane):
                     # tenant/host.
                     await self._relay_agent_msg_up(agent_id, msg_type, data)
 
+                elif msg_type and msg_type.startswith("VNC_"):
+                    # VNC console frames from the agent (VNC_FRAME_UP /
+                    # VNC_READY / VNC_ERROR / VNC_DISCONNECT) — relay up to the
+                    # hub's AGENT_RELAY_UP dispatcher, which routes them to the
+                    # browser WS for the session. data carries session_id (+ b64
+                    # frame for VNC_FRAME_UP). No Future involved — one-way.
+                    await self._relay_agent_msg_up(agent_id, msg_type, data)
+
         except Exception as e:
             logger.error(f"Agent handler error: {e}", exc_info=True)
         finally:
@@ -410,6 +418,33 @@ class PxmxControlPlane(BaseControlPlane):
         except Exception as e:
             self.pending_responses.pop(corr_id, None)
             return {"status": "ERROR", "message": str(e)}
+
+    async def send_raw_to_agent(self, agent_id: str, cmd_type: str,
+                                data: Dict[str, Any]) -> bool:
+        """Fire-and-forget signed send to one agent — no response Future, no
+        timeout. Used for VNC down-frames + control (VNC_START /
+        VNC_FRAME_DOWN / VNC_DISCONNECT) which are high-volume or one-way; the
+        agent's AGENT_RESPONSE (if any) is dropped by the ``AGENT_RESPONSE``
+        branch above (no pending corr_id). Returns True on a successful send,
+        False if the agent is gone or the send failed. Caller MUST NOT await a
+        result — there is none."""
+        rec = (self.connected_agents or {}).get(agent_id)
+        if not rec or not rec.get("ws"):
+            return False
+        msg = {
+            "header": {
+                "message_id": str(uuid.uuid4()), "timestamp": time.time(),
+                "sender_id": self.spoke_id, "destination_id": agent_id,
+            },
+            "payload": {"type": cmd_type, "data": data},
+        }
+        msg["signature"] = self.agent_signer.sign(msg)
+        try:
+            await rec["ws"].send(json.dumps(msg, separators=(',', ':')))
+            return True
+        except Exception as e:
+            logger.warning(f"send_raw_to_agent {cmd_type} -> {agent_id} failed: {e}")
+            return False
 
     async def broadcast_to_agents(self, cmd_type: str,
                                   data: Dict[str, Any]) -> List[Dict[str, Any]]:
