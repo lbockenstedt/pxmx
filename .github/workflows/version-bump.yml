@@ -4,11 +4,13 @@ name: version-bump
 # last numeric segment of every tracked VERSION file and push the result back as
 # "chore: bump version [skip ci]". The [skip ci] commit message (plus the
 # head-commit guard below) prevents this workflow from re-triggering itself.
+# workflow_dispatch lets an admin trigger a manual bump without a code push.
 on:
   push:
     branches: [main]
     paths-ignore:
       - '.github/workflows/**'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,7 +21,12 @@ concurrency:
 
 jobs:
   bump:
-    if: ${{ !startsWith(github.event.head_commit.message, 'chore: bump version') }}
+    # NOTE: the if-value MUST be quoted — the compared string 'chore: bump version'
+    # contains ': ' which YAML otherwise parses as a mapping (ScannerError → no
+    # jobs run). The event_name short-circuit also avoids touching head_commit on a
+    # workflow_dispatch (where it is null). A workflow-only push is path-ignored
+    # so editing this file never self-bumps.
+    if: "${{ github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'chore: bump version') }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
