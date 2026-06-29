@@ -279,6 +279,11 @@ class PxmxControlPlane(BaseControlPlane):
                 if msg_type == "AGENT_HEARTBEAT":
                     if agent_id in self.connected_agents:
                         self.connected_agents[agent_id]["last_seen"] = time.time()
+                    # Relay up so the hub's HeartbeatManager tracks per-agent
+                    # liveness (keyed spoke_id:agent_id) and System → Diagnostics
+                    # can render a GREEN/YELLOW/RED heartbeat for the agent like
+                    # it does for spokes. Best-effort (see _relay_agent_msg_up).
+                    await self._relay_agent_msg_up(agent_id, "AGENT_HEARTBEAT", data)
 
                 elif msg_type == "AGENT_TELEMETRY":
                     if agent_id in self.connected_agents:
