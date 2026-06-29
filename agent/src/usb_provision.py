@@ -704,7 +704,19 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
 
 
 def _sim_phy_accepts(sim_phy: str, device_type: str) -> bool:
-    return sim_phy == "any" or sim_phy == device_type
+    # sim_phy is the sim VM's required physical layer (cs domain:
+    # wireless | ethernet | any). device_type is the dongle class from the
+    # LM usb_vidpids `type` field (wireless | wired | storage | other). A sim
+    # requiring "ethernet" wants a *wired* dongle — map wired <-> ethernet so
+    # the wired/wireless selector the tenant sets in LM is actually enforced.
+    # "storage"/"other" only match sim_phy == "any".
+    if sim_phy == "any":
+        return True
+    if sim_phy == device_type:
+        return True
+    if sim_phy == "ethernet" and device_type == "wired":
+        return True
+    return False
 
 
 async def run_provision_loop(agent) -> Dict[str, Any]:
