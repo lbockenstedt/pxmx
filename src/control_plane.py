@@ -370,10 +370,13 @@ class PxmxControlPlane(BaseControlPlane):
     # ── Agent command routing ─────────────────────────────────────────────────
 
     async def send_to_agent(self, cmd_type: str, data: Dict[str, Any],
-                            agent_id: Optional[str] = None) -> Dict[str, Any]:
+                            agent_id: Optional[str] = None,
+                            timeout: float = 15.0) -> Dict[str, Any]:
         """
         Send a command to a specific agent (by agent_id) or the first available one.
-        Returns the agent's response or an error dict.
+        Returns the agent's response or an error dict. ``timeout`` bounds the
+        wait for the agent's correlated response (default 15s; pass a longer
+        window for slow ops like qm stop/snapshot).
         """
         if agent_id:
             rec = self.connected_agents.get(agent_id)
@@ -400,7 +403,7 @@ class PxmxControlPlane(BaseControlPlane):
         self.pending_responses[corr_id] = fut
         try:
             await ws.send(json.dumps(msg, separators=(',', ':')))
-            return await asyncio.wait_for(fut, timeout=15.0)
+            return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             self.pending_responses.pop(corr_id, None)
             return {"status": "ERROR", "message": "Agent response timeout"}

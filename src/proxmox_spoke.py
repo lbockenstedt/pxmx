@@ -116,6 +116,16 @@ class ProxmoxSpoke(BaseSpoke):
         if cmd in ("DELETE_VM", "AGENT_DELETE_VM"):
             return await self._route_vm_cmd("DELETE_VM", data)
 
+        # Hypervisors view VM lifecycle (unguarded — any vmid). stop/snapshot
+        # can take a few seconds, so allow a 30s agent window.
+        if cmd == "PXMX_VM_ACTION":
+            return await self._route_vm_cmd("PXMX_VM_ACTION", data, timeout=30.0)
+
+        # VNC console: agent fetches a Proxmox vncproxy {ticket, port} via local
+        # pvesh (fast); the hub opens the authenticated WSS itself.
+        if cmd == "VNC_PROXY":
+            return await self._route_vm_cmd("VNC_PROXY", data, timeout=15.0)
+
         if not self.control_plane:
             return {"status": "ERROR", "error": "Control plane not initialised"}
 
@@ -318,7 +328,8 @@ class ProxmoxSpoke(BaseSpoke):
 
         return await self.control_plane.send_to_agent("GET_VM_INFO", data, agent_id=agent_id)
 
-    async def _route_vm_cmd(self, cmd: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    async def _route_vm_cmd(self, cmd: str, data: Dict[str, Any],
+                            timeout: float = 15.0) -> Dict[str, Any]:
         """Route a VM mutation command to the correct agent via unique_id."""
         unique_id = data.get("unique_id", "")
         agent_id  = data.get("agent_id")
@@ -335,7 +346,8 @@ class ProxmoxSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": "No agents connected"}
             agent_id = next(iter(self.control_plane.connected_agents))
 
-        return await self.control_plane.send_to_agent(cmd, data, agent_id=agent_id)
+        return await self.control_plane.send_to_agent(cmd, data, agent_id=agent_id,
+                                                      timeout=timeout)
 
     # ── Status / version ──────────────────────────────────────────────────────
 

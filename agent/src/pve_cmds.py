@@ -112,6 +112,43 @@ async def snapshot_vm(vmid: Any, protected: Set[int],
     return {"vmid": vid, "action": "snapshot", "snapshot": snap, "kind": kind}
 
 
+# ── Unguarded single-VM actions (Hypervisors view — ANY vmid) ────────────────
+#
+# The guarded start_vm/stop_vm/reboot_vm/snapshot_vm above funnel through
+# cs_guard.assert_sim_vm, which refuses any vmid outside the client-sim 90000
+# floor — so they can't be reused for the Hypervisors view, which manages real
+# tenant VMs at arbitrary vmids. These *_any variants skip the guard and operate
+# on any vmid the hub requests. `kind` ("qemu"/"lxc") is taken from the caller
+# when known (the hub has the VM's type) to avoid a detect_guest_type round-trip.
+
+async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
+                        snapshot_name: Optional[str] = None) -> Dict[str, Any]:
+    """Unguarded start/stop/reboot/snapshot of ANY vmid (qemu or lxc).
+
+    Returns ``{vmid, action, kind[, snapshot]}``. Raises ``PveError`` on failure.
+    """
+    vid = int(vmid)
+    k = (kind or "").lower()
+    if k not in ("qemu", "lxc"):
+        k = await detect_guest_type(vid)
+    bin_ = "pct" if k == "lxc" else "qm"
+    act = (action or "").lower()
+    if act == "start":
+        await _run([bin_, "start", str(vid)])
+    elif act == "stop":
+        await _run([bin_, "stop", str(vid)])
+    elif act in ("reboot", "restart"):
+        await _run([bin_, "reboot", str(vid)])
+        act = "reboot"
+    elif act == "snapshot":
+        snap = snapshot_name or f"auto-{time.strftime('%Y%m%d%H%M')}"
+        await _run([bin_, "snapshot", str(vid), snap, "--description", "lm-hub"])
+        return {"vmid": vid, "action": "snapshot", "snapshot": snap, "kind": k}
+    else:
+        raise PveError(f"unknown vm action: {action}")
+    return {"vmid": vid, "action": act, "kind": k}
+
+
 # ── Batch commands (guarded filter, never unfiltered qm list) ───────────────
 
 async def list_qemu_vmids() -> List[int]:

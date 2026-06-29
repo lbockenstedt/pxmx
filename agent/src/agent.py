@@ -34,6 +34,7 @@ from . import cs_commands
 from . import cs_sim
 from . import watchdogs
 from . import usb_provision
+from . import pve_cmds
 
 class _AuthError(Exception):
     """Raised when the spoke rejects our credentials (wrong secret)."""
@@ -880,6 +881,45 @@ class ProxmoxAgent:
                         self._cs_long_ops.add(task)
                         task.add_done_callback(self._cs_long_ops.discard)
                         result = {"status": "ACCEPTED", "request_id": request_id}
+
+                    elif cmd_type == "PXMX_VM_ACTION":
+                        # Hypervisors view lifecycle: start/stop/reboot/snapshot
+                        # ANY vmid (unguarded — real tenant VMs, not the sim
+                        # 90000 floor). Fast qm/pct ops; the spoke allows a 30s
+                        # window for stop/snapshot. `kind` (qemu/lxc) is passed
+                        # by the hub to skip a detect_guest_type round-trip.
+                        try:
+                            res = await pve_cmds.vm_action_any(
+                                data.get("vmid"), data.get("action"),
+                                kind=data.get("type"),
+                                snapshot_name=data.get("snapshot_name"))
+                            result = {"status": "SUCCESS", **res}
+                        except pve_cmds.PveError as e:
+                            result = {"status": "ERROR", "message": str(e)}
+
+                    elif cmd_type == "VNC_PROXY":
+                        # VNC console: ask Proxmox for a vncproxy ticket+port via
+                        # local pvesh (root-authed, no API token needed). The hub
+                        # opens the authenticated wss://<host>:8006/vncwebsocket
+                        # itself using the cs-hub API token and relays bytes.
+                        # Returns {ticket, port, node, host} the hub needs to
+                        # build the WSS URL.
+                        try:
+                            node = data.get("node") or ""
+                            vmtype = (data.get("type") or "qemu").lower()
+                            vmid = data.get("vmid")
+                            path = f"/nodes/{node}/{vmtype}/{vmid}/vncproxy"
+                            vnc = await self._pvesh_action(
+                                "create", path, "--websocket", "1", json_out=True)
+                            result = {
+                                "status": "SUCCESS",
+                                "ticket": (vnc or {}).get("ticket") or "",
+                                "port": (vnc or {}).get("port"),
+                                "node": node,
+                                "host": node or self.config.get("hostname") or "",
+                            }
+                        except Exception as e:
+                            result = {"status": "ERROR", "message": f"vncproxy: {e}"}
 
                     resp = {
                         "header": {
