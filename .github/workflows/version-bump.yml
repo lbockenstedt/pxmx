@@ -1,0 +1,66 @@
+name: version-bump
+
+# On every push to main (except pushes that only touch workflow files), bump the
+# last numeric segment of every tracked VERSION file and push the result back as
+# "chore: bump version [skip ci]". The [skip ci] commit message (plus the
+# head-commit guard below) prevents this workflow from re-triggering itself.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/workflows/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore: bump version') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Bump every tracked VERSION file
+        run: |
+          set -e
+          bumped=0
+          while IFS= read -r f; do
+            old="$(cat "$f")"
+            new="$(python3 - "$f" <<'PY'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p).read().strip()
+          nums = list(re.finditer(r'\d+', s))
+          if not nums:
+              sys.exit(0)          # no numeric segment -> leave unchanged
+          last = nums[-1]
+          width = len(last.group())
+          val = int(last.group()) + 1
+          news = s[:last.start()] + str(val).zfill(width) + s[last.end():]
+          open(p, 'w').write(news + '\n')
+          print(news)
+          PY
+          )"
+            if [ -n "$new" ]; then
+              echo "$f: $old -> $new"
+              bumped=1
+            fi
+          done < <(git ls-files | grep -E '(^|/)VERSION$')
+
+          if [ "$bumped" -eq 0 ]; then
+            echo "No numeric VERSION to bump; nothing to do."
+            exit 0
+          fi
+
+          git config user.name  "version-bot[bot]"
+          git config user.email "version-bot@users.noreply.github.com"
+          git add -u            # stage only the tracked VERSION files we touched
+          git commit -m "chore: bump version [skip ci]" || { echo "nothing to commit"; exit 0; }
+          git push
