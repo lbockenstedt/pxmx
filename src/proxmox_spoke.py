@@ -260,6 +260,7 @@ class ProxmoxSpoke(BaseSpoke):
                 "nodes":         info.get("nodes", []),
                 "vm_count":      len(info.get("vms", [])),
                 "agent_metrics": info.get("agent_metrics", {}),
+                "version":       info.get("version", "unknown"),
                 "status":        "connected",
             })
         pending = [

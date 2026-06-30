@@ -251,6 +251,7 @@ class PxmxControlPlane(BaseControlPlane):
                 "nodes":        [],
                 "vms":          [],
                 "agent_metrics": {},
+                "version":      "unknown",  # overwritten by AGENT_TELEMETRY (agent_version)
             }
 
             # Re-push stored PVE credentials if the spoke has them
@@ -294,6 +295,7 @@ class PxmxControlPlane(BaseControlPlane):
                         rec["nodes"]        = data.get("nodes", {}).get("nodes", [])
                         rec["vms"]          = data.get("vms", {}).get("vms", [])
                         rec["agent_metrics"] = data.get("metrics", {})
+                        rec["version"]      = data.get("agent_version") or data.get("version") or rec.get("version", "unknown")
                         self._save_disk_cache()
                     if "pxmx" in self.modules and hasattr(self.modules["pxmx"], "telemetry_cache"):
                         self.modules["pxmx"].telemetry_cache[agent_id] = data

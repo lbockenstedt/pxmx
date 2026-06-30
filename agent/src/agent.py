@@ -1528,6 +1528,11 @@ class ProxmoxAgent:
                             "agent_id":     self.agent_id,
                             "hostname":     self.hostname,
                             "cluster_name": self.cluster_name,
+                            # Agent version (pxmx repo's .NN) so the spoke can
+                            # expose it via GET_AGENTS and the Hub Diagnostics
+                            # page shows a real version instead of "unknown".
+                            # `version` is computed at module load (get_version).
+                            "agent_version": version,
                         },
                     },
                 }
