@@ -100,14 +100,31 @@ def _sd_notify(state: str) -> None:
 
 
 def get_version():
-    """Return the pxmx agent version from the VERSION file (searches a few candidate paths), or ``"unknown"``."""
-    paths = ["VERSION",
-             os.path.join(os.path.dirname(__file__), "../../VERSION"),
-             os.path.join(os.path.dirname(__file__), "../VERSION")]
+    """Return the pxmx agent version from the VERSION file, or ``"unknown"``.
+
+    Searches candidate paths in priority order. The self-update git checkout
+    (``.pxmx_repo/VERSION``) is checked FIRST: it's a tracked file refreshed to
+    the current ``.NN`` on every ``git pull``, so an agent originally installed
+    BEFORE the .NN migration (whose ``install_dir/VERSION`` is a stale old-
+    format copy that self-update never overwrote) still reports the current
+    .NN instead of the stale value. Falls back to the install_dir copy, the
+    source tree (dev), then CWD."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = [
+        os.path.join(here, "..", ".pxmx_repo", "VERSION"),  # self-update checkout — current .NN
+        os.path.join(here, "..", "VERSION"),                 # install_dir/VERSION (install_agent.sh copy)
+        os.path.join(here, "..", "..", "VERSION"),           # dev source tree: pxmx/VERSION
+        "VERSION",                                           # CWD (last resort)
+    ]
     for p in paths:
-        if os.path.exists(p):
-            with open(p) as f:
-                return f.read().strip()
+        try:
+            if os.path.exists(p):
+                with open(p) as f:
+                    v = f.read().strip()
+                    if v:
+                        return v
+        except Exception:
+            pass
     return "unknown"
 
 version = get_version()
@@ -880,7 +897,10 @@ class ProxmoxAgent:
             ["git", "-C", repo_dir, "pull", "--rebase", "--autostash"],
             timeout=60, stdout=subprocess.DEVNULL,
         )
-        new_ver_path = pathlib.Path(repo_dir) / "agent" / "VERSION"
+        # The version lives at the repo root (VERSION), NOT agent/VERSION —
+        # reading agent/VERSION always missed (no such file) and made the
+        # "same version — no restart" short-circuit never fire.
+        new_ver_path = pathlib.Path(repo_dir) / "VERSION"
         new_ver = new_ver_path.read_text().strip() if new_ver_path.exists() else "?"
         if new_ver == current:
             return  # same version — no restart needed
@@ -897,6 +917,13 @@ class ProxmoxAgent:
                 shutil.copytree(str(item), str(dest))
             else:
                 shutil.copy2(str(item), str(dest))
+        # Refresh install_dir/VERSION from the repo root so an agent installed
+        # before the .NN migration doesn't keep a stale old-format copy that
+        # get_version() would fall back to. Mirrors install_agent.sh.
+        try:
+            shutil.copy2(str(pathlib.Path(repo_dir) / "VERSION"), str(dst / "VERSION"))
+        except Exception as e:
+            logger.warning(f"self-update: could not refresh {dst}/VERSION: {e}")
         pip = dst / "venv" / "bin" / "pip"
         req = dst / "requirements.txt"
         if pip.exists() and req.exists():
