@@ -451,6 +451,59 @@ class ProxmoxAgent:
         except asyncio.TimeoutError:
             pass  # partial — VMs not yet annotated keep ips=[]
 
+    async def _vm_pool_map(self) -> dict:
+        """Best-effort ``{vmid: poolid}`` from the Proxmox ``/pools`` endpoint.
+
+        ``/cluster/resources`` (the VM list source) doesn't carry pool
+        membership, so query ``/pools`` and reverse-map member vmid → poolid.
+        Some PVE versions return ``members`` inline on the ``/pools`` listing;
+        others require a per-pool ``/pools/{poolid}`` detail fetch. Both are
+        handled. Returns ``{}`` on any failure (never raises) — callers then
+        leave VM ``pool`` blank. A VM in no pool is simply absent from the map.
+        """
+        try:
+            pools = await self._pvesh("/pools")
+            out: dict = {}
+            for p in (pools if isinstance(pools, list) else []):
+                if not isinstance(p, dict):
+                    continue
+                pid = p.get("poolid")
+                if not pid:
+                    continue
+                members = p.get("members")
+                if members is None:
+                    detail = await self._pvesh(f"/pools/{pid}")
+                    members = detail.get("members") if isinstance(detail, dict) else None
+                for m in (members if isinstance(members, list) else []):
+                    if isinstance(m, dict) and m.get("vmid") is not None:
+                        # First pool seen wins; a VM shouldn't be in two pools.
+                        out.setdefault(m.get("vmid"), pid)
+            return out
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"pool map unavailable: {e}")
+            return {}
+
+    async def list_pools(self) -> list:
+        """Best-effort Proxmox resource pool list (``[{poolid, comment}, ...]``).
+
+        Used by the clone/create-VM UI's pool dropdown. Reads ``/pools`` (which
+        lists every pool id + comment); never raises — returns ``[]`` on failure.
+        """
+        try:
+            pools = await self._pvesh("/pools")
+            out = []
+            for p in (pools if isinstance(pools, list) else []):
+                if not isinstance(p, dict):
+                    continue
+                pid = p.get("poolid")
+                if not pid:
+                    continue
+                out.append({"poolid": pid, "comment": p.get("comment", "") or ""})
+            return out
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"list_pools unavailable: {e}")
+            return []
+
     async def get_vm_list(self) -> Dict[str, Any]:
         """
         All VMs and containers via local pvesh — no API credentials required.
@@ -494,9 +547,19 @@ class ProxmoxAgent:
                 # qm config / pct config round-trip is needed here.
                 "vcpus":     int(r.get("maxcpu", 0) or 0),
                 "disk_gb":   round((r.get("maxdisk", 0) or 0) / 1e9, 1),
+                # Proxmox resource pool membership (best-effort, from /pools).
+                # /cluster/resources doesn't carry pool; _vm_pool_map builds a
+                # vmid→poolid map once before the entries are constructed.
+                "pool":      pool_map.get(vmid, "") if pool_map else "",
                 "tags":      _parse_tags(r.get("tags")),
                 "ips":       [],   # filled by _annotate_vm_ips for running VMs
             }
+
+        # Best-effort vmid→poolid map. /cluster/resources doesn't expose pool
+        # membership, so query /pools (which lists each pool's member VMs) and
+        # reverse-map. A failure here is non-fatal: pool_map stays {} and every
+        # VM gets pool="".
+        pool_map = await self._vm_pool_map()
 
         try:
             # Primary: /cluster/resources — single call, Proxmox keeps this view
@@ -1055,6 +1118,117 @@ class ProxmoxAgent:
                                 snapshot_name=data.get("snapshot_name"))
                             result = {"status": "SUCCESS", **res}
                         except pve_cmds.PveError as e:
+                            result = {"status": "ERROR", "message": str(e)}
+
+                    elif cmd_type == "PXMX_CLONE_VM":
+                        # Clone-from-template: any tenant may clone a VM that
+                        # lives in a configured template pool (the hub resolves
+                        # the template unique_id and the cloning tenant's
+                        # proxmox_tag, then routes here on the template's node).
+                        # We auto-assign a free VMID, clone the template, and tag
+                        # the new VM for the cloning tenant so the next VM sync
+                        # attributes it to them. The agent runs on the
+                        # template's node (the spoke routes by unique_id node),
+                        # so qm/pct clone operates on the local template.
+                        try:
+                            # Resolve the template vmid + node + kind. The hub
+                            # sends template_unique_id "<cluster>/<node>/<vmid>"
+                            # (and the same value as unique_id for routing), or
+                            # explicit vmid/node/type.
+                            tuid = data.get("template_unique_id") or data.get("unique_id") or ""
+                            if tuid and "/" in tuid:
+                                parts = tuid.split("/")
+                                node = parts[-2] if len(parts) >= 3 else ""
+                                template_vmid = parts[-1]
+                            else:
+                                node = data.get("node") or ""
+                                template_vmid = data.get("template_vmid")
+                            if template_vmid is None:
+                                raise pve_cmds.PveError(
+                                    "template_vmid or template_unique_id required")
+                            name = (data.get("name") or "").strip()
+                            if not name:
+                                raise pve_cmds.PveError("name is required")
+                            kind = (data.get("type") or "").lower()
+                            if kind not in ("qemu", "lxc"):
+                                kind = await pve_cmds.detect_guest_type(
+                                    int(template_vmid))
+                            new_vmid = data.get("new_vmid")
+                            if new_vmid is None:
+                                new_vmid = await pve_cmds.next_free_vmid()
+                            # Tenant labels to apply to the new VM: the hub sends
+                            # tenant_tags (a list — typically the tenant display
+                            # name as the visible label + the proxmox_tag which the
+                            # Hypervisor→NetBox VM sync matches on). A single
+                            # tenant_tag string is accepted for back-compat.
+                            ttags_in = data.get("tenant_tags") or (
+                                [data.get("tenant_tag")] if data.get("tenant_tag") else [])
+                            tenant_tags = [str(t).strip() for t in ttags_in
+                                           if str(t).strip()]
+                            pool = (data.get("pool") or "").strip() or None
+                            # Clone the template → new VMID. full clone so the
+                            # new VM has its own disk (templates are shared).
+                            # pool places the new VM in a Proxmox resource pool
+                            # when the user selected one (both qm/pct clone take
+                            # --pool).
+                            await pve_cmds.clone_vm_any(
+                                template_vmid, new_vmid, name, kind, pool=pool)
+                            # Tag the new VM for the cloning tenant. Inherit the
+                            # template's existing tags (clone copies config, but
+                            # we set explicitly so the tenant labels are present
+                            # even if the template had none) and append the tenant
+                            # labels (dedup, case-insensitive). Best-effort: a tag
+                            # failure does not undo a successful clone.
+                            tags = []
+                            try:
+                                cfg = await self._pvesh(
+                                    f"/nodes/{node}/{kind}/{int(template_vmid)}/config")
+                                raw = (cfg or {}).get("tags", "")
+                                tags = [t.strip() for t in str(raw).split(";")
+                                        if t.strip()]
+                            except Exception as e:
+                                logger.warning("clone: could not read template "
+                                                "tags for %s/%s: %s", node,
+                                                template_vmid, e)
+                            lower_tags = {t.lower() for t in tags}
+                            for tt in tenant_tags:
+                                if tt.lower() not in lower_tags:
+                                    tags.append(tt)
+                                    lower_tags.add(tt.lower())
+                            if tags:
+                                try:
+                                    await pve_cmds.set_tags_any(
+                                        new_vmid, kind, tags)
+                                except pve_cmds.PveError as e:
+                                    logger.warning("clone: tag set failed for new "
+                                                   "VM %s: %s", new_vmid, e)
+                            result = {
+                                "status": "SUCCESS",
+                                "unique_id": f"{self.cluster_name}/{node}/{new_vmid}",
+                                "cluster": self.cluster_name,
+                                "node": node,
+                                "vmid": int(new_vmid),
+                                "name": name,
+                                "type": kind,
+                                "pool": pool or "",
+                                "template_vmid": int(template_vmid),
+                                "tags": tags,
+                            }
+                        except pve_cmds.PveError as e:
+                            result = {"status": "ERROR", "message": str(e)}
+                        except Exception as e:
+                            logger.exception("PXMX_CLONE_VM failed")
+                            result = {"status": "ERROR", "message": str(e)}
+
+                    elif cmd_type == "PXMX_LIST_POOLS":
+                        # Proxmox resource pool list for the clone/create-VM UI's
+                        # pool dropdown. Best-effort; [] when /pools is unavailable.
+                        try:
+                            pools = await self.list_pools()
+                            result = {"status": "SUCCESS", "pools": pools,
+                                      "cluster": self.cluster_name}
+                        except Exception as e:
+                            logger.exception("PXMX_LIST_POOLS failed")
                             result = {"status": "ERROR", "message": str(e)}
 
                     elif cmd_type == "VNC_PROXY":

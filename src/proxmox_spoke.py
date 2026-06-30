@@ -125,6 +125,33 @@ class ProxmoxSpoke(BaseSpoke):
         if cmd == "PXMX_VM_ACTION":
             return await self._route_vm_cmd("PXMX_VM_ACTION", data, timeout=30.0)
 
+        # Clone-from-template: a tenant clones a template-pool VM. Routed to the
+        # agent on the template's node via the template unique_id (cluster prefix)
+        # — qm/pct clone operates on the local template. Full-disk clones can
+        # take minutes, so allow a 600s agent window (matches clone_vm_any).
+        if cmd == "PXMX_CLONE_VM":
+            return await self._route_vm_cmd("PXMX_CLONE_VM", data, timeout=600.0)
+
+        # Proxmox resource pool list for the clone/create-VM UI's pool dropdown.
+        # Aggregated across every connected agent (each reports its cluster's
+        # pools). 15s window — /pools is a fast local pvesh read.
+        if cmd == "PXMX_LIST_POOLS":
+            pools: list = []
+            if self.control_plane:
+                for aid, info in (self.control_plane.connected_agents or {}).items():
+                    cluster = info.get("cluster_name", aid)
+                    try:
+                        r = await self.control_plane.send_to_agent(
+                            "PXMX_LIST_POOLS", data, agent_id=aid, timeout=15.0)
+                        r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
+                        for p in (r or {}).get("pools", []) if isinstance(r, dict) else []:
+                            pools.append({"poolid": p.get("poolid"),
+                                          "comment": p.get("comment", ""),
+                                          "cluster": cluster})
+                    except Exception as e:
+                        logger.debug("list_pools agent %s failed: %s", aid, e)
+            return {"status": "SUCCESS", "pools": pools}
+
         # VNC console: agent fetches a Proxmox vncproxy {ticket, port} via local
         # pvesh (fast); the hub opens the authenticated WSS itself.
         if cmd == "VNC_PROXY":

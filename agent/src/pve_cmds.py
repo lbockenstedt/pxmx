@@ -13,6 +13,7 @@ unfiltered ``qm list | awk 'NR>1{print $1}'``.
 """
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -147,6 +148,78 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
     else:
         raise PveError(f"unknown vm action: {action}")
     return {"vmid": vid, "action": act, "kind": k}
+
+
+async def next_free_vmid() -> int:
+    """Next free VMID from Proxmox (``/cluster/nextid`` via pvesh).
+
+    Falls back to max(qm list ∪ pct list)+1 when pvesh is unavailable. Used by
+    the clone-from-template flow to auto-assign the new VM's id.
+    """
+    rc, out, _ = await _run(["pvesh", "get", "/cluster/nextid"], check=False, timeout=15)
+    if rc == 0:
+        try:
+            data = json.loads(out.decode())
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            data = data.get("data", data)
+        if isinstance(data, str):
+            data = data.strip().strip('"')
+        try:
+            return int(data)
+        except (TypeError, ValueError):
+            pass
+    # Fallback: max existing vmid + 1.
+    used: List[int] = []
+    for bin_ in ("qm", "pct"):
+        rc, out, _ = await _run([bin_, "list"], check=False, timeout=20)
+        if rc != 0:
+            continue
+        for line in out.decode().splitlines()[1:]:  # skip header
+            parts = line.split()
+            if parts and parts[0].isdigit():
+                used.append(int(parts[0]))
+    return (max(used) + 1) if used else 100
+
+
+async def clone_vm_any(template_vmid: Any, new_vmid: Any, name: str, kind: str,
+                       *, full: bool = True, pool: Optional[str] = None,
+                       timeout: int = 600) -> None:
+    """Unguarded clone of a template VM/CT to a new VMID (clone-from-template).
+
+    ``kind`` is ``"qemu"`` or ``"lxc"`` (caller passes it so we skip a
+    detect_guest_type round-trip). qemu uses ``qm clone`` (full clone by default
+    so the new VM has its own disk); lxc uses ``pct clone`` with ``--hostname``.
+    ``pool`` optionally places the new VM in a Proxmox resource pool (both
+    ``qm clone`` and ``pct clone`` accept ``--pool``). Raises ``PveError`` on
+    failure.
+    """
+    tvid = int(template_vmid)
+    nvid = int(new_vmid)
+    if kind == "lxc":
+        flags = ["pct", "clone", str(tvid), str(nvid), "--hostname", name]
+        if pool:
+            flags += ["--pool", str(pool)]
+        await _run(flags, timeout=timeout)
+    else:
+        flags = ["qm", "clone", str(tvid), str(nvid), "--name", name]
+        if full:
+            flags.append("--full")
+        if pool:
+            flags += ["--pool", str(pool)]
+        await _run(flags, timeout=timeout)
+
+
+async def set_tags_any(vmid: Any, kind: str, tags: List[str]) -> None:
+    """Set the ``tags`` list on a VM/CT (qemu or lxc). ``tags`` is a list of
+    strings; Proxmox stores them semicolon-separated. Overwrites the current
+    tags. Used by clone-from-template to tag the new VM for the cloning tenant.
+    """
+    vid = int(vmid)
+    joined = ";".join(str(t).strip() for t in tags if str(t).strip())
+    bin_ = "pct" if kind == "lxc" else "qm"
+    await _run([bin_, "set", str(vid), "--tags", joined], timeout=30)
 
 
 # ── Batch commands (guarded filter, never unfiltered qm list) ───────────────
