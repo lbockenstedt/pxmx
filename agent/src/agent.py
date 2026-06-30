@@ -504,6 +504,76 @@ class ProxmoxAgent:
             logger.debug(f"list_pools unavailable: {e}")
             return []
 
+    async def list_node_isos(self, node: str) -> list:
+        """ISO images available on ``node`` for the create-VM-from-ISO flow.
+
+        Enumerates storages whose ``content`` includes ``iso`` and lists each
+        storage's ISO content (Proxmox returns ``volid`` like
+        ``local:iso/ubuntu-22.04.iso`` + ``size`` bytes). Returns a flat list of
+        ``{volid, name, storage, size}``. ``[]`` on any failure (never raises).
+        """
+        out: list = []
+        try:
+            storages = await self._pvesh(f"/nodes/{node}/storage")
+            for s in (storages if isinstance(storages, list) else []):
+                if not isinstance(s, dict):
+                    continue
+                content = s.get("content") or ""
+                if "iso" not in (content.split(",") if isinstance(content, str) else content):
+                    continue
+                storage = s.get("storage")
+                if not storage:
+                    continue
+                try:
+                    items = await self._pvesh(
+                        f"/nodes/{node}/storage/{storage}/content",
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("iso content list failed for %s/%s: %s", node, storage, e)
+                    continue
+                for it in (items if isinstance(items, list) else []):
+                    if not isinstance(it, dict):
+                        continue
+                    volid = it.get("volid") or ""
+                    if not volid.endswith(".iso"):
+                        continue
+                    out.append({
+                        "volid":   volid,
+                        "name":    it.get("volid", "").split("/")[-1],
+                        "storage": storage,
+                        "size":    it.get("size", 0) or 0,
+                    })
+            return out
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"list_node_isos unavailable: {e}")
+            return []
+
+    async def list_node_storages(self, node: str, content_filter: str = "images") -> list:
+        """Storages on ``node`` accepting the given content type (default
+        ``images`` — where a new VM's boot disk can live). Returns
+        ``[{storage, type, avail, total, shared}]``. ``[]`` on failure."""
+        out: list = []
+        try:
+            storages = await self._pvesh(f"/nodes/{node}/storage")
+            for s in (storages if isinstance(storages, list) else []):
+                if not isinstance(s, dict):
+                    continue
+                content = s.get("content") or ""
+                parts = content.split(",") if isinstance(content, str) else content
+                if content_filter not in parts:
+                    continue
+                out.append({
+                    "storage": s.get("storage"),
+                    "type":    s.get("type", ""),
+                    "avail":   s.get("avail", 0) or 0,
+                    "total":   s.get("total", 0) or 0,
+                    "shared":  bool(s.get("shared", 0)),
+                })
+            return out
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"list_node_storages unavailable: {e}")
+            return []
+
     async def get_vm_list(self) -> Dict[str, Any]:
         """
         All VMs and containers via local pvesh — no API credentials required.
@@ -1229,6 +1299,99 @@ class ProxmoxAgent:
                                       "cluster": self.cluster_name}
                         except Exception as e:
                             logger.exception("PXMX_LIST_POOLS failed")
+                            result = {"status": "ERROR", "message": str(e)}
+
+                    elif cmd_type == "PXMX_LIST_ISOS":
+                        # ISO images on a node for the create-VM-from-ISO flow.
+                        # pvesh /nodes/{node}/storage is cluster-wide, so this
+                        # works for any node in the agent's cluster.
+                        try:
+                            node = data.get("node") or ""
+                            isos = await self.list_node_isos(node)
+                            result = {"status": "SUCCESS", "isos": isos,
+                                      "node": node, "cluster": self.cluster_name}
+                        except Exception as e:
+                            logger.exception("PXMX_LIST_ISOS failed")
+                            result = {"status": "ERROR", "message": str(e)}
+
+                    elif cmd_type == "PXMX_LIST_STORAGES":
+                        # Storages on a node accepting 'images' (boot-disk targets)
+                        # for the create-VM-from-ISO disk dropdown.
+                        try:
+                            node = data.get("node") or ""
+                            content_filter = data.get("content") or "images"
+                            storages = await self.list_node_storages(node, content_filter)
+                            result = {"status": "SUCCESS", "storages": storages,
+                                      "node": node, "cluster": self.cluster_name}
+                        except Exception as e:
+                            logger.exception("PXMX_LIST_STORAGES failed")
+                            result = {"status": "ERROR", "message": str(e)}
+
+                    elif cmd_type == "PXMX_CREATE_VM":
+                        # Create a new qemu VM from an ISO (build-your-own-VM). The
+                        # hub resolves the target node's agent (agent_id) and sends
+                        # the ISO volid + disk/memory/cores config. We auto-assign
+                        # a free VMID, create via pvesh (cluster-wide — works for
+                        # any node in this cluster), tag the new VM with the acting
+                        # tenant's labels (name + proxmox_tag), and optionally
+                        # place it in a pool. The VM is created stopped; the user
+                        # boots the ISO and installs via the VNC console.
+                        try:
+                            node = (data.get("node") or "").strip()
+                            if not node:
+                                raise pve_cmds.PveError("node is required")
+                            name = (data.get("name") or "").strip()
+                            if not name:
+                                raise pve_cmds.PveError("name is required")
+                            volid = (data.get("volid") or "").strip()
+                            if not volid:
+                                raise pve_cmds.PveError("volid (ISO) is required")
+                            new_vmid = data.get("new_vmid")
+                            if new_vmid is None:
+                                new_vmid = await pve_cmds.next_free_vmid()
+                            ttags_in = data.get("tenant_tags") or (
+                                [data.get("tenant_tag")] if data.get("tenant_tag") else [])
+                            tenant_tags = [str(t).strip() for t in ttags_in if str(t).strip()]
+                            tags_joined = ";".join(tenant_tags)
+                            pool = (data.get("pool") or "").strip() or None
+                            memory_mb = int(data.get("memory_mb") or 2048)
+                            cores = int(data.get("cores") or 2)
+                            disk_storage = (data.get("disk_storage") or "").strip() or "local-lvm"
+                            disk_gb = int(data.get("disk_gb") or 32)
+                            bridge = (data.get("bridge") or "vmbr0").strip() or "vmbr0"
+                            # pvesh create /nodes/{node}/qemu (cluster-wide API).
+                            args = [
+                                "--vmid", str(new_vmid),
+                                "--name", name,
+                                "--cdrom", volid,
+                                "--memory", str(memory_mb),
+                                "--cores", str(cores),
+                                "--scsi0", f"{disk_storage}:{disk_gb}",
+                                "--net0", f"virtio,bridge={bridge}",
+                                "--ostype", "l26",
+                            ]
+                            if pool:
+                                args += ["--pool", pool]
+                            if tags_joined:
+                                args += ["--tags", tags_joined]
+                            await self._pvesh_action(
+                                "create", f"/nodes/{node}/qemu", *args,
+                                json_out=True, timeout=120)
+                            result = {
+                                "status": "SUCCESS",
+                                "unique_id": f"{self.cluster_name}/{node}/{new_vmid}",
+                                "cluster": self.cluster_name,
+                                "node": node,
+                                "vmid": int(new_vmid),
+                                "name": name,
+                                "type": "qemu",
+                                "pool": pool or "",
+                                "tags": tenant_tags,
+                            }
+                        except pve_cmds.PveError as e:
+                            result = {"status": "ERROR", "message": str(e)}
+                        except Exception as e:
+                            logger.exception("PXMX_CREATE_VM failed")
                             result = {"status": "ERROR", "message": str(e)}
 
                     elif cmd_type == "VNC_PROXY":

@@ -11,7 +11,7 @@ the canonical VM identity key.
 
 import asyncio
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 try:
     from base_spoke import BaseSpoke
@@ -151,6 +151,44 @@ class ProxmoxSpoke(BaseSpoke):
                     except Exception as e:
                         logger.debug("list_pools agent %s failed: %s", aid, e)
             return {"status": "SUCCESS", "pools": pools}
+
+        # ISO + storage listing for the create-VM-from-ISO flow. Scoped to a
+        # node: route to the agent that owns the node (agent_id passed by the
+        # hub, resolved from /api/pxmx/nodes). Falls back to the first agent.
+        if cmd == "PXMX_LIST_ISOS":
+            agent_id = data.get("agent_id")
+            if not agent_id:
+                agent_id = self._agent_for_node(data.get("node", ""))
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for node"}
+            r = await self.control_plane.send_to_agent(
+                "PXMX_LIST_ISOS", data, agent_id=agent_id, timeout=20.0)
+            r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
+            return r if isinstance(r, dict) else {"status": "ERROR", "message": "agent returned no isos"}
+
+        if cmd == "PXMX_LIST_STORAGES":
+            agent_id = data.get("agent_id")
+            if not agent_id:
+                agent_id = self._agent_for_node(data.get("node", ""))
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for node"}
+            r = await self.control_plane.send_to_agent(
+                "PXMX_LIST_STORAGES", data, agent_id=agent_id, timeout=20.0)
+            r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
+            return r if isinstance(r, dict) else {"status": "ERROR", "message": "agent returned no storages"}
+
+        # Create a new qemu VM from an ISO. Routed to the target node's agent
+        # (agent_id from the hub, or resolved from the node). pvesh create is
+        # cluster-wide so any agent in the cluster can create on any node. The
+        # create itself is fast (no install — just defines the VM); 120s window.
+        if cmd == "PXMX_CREATE_VM":
+            agent_id = data.get("agent_id")
+            if not agent_id:
+                agent_id = self._agent_for_node(data.get("node", ""))
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for node"}
+            return await self.control_plane.send_to_agent(
+                "PXMX_CREATE_VM", data, agent_id=agent_id, timeout=125.0)
 
         # VNC console: agent fetches a Proxmox vncproxy {ticket, port} via local
         # pvesh (fast); the hub opens the authenticated WSS itself.
@@ -401,6 +439,24 @@ class ProxmoxSpoke(BaseSpoke):
             return {"status": "ERROR", "message": f"Cannot resolve agent for '{unique_id}'"}
 
         return await self.control_plane.send_to_agent("GET_VM_INFO", data, agent_id=agent_id)
+
+    def _agent_for_node(self, node: str) -> Optional[str]:
+        """Resolve the agent_id whose ``nodes`` list contains ``node``. Falls
+        back to the first connected agent when none matches (single-node /
+        standalone). Used by PXMX_LIST_ISOS / PXMX_LIST_STORAGES /
+        PXMX_CREATE_VM which are node-scoped but routed via agent_id."""
+        if not self.control_plane:
+            return None
+        agents = self.control_plane.connected_agents or {}
+        if not agents:
+            return None
+        if node:
+            node_l = node.lower()
+            for aid, info in agents.items():
+                nodes = [str(n).lower() for n in (info.get("nodes") or [])]
+                if node_l in nodes:
+                    return aid
+        return next(iter(agents))
 
     async def _route_vm_cmd(self, cmd: str, data: Dict[str, Any],
                             timeout: float = 15.0) -> Dict[str, Any]:
