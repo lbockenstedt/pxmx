@@ -22,6 +22,7 @@ agent (retired in Phase G). Audience: pxmx developers; see the repo
 import asyncio
 import base64
 import json
+import re
 import uuid
 import time
 import logging
@@ -73,6 +74,15 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("PxmxAgent")
+
+
+# Matches a MAC in either colon or dash form (case-insensitive): aa:bb:cc:dd:ee:ff
+_MAC_RE = re.compile(r"^[0-9a-f]{2}([:-]?[0-9a-f]{2}){5}$", re.IGNORECASE)
+
+
+def _looks_like_mac(s: str) -> bool:
+    """True if ``s`` is a 6-octet MAC (colon or dash separators)."""
+    return bool(_MAC_RE.match((s or "").strip()))
 
 
 def _sd_notify(state: str) -> None:
@@ -391,82 +401,171 @@ class ProxmoxAgent:
             logger.error(f"Node stats error: {e}")
             return {"nodes": [], "error": str(e)}
 
-    async def _vm_ips(self, node: str, vmid: Any, rtype: str, status: str) -> List[str]:
-        """Best-effort guest IP lookup for one VM/CT. Returns IPv4 addresses
-        (loopback/link-local excluded, deduped). qemu uses the guest-agent
-        network-get-interfaces endpoint — only works when qemu-guest-agent is
-        installed and running in the guest; lxc uses /interfaces, which reads
-        the container network namespace (no guest agent needed). Stopped VMs
-        and absent/unresponsive guest agents yield []. Read-only pvesh GET,
-        safe for any VMID (no execution guard)."""
-        if status != "running" or not node or vmid in (None, ""):
+    async def _vm_interfaces(self, node: str, vmid: Any, rtype: str,
+                             status: str) -> List[Dict[str, Any]]:
+        """Best-effort per-network-interface record for one VM/CT:
+        ``[{"name", "mac", "ips": [..]}]``.
+
+        Running qemu uses the guest-agent ``network-get-interfaces`` endpoint
+        (yields the guest-visible IPs AND the MAC); running lxc uses
+        ``/interfaces`` (container netns — no guest agent needed). When the
+        guest source is absent/unresponsive OR the VM is stopped, fall back to
+        ``qm``/``pct config`` netN lines for the configured MACs (no guest IPs —
+        MACs are config, available in any state). Stopped VMs therefore still
+        get their MACs. Never raises; returns [] on any failure. Read-only
+        pvesh GET, safe for any VMID (no execution guard).
+        """
+        if not node or vmid in (None, ""):
             return []
         kind = "qemu" if rtype == "qemu" else "lxc"
-        try:
-            if kind == "qemu":
-                data = await asyncio.wait_for(
-                    self._pvesh(f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"),
-                    timeout=4)
-            else:
-                data = await asyncio.wait_for(
-                    self._pvesh(f"/nodes/{node}/lxc/{vmid}/interfaces"),
-                    timeout=4)
-        except Exception:
-            return []
-        # PVE wraps agent responses inconsistently; unwrap result/data/lists.
+        interfaces: List[Dict[str, Any]] = []
+        if status == "running":
+            try:
+                if kind == "qemu":
+                    data = await asyncio.wait_for(
+                        self._pvesh(f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"),
+                        timeout=4)
+                else:
+                    data = await asyncio.wait_for(
+                        self._pvesh(f"/nodes/{node}/lxc/{vmid}/interfaces"),
+                        timeout=4)
+                interfaces = self._parse_guest_ifaces(data)
+            except Exception:
+                interfaces = []
+        # Fall back to configured MACs when the guest source gave nothing (QGA
+        # absent, stopped VM, or empty result) — MACs are config so always
+        # available regardless of power state.
+        if not interfaces:
+            try:
+                interfaces = await self._vm_net_macs(node, vmid, kind)
+            except Exception:
+                interfaces = []
+        return interfaces
+
+    @staticmethod
+    def _parse_guest_ifaces(data: Any) -> List[Dict[str, Any]]:
+        """Normalize QGA ``network-get-interfaces`` / lxc ``/interfaces`` into
+        ``[{"name", "mac", "ips"}]``. QGA MAC is ``hardware-address``; lxc is
+        ``hwaddr``. Loopback/link-local IPs are excluded; per-interface IPs are
+        deduped. PVE wraps agent responses inconsistently (result/data/lists)
+        — unwrapped here."""
         result = data
         if isinstance(data, dict):
             result = data.get("result", data.get("data", data))
         if isinstance(result, dict) and "result" in result:
             result = result["result"]
-        ips: List[str] = []
-        if isinstance(result, list):
-            for iface in result:
-                if not isinstance(iface, dict):
-                    continue
-                # qemu guest-agent: {"ip-addresses": [{"ip-address","ip-address-type"}]}
-                for entry in (iface.get("ip-addresses") or []):
-                    if str(entry.get("ip-address-type", "")).lower() == "ipv4":
-                        ip = entry.get("ip-address")
-                        if isinstance(ip, str) and ip and not ip.startswith(("127.", "169.254.")):
-                            ips.append(ip)
-                # lxc /interfaces: {"inet": "1.2.3.4/24" | ["1.2.3.4/24", ...]}
-                inet = iface.get("inet")
-                addrs = inet if isinstance(inet, list) else (
-                    [inet] if isinstance(inet, str) and inet else [])
-                for addr in addrs:
-                    ip = str(addr).split("/")[0]
-                    if ip and not ip.startswith(("127.", "169.254.")):
+        out: List[Dict[str, Any]] = []
+        if not isinstance(result, list):
+            return out
+        seen_names: set = set()
+        for iface in result:
+            if not isinstance(iface, dict):
+                continue
+            name = str(iface.get("name") or iface.get("netdev") or "").strip()
+            mac = str(iface.get("hardware-address") or iface.get("hwaddr") or "").strip().lower()
+            # Skip the loopback / all-zeros-MAC pseudo-interfaces so they don't
+            # become NetBox vminterfaces.
+            if name.lower() == "lo" or mac == "00:00:00:00:00:00":
+                continue
+            ips: List[str] = []
+            # qemu guest-agent: {"ip-addresses": [{"ip-address","ip-address-type"}]}
+            for entry in (iface.get("ip-addresses") or []):
+                if str(entry.get("ip-address-type", "")).lower() == "ipv4":
+                    ip = entry.get("ip-address")
+                    if isinstance(ip, str) and ip and not ip.startswith(("127.", "169.254.")):
                         ips.append(ip)
-        seen, out = set(), []
-        for ip in ips:
-            if ip not in seen:
-                seen.add(ip)
-                out.append(ip)
+            # lxc /interfaces: {"inet": "1.2.3.4/24" | ["1.2.3.4/24", ...]}
+            inet = iface.get("inet")
+            addrs = inet if isinstance(inet, list) else (
+                [inet] if isinstance(inet, str) and inet else [])
+            for addr in addrs:
+                ip = str(addr).split("/")[0]
+                if ip and not ip.startswith(("127.", "169.254.")):
+                    ips.append(ip)
+            seen, uips = set(), []
+            for ip in ips:
+                if ip not in seen:
+                    seen.add(ip)
+                    uips.append(ip)
+            key = name or mac or f"iface{len(out)}"
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+            out.append({"name": name, "mac": mac, "ips": uips})
         return out
 
-    async def _annotate_vm_ips(self, vms: List[Dict[str, Any]]) -> None:
-        """Populate vm["ips"] for running VMs in parallel — best-effort, bounded
-        by a semaphore (16 concurrent pvesh calls) and an overall 10s deadline
-        so a hung guest agent can't stall the 60s telemetry tick. Stopped/template
-        VMs keep ips=[] (set in _vm_entry). VMs not annotated before the deadline
-        also keep ips=[]."""
-        running = [v for v in vms if v.get("status") == "running"]
-        if not running:
+    async def _vm_net_macs(self, node: str, vmid: Any,
+                           kind: str) -> List[Dict[str, Any]]:
+        """Parse ``qm``/``pct config`` netN lines for the configured MACs — the
+        fallback when the guest agent is absent or the VM is stopped (no guest
+        IPs, but MACs are config so always available). Returns
+        ``[{"name", "mac", "ips": []}]``."""
+        try:
+            data = await asyncio.wait_for(
+                self._pvesh(f"/nodes/{node}/{kind}/{vmid}/config"), timeout=4)
+        except Exception:
+            return []
+        cfg = data.get("data", data) if isinstance(data, dict) else data
+        if not isinstance(cfg, dict):
+            return []
+        return self._parse_config_nets(cfg)
+
+    @staticmethod
+    def _parse_config_nets(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Parse a qm/pct config dict for ``netN`` entries →
+        ``[{"name", "mac", "ips": []}]``.
+
+        qemu: ``net0: "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0[,...]"`` — the MAC
+              is the hex after the model (``virtio=``/``e1000=``/…).
+        lxc:  ``net0: "name=eth0,bridge=vmbr0,hwaddr=AA:BB:CC:DD:EE:FF[,...]"``.
+        """
+        out: List[Dict[str, Any]] = []
+        for key, val in cfg.items():
+            if not key.startswith("net") or not isinstance(val, str):
+                continue
+            mac, name = "", ""
+            for token in val.split(","):
+                token = token.strip()
+                if not token or "=" not in token:
+                    continue
+                k, v = token.split("=", 1)
+                k = k.strip().lower()
+                v = v.strip()
+                if k == "hwaddr" and _looks_like_mac(v):
+                    mac = v.lower()
+                elif k == "name":
+                    name = v
+                elif _looks_like_mac(v):
+                    mac = v.lower()   # qemu: <model>=<MAC>
+            if mac or name:
+                out.append({"name": name or key, "mac": mac, "ips": []})
+        return out
+
+    async def _annotate_vm_interfaces(self, vms: List[Dict[str, Any]]) -> None:
+        """Populate ``vm["interfaces"]`` (and the derived flat ``vm["ips"]``)
+        in parallel — best-effort, bounded by a semaphore (16 concurrent pvesh
+        calls) and a 12s deadline so a hung guest agent can't stall the 60s
+        telemetry tick. Running VMs get guest IPs + MACs (QGA/LXC); stopped VMs
+        get their configured MACs via qm/pct config. VMs not annotated before the
+        deadline keep interfaces=[] (and ips=[]); they'll be filled next tick."""
+        targets = [v for v in vms if v.get("node") and v.get("vmid") not in (None, "")]
+        if not targets:
             return
         sem = asyncio.Semaphore(16)
 
         async def _one(v):
             async with sem:
-                v["ips"] = await self._vm_ips(
+                ifaces = await self._vm_interfaces(
                     v.get("node", ""), v.get("vmid"), v.get("type"), v.get("status"))
+                v["interfaces"] = ifaces
+                v["ips"] = [ip for i in ifaces for ip in (i.get("ips") or [])]
 
         try:
             await asyncio.wait_for(
-                asyncio.gather(*[_one(v) for v in running], return_exceptions=True),
-                timeout=10)
+                asyncio.gather(*[_one(v) for v in targets], return_exceptions=True),
+                timeout=12)
         except asyncio.TimeoutError:
-            pass  # partial — VMs not yet annotated keep ips=[]
+            pass  # partial — VMs not yet annotated keep interfaces=[]/ips=[]
 
     async def _vm_pool_map(self) -> dict:
         """Best-effort ``{vmid: poolid}`` from the Proxmox ``/pools`` endpoint.
@@ -639,7 +738,13 @@ class ProxmoxAgent:
                 # vmid→poolid map once before the entries are constructed.
                 "pool":      pool_map.get(vmid, "") if pool_map else "",
                 "tags":      _parse_tags(r.get("tags")),
-                "ips":       [],   # filled by _annotate_vm_ips for running VMs
+                # Per-NIC records: [{name, mac, ips}] — filled by
+                # _annotate_vm_interfaces (running VMs get guest IPs + MACs via
+                # QGA/LXC; stopped VMs get configured MACs via qm/pct config).
+                # MACs land in NetBox on the VM's vminterfaces; ips is the flat
+                # derivation kept for back-compat with consumers reading it.
+                "interfaces": [],
+                "ips":       [],   # derived flat IP list (back-compat)
             }
 
         # Best-effort vmid→poolid map. /cluster/resources doesn't expose pool
@@ -658,7 +763,7 @@ class ProxmoxAgent:
                     for r in (resources if isinstance(resources, list) else [])
                     if r.get("type") in ("qemu", "lxc")
                 ]
-                await self._annotate_vm_ips(all_vms)
+                await self._annotate_vm_interfaces(all_vms)
                 return {"vms": all_vms, "cluster": self.cluster_name}
             except Exception as e:
                 logger.warning(f"cluster/resources unavailable ({e}), falling back to per-node queries")
@@ -681,7 +786,7 @@ class ProxmoxAgent:
                 except Exception as e:
                     logger.warning(f"LXC list error for {node_name}: {e}")
 
-            await self._annotate_vm_ips(all_vms)
+            await self._annotate_vm_interfaces(all_vms)
             return {"vms": all_vms, "cluster": self.cluster_name}
         except Exception as e:
             logger.error(f"VM list error: {e}")
