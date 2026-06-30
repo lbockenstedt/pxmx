@@ -315,13 +315,34 @@ class ProxmoxSpoke(BaseSpoke):
         agent_id  = data.get("agent_id")
         tag_filter = data.get("tag_filter", "").lower() or None
 
-        # Single agent request
+        # Single agent request (sync scoped to one pinned Proxmox server).
+        # The tenant tag_filter still applies — pinning a server must NOT bypass
+        # tenant scoping (otherwise every tenant's VMs on that server would sync).
+        # If the pinned agent is unreachable, send_to_agent returns an ERROR dict;
+        # surface it honestly so the hub records an 'error' sync status instead
+        # of silently reading an empty vms list as "0 records synced, success".
         if agent_id:
             result = await self.control_plane.send_to_agent("GET_VM_LIST", {}, agent_id=agent_id)
-            vms = result.get("vms", [])
-            for vm in vms:
+            if not isinstance(result, dict) or result.get("status") == "ERROR":
+                logger.warning("PXMX_LIST_VMS pinned agent %r unreachable: %s",
+                               agent_id, result if isinstance(result, dict) else "non-dict")
+                return result if isinstance(result, dict) else {"status": "ERROR",
+                                                                "message": "agent returned no data"}
+            cluster = result.get("cluster", agent_id)
+            vms = []
+            for vm in result.get("vms", []):
+                vm = dict(vm) if isinstance(vm, dict) else {}
                 vm["agent_id"] = agent_id
-            return {"status": "SUCCESS", "vms": vms}
+                vm.setdefault("cluster", cluster)
+                vm.setdefault("unique_id", f"{cluster}/{vm.get('node','?')}/{vm.get('vmid','?')}")
+                vms.append(vm)
+            if tag_filter:
+                vms = [v for v in vms
+                       if tag_filter in [t.lower() for t in (v.get("tags") or [])]]
+            logger.info("PXMX_LIST_VMS pinned agent=%s tag_filter=%r -> %d VMs",
+                        agent_id, tag_filter, len(vms))
+            return {"status": "SUCCESS", "vms": vms, "source": "pinned_agent",
+                    "agent_count": 1}
 
         # Aggregate from telemetry cache first (fast, no PVE API call)
         cached_vms: List[Dict] = []
@@ -343,6 +364,8 @@ class ProxmoxSpoke(BaseSpoke):
                           if tag_filter in [t.lower() for t in (v.get("tags") or [])]]
 
         if cached_vms:
+            logger.info("PXMX_LIST_VMS aggregate tag_filter=%r -> %d VMs (telemetry_cache, %d agents)",
+                        tag_filter, len(cached_vms), len(self.control_plane.connected_agents))
             return {"status": "SUCCESS", "vms": cached_vms,
                     "source": "telemetry_cache",
                     "agent_count": len(self.control_plane.connected_agents)}
@@ -363,7 +386,13 @@ class ProxmoxSpoke(BaseSpoke):
                     "unique_id": vm.get("unique_id", f"{cluster}/{node}/{vmid}"),
                 })
 
+        if tag_filter:
+            all_vms = [v for v in all_vms
+                       if tag_filter in [t.lower() for t in (v.get("tags") or [])]]
+
         if all_vms:
+            logger.info("PXMX_LIST_VMS aggregate tag_filter=%r -> %d VMs (live_query, %d agents)",
+                        tag_filter, len(all_vms), len(self.control_plane.connected_agents))
             return {"status": "SUCCESS", "vms": all_vms, "source": "live_query",
                     "agent_count": len(self.control_plane.connected_agents)}
 
