@@ -138,6 +138,16 @@ _mem_samples: Deque[Tuple[float, float]] = deque()
 _provision_halt: Optional[Dict[str, Any]] = None
 _prov_run: Dict[str, Any] = {"running": False, "items": []}
 
+# Auto-provision diagnostic state — WHY the last pass provisioned nothing (or did).
+# Surfaced in CS_TELEMETRY → WebUI Auto-Provisioning card so a silent gate (no
+# dongle_vidpids / no template ids / no eligible dongles) is visible in the UI
+# without grepping the agent log. ``run_provision_loop`` sets these every tick;
+# ``current_*`` accessors feed the telemetry body (mirror _provision_halt/_prov_run).
+_provision_reason: Optional[str] = None
+_provision_cfg_snapshot: Dict[str, Any] = {}
+_provision_loop_last_run: float = 0.0
+_auto_provision_on: bool = False
+
 
 def _normalize_toggle(v: Any) -> str:
     s = str(v or "").strip().lower()
@@ -206,6 +216,37 @@ def current_prov_run() -> Dict[str, Any]:
     """Live provision-run state (``{running, items:[{vmid,vidpid,status}]}``)
     for the telemetry body (cs ``_default_provision_run_state`` 3576-3586)."""
     return dict(_prov_run)
+
+
+def current_provision_reason() -> Optional[str]:
+    """The last pass's outcome / gate reason (``"no dongle_vidpids configured"``,
+    ``"auto-provision disabled"``, ``"no template ids configured"``,
+    ``"resource gate"``, ``"prov_run active"``, ``"slot cap reached"``,
+    ``"no eligible dongles"``, or ``"provisioning: attempted N, provisioned M"``)
+    for the telemetry body + WebUI card. None until the first pass runs."""
+    return _provision_reason
+
+
+def current_provision_cfg_snapshot() -> Dict[str, Any]:
+    """The provision config as the loop saw it last tick (``dongle_vidpids``
+    count, ``image1_template_id``/``image2_template_id`` bools, ``max_slots``,
+    ``vmid_range``, ``active_usb_vms``) so the UI can show WHICH precondition is
+    missing. Empty until the first pass runs."""
+    return dict(_provision_cfg_snapshot)
+
+
+def current_provision_loop_running() -> bool:
+    """True if the provision loop task has ticked recently (heartbeat < 180s,
+    i.e. 3× the 60s cadence — mirrors cs ``STALE_SECS=180``). False before the
+    first tick or after the task has died/stalled, so the UI can flag a crashed
+    loop separately from a gated-but-running one."""
+    return (time.time() - _provision_loop_last_run) < 180.0
+
+
+def current_auto_provision_on() -> bool:
+    """The last toggle reading (``usb_auto_provision``/``auto_provision``). For
+    the UI to confirm the tenant toggle actually reached this host."""
+    return _auto_provision_on
 
 
 def _load_delete_gate_cooldown() -> float:
@@ -743,12 +784,25 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
 
     Returns a summary the ``provision_unassigned`` long-op reports as its result.
     """
-    global _provision_halt, _prov_run
+    global _provision_halt, _prov_run, _provision_reason, _provision_cfg_snapshot, \
+        _provision_loop_last_run, _auto_provision_on
     from . import pve_cmds  # local to avoid a top-level import cycle
     cs_cfg = agent.config.get("client_simulation") or {}
     usb_cfg = cs_cfg.get("usb_config") or {}
     dongle_vidpids = _dongle_vidpids(agent)
+    # Heartbeat: the loop is alive. Stamped before any gate so
+    # current_provision_loop_running() flips true on the very first tick (lets the
+    # UI distinguish "loop not running" from "loop running but gated").
+    _provision_loop_last_run = time.time()
     if not dongle_vidpids:
+        # Silent gate made loud — this is the #1 cause of "nothing provisions" and
+        # previously left no log line at all. Surface it in the log + telemetry.
+        _provision_reason = "no dongle_vidpids configured"
+        _provision_cfg_snapshot = {"dongle_vidpids": 0, "image1_template_id": False,
+                                    "image2_template_id": False, "max_slots": None,
+                                    "vmid_range": {}, "active_usb_vms": None}
+        logger.warning("auto-provision: no dongle_vidpids configured — certify USB "
+                       "vid:pid values in the Simulations UI so dongles can be matched")
         return {"provisioned": 0, "torn_down": 0, "reason": "no dongle_vidpids configured"}
 
     ap_on = _toggle_on(usb_cfg)
@@ -772,6 +826,19 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                                       "missing_timeout"), 0) or 0)
     concurrency = max(1, int(usb_cfg.get("reclone_concurrency", 2) or 2))
     max_slots = int(_cfg_first(usb_cfg, ("usb_max_slots", "max_slots"), 24) or 24)
+
+    # Config snapshot for telemetry: lets the UI show WHICH precondition is missing
+    # (dongle_vidpids count, template ids set, slot cap, vmid range). active_usb_vms
+    # is filled after the slot cap is evaluated below.
+    _auto_provision_on = ap_on
+    _provision_cfg_snapshot = {
+        "dongle_vidpids": len(dongle_vidpids),
+        "image1_template_id": bool(img1),
+        "image2_template_id": bool(img2),
+        "max_slots": max_slots,
+        "vmid_range": {"start": start, "end": end},
+        "active_usb_vms": None,
+    }
 
     # Resource state (sampled each tick by _usb_provision_loop → sample_resources).
     cpu_avg = _resource_1h_average(_cpu_samples)
@@ -805,6 +872,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     if not ap_on:
         save_usb_state(state)
         _provision_halt = None
+        _provision_reason = "auto-provision disabled"
         logger.info("auto-provision: usb_auto_provision=off — telemetry-only pass")
         return {"provisioned": 0, "torn_down": 0, "reason": "auto-provision disabled"}
 
@@ -893,6 +961,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     save_usb_state(state)
 
     if not img1 and not img2:
+        # Silent gate made loud — the #2 cause of "nothing provisions"; previously
+        # returned with no log line. Surface it in the log + telemetry.
+        _provision_reason = "no template ids configured"
+        logger.warning("auto-provision: no image1/image2 template_id configured — "
+                        "set clone-source templates in the Simulations UI so VMs can be cloned")
         return {"provisioned": 0, "torn_down": len(torn_down),
                 "reason": "no template ids configured"}
 
@@ -907,6 +980,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         and mem_avg is not None and mem_avg < mem_prov_thr
     )
     if not resource_ok:
+        _provision_reason = "resource gate"
         logger.info(
             "auto-provision gate: suppressing clone (cpu_avg=%s mem_avg=%s "
             "cpu_instant=%s delete_queued=%s cooldown=%s ceil=%s halt=%s)",
@@ -915,11 +989,14 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         return {"provisioned": 0, "torn_down": len(torn_down),
                 "reason": "resource gate"}
     if _prov_run.get("running"):
+        _provision_reason = "prov_run active"
         logger.info("auto-provision gate: prov_run already active — skipping trigger")
         return {"provisioned": 0, "torn_down": len(torn_down),
                 "reason": "prov_run active"}
     active_usb_vms = len(state["vmid_to_bus"])
+    _provision_cfg_snapshot["active_usb_vms"] = active_usb_vms
     if active_usb_vms >= max_slots:
+        _provision_reason = "slot cap reached"
         logger.info("auto-provision: slot cap reached (%d >= %d) — stop provisioning",
                     active_usb_vms, max_slots)
         return {"provisioned": 0, "torn_down": len(torn_down),
@@ -944,6 +1021,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
 
     ordered = preferred + overflow
     if not ordered:
+        # Silent gate made loud — every dongle is assigned/excluded/quarantined or
+        # none is present. Previously returned with no log line.
+        _provision_reason = "no eligible dongles"
+        logger.info("auto-provision: no eligible dongles "
+                    "(all assigned/excluded/quarantined or none present)")
         return {"provisioned": 0, "torn_down": len(torn_down)}
 
     existing_after = set(await pve_cmds.list_all_vmids())
@@ -1010,6 +1092,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     _prov_run["completed"] = provisioned
     _prov_run["failed"] = len(ordered) - provisioned
     _prov_run["completed_at"] = int(time.time())
+    _provision_reason = f"provisioning: attempted {len(ordered)}, provisioned {provisioned}"
     return {"provisioned": provisioned, "torn_down": len(torn_down),
             "attempted": len(ordered)}
 

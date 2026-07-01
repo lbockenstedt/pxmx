@@ -1772,6 +1772,20 @@ class ProxmoxAgent:
             "usb_state":        usb.get("usb_state") or [],
             "present_usb":      usb.get("present_usb") or [],
             "unknown_usb":      usb.get("unknown_usb") or [],
+            # Auto-provision diagnostic — WHY the last pass provisioned nothing
+            # (or did). Surfaced through the cs spoke → hub cache → WebUI
+            # Auto-Provisioning card so a silent gate (no dongle_vidpids / no
+            # template ids / no eligible dongles) is visible without grepping the
+            # agent log. ``loop_running`` is a heartbeat (3× the 60s cadence); it
+            # is False before the first tick or after the loop task has died.
+            "provision": {
+                "cs_enabled":         bool(self.cs_enabled),
+                "loop_running":       usb_provision.current_provision_loop_running(),
+                "auto_provision_on": usb_provision.current_auto_provision_on(),
+                "reason":            usb_provision.current_provision_reason(),
+                "halt":              usb_provision.current_provision_halt(),
+                "config":           usb_provision.current_provision_cfg_snapshot(),
+            },
         }
 
     # ── Client Simulation mode actuation ──────────────────────────────────────
