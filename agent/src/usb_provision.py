@@ -71,14 +71,17 @@ def _usb_cfg(agent) -> Dict[str, Any]:
 
 def _dongle_vidpids(agent) -> Set[str]:
     """The certified dongle VID:PID set (lowercased ``vid:pid``). Reads the
-    cs-spoke ``usb_config.usb_vidpids`` array of ``{vidpid,...}`` dicts, with a
-    legacy ``dongle_vidpids``/``certified_types`` fallback. Empty until the hub
-    delivers usb_config — the blacklist + telemetry classify as no-op/unknown."""
+    cs-spoke ``usb_config.vidpids`` array of ``{vidpid,...}`` dicts (the key the
+    cs spoke's ``usb_config_payload`` emits), with legacy
+    ``usb_vidpids``/``dongle_vidpids``/``certified_types`` fallbacks for older
+    spoke builds. Empty until the hub delivers usb_config — the blacklist +
+    telemetry classify as no-op/unknown."""
     cfg = _usb_cfg(agent)
-    items = _parse_vidpid_items(cfg.get("usb_vidpids"))
-    if not items:  # legacy fallback
-        items = _parse_vidpid_items(cfg.get("dongle_vidpids")) or \
-                list(cfg.get("certified_types") or [])
+    items = _parse_vidpid_items(cfg.get("vidpids"))
+    if not items:  # legacy fallbacks (older cs spoke builds)
+        items = (_parse_vidpid_items(cfg.get("usb_vidpids"))
+                 or _parse_vidpid_items(cfg.get("dongle_vidpids"))
+                 or list(cfg.get("certified_types") or []))
     out: Set[str] = set()
     for v in items:
         vp = (v.get("vidpid") if isinstance(v, dict) else v)
@@ -89,9 +92,12 @@ def _dongle_vidpids(agent) -> Set[str]:
 
 
 def _certified_types(agent) -> Dict[str, str]:
-    """``{vidpid: type}`` from the certified list (default ``wireless``)."""
+    """``{vidpid: type}`` from the certified list (default ``wireless``). Reads
+    the cs-spoke ``usb_config.vidpids`` array (legacy ``usb_vidpids`` fallback)."""
     cfg = _usb_cfg(agent)
-    items = _parse_vidpid_items(cfg.get("usb_vidpids"))
+    items = _parse_vidpid_items(cfg.get("vidpids"))
+    if not items:  # legacy fallback (older cs spoke builds)
+        items = _parse_vidpid_items(cfg.get("usb_vidpids"))
     out: Dict[str, str] = {}
     for v in items:
         if not isinstance(v, dict):
@@ -103,10 +109,14 @@ def _certified_types(agent) -> Dict[str, str]:
 
 
 def _ignored_vidpids(agent) -> Set[str]:
-    """The ignored dongle VID:PID set (lowercased) from ``usb_ignored_vidpids``."""
+    """The ignored dongle VID:PID set (lowercased) from the cs-spoke
+    ``usb_config.ignored_vidpids`` array (legacy ``usb_ignored_vidpids`` fallback)."""
     cfg = _usb_cfg(agent)
     out: Set[str] = set()
-    for v in _parse_vidpid_items(cfg.get("usb_ignored_vidpids")):
+    items = _parse_vidpid_items(cfg.get("ignored_vidpids"))
+    if not items:  # legacy fallback (older cs spoke builds)
+        items = _parse_vidpid_items(cfg.get("usb_ignored_vidpids"))
+    for v in items:
         vp = (v.get("vidpid") if isinstance(v, dict) else v)
         s = str(vp or "").strip().lower()
         if _VIDPID_RE.match(s):
@@ -806,9 +816,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         return {"provisioned": 0, "torn_down": 0, "reason": "no dongle_vidpids configured"}
 
     ap_on = _toggle_on(usb_cfg)
-    certified_types = usb_cfg.get("certified_types") or {}
-    if not isinstance(certified_types, dict):
-        certified_types = {}
+    # The cs spoke emits the certified list as ``vidpids`` (a list of
+    # {vidpid, type} dicts), not a ``certified_types`` {vidpid: type} map — so
+    # build the map via the accessor (which reads ``vidpids``) instead of the
+    # stale legacy key. Used to tag each present dongle with its dongle class.
+    certified_types = _certified_types(agent)
     sim_phy = str(usb_cfg.get("sim_phy") or "any").lower()
     use_all = bool(usb_cfg.get("use_all_dongles", False))
     img1 = usb_cfg.get("image1_template_id")
