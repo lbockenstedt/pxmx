@@ -90,6 +90,14 @@ def _cfg(agent) -> Dict[str, Any]:
     return (agent.config.get("client_simulation") or {}).get("watchdog") or {}
 
 
+def _usb_cfg(agent) -> Dict[str, Any]:
+    # The cs spoke is the source of truth for the hub-managed watchdog knobs
+    # (guest_agent_* / watchdog_reboot_enabled): it emits them in the
+    # ``usb_config`` blob the cs_bridge relays into client_simulation.usb_config.
+    # The watchdog section (_cfg) + env vars remain as fallbacks/overrides.
+    return (agent.config.get("client_simulation") or {}).get("usb_config") or {}
+
+
 def _env_bool(name: str, default: bool) -> bool:
     v = os.environ.get(name)
     if v is None:
@@ -107,8 +115,37 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _usb_toggle(val: Any, fallback: bool) -> bool:
+    """Resolve a cs-speak (usb_config) on/off value, falling back if absent.
+
+    The cs speak emits these via ``_normalize_toggle`` (``"on"``/``"off"``); a
+    bool or ``"1"/"true"`` is also accepted. ``None``/missing → ``fallback``.
+    """
+    if val is None:
+        return fallback
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "on", "true", "yes", "enabled")
+
+
+def _usb_int(val: Any, fallback: int) -> int:
+    """Resolve a cs-speak (usb_config) integer, falling back if absent/bad."""
+    if val is None:
+        return fallback
+    try:
+        return int(str(val).strip())
+    except (ValueError, TypeError):
+        return fallback
+
+
 def _hw_settings(agent) -> Dict[str, Any]:
     c = _cfg(agent).get("hardware") or {}
+    # watchdog_reboot_enabled is hub-owned (cs speak → usb_config); the other
+    # hardware knobs (enabled/interval/tier2/cooldown) are env/watchdog-section
+    # only — the original never hub-managed them.
+    usb = _usb_cfg(agent)
+    reboot_enabled = _usb_toggle(usb.get("watchdog_reboot_enabled"),
+                                 bool(c.get("reboot_enabled", DEF_WATCHDOG_REBOOT_ENABLED)))
     return {
         "enabled": _env_bool("CLIENT_SIM_HW_WATCHDOG_ENABLED",
                               bool(c.get("enabled", DEF_HW_ENABLED))),
@@ -119,25 +156,36 @@ def _hw_settings(agent) -> Dict[str, Any]:
         "cooldown": _env_int("CLIENT_SIM_HW_REBOOT_COOLDOWN",
                              int(c.get("reboot_cooldown", DEF_HW_REBOOT_COOLDOWN))),
         "reboot_enabled": _env_bool("CLIENT_SIM_WATCHDOG_REBOOT_ENABLED",
-                                    bool(c.get("reboot_enabled", DEF_WATCHDOG_REBOOT_ENABLED))),
+                                    reboot_enabled),
     }
 
 
 def _ga_settings(agent) -> Dict[str, Any]:
+    # All guest-agent watchdog knobs are hub-owned (cs speak → usb_config), with
+    # the watchdog section + env as fallbacks/overrides — mirroring the legacy
+    # spoke where the settings store was the source. Env still wins so ops can
+    # force a value; when env is unset the hub-managed value takes effect.
+    usb = _usb_cfg(agent)
     c = _cfg(agent).get("guest_agent") or {}
+    enabled = _usb_toggle(usb.get("guest_agent_watchdog_enabled"),
+                          bool(c.get("enabled", DEF_GA_ENABLED)))
+    check = _usb_int(usb.get("guest_agent_check_interval_minutes"),
+                     int(c.get("check_interval_min", DEF_GA_CHECK_INTERVAL_MIN)))
+    grace = _usb_int(usb.get("guest_agent_grace_minutes"),
+                     int(c.get("grace_min", DEF_GA_GRACE_MIN)))
+    reboot_after = _usb_int(usb.get("guest_agent_reboot_after_minutes"),
+                            int(c.get("reboot_after_min", DEF_GA_REBOOT_AFTER_MIN)))
+    reclone_after = _usb_int(usb.get("guest_agent_reclone_after_minutes"),
+                             int(c.get("reclone_after_min", DEF_GA_RECLONE_AFTER_MIN)))
+    reboot_enabled = _usb_toggle(usb.get("watchdog_reboot_enabled"),
+                                bool(c.get("reboot_enabled", DEF_WATCHDOG_REBOOT_ENABLED)))
     return {
-        "enabled": _env_bool("CLIENT_SIM_GUEST_AGENT_WATCHDOG_ENABLED",
-                             bool(c.get("enabled", DEF_GA_ENABLED))),
-        "check_interval": _env_int("CLIENT_SIM_GUEST_AGENT_CHECK_INTERVAL_MINUTES",
-                                   int(c.get("check_interval_min", DEF_GA_CHECK_INTERVAL_MIN))) * 60,
-        "grace": _env_int("CLIENT_SIM_GUEST_AGENT_GRACE_MINUTES",
-                          int(c.get("grace_min", DEF_GA_GRACE_MIN))) * 60,
-        "reboot_after": _env_int("CLIENT_SIM_GUEST_AGENT_REBOOT_AFTER_MINUTES",
-                                 int(c.get("reboot_after_min", DEF_GA_REBOOT_AFTER_MIN))) * 60,
-        "reclone_after": _env_int("CLIENT_SIM_GUEST_AGENT_RECLONE_AFTER_MINUTES",
-                                  int(c.get("reclone_after_min", DEF_GA_RECLONE_AFTER_MIN))) * 60,
-        "reboot_enabled": _env_bool("CLIENT_SIM_WATCHDOG_REBOOT_ENABLED",
-                                    bool(c.get("reboot_enabled", DEF_WATCHDOG_REBOOT_ENABLED))),
+        "enabled": _env_bool("CLIENT_SIM_GUEST_AGENT_WATCHDOG_ENABLED", enabled),
+        "check_interval": _env_int("CLIENT_SIM_GUEST_AGENT_CHECK_INTERVAL_MINUTES", check) * 60,
+        "grace": _env_int("CLIENT_SIM_GUEST_AGENT_GRACE_MINUTES", grace) * 60,
+        "reboot_after": _env_int("CLIENT_SIM_GUEST_AGENT_REBOOT_AFTER_MINUTES", reboot_after) * 60,
+        "reclone_after": _env_int("CLIENT_SIM_GUEST_AGENT_RECLONE_AFTER_MINUTES", reclone_after) * 60,
+        "reboot_enabled": _env_bool("CLIENT_SIM_WATCHDOG_REBOOT_ENABLED", reboot_enabled),
     }
 
 
