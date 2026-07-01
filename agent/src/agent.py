@@ -1756,10 +1756,14 @@ class ProxmoxAgent:
                 "_agent_hostname": self.hostname,
             })
 
-        vr = cs_cfg.get("vmid_range") or {}
+        # The cs speak emits the hub-managed range as flat vmid_start/vmid_end in
+        # usb_config (not the nested client_simulation.vmid_range this used to
+        # read, which was never populated → always reported 90000-99999). Mirror
+        # the allocator's read so the UI shows the range the agent actually uses.
+        _usb = cs_cfg.get("usb_config") or {}
         vmid_range = {
-            "start": int(vr.get("start", 90000)) if vr.get("start") is not None else 90000,
-            "end":   int(vr.get("end", 99999)) if vr.get("end") is not None else 99999,
+            "start": int(_usb.get("vmid_start") or 90000),
+            "end":   int(_usb.get("vmid_end") or 99999),
         }
 
         # USB passthrough detail: scan /sys/bus/usb/devices and classify against

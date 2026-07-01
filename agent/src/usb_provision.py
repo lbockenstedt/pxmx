@@ -826,9 +826,14 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     img1 = usb_cfg.get("image1_template_id")
     img2 = usb_cfg.get("image2_template_id")
     img1_pct = int(usb_cfg.get("image1_pct", 50) or 50)
-    vr = cs_cfg.get("vmid_range") or {}
-    start = int((vr or {}).get("start", 90000) or 90000)
-    end = int((vr or {}).get("end", 99999) or 99999)
+    # The cs speak emits the hub-managed VMID allocation range as flat
+    # vmid_start/vmid_end in usb_config. This used to read the nested
+    # client_simulation.vmid_range, which the cs_bridge never populates (it
+    # relays into client_simulation.usb_config), so the range always fell back to
+    # 90000-99999 and hub-set ranges never reached the allocator. Defaults match
+    # the cs speak (90000/99999) so an unset hub value keeps the historical range.
+    start = int(usb_cfg.get("vmid_start") or 90000)
+    end = int(usb_cfg.get("vmid_end") or 99999)
     # missing_timeout: accept the union of relay key names (webui-spoke sends
     # usb_missing_timeout, lm-spoke sends missing_timeout) — the old single-key
     # read (usb_missing_timeout_seconds, which nothing sends) left the teardown
@@ -1057,10 +1062,26 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     async def _do(bus: str) -> bool:
         info = present[bus]
         async with sem:
+            # The clone-source templates (image1/2_template_id) must stay OUTSIDE
+            # the allocation pool: a sim VM must never grab a template's VMID
+            # (cloning "from" a sim VM, or colliding when a deleted template's
+            # VMID is reused on reclone). They are fixed, cluster-consistent
+            # VMIDs, not allocation candidates — exclude them explicitly in
+            # addition to existing_after (which already covers present templates
+            # but not a just-deleted one mid-reclone).
+            templates = set()
+            for _t in (img1, img2):
+                try:
+                    _tv = int(_t)
+                    if _tv > 0:
+                        templates.add(_tv)
+                except (TypeError, ValueError):
+                    pass
             # Find a free vmid in the sim range.
             vid = start
             while vid <= end and (str(vid) in state["vmid_to_bus"]
-                                  or vid in existing_after):
+                                  or vid in existing_after
+                                  or vid in templates):
                 vid += 1
             if vid > end:
                 logger.info("provision loop: no free VM slot — stopping")
