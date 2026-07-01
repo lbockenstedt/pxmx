@@ -724,6 +724,13 @@ class ProxmoxAgent:
                 "type":      rtype,
                 "name":      r.get("name", f"{'vm' if rtype == 'qemu' else 'ct'}-{vmid}"),
                 "status":    r.get("status", "unknown"),
+                # Proxmox ``template: 1`` flag (set by ``qm template`` /
+                # convert-to-template). /cluster/resources and the per-node
+                # /qemu + /lxc endpoints all carry it. Captured here so the cs
+                # telemetry ``_is_template`` heuristic can honor the real flag
+                # instead of only tags/name (templates without a "template"
+                # tag or a "template-" name were misfiled as 'Other').
+                "template":  int(r.get("template", 0) or 0),
                 "cpu":       round(r.get("cpu", 0) * 100, 1),
                 "mem_bytes": r.get("mem") or r.get("maxmem", 0),
                 "uptime":    r.get("uptime", 0),
@@ -1720,6 +1727,12 @@ class ProxmoxAgent:
         }
 
         def _is_template(v: Dict[str, Any]) -> bool:
+            # Honor the real Proxmox ``template: 1`` flag first — a VM converted
+            # with ``qm template`` carries this even when it has no "template"
+            # tag and a non-template name (the case that misfiled templates as
+            # 'Other'). int flags from /cluster/resources: 1 = template.
+            if int(v.get("template", 0) or 0):
+                return True
             tags = [str(t).lower() for t in (v.get("tags") or [])]
             if any(t in ("template", "tmpl", "is-template") for t in tags):
                 return True
