@@ -170,6 +170,12 @@ class ProxmoxAgent:
         self.signer = MessageSigner(self.secret or "")
         self.hostname = socket.gethostname()
         self.agent_type = "pxmx-agent"
+        # Stable install UUID (minted at first start, persisted to .env) + the
+        # current OS hostname are sent on every connect so the hub can detect a
+        # clone-and-rename of this Proxmox node and carry over its agent config
+        # rather than treating it as a brand-new agent. prep-for-imaging strips
+        # INSTALL_UUID from .env so a cloned node mints a fresh identity.
+        self.install_uuid = self._ensure_install_uuid()
 
         # Proxmox cluster name — resolved on first telemetry push; defaults to hostname.
         self.cluster_name: str = self.hostname
@@ -266,6 +272,51 @@ class ProxmoxAgent:
             logger.warning(f"Could not clear secret from .env: {e}")
         self.secret = None
         self.signer = MessageSigner("")
+
+    def _env_path(self) -> str:
+        """Absolute path to the agent .env (/opt/lm/pxmx/agent/.env in production)."""
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+    def _ensure_install_uuid(self) -> str:
+        """Return this agent's stable install UUID, minting + persisting it on first start.
+
+        Mirrors the spoke-side BaseControlPlane._ensure_install_uuid: the UUID is
+        created at FIRST START (not install) so cloning the agent install tree
+        does not copy a UUID — a clone gets its own on first start. prep-for-imaging
+        strips INSTALL_UUID so a cloned node mints a fresh one (clean new identity
+        vs. a rename of the original). We trust only what lands on disk: a failed
+        write returns '' (no UUID) rather than a volatile value that would differ
+        every boot. The hub treats '' as "no correlation".
+        """
+        env_path = self._env_path()
+        try:
+            existing = ""
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    for line in f:
+                        if line.startswith("INSTALL_UUID="):
+                            existing = line.split("=", 1)[1].strip()
+                            if existing:
+                                return existing
+            new_uuid = str(uuid.uuid4())
+            lines = []
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    lines = [l for l in f if not l.startswith("INSTALL_UUID=")]
+            lines.append(f"INSTALL_UUID={new_uuid}\n")
+            with open(env_path, "w") as f:
+                f.writelines(lines)
+            logger.info(f"Install UUID minted and saved to {env_path}")
+            # Re-read so a silent write failure can't leave us reporting a UUID
+            # that isn't actually on disk (which would mismatch on next start).
+            with open(env_path) as f:
+                for line in f:
+                    if line.startswith("INSTALL_UUID="):
+                        return line.split("=", 1)[1].strip()
+            return ""
+        except Exception as e:
+            logger.warning(f"Could not ensure INSTALL_UUID in .env: {e}")
+            return ""
 
     # ── Local pvesh helpers ───────────────────────────────────────────────────
 
@@ -1215,6 +1266,13 @@ class ProxmoxAgent:
             handshake: Dict[str, Any] = {"agent_id": self.agent_id}
             if self.secret:
                 handshake["secret"] = self.secret
+            # install_uuid + hostname let the hub detect a clone-and-rename of this
+            # node and carry over the agent's config/approval. Empty install_uuid =
+            # .env unwritable → hub skips correlation (agent treated as before).
+            if self.install_uuid:
+                handshake["install_uuid"] = self.install_uuid
+            if self.hostname:
+                handshake["hostname"] = self.hostname
             await websocket.send(json.dumps(handshake))
 
             # 2. Hub response — may be APPROVAL_REQUIRED, HUB_VERIFIED, or 1008 close
@@ -1931,9 +1989,16 @@ class ProxmoxAgent:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--spoke-url", required=True)
-    parser.add_argument("--id", default="pxmx-agent-1")
+    # --id is OPTIONAL: when not supplied the agent derives its id from the
+    # current OS hostname at startup, so a cloned+renamed Proxmox node reconnects
+    # under a new id (correlated to the old one via the install UUID by the hub)
+    # instead of being frozen to the hostname captured at install. A pinned --id
+    # (install_pxmx.sh printed cmd / explicit --id) wins.
+    parser.add_argument("--id", default=None)
     parser.add_argument("--secret")
     args = parser.parse_args()
+    if not args.id:
+        args.id = f"{socket.gethostname()}-agent"
 
     try:
         agent = ProxmoxAgent(args.spoke_url, args.id, args.secret)

@@ -3,14 +3,21 @@ set -e
 
 # Default Configuration
 HUB_URL="ws://localhost:8765"
-SPOKE_ID="${SPOKE_ID:-pxmx-$(hostname -s)}"
+# SPOKE_ID is OPTIONAL. When neither the SPOKE_ID env var nor --id is supplied
+# the spoke derives its id from the current OS hostname at startup (see
+# control_plane __main__) — so a cloned+renamed container reconnects under a new
+# id (correlated to the old one via the install UUID) instead of being frozen to
+# the hostname at install. A pinned --id (install_all.sh / explicit --id) wins.
+SPOKE_ID="${SPOKE_ID:-}"
+SPOKE_ID_PINNED=0
+[ -n "$SPOKE_ID" ] && SPOKE_ID_PINNED=1
 SPOKE_SECRET="lm-secret"
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --hub) HUB_URL="$2"; shift ;;
-        --id|--name) SPOKE_ID="$2"; shift ;;
+        --id|--name) SPOKE_ID="$2"; SPOKE_ID_PINNED=1; shift ;;
         --secret) SPOKE_SECRET="$2"; shift ;;
         --hub-secret) HUB_SECRET="$2"; shift ;;
         --all-prereqs) ;;  # no-op (system prereqs are always installed); accepted so the Hub's install-module call doesn't abort
@@ -75,9 +82,20 @@ fi
 
 # --- Persistence Configuration ---
 echo "⚙️ Configuring Spoke Identity..."
+# Bake SPOKE_ID into .env + the unit ONLY when it was explicitly pinned. In the
+# derived case Python computes `<hostname>-spoke` at startup, so a clone that
+# was renamed reconnects under a new id (correlated to the old one via the
+# install UUID). INSTALL_UUID is NOT written here — the spoke mints it at first
+# start. ID_ARG uses \$SPOKE_ID so systemd expands it from EnvironmentFile.
+SPOKE_ID_LINE=""
+ID_ARG=""
+if [ "$SPOKE_ID_PINNED" = "1" ]; then
+    SPOKE_ID_LINE="SPOKE_ID=$SPOKE_ID"
+    ID_ARG="--id \$SPOKE_ID"
+fi
 cat <<EOF > .env
 HUB_URL=$HUB_URL
-SPOKE_ID=$SPOKE_ID
+${SPOKE_ID_LINE}
 SPOKE_SECRET=$SPOKE_SECRET
 HUB_SECRET=$HUB_SECRET
 EOF
@@ -135,7 +153,7 @@ User=svc_lm
 WorkingDirectory=$INSTALL_DIR/pxmx
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/pxmx/src"
 EnvironmentFile=$INSTALL_DIR/pxmx/.env
-ExecStart=$INSTALL_DIR/pxmx/venv/bin/python3 -m src.control_plane --id \$SPOKE_ID --hub \$HUB_URL $SECRET_ARG $HUB_SECRET_ARG
+ExecStart=$INSTALL_DIR/pxmx/venv/bin/python3 -m src.control_plane $ID_ARG --hub \$HUB_URL $SECRET_ARG $HUB_SECRET_ARG
 StandardOutput=append:/var/log/lm/lm-pxmx.log
 StandardError=append:/var/log/lm/lm-pxmx.log
 Restart=always
@@ -160,7 +178,11 @@ systemctl start lm-pxmx
 
 echo "🎉 Proxmox Manager installation complete!"
 echo "🌐 Hub Target: $HUB_URL"
-echo "🆔 Spoke ID: $SPOKE_ID"
+if [ "$SPOKE_ID_PINNED" = "1" ]; then
+    echo "🆔 Spoke ID: $SPOKE_ID  (pinned)"
+else
+    echo "🆔 Spoke ID: $(hostname -s)-spoke  (derived from hostname at startup)"
+fi
 echo "📦 Version: $(cat VERSION 2>/dev/null || echo unknown)"
 
 # Print the agent install command so the admin knows what to run on each Proxmox node
@@ -171,8 +193,8 @@ echo "  Run this on each Proxmox node to install the pxmx agent:"
 echo ""
 echo "  curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh \\"
 echo "    | sudo bash -s -- \\"
-echo "    --spoke-url ws://${LM_HOST}:8766 \\"
-echo "    --id pxmx-agent-\$(hostname)"
+echo "    --spoke-url ws://${LM_HOST}:8766"
+echo "  (omitting --id derives <hostname>-agent; clone+rename auto-correlates via install UUID)"
 echo ""
 echo "  The agent will appear as 'Pending' in the LM WebUI (Setup → Spokes & Agents → Agents tile)."
 echo "  Approve it there and the authentication secret will be provisioned automatically."

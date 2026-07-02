@@ -2,16 +2,23 @@
 set -e
 
 # Default Configuration
-# AGENT_ID defaults to "<hostname>-agent" — overridden by --id at install.
+# AGENT_ID is OPTIONAL. When --id is not supplied the agent derives its id from
+# the current OS hostname at startup (see agent.py __main__), so a cloned+renamed
+# Proxmox node reconnects under a new id (correlated to the old one via the
+# install UUID by the hub) instead of being frozen to the hostname at install.
+# A pinned --id is honored as-is. We only bake AGENT_ID into .env + the unit
+# when it was explicitly pinned; otherwise Python owns the id. INSTALL_UUID is
+# never written here — the agent mints it at first start.
 SPOKE_URL=""
-AGENT_ID="$(hostname -s)-agent"
+AGENT_ID=""
+AGENT_ID_PINNED=0
 AGENT_SECRET=""
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --spoke-url) SPOKE_URL="$2"; shift ;;
-        --id) AGENT_ID="$2"; shift ;;
+        --id) AGENT_ID="$2"; AGENT_ID_PINNED=1; shift ;;
         --secret) AGENT_SECRET="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
@@ -80,10 +87,21 @@ if [ -f "$INSTALL_DIR/requirements.txt" ]; then
     "$INSTALL_DIR/venv/bin/python3" -m pip install -r "$INSTALL_DIR/requirements.txt" -q
 fi
 
+# Bake AGENT_ID into .env + the unit ONLY when it was explicitly pinned. In the
+# derived case Python computes `<hostname>-agent` at startup, so a clone that was
+# renamed reconnects under a new id (correlated to the old one via the install
+# UUID). INSTALL_UUID is NOT written here — the agent mints it at first start.
+AGENT_ID_LINE=""
+ID_ARG=""
+if [ "$AGENT_ID_PINNED" = "1" ]; then
+    AGENT_ID_LINE="AGENT_ID=$AGENT_ID"
+    ID_ARG="--id $AGENT_ID"
+fi
+
 # ── Write .env (preserving secret) ────────────────────────────────────────────
 cat <<EOF > "$INSTALL_DIR/.env"
 SPOKE_URL=$SPOKE_URL
-AGENT_ID=$AGENT_ID
+${AGENT_ID_LINE}
 AGENT_SECRET=$FINAL_SECRET
 EOF
 
@@ -97,7 +115,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/venv/bin/python3 -m src.agent --spoke-url $SPOKE_URL --id $AGENT_ID
+ExecStart=$INSTALL_DIR/venv/bin/python3 -m src.agent --spoke-url $SPOKE_URL $ID_ARG
 StandardOutput=append:/var/log/lm-pxmx-agent.log
 StandardError=append:/var/log/lm-pxmx-agent.log
 Restart=always
@@ -212,5 +230,9 @@ fi
 
 echo "🎉 Proxmox Local Agent installation complete!"
 echo "🌐 Target Spoke: $SPOKE_URL"
-echo "🆔 Agent ID: $AGENT_ID"
+if [ "$AGENT_ID_PINNED" = "1" ]; then
+    echo "🆔 Agent ID: $AGENT_ID  (pinned)"
+else
+    echo "🆔 Agent ID: $(hostname -s)-agent  (derived from hostname at startup)"
+fi
 echo "📦 Version: $(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo unknown)"

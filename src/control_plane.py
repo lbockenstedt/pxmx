@@ -214,6 +214,12 @@ class PxmxControlPlane(BaseControlPlane):
             auth = json.loads(await websocket.recv())
             agent_id     = auth.get("agent_id")
             agent_secret = auth.get("secret")
+            # Stable install UUID + current OS hostname (sent by the agent on
+            # every connect) so the hub can detect a clone-and-rename of this
+            # Proxmox node and carry over its per-agent config. Captured here and
+            # relayed up on every AGENT_RELAY_UP frame via _relay_agent_msg_up.
+            agent_install_uuid = (auth.get("install_uuid") or "").strip()
+            agent_hostname     = (auth.get("hostname") or "").strip()
 
             if not agent_id:
                 await websocket.close(1008, "Missing agent_id"); return
@@ -255,8 +261,9 @@ class PxmxControlPlane(BaseControlPlane):
             logger.info(f"Agent '{agent_id}' connected")
             self.connected_agents[agent_id] = {
                 "ws":           websocket,
-                "hostname":     agent_id,
+                "hostname":     agent_hostname or agent_id,
                 "cluster_name": agent_id,   # overwritten by telemetry
+                "install_uuid": agent_install_uuid,
                 "last_seen":    time.time(),
                 "nodes":        [],
                 "vms":          [],
@@ -375,6 +382,11 @@ class PxmxControlPlane(BaseControlPlane):
                 "(hub connection not yet authenticated)", msg_type, agent_id)
             return
         try:
+            # Attach the agent's install_uuid + hostname to the relay envelope so
+            # the hub can reconcile agent identity (clone-and-rename detection)
+            # on every relayed frame, not just telemetry. Sourced from the
+            # capture in _agent_handler; falls back to agent_id when absent.
+            rec = self.connected_agents.get(agent_id, {})
             relay = {
                 "header": {
                     "message_id": str(uuid.uuid4()),
@@ -386,6 +398,8 @@ class PxmxControlPlane(BaseControlPlane):
                     "type": "AGENT_RELAY_UP",
                     "data": {
                         "agent_id": agent_id,
+                        "install_uuid": rec.get("install_uuid", ""),
+                        "hostname": rec.get("hostname", agent_id),
                         "original_payload": {"payload": {"type": msg_type, "data": data}},
                     },
                 },
@@ -522,12 +536,20 @@ class PxmxControlPlane(BaseControlPlane):
 
 
 if __name__ == "__main__":
+    import socket
     parser = argparse.ArgumentParser()
-    parser.add_argument("--id",         required=True)
+    # --id is OPTIONAL: when not supplied the spoke derives its id from the
+    # current OS hostname at startup, so a cloned+renamed container reconnects
+    # under a new id (correlated to the old one via the install UUID by the hub)
+    # instead of being frozen to the hostname captured at install. A pinned --id
+    # (install_all.sh / explicit --id) wins.
+    parser.add_argument("--id",         default=None)
     parser.add_argument("--secret",     default="")
     parser.add_argument("--hub-secret", nargs='?', default="", const="")
     parser.add_argument("--hub",        required=True)
     args = parser.parse_args()
+    if not args.id:
+        args.id = f"{socket.gethostname()}-spoke"
 
     cp = PxmxControlPlane(args.id, args.secret or None, args.hub_secret, args.hub)
     asyncio.run(cp.run())
