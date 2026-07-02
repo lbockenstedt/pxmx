@@ -192,6 +192,162 @@ EOF
 systemctl daemon-reload
 systemctl enable lm-pxmx
 
+# ── Failed-update rollback watchdog + sudoers ─────────────────────────────────
+# Per-spoke recovery state lives in /var/lib/lm/<spoke_id>/ (created on demand at
+# runtime by the spoke): pre-swap code snapshot, pending-update manifest, healthy
+# marker, bad-commit registry. The external health-gate watchdog below reads them
+# and rolls back a self-update that crashes at boot (git reset --hard <from_commit>)
+# instead of letting it crash-loop forever under Restart=always. The spoke (svc_lm)
+# schedules it via `sudo -n` right before it os._exit(3)s to load new code; the
+# sudoers entry grants only this path. Mirrors the hub's lm-update-restart.
+cat > /usr/local/bin/lm-component-update-restart <<'HELPER'
+#!/bin/bash
+# lm-component-update-restart — external health-gate watchdog for spoke/agent
+# self-updates. Scheduled by the component (sudo -n for spokes, direct for the
+# root agent) right before it exits to load new code. Runs OUTSIDE the
+# component's systemd cgroup (via systemd-run) so it survives the component's
+# restart and can roll back a failed update instead of letting it crash-loop
+# forever under Restart=always.
+#
+# Rollback policy: the watchdog waits up to --deadline for a `healthy` marker
+# (written by the component after it re-auths with the hub/spoke). If instead
+# it sees a crash-loop (NRestarts >= 3) or a failed/inactive unit, it rolls
+# back — `git reset --hard <from_commit>` for a spoke (--repo-root, a git repo)
+# or a file-tree restore for the agent (--install-dir, non-git) — marks the
+# version/commit bad so the next update skips it, and restarts the component.
+# A unit that is active-and-running but hasn't written the marker (the hub/spoke
+# is unreachable so the component can't auth) is NOT rolled back — the code
+# booted; the missing marker is a connectivity issue, not a code failure, and
+# rolling back a good update during a hub outage would strand the component on
+# old code and mark a good commit/version bad.
+#
+# State-file ops delegate to the Python CLI update_recovery.py (SINGLE SOURCE OF
+# TRUTH for the on-disk recovery state machine). Only poll/systemd/git logic
+# lives here. This file is the canonical source; install_cs.sh / install_pxmx.sh
+# / install_agent.sh embed it verbatim via here-doc — keep them in sync.
+set -uo pipefail
+
+UNIT="" STATE_DIR="" REPO_ROOT="" INSTALL_DIR="" DEADLINE=90
+RECOVERY_PY="/opt/lm/core/src/update_recovery.py"
+
+# Re-exec under a transient systemd unit outside the component's cgroup so this
+# process survives the `systemctl restart <unit>` it issues (otherwise the
+# restart kills us before we can poll or roll back). The guard prevents an
+# infinite re-exec loop. Mirrors lm-update-restart's transient-unit trick.
+if [ -z "${LM_COMP_UPDATE_GUARD:-}" ]; then
+    export LM_COMP_UPDATE_GUARD=1
+    exec systemd-run --no-block --quiet --collect \
+        --unit="lm-comp-update-$$-$RANDOM" --service-type=oneshot \
+        --setenv=LM_COMP_UPDATE_GUARD=1 \
+        /usr/local/bin/lm-component-update-restart "$@"
+fi
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --unit) UNIT="$2"; shift 2;;
+        --state-dir) STATE_DIR="$2"; shift 2;;
+        --repo-root) REPO_ROOT="$2"; shift 2;;
+        --install-dir) INSTALL_DIR="$2"; shift 2;;
+        --deadline) DEADLINE="$2"; shift 2;;
+        --recovery-py) RECOVERY_PY="$2"; shift 2;;
+        *) shift;;
+    esac
+done
+
+HEALTHY="$STATE_DIR/healthy"
+PENDING="$STATE_DIR/pending_update.json"
+
+# 0 if the component is healthy (marker present) OR booted-but-pending-auth
+# (active, not crash-looping); 1 if still failing (crash-loop / failed / unknown).
+unit_ok() {
+    [ -f "$HEALTHY" ] && return 0
+    local a n
+    a="$(systemctl show "$UNIT" -p ActiveState --value 2>/dev/null || echo "")"
+    n="$(systemctl show "$UNIT" -p NRestarts --value 2>/dev/null || echo 0)"
+    n="${n:-0}"
+    [ "$a" = "active" ] && [ "$n" -lt 3 ] && return 0
+    return 1
+}
+
+clear_and_prune() {
+    python3 "$RECOVERY_PY" clearpending --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+    python3 "$RECOVERY_PY" prune --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+}
+
+# 1) Wait up to DEADLINE for the new code to boot + re-auth (healthy marker).
+waited=0
+while [ "$waited" -lt "$DEADLINE" ]; do
+    if [ -f "$HEALTHY" ]; then
+        clear_and_prune
+        exit 0
+    fi
+    sleep 5; waited=$((waited + 5))
+done
+
+# 2) Deadline elapsed, no marker. Active-and-stable → connectivity, not code.
+if unit_ok; then
+    echo "lm-component-update-restart: $UNIT active but no healthy marker within ${DEADLINE}s — assuming hub/spoke unreachable (not a code failure); no rollback." >&2
+    clear_and_prune
+    exit 0
+fi
+
+# 3) Crash-loop or failed → roll back to the pre-swap code.
+pending="$(cat "$PENDING" 2>/dev/null || true)"
+bdir="$(printf '%s' "$pending" | jq -r '.backup_dir // empty' 2>/dev/null)"
+from_commit="$(printf '%s' "$pending" | jq -r '.from_commit // empty' 2>/dev/null)"
+to_commit="$(printf '%s' "$pending" | jq -r '.to_commit // empty' 2>/dev/null)"
+to_v="$(printf '%s' "$pending" | jq -r '.to_version // empty' 2>/dev/null)"
+
+echo "lm-component-update-restart: $UNIT failed to boot (crash-loop/failed); rolling back." >&2
+
+if [ -n "$REPO_ROOT" ]; then
+    # Spoke (git repo): reset hard to the pre-update commit + clean stray files.
+    if [ -n "$from_commit" ]; then
+        git -C "$REPO_ROOT" reset --hard "$from_commit" >/dev/null 2>&1 || true
+        git -C "$REPO_ROOT" clean -fd >/dev/null 2>&1 || true
+    fi
+    if [ -n "$to_commit" ]; then
+        python3 "$RECOVERY_PY" markbadcommit "$to_commit" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+    fi
+elif [ -n "$INSTALL_DIR" ]; then
+    # Agent (non-git install dir): file-tree restore from the pre-swap snapshot.
+    if [ -n "$bdir" ] && [ -d "$bdir/src" ]; then
+        python3 "$RECOVERY_PY" rollback --hub-root "$INSTALL_DIR" --backup-dir "$bdir" \
+            --tree src --state-dir "$STATE_DIR" --chown-user root >/dev/null 2>&1 || true
+    fi
+    if [ -n "$to_v" ]; then
+        python3 "$RECOVERY_PY" markbad "$to_v" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+    fi
+fi
+
+python3 "$RECOVERY_PY" clearpending --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+systemctl restart "$UNIT" 2>/dev/null || true
+
+# 4) Did the rolled-back code come back? (marker OR active-and-stable.)
+waited=0
+while [ "$waited" -lt 30 ]; do
+    if unit_ok; then
+        echo "lm-component-update-restart: $UNIT rolled back; marked bad; recovered." >&2
+        python3 "$RECOVERY_PY" prune --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+        exit 0
+    fi
+    sleep 5; waited=$((waited + 5))
+done
+
+# 5) Rolled-back code ALSO failed — last-resort marker for manual recovery.
+python3 "$RECOVERY_PY" writefailed --to-version "${to_v:-${to_commit:-unknown}}" \
+    --backup-dir "$bdir" --reason "rollback did not come healthy within 30s" \
+    --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+echo "lm-component-update-restart: $UNIT rollback also failed; left for manual recovery (snapshot at $bdir)." >&2
+exit 1
+HELPER
+chmod 0755 /usr/local/bin/lm-component-update-restart
+cat > /etc/sudoers.d/lm-component-update <<SUDOERS
+svc_lm ALL=(ALL) NOPASSWD: /usr/local/bin/lm-component-update-restart
+SUDOERS
+chmod 0440 /etc/sudoers.d/lm-component-update
+visudo -cf /etc/sudoers.d/lm-component-update >/dev/null 2>&1 || true
+
 # Apply new code now and prevent split-brain: stop the current instance, reap
 # any orphaned/stale pxmx control_plane process left by a previous install
 # (different unit or invocation), then start fresh. A stale instance holding
@@ -214,6 +370,10 @@ else
     echo "🆔 Spoke ID: $(hostname -s)-spoke  (derived from hostname at startup)"
 fi
 echo "📦 Version: $(cat VERSION 2>/dev/null || echo unknown)"
+echo "🛡️  Rollback: /usr/local/bin/lm-component-update-restart — a failed self-update"
+echo "    (crash at boot) is rolled back to the prior commit automatically. NOTE:"
+echo "    this watchdog + sudoers land only on a full installer re-run; a box that"
+echo "    only git-pulled the new spoke code must be re-installed once to enable it."
 
 # Print the agent install command so the admin knows what to run on each Proxmox node
 LM_HOST=$(echo "$HUB_URL" | sed 's|^ws://||' | cut -d: -f1)

@@ -135,6 +135,13 @@ if _log_path == "/var/log/lm/pxmx-agent.log":
 logger = logging.getLogger("PxmxAgent")
 
 
+# Per-agent update-recovery state dir. Separate from the hub's /var/lib/lm/state
+# and the spokes' /var/lib/lm/<spoke_id>/ so a co-located box never collides.
+# The external health-gate watchdog (lm-component-update-restart) reads the
+# pending manifest + healthy marker here and rolls back a failed self-update.
+AGENT_STATE_DIR = os.environ.get("LM_PXMX_STATE_DIR", "/var/lib/pxmx/update-state")
+
+
 # Matches a MAC in either colon or dash form (case-insensitive): aa:bb:cc:dd:ee:ff
 _MAC_RE = re.compile(r"^[0-9a-f]{2}([:-]?[0-9a-f]{2}){5}$", re.IGNORECASE)
 
@@ -1113,8 +1120,21 @@ class ProxmoxAgent:
         return int(out.decode().strip())
 
     def _apply_update(self, install_dir: str, repo_dir: str):
-        """Pull latest code, sync to install dir, pip install, then restart."""
+        """Pull latest code, sync to install dir, pip install, then restart.
+
+        Snapshots the install-dir code + writes a pending-update manifest BEFORE
+        the copytree swap, and schedules the external health-gate watchdog
+        (``lm-component-update-restart``) before restarting. The watchdog checks
+        the ``healthy`` marker + ``systemctl`` state and, if the new code crashes
+        at boot, restores the pre-swap snapshot (the agent install dir is NOT a
+        git repo, so rollback is a file-tree restore, not ``git reset``), marks
+        the version bad, and restarts us. A version already marked bad is skipped
+        here so we never crash-loop into the same broken release. Best-effort: if
+        the watchdog script isn't installed yet (pre-reinstall), the Popen fails
+        silently and we degrade to the pre-rollback behavior (restart, no rollback).
+        """
         import subprocess, shutil, pathlib
+        from . import update_recovery as ur
         current = get_version()
         subprocess.check_call(
             ["git", "-C", repo_dir, "pull", "--rebase", "--autostash"],
@@ -1127,7 +1147,30 @@ class ProxmoxAgent:
         new_ver = new_ver_path.read_text().strip() if new_ver_path.exists() else "?"
         if new_ver == current:
             return  # same version — no restart needed
+        # Skip a known-bad version (rolled back before) so we don't crash-loop
+        # into the same broken release.
+        try:
+            if ur.is_version_bad(new_ver, state_dir=AGENT_STATE_DIR):
+                logger.warning(
+                    f"pxmx-agent update to {new_ver} skipped (marked bad — rolled "
+                    f"back before); staying on {current}.")
+                ur.clear_pending(state_dir=AGENT_STATE_DIR)
+                return
+        except Exception as e:  # pragma: no cover - update_recovery unavailable
+            logger.debug(f"bad-version check skipped: {e}")
         logger.info(f"Updating pxmx-agent {current} → {new_ver}")
+        # Snapshot the current install-dir code BEFORE the swap so the watchdog
+        # can restore it (file-tree rollback — the install dir is non-git) if the
+        # new code crashes at boot. belt-and-suspenders alongside the version record.
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            backup_dir = ur.snapshot_code(install_dir, ts, tree_list=["src"],
+                                          state_dir=AGENT_STATE_DIR)
+            ur.write_pending(backup_dir, from_version=current, to_version=new_ver,
+                             ts=ts, state_dir=AGENT_STATE_DIR,
+                             extra={"service_unit": "lm-pxmx-agent", "deadline": 90})
+        except Exception as e:
+            logger.warning(f"pre-update snapshot failed (rollback disabled): {e}")
         src = pathlib.Path(repo_dir) / "agent"
         dst = pathlib.Path(install_dir)
         for item in src.iterdir():
@@ -1151,6 +1194,21 @@ class ProxmoxAgent:
         req = dst / "requirements.txt"
         if pip.exists() and req.exists():
             subprocess.check_call([str(pip), "install", "-r", str(req), "-q"], timeout=120)
+        # Schedule the external health-gate watchdog. The agent runs as root, so
+        # no sudo — the script re-execs via systemd-run to escape our cgroup so it
+        # survives our exit. Best-effort: a missing script (pre-reinstall) fails
+        # silently and we just restart with no rollback (the pre-rollback behavior).
+        try:
+            subprocess.Popen(
+                ["/usr/local/bin/lm-component-update-restart",
+                 "--unit", "lm-pxmx-agent", "--state-dir", AGENT_STATE_DIR,
+                 "--install-dir", str(dst), "--deadline", "90",
+                 "--recovery-py", os.path.abspath(ur.__file__)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:  # pragma: no cover - script missing / not executable
+            logger.debug(f"could not schedule update watchdog: {e}")
         logger.info("Self-update applied — restarting service")
         subprocess.Popen(["systemctl", "restart", "lm-pxmx-agent"])
         os._exit(0)
@@ -1286,6 +1344,27 @@ class ProxmoxAgent:
             logger.warning("Hub auto-discovery found no hub (no lm-hub DNS record / "
                            "mDNS broadcast); will retry on reconnect. Pass --spoke-url to pin.")
 
+    # ── Update-recovery healthy marker ──────────────────────────────────────
+    def _clear_healthy_marker(self) -> None:
+        """Drop a stale ``healthy`` marker on boot so a fresh start must re-prove
+        health (the external update watchdog treats the marker as the positive
+        "new code booted OK" signal)."""
+        try:
+            m = os.path.join(AGENT_STATE_DIR, "healthy")
+            if os.path.exists(m):
+                os.remove(m)
+        except Exception:  # pragma: no cover - state dir missing / not writable
+            pass
+
+    def _touch_healthy_marker(self) -> None:
+        """Mark the agent healthy after spoke auth completes — the watchdog's
+        positive health signal (presence => new code booted + authed)."""
+        try:
+            os.makedirs(AGENT_STATE_DIR, exist_ok=True)
+            open(os.path.join(AGENT_STATE_DIR, "healthy"), "w").close()
+        except Exception as e:  # pragma: no cover - state dir not writable
+            logger.debug(f"could not write healthy marker: {e}")
+
     async def run(self):
         """Main agent loop — connect, auth, run telemetry/provision/command/watchdog tasks, reconnect with backoff.
 
@@ -1294,6 +1373,12 @@ class ProxmoxAgent:
         on repeated auth failure so a bad secret doesn't spin forever.
         """
         import websockets
+        # Clear any stale healthy marker from a prior boot — a fresh start must
+        # re-prove health (re-auth with the spoke) before the update watchdog
+        # treats it as the "new code booted OK" signal. Without this a
+        # crash-looping new version could inherit a stale marker and the watchdog
+        # would never roll back.
+        self._clear_healthy_marker()
         backoff = 5
         _consecutive_auth_fails = 0
         asyncio.create_task(self._update_check_loop())
@@ -1388,6 +1473,10 @@ class ProxmoxAgent:
 
             await websocket.send(json.dumps({"status": "HUB_OK"}))
             logger.info("Spoke identity verified. Auth complete.")
+            # New code booted + authed with the spoke → mark healthy. The external
+            # update watchdog treats this marker as the "new version is good"
+            # signal; its absence past the deadline triggers a rollback.
+            self._touch_healthy_marker()
 
             log_handler = WebSocketLogHandler(self)
             log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
