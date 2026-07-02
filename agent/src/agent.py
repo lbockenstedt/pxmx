@@ -1245,6 +1245,31 @@ class ProxmoxAgent:
                 pass
             await asyncio.sleep(interval)
 
+    async def _resolve_spoke_url(self) -> None:
+        """When ``self.spoke_url`` is empty/``auto``/None, auto-discover the hub
+        box via DNS (``lm-hub.<suffix>``) then mDNS and target its pxmx-agent
+        listener (:8766). Lets an agent install/launch with no ``--spoke-url`` and
+        still find the hub. Best-effort: on no result it leaves the sentinel so the
+        next reconnect retries — discovery is never fatal to the agent."""
+        if self.spoke_url not in ("", "auto", None):
+            return
+        try:
+            from .discovery import discover_hub_url
+        except ImportError:
+            try:
+                from discovery import discover_hub_url
+            except ImportError:
+                logger.warning("discovery module unavailable — cannot auto-discover "
+                               "the hub; pass --spoke-url or set SPOKE_URL.")
+                return
+        url = discover_hub_url(timeout=5.0, port_override=8766)
+        if url:
+            self.spoke_url = url
+            logger.info(f"Auto-discovered hub (agent listener) at {url}")
+        else:
+            logger.warning("Hub auto-discovery found no hub (no lm-hub DNS record / "
+                           "mDNS broadcast); will retry on reconnect. Pass --spoke-url to pin.")
+
     async def run(self):
         """Main agent loop — connect, auth, run telemetry/provision/command/watchdog tasks, reconnect with backoff.
 
@@ -1257,7 +1282,12 @@ class ProxmoxAgent:
         _consecutive_auth_fails = 0
         asyncio.create_task(self._update_check_loop())
         asyncio.create_task(self._sd_watchdog_loop())
+        await self._resolve_spoke_url()
         while True:
+            # Re-discover each pass while the URL is still the sentinel so a hub
+            # that comes up after this agent (or moves) is found without a restart.
+            if self.spoke_url in ("", "auto", None):
+                await self._resolve_spoke_url()
             try:
                 await self._connect_once()
                 backoff = 5  # reset on clean disconnect
@@ -2019,7 +2049,11 @@ class ProxmoxAgent:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--spoke-url", required=True)
+    # --spoke-url is OPTIONAL: when neither --spoke-url nor SPOKE_URL env is
+    # supplied the agent auto-discovers the hub box via DNS (lm-hub.<dns-suffix>)
+    # then mDNS (_lm-hub._tcp.local.) and targets its agent listener (:8766) —
+    # see _resolve_spoke_url + src.discovery. A pinned --spoke-url wins.
+    parser.add_argument("--spoke-url", default=os.getenv("SPOKE_URL") or None)
     # --id is OPTIONAL: when not supplied the agent derives its id from the
     # current OS hostname at startup, so a cloned+renamed Proxmox node reconnects
     # under a new id (correlated to the old one via the install UUID by the hub)

@@ -1,3 +1,7 @@
 websockets
 fastapi
 uvicorn[standard]
+# mDNS hub auto-discovery (_lm-hub._tcp.local.) at install + runtime; the pxmx
+# spoke imports the vendored src/discovery.py which degrades to DNS-only if this
+# is missing, but installing it lets the spoke hear the hub's broadcast.
+zeroconf>=0.131,<1.0

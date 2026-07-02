@@ -536,6 +536,7 @@ class PxmxControlPlane(BaseControlPlane):
 
 
 if __name__ == "__main__":
+    import os
     import socket
     parser = argparse.ArgumentParser()
     # --id is OPTIONAL: when not supplied the spoke derives its id from the
@@ -543,10 +544,13 @@ if __name__ == "__main__":
     # under a new id (correlated to the old one via the install UUID by the hub)
     # instead of being frozen to the hostname captured at install. A pinned --id
     # (install_all.sh / explicit --id) wins.
-    parser.add_argument("--id",         default=None)
-    parser.add_argument("--secret",     default="")
-    parser.add_argument("--hub-secret", nargs='?', default="", const="")
-    parser.add_argument("--hub",        required=True)
+    parser.add_argument("--id",         default=os.getenv("SPOKE_ID") or None)
+    parser.add_argument("--secret",     default=os.getenv("SPOKE_SECRET", ""))
+    parser.add_argument("--hub-secret", nargs='?', default=os.getenv("HUB_SECRET", ""), const="")
+    # --hub is OPTIONAL: when neither --hub nor HUB_URL is supplied the spoke
+    # auto-discovers the hub via DNS (lm-hub.<dns-suffix>) then mDNS
+    # (_lm-hub._tcp.local.) — see BaseControlPlane.run + src.discovery.
+    parser.add_argument("--hub",        default=os.getenv("HUB_URL") or None)
     args = parser.parse_args()
     if not args.id:
         args.id = f"{socket.gethostname()}-spoke"

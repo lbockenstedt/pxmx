@@ -9,7 +9,14 @@ set -e
 # A pinned --id is honored as-is. We only bake AGENT_ID into .env + the unit
 # when it was explicitly pinned; otherwise Python owns the id. INSTALL_UUID is
 # never written here — the agent mints it at first start.
-SPOKE_URL=""
+SPOKE_URL="${SPOKE_URL:-}"
+# Track whether the spoke URL was explicitly given (arg or env). When NOT pinned
+# the installer auto-discovers the hub box via DNS (lm-hub.<dns-suffix>) then
+# mDNS (_lm-hub._tcp.local.) and targets its agent listener (:8766) after the
+# venv is ready; if nothing is found SPOKE_URL is left empty and the agent
+# re-discovers at startup (agent _resolve_spoke_url sentinel).
+SPOKE_URL_PINNED=0
+[ -n "$SPOKE_URL" ] && SPOKE_URL_PINNED=1
 AGENT_ID=""
 AGENT_ID_PINNED=0
 AGENT_SECRET=""
@@ -17,18 +24,13 @@ AGENT_SECRET=""
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --spoke-url) SPOKE_URL="$2"; shift ;;
+        --spoke-url) SPOKE_URL="$2"; SPOKE_URL_PINNED=1; shift ;;
         --id) AGENT_ID="$2"; AGENT_ID_PINNED=1; shift ;;
         --secret) AGENT_SECRET="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
-
-if [ -z "$SPOKE_URL" ]; then
-    echo "❌ --spoke-url is required. Example: --spoke-url ws://<LM-SERVER-IP>:8766"
-    exit 1
-fi
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "⚠️  This script must be run as root."
@@ -90,6 +92,28 @@ if [ -f "$INSTALL_DIR/requirements.txt" ]; then
     "$INSTALL_DIR/venv/bin/python3" -m pip install -r "$INSTALL_DIR/requirements.txt" -q
 fi
 
+# ── Hub auto-discovery ──────────────────────────────────────────────────────
+# When --spoke-url was not given (and no SPOKE_URL env), auto-locate the hub box
+# via DNS (lm-hub.<dns-suffix>) then mDNS (_lm-hub._tcp.local.) using the
+# just-installed venv + the vendored src/discovery.py, targeting the hub box's
+# agent listener on :8766 (--port-override 8766; the hub advertises 8765 with an
+# agent_port=8766 TXT record). If nothing is found, leave SPOKE_URL empty — the
+# agent re-discovers at startup (agent _resolve_spoke_url sentinel) once the hub
+# is up. cwd is $INSTALL_DIR so `src.discovery` imports (src/ is a package dir).
+if [ "$SPOKE_URL_PINNED" != "1" ]; then
+    echo "🔎 No --spoke-url given; auto-discovering the LM hub box (DNS lm-hub.* / mDNS, port 8766)…"
+    DISCOVERED=$(cd "$INSTALL_DIR" && "./venv/bin/python3" -m src.discovery --timeout 5 --port-override 8766 2>/dev/null || echo NONE)
+    if [ -n "$DISCOVERED" ] && [ "$DISCOVERED" != "NONE" ]; then
+        SPOKE_URL="$DISCOVERED"
+        echo "✅ Discovered hub box: $SPOKE_URL"
+    else
+        echo "⚠️  Hub box not found via DNS/mDNS. Leaving SPOKE_URL empty — the agent will"
+        echo "    retry auto-discovery at startup. To pin it now, re-run with"
+        echo "    --spoke-url ws://HUBBOX:8766 (or create an 'lm-hub' DNS record / enable mDNS on the hub)."
+        SPOKE_URL=""
+    fi
+fi
+
 # Bake AGENT_ID into .env + the unit ONLY when it was explicitly pinned. In the
 # derived case Python computes `<hostname>-agent` at startup, so a clone that was
 # renamed reconnects under a new id (correlated to the old one via the install
@@ -109,6 +133,14 @@ AGENT_SECRET=$FINAL_SECRET
 EOF
 
 # ── Systemd service ───────────────────────────────────────────────────────────
+# Build the --spoke-url arg conditionally: when SPOKE_URL is empty (discovery
+# found nothing and nothing was pinned) we OMIT the flag entirely so argparse
+# falls back to its default (os.getenv("SPOKE_URL") or None → None) and the
+# agent's run() sentinel re-discovers at startup. Passing `--spoke-url ""`
+# would instead make argparse error ("expected one argument") and crash-loop the
+# unit. A concrete discovered/pinned URL is baked into the unit directly.
+SPOKE_URL_ARG=""
+[ -n "$SPOKE_URL" ] && SPOKE_URL_ARG="--spoke-url $SPOKE_URL"
 cat <<EOF > /etc/systemd/system/lm-pxmx-agent.service
 [Unit]
 Description=Lab Manager - Local Proxmox Agent
@@ -118,7 +150,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/venv/bin/python3 -m src.agent --spoke-url $SPOKE_URL $ID_ARG
+ExecStart=$INSTALL_DIR/venv/bin/python3 -m src.agent $SPOKE_URL_ARG $ID_ARG
 StandardOutput=append:/var/log/lm/pxmx-agent.log
 StandardError=append:/var/log/lm/pxmx-agent.log
 Restart=always
@@ -232,7 +264,11 @@ else
 fi
 
 echo "🎉 Proxmox Local Agent installation complete!"
-echo "🌐 Target Spoke: $SPOKE_URL"
+if [ -n "$SPOKE_URL" ]; then
+    echo "🌐 Target Spoke: $SPOKE_URL"
+else
+    echo "🌐 Target Spoke: (auto-discover at startup — no lm-hub DNS/mDNS found yet)"
+fi
 if [ "$AGENT_ID_PINNED" = "1" ]; then
     echo "🆔 Agent ID: $AGENT_ID  (pinned)"
 else
