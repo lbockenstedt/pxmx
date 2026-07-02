@@ -317,6 +317,31 @@ def _host_vmid_range(hostname: str, max_slots: int,
     return s, e, bid, True
 
 
+# ── Sim-VM hostnames ─────────────────────────────────────────────────────────
+# The legacy cs/proxmox/client-setup.conf mapped every sim VMID to a realistic
+# random client hostname (c90025→kbell, c90026→ibennett, …) — 10000 entries,
+# VMID 90001-100000. That identity did not carry over to the unified agent
+# (which named VMs sim-{vmid}-{type}). Ship the same map (vm_names.json, next
+# to this module) and look it up at clone time so a VMID always gets the same
+# deterministic human name across re-clones; fall back to sim-{vmid}-{type} when
+# the VMID is outside the mapped range.
+
+_VM_NAMES: Optional[Dict[str, str]] = None
+
+
+def _vm_name(vmid: int) -> Optional[str]:
+    """Realistic hostname for a sim VMID from the legacy client-setup.conf map,
+    or None if ``vmid`` is outside the 90001-100000 mapped range."""
+    global _VM_NAMES
+    if _VM_NAMES is None:
+        try:
+            with open(os.path.join(os.path.dirname(__file__), "vm_names.json")) as f:
+                _VM_NAMES = json.load(f) or {}
+        except (OSError, json.JSONDecodeError):
+            _VM_NAMES = {}
+    return _VM_NAMES.get(str(vmid))
+
+
 def current_provision_loop_running() -> bool:
     """True if the provision loop task has ticked recently (heartbeat < 180s,
     i.e. 3× the 60s cadence — mirrors cs ``STALE_SECS=180``). False before the
@@ -1312,7 +1337,7 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
     agent, set the hostname (bash ``clone_vm_for_usb`` 1943-2098, slimmed)."""
     from . import pve_cmds
     protected = _protected_vmids(agent)
-    name = f"sim-{vmid}-{info.get('type', 'wireless')}"
+    name = _vm_name(vmid) or f"sim-{vmid}-{info.get('type', 'wireless')}"
     await pve_cmds.qm_clone(template, vmid, name, protected=protected, timeout=600)
     await pve_cmds.qm_set(vmid, "--onboot", "1", "--startup", "order=2,up=60",
                          protected=protected)

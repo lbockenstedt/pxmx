@@ -110,8 +110,11 @@ for d in "$INSTALLER_DIR" "$OLD_WD_STATE"; do
     fi
 done
 
-# [5/6] Remove the kernel-watchdog sysctl + module-load configs (the unified
-# agent uses systemd WatchdogSec= + sd_notify instead of softdog).
+# [5/6] Remove the legacy kernel-watchdog sysctl + module-load configs. These
+# are the OLD client-sim-prefixed files the bash agent deployed. The unified
+# agent re-provides the same kernel crash-hardening under lm-pxmx-prefixed
+# filenames (install_agent.sh), so this only cleans up the stale bash copies —
+# it does NOT unload the unified agent's softdog/sysctl.
 if [ -f "$SYSCTL_CONF" ]; then
     echo "🗑  Removing $SYSCTL_CONF"
     rm -f "$SYSCTL_CONF"
@@ -122,8 +125,14 @@ if [ -f "$MODULES_CONF" ]; then
     rm -f "$MODULES_CONF"
 fi
 if lsmod 2>/dev/null | grep -q "^softdog\b"; then
-    echo "🗑  Unloading softdog module"
-    rmmod softdog 2>/dev/null || true
+    # Only unload softdog if the unified agent isn't using it (it re-provides
+    # kernel crash-hardening under an lm-pxmx-prefixed modules-load file).
+    if [ ! -f "/etc/modules-load.d/lm-pxmx-watchdog.conf" ]; then
+        echo "🗑  Unloading softdog module"
+        rmmod softdog 2>/dev/null || true
+    else
+        echo "   softdog still in use by the unified agent — leaving loaded"
+    fi
 fi
 
 # [6/6] Remove the /etc/pve/scripts helpers (reimplemented in the unified

@@ -134,6 +134,47 @@ chmod 0755 /usr/local/bin/lm-pxmx-net-watchdog 2>/dev/null || true
 cp "$INSTALL_DIR/lm-pxmx-net-watchdog.service" /etc/systemd/system/ 2>/dev/null || true
 cp "$INSTALL_DIR/lm-pxmx-net-watchdog.timer"   /etc/systemd/system/ 2>/dev/null || true
 
+# ── Kernel crash-hardening ────────────────────────────────────────────────────
+# Re-provide the kernel-level recovery the legacy cs bash agent deployed
+# (install-proxmox-agent.sh [6/7]) that the unified agent dropped in favor of
+# systemd WatchdogSec= + sd_notify. That catches a hung *agent event loop* and
+# the net-watchdog reboots on *gateway loss*, but neither detects a kernel
+# hung-task, auto-reboots on a kernel panic/oops, or collects a crash dump.
+# Use lm-pxmx-prefixed files so retire_bash_agent.sh (which removes only the
+# old client-sim-prefixed ones) doesn't clobber these. Idempotent: re-runs only
+# write when content changes.
+SYSCTL_CONF="/etc/sysctl.d/99-lm-pxmx-watchdog.conf"
+if [ ! -f "$SYSCTL_CONF" ] || ! grep -q "kernel.panic=10" "$SYSCTL_CONF" 2>/dev/null; then
+    cat > "$SYSCTL_CONF" <<'SYSCTL'
+# Lab Manager pxmx agent: detect and recover from kernel hangs / panics
+kernel.hung_task_timeout_secs=120
+kernel.panic=10
+kernel.panic_on_oops=1
+SYSCTL
+    sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 \
+        && echo "  OK: kernel hang/panic sysctl applied" \
+        || echo "  WARNING: sysctl apply failed — settings take effect on next reboot"
+fi
+
+MODULES_CONF="/etc/modules-load.d/lm-pxmx-watchdog.conf"
+if ! grep -q "^softdog" "$MODULES_CONF" 2>/dev/null; then
+    echo "softdog" >> "$MODULES_CONF"
+fi
+modprobe softdog soft_margin=60 2>/dev/null \
+    && echo "  OK: softdog watchdog module loaded" \
+    || echo "  WARNING: softdog module unavailable — kernel-level reboot watchdog not active"
+
+# Crash dumps to /var/crash/ (survive reboots). Best-effort — not all
+# kernels/distros support kdump-tools.
+if ! dpkg -l kdump-tools >/dev/null 2>&1; then
+    if apt-get install -y -qq kdump-tools 2>/dev/null; then
+        systemctl enable kdump-tools 2>/dev/null || true
+        echo "  OK: kdump-tools installed — crash dumps written to /var/crash/"
+    else
+        echo "  INFO: kdump-tools unavailable on this kernel/distro — skipping crash dump setup"
+    fi
+fi
+
 systemctl daemon-reload
 systemctl enable --now lm-pxmx-net-watchdog.timer --no-block 2>/dev/null || true
 systemctl enable lm-pxmx-agent

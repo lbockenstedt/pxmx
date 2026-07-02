@@ -234,7 +234,7 @@ async def _clone_lxc(agent, data, cs_cmd_id) -> None:
     for k, v in cfg.items():
         if k.startswith("net") and v:
             reapply += [f"--{k}", v]
-    ct_name = cfg.get("hostname") or f"ct-{vid}"
+    ct_name = cfg.get("hostname") or usb_provision._vm_name(vid) or f"ct-{vid}"
 
     await _progress(agent, cs_cmd_id, "clone_lxc", "running", "destroying", 20, vmid=vid)
     await pve_cmds.pct_stop(vid, prot)
