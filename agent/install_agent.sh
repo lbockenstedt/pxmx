@@ -44,6 +44,9 @@ echo "🚀 Installing Proxmox Local Agent..."
 INSTALL_DIR="/opt/lm/pxmx/agent"
 REPO_DIR="$INSTALL_DIR/.pxmx_repo"
 mkdir -p "$INSTALL_DIR"
+# Log dir shared with the hub + spokes; the agent (User=root) writes its
+# FileHandler here and the systemd unit appends stderr to the same file.
+mkdir -p /var/log/lm
 
 # ── Preserve existing AGENT_SECRET across reinstalls ──────────────────────────
 # Precedence: --secret arg > existing .env value > empty (zero-touch)
@@ -116,8 +119,8 @@ Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/venv/bin/python3 -m src.agent --spoke-url $SPOKE_URL $ID_ARG
-StandardOutput=append:/var/log/lm-pxmx-agent.log
-StandardError=append:/var/log/lm-pxmx-agent.log
+StandardOutput=append:/var/log/lm/pxmx-agent.log
+StandardError=append:/var/log/lm/pxmx-agent.log
 Restart=always
 RestartSec=10
 # Phase G: service-hang detection. The agent sends WATCHDOG=1 from its
@@ -200,7 +203,7 @@ systemctl enable lm-pxmx-agent
 systemctl restart lm-pxmx-agent
 
 echo "⏳ Verifying agent started..."
-LOG_FILE="/var/log/lm-pxmx-agent.log"
+LOG_FILE="/var/log/lm/pxmx-agent.log"
 MAX_RETRIES=10
 COUNT=0
 CONNECTED=false

@@ -64,6 +64,24 @@ class WebSocketLogHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
+def get_log_path():
+    """Resolve the agent log file path.
+
+    Logs under ``/var/log/lm`` alongside the hub + spokes (the pxmx installer
+    creates /var/log/lm and chowns it so the systemd service can write here).
+    Falls back to a local ``logs/`` dir if that path isn't writable (e.g. run
+    by hand as an unprivileged user without the install step).
+    """
+    primary = "/var/log/lm/pxmx-agent.log"
+    try:
+        with open(primary, "a") as f:
+            pass
+        return primary
+    except Exception:
+        local_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(local_dir, exist_ok=True)
+        return os.path.join(local_dir, "pxmx-agent.log")
+
 try:
     from logging_setup import configure_logging, set_log_level
 except ImportError:
@@ -84,7 +102,20 @@ except ImportError:
             for _n in list(_logging.root.manager.loggerDict):
                 _logging.getLogger(_n).setLevel(level)
             return level
-configure_logging(log_file="/var/log/pxmx-agent.log")
+_log_path = get_log_path()
+configure_logging(log_file=_log_path)
+# When writing to the canonical /var/log/lm file, the systemd unit captures
+# stderr into the SAME file (StandardError=append:/var/log/lm/pxmx-agent.log).
+# configure_logging attaches a stderr StreamHandler alongside the FileHandler,
+# which would write every record twice into that one file. Drop the stderr
+# StreamHandler in that case so each record lands once (the FileHandler writes
+# it; raw interpreter tracebacks still reach the file via systemd's stderr
+# capture). Keep the StreamHandler for the local fallback path so a manual run
+# still shows on the console.
+if _log_path == "/var/log/lm/pxmx-agent.log":
+    for _h in list(logging.getLogger().handlers):
+        if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+            logging.getLogger().removeHandler(_h)
 logger = logging.getLogger("PxmxAgent")
 
 
