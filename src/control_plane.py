@@ -328,6 +328,14 @@ class PxmxControlPlane(BaseControlPlane):
                     # frame for VNC_FRAME_UP). No Future involved — one-way.
                     await self._relay_agent_msg_up(agent_id, msg_type, data)
 
+        except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
+            # Expected disconnect — the agent rebooted, the network blipped,
+            # or lm-pxmx restarted. The finally below removes it from
+            # connected_agents + pending_agents and the agent re-registers on
+            # reconnect. No traceback for the documented case (was a 60-line
+            # ERROR+exc_info dump per disconnect); keep ERROR+exc_info below
+            # for genuinely unexpected exceptions.
+            pass
         except Exception as e:
             logger.error(f"Agent handler error: {e}", exc_info=True)
         finally:
