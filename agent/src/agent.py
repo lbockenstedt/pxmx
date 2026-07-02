@@ -19,6 +19,22 @@ agent (retired in Phase G). Audience: pxmx developers; see the repo
 ``ARCHITECTURE.md`` for topology and ``README.md`` for operators.
 """
 
+# ── Dependency self-heal (must run BEFORE the third-party imports below) ──────
+# A skewed auto-update / partial install can leave the venv missing a declared
+# dep (e.g. psutil — the generic-agent crash-loop root cause) → hard crash at
+# `import psutil` below, crash-looping the agent under Restart=always. dep_guard
+# is stdlib-only (vendored as a sibling so it imports with no third-party deps
+# and no lm-core dependency — keep in sync with lm/core/src/dep_guard.py); it
+# parses agent/requirements.txt, find_spec-checks each top-level package, and
+# runs `pip install -r` in this venv if any are missing. LM_DEP_GUARD_DISABLE=1
+# opts out.
+from .dep_guard import ensure_requirements as _ensure_requirements
+import os as _os
+_req = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                     "requirements.txt")
+_ensure_requirements(_req)
+del _os, _ensure_requirements, _req
+
 import asyncio
 import base64
 import json

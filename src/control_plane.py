@@ -8,6 +8,26 @@ guarantees :8766 is released before a new instance starts (the v2.0.3
 agent-blackout fix). Audience: pxmx developers; see the repo ``ARCHITECTURE.md``.
 """
 
+# ── Dependency self-heal (must run BEFORE the third-party imports below) ──────
+# A skewed auto-update / partial install can leave the venv missing a declared
+# dep (e.g. websockets) → hard crash at `import websockets` below, crash-looping
+# the spoke under Restart=always. dep_guard is stdlib-only so it imports even
+# when third-party deps are absent; it parses requirements.txt, find_spec-checks
+# each top-level package, and runs `pip install -r` in this venv if any are
+# missing. LM_DEP_GUARD_DISABLE=1 opts out. PYTHONPATH ($INSTALL_DIR +
+# $INSTALL_DIR/core/src) resolves both `core.src.dep_guard` and the bare
+# `dep_guard` fallback.
+import os as _os
+import sys as _sys
+try:
+    from core.src.dep_guard import ensure_requirements as _ensure_requirements
+except ImportError:  # lm core not on path as a package — bare module on core/src
+    from dep_guard import ensure_requirements as _ensure_requirements
+_req = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                     "requirements.txt")
+_ensure_requirements(_req)
+del _os, _sys, _ensure_requirements, _req
+
 import asyncio
 import json
 import uuid
