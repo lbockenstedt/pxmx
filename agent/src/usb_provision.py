@@ -265,6 +265,58 @@ def current_provision_cfg_snapshot() -> Dict[str, Any]:
     return dict(_provision_cfg_snapshot)
 
 
+# ── Per-host VMID batch derivation ──────────────────────────────────────────
+# Port of proxmox-agent.sh:122-172: each proxmox host runs its own batch of sim
+# VMs, the VMID block derived from the host's trailing numeric suffix so ranges
+# don't collide across hosts (svr-01→90001-90024, svr-02→90025-90048,
+# svr-003→90049-90072). An explicit non-default vmid_start/vmid_end from the cs
+# spoke (per-host override / manual range for >25 slots) wins over the derived
+# block; vm_set_override (1-99, legacy VM_SET_OVERRIDE) replaces the batch id.
+
+_VMID_BLOCK_STRIDE = 24
+_VMID_DEFAULT_START = 90000
+_VMID_DEFAULT_END = 99999
+
+
+def _host_suffix_id(hostname: str, vm_set_override: Any = 0) -> int:
+    """Trailing numeric suffix of a proxmox hostname → 1-based batch id
+    (svr-02→2, svr-003→3, no-suffix→1). ``vm_set_override`` (1-99) replaces the
+    derived id, mirroring the legacy ``VM_SET_OVERRIDE``."""
+    if vm_set_override:
+        try:
+            o = int(vm_set_override)
+            if 1 <= o <= 99:
+                return o
+        except (TypeError, ValueError):
+            pass
+    m = re.search(r'(\d+)$', (hostname or '').strip())
+    n = int(m.group(1)) if m else 1
+    return max(1, n)
+
+
+def _host_vmid_range(hostname: str, max_slots: int,
+                     cfg_start: Any, cfg_end: Any,
+                     vm_set_override: Any = 0) -> Tuple[int, int, int, bool]:
+    """Resolve this host's sim-VMID range.
+
+    Returns ``(start, end, batch_id, derived)``. When the cs spoke sent an
+    explicit non-default ``vmid_start``/``vmid_end`` (per-host override or a
+    manual range for >25 slots), that range wins (``derived=False``).
+    Otherwise the block is derived from the hostname suffix (``derived=True``):
+    ``start = 90000 + (batch_id-1)*24 + 1``, ``end = start + max_slots - 1``.
+    """
+    start_default = (cfg_start in (None, "") or int(cfg_start) == _VMID_DEFAULT_START)
+    end_default = (cfg_end in (None, "") or int(cfg_end) == _VMID_DEFAULT_END)
+    if not (start_default and end_default):
+        s = int(cfg_start) if cfg_start not in (None, "") else _VMID_DEFAULT_START
+        e = int(cfg_end) if cfg_end not in (None, "") else _VMID_DEFAULT_END
+        return s, e, _host_suffix_id(hostname, vm_set_override), False
+    bid = _host_suffix_id(hostname, vm_set_override)
+    s = _VMID_DEFAULT_START + (bid - 1) * _VMID_BLOCK_STRIDE + 1
+    e = s + max(1, max_slots) - 1
+    return s, e, bid, True
+
+
 def current_provision_loop_running() -> bool:
     """True if the provision loop task has ticked recently (heartbeat < 180s,
     i.e. 3× the 60s cadence — mirrors cs ``STALE_SECS=180``). False before the

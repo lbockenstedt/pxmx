@@ -64,15 +64,27 @@ class WebSocketLogHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler("/var/log/pxmx-agent.log"),
-        logging.StreamHandler()
-    ]
-)
+try:
+    from logging_setup import configure_logging, set_log_level
+except ImportError:
+    try:
+        from core.src.logging_setup import configure_logging, set_log_level
+    except ImportError:
+        import logging as _logging
+        _FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        _DFMT = '%Y-%m-%d %H:%M:%S'
+        def configure_logging(default_level=_logging.INFO, *, log_file=None, **_):
+            handlers = ([_logging.FileHandler(log_file), _logging.StreamHandler()]
+                        if log_file else None)
+            _logging.basicConfig(level=default_level, force=True,
+                                 format=_FMT, datefmt=_DFMT, handlers=handlers)
+        def set_log_level(enabled):
+            level = _logging.DEBUG if enabled else _logging.INFO
+            _logging.getLogger().setLevel(level)
+            for _n in list(_logging.root.manager.loggerDict):
+                _logging.getLogger(_n).setLevel(level)
+            return level
+configure_logging(log_file="/var/log/pxmx-agent.log")
 logger = logging.getLogger("PxmxAgent")
 
 
@@ -1283,8 +1295,7 @@ class ProxmoxAgent:
                         result = await self.collect_metrics()
 
                     elif cmd_type == "SET_LOG_LEVEL":
-                        level = logging.DEBUG if data.get("enabled") else logging.INFO
-                        logging.getLogger().setLevel(level)
+                        level = set_log_level(data.get("enabled"))
                         result = {"status": "SUCCESS",
                                   "message": f"Log level → {logging.getLevelName(level)}"}
 
