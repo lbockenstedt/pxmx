@@ -221,8 +221,15 @@ class ProxmoxSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": "No agent resolved for VNC_START"}
             if session_id:
                 self.vnc_sessions[session_id] = agent_id
-            await self.control_plane.send_raw_to_agent(agent_id, "VNC_START", data)
-            return {"status": "OK", "session_id": session_id}
+            # Request/response (NOT send_raw_to_agent): the agent opens the
+            # Proxmox vncwebsocket synchronously and returns the ticket, which
+            # doubles as the RFB VNC password the browser's noVNC must present.
+            # The hub relays it to the WebUI; without it noVNC auths with an
+            # empty password and Proxmox drops the RFB session. 25s covers the
+            # vncproxy POST + WSS open + first-use root@pam!lm-vnc token mint.
+            r = await self.control_plane.send_to_agent(
+                "VNC_START", data, agent_id=agent_id, timeout=25.0)
+            return r
 
         if cmd == "VNC_FRAME_DOWN":
             session_id = data.get("session_id") or ""

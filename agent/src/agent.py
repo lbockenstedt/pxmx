@@ -902,34 +902,35 @@ class ProxmoxAgent:
         return self._console_token
 
     async def _start_vnc_session(self, session_id: str, vmid: Any,
-                                 node: str, kind: str) -> None:
+                                 node: str, kind: str) -> str:
         """Open the Proxmox WSS for a session and spawn the relay tasks.
 
-        Runs as a background task (VNC_START acks ACCEPTED immediately so the
-        dispatch loop isn't blocked on the vncproxy/WSS open). Emits VNC_READY
-        on success or VNC_ERROR on failure. Down-frames buffered in the
-        session's down_q are drained to the WSS once it's open."""
+        Awaited synchronously by the VNC_START handler so the Proxmox ``ticket``
+        (which doubles as the RFB VNC password the browser's noVNC must present
+        during the security handshake) is returned to the hub in the VNC_START
+        response — without it, noVNC authenticates with an empty password and
+        Proxmox drops the RFB session ("Security failure" / blank console).
+        The vncproxy POST + WSS open is ~1-2s (one-shot, user-initiated), an
+        acceptable block of the dispatch loop — the high-volume frame relay
+        stays non-blocking. Emits VNC_READY on success or VNC_ERROR on failure.
+        Down-frames buffered in the session's down_q are drained to the WSS
+        once it's open. Returns the ticket string; raises on failure."""
         sess = self._vnc_sessions.get(session_id)
         if not sess:
-            return
-        try:
-            k = (kind or "").lower()
-            if k not in ("qemu", "lxc"):
-                k = await pve_cmds.detect_guest_type(int(vmid))
-            token = await self._ensure_console_token()
-            px_ws, _ticket, _port = await pve_cmds.open_vnc_ws(vmid, node, k, token)
-        except Exception as e:
-            logger.warning(f"VNC start {session_id} failed: {e}")
-            await self.send_vnc_event("VNC_ERROR",
-                                      {"session_id": session_id, "error": str(e)[:300]})
-            self._vnc_sessions.pop(session_id, None)
-            return
+            raise RuntimeError(f"no VNC session record for {session_id}")
+        k = (kind or "").lower()
+        if k not in ("qemu", "lxc"):
+            k = await pve_cmds.detect_guest_type(int(vmid))
+        token = await self._ensure_console_token()
+        px_ws, ticket, _port = await pve_cmds.open_vnc_ws(vmid, node, k, token)
         sess["px_ws"] = px_ws
+        sess["ticket"] = ticket
         up_task = asyncio.create_task(self._vnc_proxmox_to_hub(session_id, px_ws))
         drain_task = asyncio.create_task(self._vnc_drain_down(session_id, px_ws, sess["down_q"]))
         sess["tasks"] = [up_task, drain_task]
         await self.send_vnc_event("VNC_READY", {"session_id": session_id})
         logger.info(f"VNC session {session_id} ready (vmid={vmid} node={node} kind={k})")
+        return ticket
 
     async def _vnc_proxmox_to_hub(self, session_id: str, px_ws) -> None:
         """Relay Proxmox→browser frames. When the Proxmox WSS closes (VM
@@ -1560,22 +1561,38 @@ class ProxmoxAgent:
                     elif cmd_type == "VNC_START":
                         # Hub→spoke→agent: open a Proxmox vncwebsocket HERE and
                         # relay frames over the existing agent↔spoke WS (agent-
-                        # terminates-WSS model). Ack ACCEPTED immediately; the
-                        # session task opens the WSS and emits VNC_READY/
-                        # VNC_ERROR up. down_q buffers browser frames until the
-                        # WSS is open. vmid is unguarded — Hypervisors console
-                        # targets real tenant VMs, not the sim floor.
+                        # terminates-WSS model). Awaited synchronously so the
+                        # Proxmox ticket (the RFB VNC password noVNC must
+                        # present) is returned to the hub → browser; without it
+                        # noVNC auths with an empty password and Proxmox drops
+                        # the RFB session. down_q buffers browser frames until
+                        # the WSS is open. vmid is unguarded — Hypervisors
+                        # console targets real tenant VMs, not the sim floor.
                         session_id = data.get("session_id") or ""
                         if session_id and session_id not in self._vnc_sessions:
                             self._vnc_sessions[session_id] = {
                                 "down_q": asyncio.Queue(), "px_ws": None, "tasks": [],
                             }
-                            task = asyncio.create_task(self._start_vnc_session(
-                                session_id, data.get("vmid"),
-                                data.get("node"), data.get("type")))
-                            self._cs_long_ops.add(task)
-                            task.add_done_callback(self._cs_long_ops.discard)
-                        result = {"status": "ACCEPTED", "session_id": session_id}
+                            try:
+                                ticket = await self._start_vnc_session(
+                                    session_id, data.get("vmid"),
+                                    data.get("node"), data.get("type"))
+                            except Exception as e:
+                                logger.warning(f"VNC start {session_id} failed: {e}")
+                                await self.send_vnc_event("VNC_ERROR",
+                                    {"session_id": session_id, "error": str(e)[:300]})
+                                self._vnc_sessions.pop(session_id, None)
+                                result = {"status": "ERROR",
+                                          "message": str(e)[:300],
+                                          "session_id": session_id}
+                            else:
+                                result = {"status": "SUCCESS",
+                                          "session_id": session_id,
+                                          "ticket": ticket}
+                        else:
+                            result = {"status": "SUCCESS",
+                                      "session_id": session_id,
+                                      "ticket": self._vnc_sessions[session_id].get("ticket", "")}
 
                     elif cmd_type == "VNC_FRAME_DOWN":
                         # Browser→Proxmox frame. Buffer onto the session's
