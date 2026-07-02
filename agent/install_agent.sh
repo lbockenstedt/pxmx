@@ -2,8 +2,9 @@
 set -e
 
 # Default Configuration
+# AGENT_ID defaults to "<hostname>-agent" — overridden by --id at install.
 SPOKE_URL=""
-AGENT_ID="pxmx-agent-1"
+AGENT_ID="$(hostname -s)-agent"
 AGENT_SECRET=""
 
 # Parse arguments
