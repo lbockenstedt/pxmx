@@ -120,9 +120,9 @@ echo "⚙️ Creating systemd service for auto-start..."
 
 # Only pass --secret when a value is present; zero-touch provisioning handles the empty case
 SECRET_ARG=""
-[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret $SPOKE_SECRET"
+[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret=$SPOKE_SECRET"
 HUB_SECRET_ARG=""
-[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret $HUB_SECRET"
+[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret=$HUB_SECRET"
 
 cat <<EOF > /etc/systemd/system/lm-pxmx.service
 [Unit]
