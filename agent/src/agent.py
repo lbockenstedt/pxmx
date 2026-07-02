@@ -1871,7 +1871,9 @@ class ProxmoxAgent:
                 # Feed the rolling 1h cpu/mem window the auto-provision brain
                 # gates on (cs _record_resource_samples). Sampled on the same
                 # cadence as the provision loop.
-                usb_provision.sample_resources(self)
+                # sample_resources is async (Proxmox node stats via pvesh) —
+                # awaited here on the same cadence as the provision pass.
+                await usb_provision.sample_resources(self)
                 await usb_provision.run_provision_loop(self)
             except asyncio.CancelledError:
                 raise

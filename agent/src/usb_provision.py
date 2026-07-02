@@ -191,17 +191,37 @@ def _pct_setting(usb_cfg: Dict[str, Any], key: str, default: int) -> int:
         return default
 
 
-def sample_resources(agent) -> None:
-    """Append a CPU + memory sample (agent host == proxmox host) to the rolling
-    1h deques. Called once per ``_usb_provision_loop`` tick. Best-effort — a
-    failure leaves the deques untouched (averages degrade to None/cold-start)."""
+async def sample_resources(agent) -> None:
+    """Append a CPU + memory sample to the rolling 1h deques, sourced from the
+    SAME Proxmox node figures the CS telemetry displays (``get_node_stats`` →
+    /cluster/resources: ``cpu_usage`` + ``mem_pct``). Called once per
+    ``_usb_provision_loop`` tick. Best-effort — a failure leaves the deques
+    untouched (averages degrade to None/cold-start, which the gate treats as
+    "no data yet → don't block", matching the card's "applies only after a full
+    hour" help text).
+
+    Why Proxmox not psutil: the gate used to read ``psutil.virtual_memory()`` /
+    ``cpu_percent`` (the agent OS view), but the user-visible CPU/Mem 1h tiles
+    read Proxmox's own node stats. On a Proxmox host the two diverge — esp.
+    memory, where psutil counts VM RAM + page cache as "used" and routinely
+    reads 80%+ while Proxmox's ``mem_used`` reads far lower — so the gate fired
+    "resource gate" while the card showed low load. Sourcing the gate from the
+    same Proxmox figures makes "below threshold" mean below threshold. Uses
+    ``nodes[0]`` to mirror ``_cs_telemetry_body`` so the gate sees exactly what
+    the card renders."""
     try:
-        import psutil  # local: not every host has psutil at import time
+        stats = await agent.get_node_stats()
+        nodes = (stats or {}).get("nodes", []) or []
+        if not nodes:
+            return
+        n = nodes[0]
+        cpu_pct = float(n.get("cpu_usage", 0) or 0)
+        mem_pct = float(n.get("mem_pct", 0) or 0)
         now = time.time()
         cutoff = now - _RESOURCE_SAMPLE_WINDOW
-        _cpu_samples.append((now, float(psutil.cpu_percent(interval=None))))
+        _cpu_samples.append((now, cpu_pct))
         _cpu_samples[:] = [(ts, v) for ts, v in _cpu_samples if ts >= cutoff]
-        _mem_samples.append((now, float(psutil.virtual_memory().percent)))
+        _mem_samples.append((now, mem_pct))
         _mem_samples[:] = [(ts, v) for ts, v in _mem_samples if ts >= cutoff]
     except Exception as exc:  # noqa: BLE001
         logger.debug("sample_resources failed: %s", exc)
@@ -989,22 +1009,44 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # 7. resource_ok gate + prov_run-already-active + slot cap before cloning.
     in_delete_cooldown = now < cooldown_until
     ceil_hit = cpu_instant is not None and cpu_instant >= cpu_prov_ceil
+    # No data yet (cold start, or get_node_stats failing) → DO NOT gate: the card
+    # documents "Values apply only after a full hour of telemetry data is
+    # available", so absent data means provision freely, not block. The old
+    # ``cpu_avg is not None and cpu_avg < thr`` form inverted this — None → False
+    # → "resource gate" fired forever on a fresh / failed-sampling agent even
+    # though there was no resource pressure at all.
     resource_ok = (
         not delete_queued
         and not in_delete_cooldown
         and not ceil_hit
-        and cpu_avg is not None and cpu_avg < cpu_prov_thr
-        and mem_avg is not None and mem_avg < mem_prov_thr
+        and (cpu_avg is None or cpu_avg < cpu_prov_thr)
+        and (mem_avg is None or mem_avg < mem_prov_thr)
     )
     if not resource_ok:
-        _provision_reason = "resource gate"
+        # Pin the sub-cause so "resource gate" is self-diagnosing on the card
+        # instead of a generic label — the user can't tell cpu/mem/cooldown/ceil
+        # apart from "resource gate" alone (the original "should not fire" report
+        # was un-diagnosable from the card).
+        if in_delete_cooldown:
+            sub = f"delete cooldown ({int(cooldown_until - now)}s left)"
+        elif delete_queued:
+            sub = "delete just queued"
+        elif ceil_hit:
+            sub = f"cpu ceiling {cpu_instant:.0f}% >= {cpu_prov_ceil:.0f}%"
+        elif cpu_avg is not None and cpu_avg >= cpu_prov_thr:
+            sub = f"cpu {cpu_avg:.0f}% >= {cpu_prov_thr:.0f}%"
+        elif mem_avg is not None and mem_avg >= mem_prov_thr:
+            sub = f"mem {mem_avg:.0f}% >= {mem_prov_thr:.0f}%"
+        else:
+            sub = "unknown"
+        _provision_reason = f"resource gate ({sub})"
         logger.info(
             "auto-provision gate: suppressing clone (cpu_avg=%s mem_avg=%s "
             "cpu_instant=%s delete_queued=%s cooldown=%s ceil=%s halt=%s)",
             cpu_avg, mem_avg, cpu_instant, delete_queued, in_delete_cooldown,
             ceil_hit, _provision_halt)
         return {"provisioned": 0, "torn_down": len(torn_down),
-                "reason": "resource gate"}
+                "reason": _provision_reason}
     if _prov_run.get("running"):
         _provision_reason = "prov_run active"
         logger.info("auto-provision gate: prov_run already active — skipping trigger")
