@@ -898,14 +898,21 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     img1 = usb_cfg.get("image1_template_id")
     img2 = usb_cfg.get("image2_template_id")
     img1_pct = int(usb_cfg.get("image1_pct", 50) or 50)
-    # The cs speak emits the hub-managed VMID allocation range as flat
-    # vmid_start/vmid_end in usb_config. This used to read the nested
-    # client_simulation.vmid_range, which the cs_bridge never populates (it
-    # relays into client_simulation.usb_config), so the range always fell back to
-    # 90000-99999 and hub-set ranges never reached the allocator. Defaults match
-    # the cs speak (90000/99999) so an unset hub value keeps the historical range.
-    start = int(usb_cfg.get("vmid_start") or 90000)
-    end = int(usb_cfg.get("vmid_end") or 99999)
+    # Per-host VMID batch: the cs speak emits vmid_start/vmid_end in usb_config
+    # (defaults 90000/99999). When those are at the default the agent derives
+    # this host's block from its own hostname suffix (svr-02→90025-90048, stride
+    # 24) so each proxmox server runs its own batch and ranges don't collide —
+    # a port of proxmox-agent.sh:122-172 that the unified agent was missing. An
+    # explicit non-default vmid_start/vmid_end (cs-spoke per-host override or a
+    # manual range for >25 slots) wins over the derived block; vm_set_override
+    # (1-99, legacy VM_SET_OVERRIDE) replaces the batch id.
+    max_slots = int(_cfg_first(usb_cfg, ("usb_max_slots", "max_slots"), 24) or 24)
+    start, end, batch_id, _range_derived = _host_vmid_range(
+        getattr(agent, "hostname", "") or "",
+        max_slots,
+        usb_cfg.get("vmid_start"), usb_cfg.get("vmid_end"),
+        usb_cfg.get("vm_set_override") or 0,
+    )
     # missing_timeout: accept the union of relay key names (webui-spoke sends
     # usb_missing_timeout, lm-spoke sends missing_timeout) — the old single-key
     # read (usb_missing_timeout_seconds, which nothing sends) left the teardown
@@ -914,7 +921,6 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                                      ("usb_missing_timeout_seconds", "usb_missing_timeout",
                                       "missing_timeout"), 0) or 0)
     concurrency = max(1, int(usb_cfg.get("reclone_concurrency", 2) or 2))
-    max_slots = int(_cfg_first(usb_cfg, ("usb_max_slots", "max_slots"), 24) or 24)
 
     # Config snapshot for telemetry: lets the UI show WHICH precondition is missing
     # (dongle_vidpids count, template ids set, slot cap, vmid range). active_usb_vms
@@ -925,7 +931,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         "image1_template_id": bool(img1),
         "image2_template_id": bool(img2),
         "max_slots": max_slots,
-        "vmid_range": {"start": start, "end": end},
+        "vmid_range": {"start": start, "end": end, "batch_id": batch_id},
         "active_usb_vms": None,
     }
 
@@ -964,6 +970,32 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         _provision_reason = "auto-provision disabled"
         logger.info("auto-provision: usb_auto_provision=off — telemetry-only pass")
         return {"provisioned": 0, "torn_down": 0, "reason": "auto-provision disabled"}
+
+    # 2b. Migrate to per-host batches: destroy agent-owned sim VMs whose VMIDs
+    #     fall outside this host's batch range (created under the old flat
+    #     90000-99999 default, before the hostname-suffix derivation was ported).
+    #     Only touches VMs tracked in the sim state — never clone templates
+    #     (100/200) or the user's real VMs, which aren't in state. Idempotent:
+    #     once the out-of-range VMs are gone this is a no-op each tick.
+    out_of_range = [(int(v), b) for v, b in state["vmid_to_bus"].items()
+                    if not (start <= int(v) <= end)]
+    if out_of_range:
+        from . import cs_sim  # deferred — cs_sim imports usb_provision
+        logger.info("auto-provision: %d sim VM(s) outside batch range %d-%d "
+                    "(batch %d) — tearing down (migrating to per-host batches)",
+                    len(out_of_range), start, end, batch_id)
+        for vmid, bus in out_of_range:
+            try:
+                await cs_sim.destroy_vm(agent, vmid, bus=bus)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("auto-provision: migration teardown of %s failed: %s",
+                               vmid, e)
+            state["vmid_to_bus"].pop(str(vmid), None)
+            state["bus_to_vmid"].pop(bus, None)
+            state["vmid_to_image"].pop(str(vmid), None)
+            state["missing_since"].pop(bus, None)
+            torn_down.append(vmid)
+        save_usb_state(state)
 
     # 3. Thresholds (cs defaults: prov 80 / delete 90 / ceiling 90).
     cpu_prov_thr = _pct_setting(usb_cfg, "cpu_provision_threshold", 80)

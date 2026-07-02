@@ -1784,15 +1784,21 @@ class ProxmoxAgent:
                 "_agent_hostname": self.hostname,
             })
 
-        # The cs speak emits the hub-managed range as flat vmid_start/vmid_end in
-        # usb_config (not the nested client_simulation.vmid_range this used to
-        # read, which was never populated → always reported 90000-99999). Mirror
-        # the allocator's read so the UI shows the range the agent actually uses.
+        # Mirror the allocator's actual range resolution so the UI shows the
+        # VMID block this host really uses. The cs speak sends flat
+        # vmid_start/vmid_end (default 90000/99999); when those are at the
+        # default the allocator derives a per-host block from this host's
+        # hostname suffix (svr-02→90025-90048), so reporting the flat default
+        # here would be wrong. Resolve the same way (incl. vm_set_override).
         _usb = cs_cfg.get("usb_config") or {}
-        vmid_range = {
-            "start": int(_usb.get("vmid_start") or 90000),
-            "end":   int(_usb.get("vmid_end") or 99999),
-        }
+        _max_slots = int(usb_provision._cfg_first(
+            _usb, ("usb_max_slots", "max_slots"), 24) or 24)
+        _vstart, _vend, _batch_id, _ = usb_provision._host_vmid_range(
+            self.hostname, _max_slots,
+            _usb.get("vmid_start"), _usb.get("vmid_end"),
+            _usb.get("vm_set_override") or cs_cfg.get("vm_set_override") or 0,
+        )
+        vmid_range = {"start": _vstart, "end": _vend, "batch_id": _batch_id}
 
         # USB passthrough detail: scan /sys/bus/usb/devices and classify against
         # the hub-delivered certified/ignored vidpid sets. Best-effort → empty
