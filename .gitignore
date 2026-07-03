@@ -3,6 +3,7 @@ node_modules/
 .DS_Store
 __pycache__/
 *.pyc
+logs/
 
 # Secrets and credentials — never commit these
 .env

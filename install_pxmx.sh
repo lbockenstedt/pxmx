@@ -66,7 +66,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 apt-get update
-apt-get install -y python3-pip python3-venv git curl
+apt-get install -y python3-pip python3-venv git curl sudo
 
 INSTALL_DIR="/opt/lm"
 OLD_INSTALL_DIR="/opt/lm-manager"
@@ -421,6 +421,10 @@ echo "lm-component-update-restart: $UNIT rollback also failed; left for manual r
 exit 1
 HELPER
 chmod 0755 /usr/local/bin/lm-component-update-restart
+# /etc/sudoers.d is created by the sudo package's postinst (installed above);
+# mkdir here too as a defensive belt-and-suspenders in case a minimal image
+# ever lacks it.
+mkdir -p /etc/sudoers.d
 cat > /etc/sudoers.d/lm-component-update <<SUDOERS
 svc_lm ALL=(ALL) NOPASSWD: /usr/local/bin/lm-component-update-restart
 SUDOERS
