@@ -61,7 +61,10 @@ class WebSocketLogHandler(logging.Handler):
     """Relays agent log records (INFO+, own loggers only) over the WebSocket connection."""
 
     # Only relay records from loggers whose names start with these prefixes.
-    _RELAY_PREFIXES = ("PxmxAgent", "ProxmoxAgent")
+    # HubDiscovery is included so the agent's same-box-vs-remote / ws-vs-wss
+    # decision (the key TLS troubleshooting fact) reaches the hub via AGENT_LOG,
+    # not just the local pxmx-agent.log.
+    _RELAY_PREFIXES = ("PxmxAgent", "ProxmoxAgent", "HubDiscovery")
 
     def __init__(self, agent):
         super().__init__(level=logging.INFO)
@@ -1424,17 +1427,25 @@ class ProxmoxAgent:
         # the hub box's self-signed cert; LM_HUB_TLS_VERIFY=1 + LM_HUB_CA_CERT
         # verifies). ws:// stays plaintext. Mirrors BaseControlPlane._client_ssl_ctx.
         ssl_ctx = None
+        _tls_mode = "plaintext (loopback/legacy)"
         if self.spoke_url.lower().startswith("wss://"):
             try:
                 import ssl as _ssl
                 if os.environ.get("LM_HUB_TLS_VERIFY", "0").strip() in ("1", "true", "yes") \
                         and os.environ.get("LM_HUB_CA_CERT", "").strip():
                     ssl_ctx = _ssl.create_default_context(cafile=os.environ["LM_HUB_CA_CERT"].strip())
+                    _tls_mode = f"TLS verified (CA={os.environ['LM_HUB_CA_CERT'].strip()})"
                 else:
                     ssl_ctx = _ssl.create_unverified_context()
+                    _tls_mode = "TLS unverified (self-signed cert)"
             except Exception as e:
                 logger.warning(f"wss SSL context build failed: {e}; connecting without TLS")
                 ssl_ctx = None
+                _tls_mode = "TLS disabled (context build failed)"
+        # INFO so the mode reaches the hub via the WebSocketLogHandler relay
+        # (PxmxAgent prefix); pairs with the "Connection to ... failed" warning
+        # in run() to form a TLS troubleshooting trail.
+        logger.info("TLS mode: %s", _tls_mode)
 
         async with websockets.connect(self.spoke_url, ssl=ssl_ctx) as websocket:
             self.websocket = websocket
