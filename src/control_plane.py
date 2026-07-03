@@ -169,30 +169,49 @@ class PxmxControlPlane(BaseControlPlane):
     async def run_agent_server(self):
         """Serve the pxmx agent listener.
 
-        When the hub box has a TLS cert (``LM_TLS_CERT``/``LM_TLS_KEY``) the
-        listener is ``wss`` on ``LM_PXMX_AGENT_PORT`` (default 8443 — avoids
-        colliding with the hub's 443 when co-located; a standalone pxmx spoke
-        sets it to 443). The hub advertises this port in mDNS TXT ``agent_port``
-        so pxmx agents discover it. Without a cert the listener stays plaintext
-        on the legacy :8766. Retries up to 10× on EADDRINUSE."""
+        Three modes:
+
+        * **Loopback (all-in-one, unified 443)** — ``LM_PXMX_AGENT_LOOPBACK=1``:
+          bind ``127.0.0.1`` only, **plaintext**, on ``LM_PXMX_AGENT_PORT``
+          (default 8443). TLS terminates at the hub's single :443 surface; the
+          hub's ``/ws/agent`` route byte-proxies to this loopback listener. The
+          port is NOT advertised (the mDNS ``agent_port`` TXT advertises the
+          external 443).
+        * **Standalone wss** — a cert is present (``LM_TLS_CERT``/``LM_TLS_KEY``)
+          and loopback is OFF: ``wss`` on ``0.0.0.0:LM_PXMX_AGENT_PORT`` (a
+          standalone pxmx spoke sets it to 443 so agents dial
+          ``wss://<pxmx>:443/ws/agent`` directly).
+        * **Standalone plaintext (legacy / cert-less)** — no cert, loopback OFF:
+          ``ws`` on ``0.0.0.0:8766``.
+
+        Retries up to 10× on EADDRINUSE."""
+        loopback = os.environ.get("LM_PXMX_AGENT_LOOPBACK", "").strip() in ("1", "true", "True")
         cert = os.environ.get("LM_TLS_CERT", "").strip()
         key = os.environ.get("LM_TLS_KEY", "").strip()
-        if cert and key:
+        if loopback:
+            # TLS terminates at the hub's 443; the loopback hop is plaintext.
+            host = "127.0.0.1"
+            port = int(os.environ.get("LM_PXMX_AGENT_PORT", "8443"))
+            serve_kwargs = {}
+            scheme = "ws"
+        elif cert and key:
+            host = "0.0.0.0"
             port = int(os.environ.get("LM_PXMX_AGENT_PORT", "8443"))
             server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             server_ctx.load_cert_chain(cert, key)
             serve_kwargs = {"ssl": server_ctx}
             scheme = "wss"
         else:
+            host = "0.0.0.0"
             port = int(os.environ.get("LM_PXMX_AGENT_PORT", "8766"))
             serve_kwargs = {}
             scheme = "ws"
         for attempt in range(10):
             try:
                 async with websockets.serve(
-                    self._agent_handler, "0.0.0.0", port, **serve_kwargs,
+                    self._agent_handler, host, port, **serve_kwargs,
                 ):
-                    logger.info(f"Agent listener on {scheme}://0.0.0.0:{port}")
+                    logger.info(f"Agent listener on {scheme}://{host}:{port}")
                     await asyncio.Future()
                 return
             except OSError as e:
@@ -249,6 +268,21 @@ class PxmxControlPlane(BaseControlPlane):
     async def _agent_handler(self, websocket, path=None):
         agent_id = None
         try:
+            # 0. Path enforcement — under the unified-443 merge an agent dials
+            # ``/ws/agent`` (the hub proxies /ws/agent to this loopback listener
+            # on all-in-one; a standalone spoke serves /ws/agent directly on 443).
+            # Reject any other path so this listener is never reached via a stray
+            # URL. ``path`` is the 3rd arg on older websockets; newer versions
+            # drop it from the handler sig → read ``websocket.path`` (or
+            # ``websocket.request.path``).
+            if path is None:
+                path = getattr(websocket, "path", None) or getattr(
+                    getattr(websocket, "request", None), "path", None)
+            if path != "/ws/agent":
+                logger.warning(f"Agent handler rejecting unexpected path: {path!r}")
+                await websocket.close(1008, "unexpected path")
+                return
+
             # 1. Auth
             auth = json.loads(await websocket.recv())
             agent_id     = auth.get("agent_id")

@@ -430,7 +430,7 @@ visudo -cf /etc/sudoers.d/lm-component-update >/dev/null 2>&1 || true
 # Apply new code now and prevent split-brain: stop the current instance, reap
 # any orphaned/stale pxmx control_plane process left by a previous install
 # (different unit or invocation), then start fresh. A stale instance holding
-# :8766 while a new one reaches the hub with no agent is exactly the split-brain
+# :443 while a new one reaches the hub with no agent is exactly the split-brain
 # that makes the node agent invisible in the UI.
 systemctl stop lm-pxmx 2>/dev/null || true
 pkill -f 'control_plane.*--id pxmx-spoke-1' 2>/dev/null || true
@@ -456,9 +456,9 @@ echo "    only git-pulled the new spoke code must be re-installed once to enable
 
 # Print the agent install command so the admin knows what to run on each Proxmox node.
 # Default to mDNS/DNS auto-discovery: the agent reads this box's _lm-hub._tcp TXT
-# agent_port record (443 on a standalone pxmx spoke with TLS on, 8766 legacy no-TLS)
-# and picks ws:// vs wss:// automatically — no --spoke-url / port needed. Pinning is
-# shown only as an optional fallback.
+# agent_port record (443 — the unified external surface) and dials
+# wss://<host>:443/ws/agent automatically — no --spoke-url / port needed. Pinning
+# is shown only as an optional fallback.
 LM_HOST=$(echo "$HUB_URL" | sed 's|^wss://||;s|^ws://||' | cut -d: -f1)
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -467,9 +467,9 @@ echo ""
 echo "  curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh \\"
 echo "    | sudo bash"
 echo "  (auto-discovers this spoke via DNS lm-hub.* / mDNS _lm-hub._tcp — no port needed;"
-echo "   the agent reads the agent_port TXT record, 443 here with TLS on.)"
+echo "   the agent reads the agent_port TXT record, 443, and dials wss://<host>:443/ws/agent.)"
 if [ -n "$LM_HOST" ]; then
-    echo "  To pin instead:  --spoke-url wss://${LM_HOST}:443   (or ws://${LM_HOST}:8766 with TLS off)"
+    echo "  To pin instead:  --spoke-url wss://${LM_HOST}:443/ws/agent"
 fi
 echo "  (omitting --id derives <hostname>-agent; clone+rename auto-correlates via install UUID)"
 echo ""
