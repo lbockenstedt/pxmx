@@ -18,7 +18,7 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
           │        │                                      
           │  relay-only for Proxmox                       
           ▼                                              
-   pxmx host agents  (wss to hub /ws/agent → pxmx spoke loopback :8443, or :443 standalone)
+   pxmx host agents  (wss to pxmx spoke :443 standalone [DEFAULT, agent→spoke→hub]; or hub /ws/agent → spoke loopback :8443 [all-in-one, --loopback/install_all only])
    GenericLeafAgent leaf agents  (ws/wss to hub /ws/spoke or a SpokeGateway)
    bugfixer  (agent-type WS client of the hub, not a spoke)
 ```
@@ -42,12 +42,13 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
 | Link | Same-box | Remote |
 |---|---|---|
 | spoke → hub | `wss://127.0.0.1:443/ws/spoke` (loopback, verify-off) | `wss://<hub>:443/ws/spoke` |
-| pxmx agent → hub `/ws/agent` | `wss://127.0.0.1:443/ws/agent` (loopback) | `wss://<hub>:443/ws/agent` (hub byte-proxies to pxmx spoke loopback :8443) |
+| pxmx agent → pxmx spoke (standalone, **default**) | n/a (spoke is on its own box) | `wss://<spoke>:443/ws/agent` (agent → spoke → hub; agent pinned via `--spoke-url`) |
+| pxmx agent → hub `/ws/agent` (loopback, all-in-one `--loopback` only) | `wss://127.0.0.1:443/ws/agent` (loopback) | `wss://<hub>:443/ws/agent` (hub byte-proxies to pxmx spoke loopback :8443) |
 | leaf agent → hub/gateway | `wss://127.0.0.1:443/ws/spoke` (loopback, verify-off) | `wss://<hub>:443/ws/spoke` |
 
 - **Hub unified server:** one uvicorn process on `0.0.0.0:LM_TLS_PORT` (default **443**), `wss` when `LM_TLS_CERT`/`LM_TLS_KEY` are set, plaintext otherwise. WebSocket routes: `/ws/spoke` (spoke + agent control), `/ws/console/{session_id}` (browser ↔ Proxmox VNC byte relay), `/sim/ws` (cs telemetry). HTTP routes: `/api/*`, `/setup/*`, `/auth/*`, `/admin/*`, `/sim/api/*`, plus the mounted WebUI.
-- **Co-located (loopback):** same-box spokes/agents dial `wss://127.0.0.1:443/ws/spoke` (or `/ws/agent`) with TLS verify OFF — the single :443 listener serves loopback too, so same-box traffic isn't a separate port. (The pxmx spoke's own agent listener stays loopback `127.0.0.1:8443`, reached via the hub `/ws/agent` byte-proxy — not advertised externally.)
-- **pxmx agent listener:** `LM_PXMX_AGENT_PORT` — default **8443** loopback all-in-one (`LM_PXMX_AGENT_LOOPBACK=1`; the hub `/ws/agent` byte-proxy dials it); standalone pxmx spoke uses **443** wss. Legacy no-cert port **8766**. mDNS TXT `agent_port` advertises the **external** dial port (**443** on both deployments) so agents auto-discover `wss://<hub>:443/ws/agent`; the loopback 8443 is NOT advertised. `/api/pxmx/agent-install-cmd` returns the `wss://<host>:443/ws/agent` install string.
+- **Co-located (loopback):** same-box spokes/agents dial `wss://127.0.0.1:443/ws/spoke` (or `/ws/agent`) with TLS verify OFF — the single :443 listener serves loopback too, so same-box traffic isn't a separate port. (The pxmx spoke's own agent listener is loopback `127.0.0.1:8443` **only on the co-located all-in-one path** — `install_all.sh` passes `--loopback`; reached via the hub `/ws/agent` byte-proxy, not advertised externally. A standalone pxmx spoke instead serves `wss://0.0.0.0:443` directly — see below.)
+- **pxmx agent listener:** `LM_PXMX_AGENT_PORT` — **443 (standalone DEFAULT)** `wss://0.0.0.0:443` (the spoke lives on its own box; a Proxmox agent dials `wss://<spoke>:443/ws/agent` directly — agent → spoke → hub; the agent is **pinned** via `--spoke-url` since a standalone spoke does not broadcast `_lm-hub` mDNS); **8443 loopback** (`LM_PXMX_AGENT_LOOPBACK=1`, `--loopback`/`install_all` co-located only) bound `127.0.0.1:8443` plaintext, reached via the hub `/ws/agent` byte-proxy — agent → hub → spoke. Legacy no-cert fallback **8766**. mDNS TXT `agent_port` advertises `443` (the hub's external surface on the all-in-one path); the loopback 8443 is NOT advertised. `/api/pxmx/agent-install-cmd` returns the `wss://<host>:443/ws/agent` install string. See [pxmx.md "Agent listener modes"](pxmx.md).
 - **No-cert fallback:** if `LM_TLS_CERT`/`LM_TLS_KEY` are unset, the hub serves a single `0.0.0.0:443` plaintext listener and discovery returns `ws://<host>:443/ws/spoke` — backward compatible.
 
 ## Discovery (mDNS + DNS)
@@ -56,7 +57,7 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
 
 - **mDNS:** the hub broadcasts `_lm-hub._tcp.local.` (`lm-hub._lm-hub._tcp.local.`) via `zeroconf` (optional dep; skipped gracefully). TXT records: `version`, `agent_port` (always), and `tls_port` **only when** a cert is configured or `LM_HUB_ADVERTISE_TLS=1` (lets a reverse-proxy/TLS-terminator shape advertise TLS without owning the cert).
 - **DNS:** tries `lm-hub.<search-domain>`, `lm-hub.local` (Avahi), bare `lm-hub`. DNS has no TXT → always returns `ws://` (pin `--hub wss://...` for a TLS remote hub reached only by DNS).
-- **Scheme selection:** same-box → `wss://127.0.0.1:443/ws/spoke` (verify-off, loopback on the single :443 listener); remote + mDNS TXT `tls_port` → `wss://<ip>:443`; remote no TXT → `ws://<ip>:443` (no-cert hub). `agent_listener=True` reads TXT `agent_port` (advertised **443** on both deployments) → `wss://<hub>:443/ws/agent`.
+- **Scheme selection:** same-box → `wss://127.0.0.1:443/ws/spoke` (verify-off, loopback on the single :443 listener); remote + mDNS TXT `tls_port` → `wss://<ip>:443`; remote no TXT → `ws://<ip>:443` (no-cert hub). `agent_listener=True` reads TXT `agent_port` (advertised **443** on both deployments) → `wss://<hub>:443/ws/agent` — this is the **loopback/all-in-one** path (agent → hub → spoke). On the **standalone** path (agent → spoke → hub, the default) the pxmx spoke does NOT broadcast `_lm-hub` mDNS, so the agent cannot auto-discover it and **must be pinned** with `agent/install_agent.sh --spoke-url wss://<spoke>:443/ws/agent` (the installer prints this).
 - **Same-box = IP-equality, NOT mDNS receipt.** mDNS crosses the LAN (L2-scoped), so hearing the hub over mDNS does not mean same-box. `is_hub_local(hub_ip)` compares the resolved/mDNS hub IP against this box's own interface IPv4s (UDP-connect-to-`223.255.255.1` + psutil, loopback included). When same-box, the caller dials `127.0.0.1:443` on the same unified listener instead of the LAN IP.
 - **Four byte-identical vendored copies** of `hub_discovery.py` must move together: `lm/core/src/messaging/hub_discovery.py` (canonical), `pxmx/src/discovery.py`, `pxmx/agent/src/discovery.py`, `lm/generic_agent/src/hub_discovery.py`.
 

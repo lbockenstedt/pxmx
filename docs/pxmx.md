@@ -15,8 +15,17 @@ A **bridge spoke**: connects the LM hub to one or more **pxmx host agents** runn
 ## Ports
 
 - Spoke dials hub on **443** (`/ws/spoke`, wss).
-- Agent listener: `LM_PXMX_AGENT_PORT` — default **8443** loopback all-in-one (`LM_PXMX_AGENT_LOOPBACK=1`; the hub `/ws/agent` byte-proxy dials it — NOT advertised externally); **443** wss standalone pxmx spoke; legacy **8766** plaintext. mDNS TXT `agent_port` advertises the **external** dial port (**443** on both deployments) → agents auto-discover `wss://<hub>:443/ws/agent`.
+- Agent listener (`run_agent_server`): **standalone (DEFAULT)** serves `wss://0.0.0.0:443` so a remote Proxmox agent dials `wss://<this-spoke>:443/ws/agent` directly; **loopback** (`--loopback`, co-located all-in-one only) binds `127.0.0.1:8443` plaintext and the hub `/ws/agent` route byte-proxies to it; legacy no-cert fallback `ws://0.0.0.0:8766`. mDNS TXT `agent_port` advertises `443` (the hub's external surface on the all-in-one path).
 - mDNS browses `_lm-hub._tcp.local.` (TXT `tls_port` + `agent_port`); DNS `lm-hub.<search>`.
+
+## Agent listener modes — standalone vs loopback (important caveat)
+
+The pxmx spoke's agent listener has two modes. **Which mode is deployed determines the whole agent path** — get this right or the agent gets `Connection refused`:
+
+- **Standalone (DEFAULT — agent → spoke → hub).** The pxmx spoke lives on its **own box**, separate from the hub. It serves `wss://0.0.0.0:443` (self-signed cert) and a Proxmox agent dials `wss://<spoke>:443/ws/agent` **directly**; the spoke then talks to the hub outbound. This is the design across the board. `install_pxmx.sh` (run directly on the spoke box) defaults to this — **no `--loopback`**. Because a standalone spoke does **not** broadcast `_lm-hub` mDNS (only the hub does), the agent **cannot auto-discover it** — the agent install must be **pinned**: `agent/install_agent.sh --spoke-url wss://<spoke-host>:443/ws/agent`. The installer prints this pinned command.
+- **Loopback (opt-in — agent → hub → spoke).** The pxmx spoke is **co-located with the hub on the same box** (all-in-one). The hub already owns `:443`, so the pxmx agent listener binds `127.0.0.1:8443` **plaintext**; a Proxmox agent dials `wss://<hub>:443/ws/agent` (auto-discovered via `_lm-hub` mDNS / `lm-hub` DNS) and the hub `/ws/agent` route byte-proxies to the loopback listener. `--loopback` is passed **only by `install_all.sh`** (the rare co-located all-in-one path); a standalone install never sets it.
+
+> **If a remote agent reports `[Errno 111] Connect call failed (<spoke>, 443)`**, the spoke is almost certainly in loopback mode (bound `127.0.0.1:8443`, refuses remote) when it should be standalone — i.e. `install_all.sh` was used on a box that is actually a standalone spoke, or `LM_PXMX_AGENT_LOOPBACK=1` is set in `/opt/lm/pxmx/.env`. Fix: reinstall with the standalone `install_pxmx.sh` (no `--loopback`) and pin the agent to `wss://<spoke>:443/ws/agent`. Check with `journalctl -u lm-pxmx | grep 'Agent listener on'` — standalone shows `wss://0.0.0.0:443`, loopback shows `ws://127.0.0.1:8443`.
 
 ## Environment variables
 
@@ -26,7 +35,7 @@ A **bridge spoke**: connects the LM hub to one or more **pxmx host agents** runn
 
 ## Install flags
 
-- `install_pxmx.sh`: `--hub`, `--id`/`--name`, `--secret`, `--hub-secret`, `--tls-verify` (+ `--tls-ca-cert`; **required** on standalone), `--all-prereqs` (no-op). IDs default `<hostname>-spoke`.
+- `install_pxmx.sh`: `--hub`, `--id`/`--name`, `--secret`, `--hub-secret`, `--tls-verify` (+ `--tls-ca-cert`; **required** on standalone), `--loopback` (opt-in co-located/all-in-one mode — passed only by `install_all.sh`; default is standalone `agent → spoke → hub`), `--all-prereqs` (no-op). IDs default `<hostname>-spoke`.
 - `agent/install_agent.sh`: `--spoke-url`, `--id`, `--secret` (all optional; auto-discovers when `--spoke-url` absent).
 
 ## Key commands / handlers
@@ -38,7 +47,7 @@ A **bridge spoke**: connects the LM hub to one or more **pxmx host agents** runn
 
 ## Key files
 
-- Spoke: `src/control_plane.py` (`PxmxControlPlane`, `run_agent_server` — self-healing agent listener, loopback `:8443` all-in-one via `LM_PXMX_AGENT_LOOPBACK` reached through the hub `/ws/agent` byte-proxy, `:443` wss standalone), `src/proxmox_spoke.py` (`ProxmoxSpoke`), `src/discovery.py` (vendored).
+- Spoke: `src/control_plane.py` (`PxmxControlPlane`, `run_agent_server` — self-healing agent listener; **standalone DEFAULT** `wss://0.0.0.0:443` (agent → spoke → hub); **loopback** `127.0.0.1:8443` plaintext via `LM_PXMX_AGENT_LOOPBACK=1` reached through the hub `/ws/agent` byte-proxy (agent → hub → spoke, `--loopback`/install_all only); legacy no-cert `ws://0.0.0.0:8766`), `src/proxmox_spoke.py` (`ProxmoxSpoke`), `src/discovery.py` (vendored).
 - Agent: `agent/src/agent.py` (`ProxmoxAgent`, telemetry `_cs_telemetry_body`, VNC, self-update, sd_notify watchdog), `agent/src/usb_provision.py` (7-layer auto-provision brain), `agent/src/cs_commands.py`, `agent/src/cs_sim.py`, `agent/src/cs_guard.py` (90000 VMID floor + `PROTECTED_VMIDS`), `agent/src/pve_cmds.py` (async `qm`/`pct`), `agent/src/watchdogs.py`, `agent/src/security_utils.py` (HMAC), `agent/src/update_recovery.py`, `agent/src/vm_names.json`, `agent/src/dep_guard.py`.
 
 ## Notable behaviors & gotchas

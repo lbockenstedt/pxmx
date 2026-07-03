@@ -32,8 +32,8 @@ sudo ./install_pxmx.sh --hub ws://<hub-host>:8765 --id pxmx-spoke-1 [--secret <p
 - Installs to `/opt/lm`, creates a systemd service, and starts it.
 
 ### Ports
-- LM Hub control plane: **8765** (the spoke connects to this).
-- pxmx agent listener: **8766** (the spoke bridges Hub ↔ agents on this).
+- LM Hub control plane: **443** wss (`/ws/spoke` — the spoke connects to this).
+- pxmx agent listener: **443** wss **standalone (default)** — the spoke (on its own box) serves `wss://0.0.0.0:443` and a Proxmox agent dials `wss://<spoke>:443/ws/agent` directly (**agent → spoke → hub**; agent pinned via `--spoke-url` — a standalone spoke does not broadcast `_lm-hub` mDNS). **8443** loopback (co-located all-in-one, `--loopback`/`install_all.sh` only — `agent → hub → spoke`, hub `/ws/agent` byte-proxies to it). **8766** is the legacy no-cert plaintext fallback. See [docs/pxmx.md](docs/pxmx.md).
 
 ### Notable fix
 A recurring **agent-blackout** bug (the agent-server task died and the spoke
@@ -53,7 +53,7 @@ now kept alive and self-heals on exit (`93f09df`). Current version: see `VERSION
 | `agent/src/pve_cmds.py` | Async `qm`/`pct` wrappers. |
 | `agent/src/watchdogs.py` | Hardware + guest-agent watchdogs. |
 | `agent/src/security_utils.py` | HMAC message signing. |
-| `src/control_plane.py` | `PxmxControlPlane` — Hub-side: accepts agents on :8766, runs self-update. |
+| `src/control_plane.py` | `PxmxControlPlane` — Hub-side: runs the agent listener (`run_agent_server` — `:443` wss standalone default, `:8443` loopback via `LM_PXMX_AGENT_LOOPBACK=1`/`--loopback`, `:8766` no-cert fallback), runs self-update. |
 | `src/proxmox_spoke.py` | `ProxmoxSpoke` — the multi-agent bridge spoke (Hub ↔ agents). |
 | `install_pxmx.sh` | Installer (systemd service + prereqs). |
 | `pxmx.Dockerfile` | Container build. |

@@ -18,6 +18,15 @@ SPOKE_ID="${SPOKE_ID:-}"
 SPOKE_ID_PINNED=0
 [ -n "$SPOKE_ID" ] && SPOKE_ID_PINNED=1
 SPOKE_SECRET="lm-secret"
+# Agent-listener mode. DEFAULT is standalone: this pxmx spoke lives on its OWN
+# box, serves wss on :443 directly so a remote Proxmox agent dials
+# wss://<this-spoke>:443/ws/agent, and this spoke talks to the hub outbound
+# (agent → spoke → hub). --loopback flips to all-in-one/co-located mode (hub on
+# the SAME box): the listener binds 127.0.0.1:8443 plaintext and the hub's
+# /ws/agent route byte-proxies to it (the hub owns :443). --loopback is intended
+# to be passed ONLY by install_all.sh (the rare co-located all-in-one path); a
+# standalone install never sets it. See docs/pxmx.md "Agent listener modes".
+PXMX_LOOPBACK=0
 
 # Parse arguments
 # TLS cert verification is OFF by default (self-signed hub cert → encrypt
@@ -35,6 +44,7 @@ while [[ "$#" -gt 0 ]]; do
         --hub-secret) HUB_SECRET="$2"; shift ;;
         --tls-verify)  TLS_VERIFY=true ;;
         --tls-ca-cert) shift; TLS_CA_CERT="$1" ;;
+        --loopback) PXMX_LOOPBACK=1 ;;
         --all-prereqs) ;;  # no-op (system prereqs are always installed); accepted so the Hub's install-module call doesn't abort
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
@@ -147,39 +157,59 @@ SPOKE_SECRET=$SPOKE_SECRET
 HUB_SECRET=$HUB_SECRET
 EOF
 
-# ── TLS for the pxmx agent listener (remote Proxmox agents report in) ──────
-# A standalone pxmx spoke serves wss on LM_PXMX_AGENT_PORT (443 here — this box
-# isn't the hub, so 443 is free). The cert is self-signed; agents skip
-# verification by default (set LM_HUB_TLS_VERIFY=1 + LM_HUB_CA_CERT to verify).
-# Skip gracefully if openssl is absent → listener stays plaintext on :8766.
+# ── Agent-listener TLS (standalone mode only) ──────────────────────────────
+# Standalone (default): this pxmx spoke is on its OWN box and serves wss on
+# LM_PXMX_AGENT_PORT (443 — this box isn't the hub, so 443 is free) so a remote
+# Proxmox agent dials wss://<this-spoke>:443/ws/agent directly. The cert is
+# self-signed; agents skip verification by default (set LM_HUB_TLS_VERIFY=1 +
+# LM_HUB_CA_CERT to verify). Skip gracefully if openssl is absent → listener
+# falls back to plaintext :8766.
+# Loopback (--loopback, install_all only): no cert — the listener binds
+# 127.0.0.1:8443 plaintext and the hub's /ws/agent route byte-proxies to it;
+# TLS terminates at the hub's :443, which the hub owns.
 PXMX_CERT_DIR="$INSTALL_DIR/pxmx/certs"
 PXMX_CERT="$PXMX_CERT_DIR/hub.crt"
 PXMX_KEY="$PXMX_CERT_DIR/hub.key"
-mkdir -p "$PXMX_CERT_DIR"
-if ! command -v openssl >/dev/null 2>&1; then
-    echo "⚠️  openssl not found — skipping pxmx TLS cert (agent listener stays plaintext :8766)."
-elif [ -f "$PXMX_CERT" ] && [ -f "$PXMX_KEY" ]; then
-    echo "🔒 pxmx TLS cert already present at $PXMX_CERT — preserving."
-else
-    echo "🔒 Generating self-signed pxmx TLS cert at $PXMX_CERT…"
-    openssl req -x509 -newkey rsa:2048 -nodes \
-        -keyout "$PXMX_KEY" -out "$PXMX_CERT" -days 3650 \
-        -subj "/CN=lm-pxmx" -addext "subjectAltName=IP:127.0.0.1,DNS:lm-hub,DNS:lm-hub.local" \
-        >/dev/null 2>&1 || echo "⚠️  openssl cert generation failed — agent listener stays plaintext."
+if [ "$PXMX_LOOPBACK" != "1" ]; then
+    mkdir -p "$PXMX_CERT_DIR"
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "⚠️  openssl not found — skipping pxmx TLS cert (agent listener stays plaintext :8766)."
+    elif [ -f "$PXMX_CERT" ] && [ -f "$PXMX_KEY" ]; then
+        echo "🔒 pxmx TLS cert already present at $PXMX_CERT — preserving."
+    else
+        echo "🔒 Generating self-signed pxmx TLS cert at $PXMX_CERT…"
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$PXMX_KEY" -out "$PXMX_CERT" -days 3650 \
+            -subj "/CN=lm-pxmx" -addext "subjectAltName=IP:127.0.0.1,DNS:lm-hub,DNS:lm-hub.local" \
+            >/dev/null 2>&1 || echo "⚠️  openssl cert generation failed — agent listener stays plaintext."
+    fi
+    if [ -f "$PXMX_KEY" ]; then
+        chmod 600 "$PXMX_KEY"
+        chown svc_lm:svc_lm "$PXMX_KEY" "$PXMX_CERT" 2>/dev/null || true
+    fi
 fi
-if [ -f "$PXMX_KEY" ]; then
-    chmod 600 "$PXMX_KEY"
-    chown svc_lm:svc_lm "$PXMX_KEY" "$PXMX_CERT" 2>/dev/null || true
-fi
-# Persist the TLS knobs into .env (the unit's EnvironmentFile loads these).
-if ! grep -q "^LM_TLS_CERT=" .env 2>/dev/null; then
+# Persist the agent-listener mode knobs into .env (the unit's EnvironmentFile
+# loads these). .env was just (re)written above with the base identity lines, so
+# append the mode-specific block fresh.
+if [ "$PXMX_LOOPBACK" = "1" ]; then
     {
-        echo "LM_TLS_CERT=$PXMX_CERT"
-        echo "LM_TLS_KEY=$PXMX_KEY"
-        echo "LM_PXMX_AGENT_PORT=443"
+        echo "# Loopback (all-in-one, --loopback): bind 127.0.0.1:8443 plaintext;"
+        echo "# the hub /ws/agent route byte-proxies here. TLS terminates at the hub :443."
+        echo "LM_PXMX_AGENT_PORT=8443"
+        echo "LM_PXMX_AGENT_LOOPBACK=1"
         echo "LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV"
         [ -n "$HUB_TLS_CA_ENV" ] && echo "LM_HUB_CA_CERT=$HUB_TLS_CA_ENV"
     } >> .env
+else
+    if ! grep -q "^LM_TLS_CERT=" .env 2>/dev/null; then
+        {
+            echo "LM_TLS_CERT=$PXMX_CERT"
+            echo "LM_TLS_KEY=$PXMX_KEY"
+            echo "LM_PXMX_AGENT_PORT=443"
+            echo "LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV"
+            [ -n "$HUB_TLS_CA_ENV" ] && echo "LM_HUB_CA_CERT=$HUB_TLS_CA_ENV"
+        } >> .env
+    fi
 fi
 # A re-install toggling --tls-verify should update an existing .env, not leave
 # a stale setting from a prior install.
@@ -240,6 +270,15 @@ HUB_SECRET_ARG=""
 _TLS_CA_UNIT=""
 [ -n "$HUB_TLS_CA_ENV" ] && _TLS_CA_UNIT=" LM_HUB_CA_CERT=$HUB_TLS_CA_ENV"
 
+# Agent-listener port per mode: 443 wss standalone (default), 8443 loopback
+# (--loopback / install_all co-located). AmbientCapabilities lets svc_lm bind
+# 443 non-root (harmless in loopback, which binds 8443 >1024).
+if [ "$PXMX_LOOPBACK" = "1" ]; then
+    PXMX_AGENT_PORT_UNIT=8443
+else
+    PXMX_AGENT_PORT_UNIT=443
+fi
+
 cat <<EOF > /etc/systemd/system/lm-pxmx.service
 [Unit]
 Description=Lab Manager Spoke - Proxmox Manager
@@ -251,11 +290,13 @@ User=svc_lm
 WorkingDirectory=$INSTALL_DIR/pxmx
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/pxmx/src"
 EnvironmentFile=$INSTALL_DIR/pxmx/.env
-# TLS: the pxmx agent listener serves wss on LM_PXMX_AGENT_PORT (443 for a
-# standalone pxmx spoke). Cert verification OFF by default; --tls-verify at
-# install sets LM_HUB_TLS_VERIFY=1 + LM_HUB_CA_CERT so this spoke verifies the
-# hub. AmbientCapabilities lets svc_lm bind 443 non-root.
-Environment=LM_PXMX_AGENT_PORT=443 LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV$_TLS_CA_UNIT
+# Agent listener: standalone serves wss on :443 (remote Proxmox agents dial
+# wss://<this-spoke>:443/ws/agent directly — agent → spoke → hub); loopback
+# (--loopback, install_all co-located only) binds 127.0.0.1:8443 plaintext and
+# the hub /ws/agent route byte-proxies to it (agent → hub → spoke). Hub-cert
+# verification OFF by default; --tls-verify sets LM_HUB_TLS_VERIFY=1 +
+# LM_HUB_CA_CERT so this spoke verifies the hub.
+Environment=LM_PXMX_AGENT_PORT=$PXMX_AGENT_PORT_UNIT LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV$_TLS_CA_UNIT
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ExecStart=$INSTALL_DIR/pxmx/venv/bin/python3 -m src.control_plane $ID_ARG --hub "\${HUB_URL}" $SECRET_ARG $HUB_SECRET_ARG
@@ -459,21 +500,32 @@ echo "    this watchdog + sudoers land only on a full installer re-run; a box th
 echo "    only git-pulled the new spoke code must be re-installed once to enable it."
 
 # Print the agent install command so the admin knows what to run on each Proxmox node.
-# Default to mDNS/DNS auto-discovery: the agent reads this box's _lm-hub._tcp TXT
-# agent_port record (443 — the unified external surface) and dials
-# wss://<host>:443/ws/agent automatically — no --spoke-url / port needed. Pinning
-# is shown only as an optional fallback.
+# Standalone (default): the agent dials THIS spoke directly (agent → spoke → hub).
+#   A standalone spoke does NOT broadcast _lm-hub mDNS (only the hub does), so the
+#   agent cannot auto-discover it — --spoke-url (pinned to this box) is REQUIRED.
+# Loopback (--loopback, install_all co-located): the agent auto-discovers the HUB
+#   via _lm-hub mDNS / lm-hub DNS and dials wss://<hub>:443/ws/agent; the hub's
+#   /ws/agent route byte-proxies to this spoke's loopback :8443.
 LM_HOST=$(echo "$HUB_URL" | sed 's|^wss://||;s|^ws://||' | cut -d: -f1)
+SPOKE_HOST="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -v '^127\.' | head -1)"
+[ -z "$SPOKE_HOST" ] && SPOKE_HOST="$(hostname -s)"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Run this on each Proxmox node to install the pxmx agent:"
 echo ""
 echo "  curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh \\"
-echo "    | sudo bash"
-echo "  (auto-discovers this spoke via DNS lm-hub.* / mDNS _lm-hub._tcp — no port needed;"
-echo "   the agent reads the agent_port TXT record, 443, and dials wss://<host>:443/ws/agent.)"
-if [ -n "$LM_HOST" ]; then
-    echo "  To pin instead:  --spoke-url wss://${LM_HOST}:443/ws/agent"
+if [ "$PXMX_LOOPBACK" = "1" ]; then
+    echo "    | sudo bash"
+    echo "  (loopback/all-in-one: the agent auto-discovers the HUB via DNS lm-hub.* / mDNS"
+    echo "   _lm-hub._tcp and dials wss://<hub>:443/ws/agent; the hub /ws/agent route"
+    echo "   byte-proxies to this spoke's loopback :8443 — agent → hub → spoke.)"
+    if [ -n "$LM_HOST" ]; then
+        echo "  To pin instead:  --spoke-url wss://${LM_HOST}:443/ws/agent"
+    fi
+else
+    echo "    | sudo bash -s -- --spoke-url wss://${SPOKE_HOST}:443/ws/agent"
+    echo "  (standalone spoke: the agent dials THIS spoke directly — agent → spoke → hub."
+    echo "   A standalone spoke does not broadcast _lm-hub mDNS, so --spoke-url is REQUIRED.)"
 fi
 echo "  (omitting --id derives <hostname>-agent; clone+rename auto-correlates via install UUID)"
 echo ""
