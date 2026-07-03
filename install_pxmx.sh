@@ -414,20 +414,22 @@ echo "    (crash at boot) is rolled back to the prior commit automatically. NOTE
 echo "    this watchdog + sudoers land only on a full installer re-run; a box that"
 echo "    only git-pulled the new spoke code must be re-installed once to enable it."
 
-# Print the agent install command so the admin knows what to run on each Proxmox node
-LM_HOST=$(echo "$HUB_URL" | sed 's|^ws://||' | cut -d: -f1)
+# Print the agent install command so the admin knows what to run on each Proxmox node.
+# Default to mDNS/DNS auto-discovery: the agent reads this box's _lm-hub._tcp TXT
+# agent_port record (443 on a standalone pxmx spoke with TLS on, 8766 legacy no-TLS)
+# and picks ws:// vs wss:// automatically — no --spoke-url / port needed. Pinning is
+# shown only as an optional fallback.
+LM_HOST=$(echo "$HUB_URL" | sed 's|^wss://||;s|^ws://||' | cut -d: -f1)
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Run this on each Proxmox node to install the pxmx agent:"
 echo ""
+echo "  curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh \\"
+echo "    | sudo bash"
+echo "  (auto-discovers this spoke via DNS lm-hub.* / mDNS _lm-hub._tcp — no port needed;"
+echo "   the agent reads the agent_port TXT record, 443 here with TLS on.)"
 if [ -n "$LM_HOST" ]; then
-    echo "  curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh \\"
-    echo "    | sudo bash -s -- \\"
-    echo "    --spoke-url ws://${LM_HOST}:8766"
-else
-    echo "  curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh \\"
-    echo "    | sudo bash"
-    echo "  (no --spoke-url: the agent auto-discovers the hub via DNS lm-hub.* / mDNS)"
+    echo "  To pin instead:  --spoke-url wss://${LM_HOST}:443   (or ws://${LM_HOST}:8766 with TLS off)"
 fi
 echo "  (omitting --id derives <hostname>-agent; clone+rename auto-correlates via install UUID)"
 echo ""

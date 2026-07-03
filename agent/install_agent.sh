@@ -12,9 +12,10 @@ set -e
 SPOKE_URL="${SPOKE_URL:-}"
 # Track whether the spoke URL was explicitly given (arg or env). When NOT pinned
 # the installer auto-discovers the hub box via DNS (lm-hub.<dns-suffix>) then
-# mDNS (_lm-hub._tcp.local.) and targets its agent listener (:8766) after the
-# venv is ready; if nothing is found SPOKE_URL is left empty and the agent
-# re-discovers at startup (agent _resolve_spoke_url sentinel).
+# mDNS (_lm-hub._tcp.local.) and targets its agent listener via the service's
+# agent_port TXT record (8443 all-in-one / 443 standalone with TLS, 8766 legacy
+# no-TLS) after the venv is ready; if nothing is found SPOKE_URL is left empty
+# and the agent re-discovers at startup (agent _resolve_spoke_url sentinel).
 SPOKE_URL_PINNED=0
 [ -n "$SPOKE_URL" ] && SPOKE_URL_PINNED=1
 AGENT_ID=""
@@ -110,7 +111,9 @@ if [ "$SPOKE_URL_PINNED" != "1" ]; then
     else
         echo "⚠️  Hub box not found via DNS/mDNS. Leaving SPOKE_URL empty — the agent will"
         echo "    retry auto-discovery at startup. To pin it now, re-run with"
-        echo "    --spoke-url ws://HUBBOX:8766 (or create an 'lm-hub' DNS record / enable mDNS on the hub)."
+        echo "    --spoke-url wss://HUBBOX:8443 (all-in-one hub w/ TLS) or wss://HUBBOX:443"
+        echo "    (standalone pxmx spoke w/ TLS) — or ws://HUBBOX:8766 with TLS off."
+        echo "    (Or create an 'lm-hub' DNS record / enable mDNS on the hub.)"
         SPOKE_URL=""
     fi
 fi
