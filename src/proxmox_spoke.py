@@ -190,6 +190,24 @@ class ProxmoxSpoke(BaseSpoke):
             return await self.control_plane.send_to_agent(
                 "PXMX_CREATE_VM", data, agent_id=agent_id, timeout=125.0)
 
+        # Hub-brokered cert install: the le spoke issued/renewed a Let's Encrypt
+        # cert and the hub pushes INSTALL_CERT here to apply it to a Proxmox
+        # node's pveproxy. Routed to the agent that owns the target node
+        # (agent_id from the hub, or resolved from `identifier`/`node`); the
+        # agent runs `pvenode cert set` on its local node. 120s covers the
+        # pveproxy restart. The spoke never touches Proxmox directly.
+        if cmd == "INSTALL_CERT":
+            agent_id = data.get("agent_id")
+            if not agent_id:
+                agent_id = self._agent_for_node(
+                    data.get("identifier") or data.get("node") or "")
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for cert install"}
+            r = await self.control_plane.send_to_agent(
+                "INSTALL_CERT", data, agent_id=agent_id, timeout=120.0)
+            r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
+            return r if isinstance(r, dict) else {"status": "ERROR", "message": "agent returned no result"}
+
         # VNC console: agent fetches a Proxmox vncproxy {ticket, port} via local
         # pvesh (fast); the hub opens the authenticated WSS itself.
         if cmd == "VNC_PROXY":

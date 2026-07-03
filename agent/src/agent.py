@@ -46,6 +46,7 @@ import psutil
 import argparse
 import os
 import socket
+import tempfile
 from typing import Any, Dict, List, Optional
 from .security_utils import MessageSigner
 from . import cs_commands
@@ -422,6 +423,82 @@ class ProxmoxAgent:
             return json.loads(stdout.decode())
         except json.JSONDecodeError:
             return stdout.decode()
+
+    def _pvenode_bin(self) -> str:
+        """Locate the pvenode binary (same pve-manager package as pvesh)."""
+        for candidate in ["/usr/bin/pvenode", "/usr/sbin/pvenode", "pvenode"]:
+            if candidate == "pvenode":
+                return candidate  # fall back to PATH
+            if os.path.isfile(candidate):
+                return candidate
+        return "pvenode"
+
+    async def install_cert(self, fullchain: str, privkey: str,
+                           node: str = "") -> Dict[str, Any]:
+        """Install a custom TLS cert on this node's pveproxy (the Proxmox web UI
+        + API listener). The le spoke (via the hub) supplies the PEM fullchain +
+        unencrypted privkey; we write them to root-only temp files and call
+        ``pvenode cert set <cert> <key> --force --restart``, which writes
+        ``/etc/pve/local/pveproxy-ssl.{pem,key}`` and restarts pveproxy — the
+        same endpoint as the WebUI's Node→Certificates→Upload Custom Certificate.
+
+        The agent runs ON a Proxmox node, so it installs on its local node only
+        (``self.hostname``); the spoke routes INSTALL_CERT to the agent that
+        owns the target node. ``node`` is accepted for a sanity check + log
+        clarity but pvenode has no --node flag (it is inherently local).
+
+        The private key is written to a 0600 temp file pvenode reads, then
+        unlinked — it is never logged (mirrors the Proxmox-token-secret rule).
+        """
+        fullchain = (fullchain or "").strip()
+        privkey = (privkey or "").strip()
+        if not fullchain or "BEGIN CERTIFICATE" not in fullchain:
+            return {"status": "ERROR", "message": "missing or invalid fullchain PEM"}
+        if not privkey or "PRIVATE KEY" not in privkey:
+            return {"status": "ERROR", "message": "missing or invalid private key PEM"}
+        if node and node.lower() != self.hostname.lower():
+            logger.warning("INSTALL_CERT: requested node '%s' != local '%s'; "
+                           "pvenode installs on the local node only",
+                           node, self.hostname)
+
+        cert_fd, cert_path = tempfile.mkstemp(prefix="pve-cert-", suffix=".pem")
+        key_fd, key_path = tempfile.mkstemp(prefix="pve-key-", suffix=".pem")
+        try:
+            os.write(cert_fd, fullchain.encode())
+            os.close(cert_fd)
+            os.write(key_fd, privkey.encode())
+            os.close(key_fd)
+            os.chmod(cert_path, 0o600)
+            os.chmod(key_path, 0o600)
+            bin_ = self._pvenode_bin()
+            proc = await asyncio.create_subprocess_exec(
+                bin_, "cert", "set", cert_path, key_path, "--force", "--restart",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            if proc.returncode != 0:
+                err = (stderr.decode().strip() or stdout.decode().strip()
+                       or f"pvenode exited {proc.returncode}")
+                return {"status": "ERROR",
+                        "message": f"pvenode cert set failed: {err[:300]}"}
+            logger.info("INSTALL_CERT: pveproxy cert installed on %s (pvenode restart)",
+                        self.hostname)
+            return {"status": "SUCCESS",
+                    "message": f"cert installed on {self.hostname} (pveproxy restarted)"}
+        except asyncio.TimeoutError:
+            return {"status": "ERROR",
+                    "message": "pvenode cert set timed out (pveproxy restart?)"}
+        except FileNotFoundError:
+            return {"status": "ERROR", "message": "pvenode not found (not a Proxmox node?)"}
+        except Exception as e:  # noqa: BLE001
+            return {"status": "ERROR", "message": f"install_cert failed: {str(e)[:300]}"}
+        finally:
+            for p in (cert_path, key_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     async def _fetch_cluster_name(self) -> str:
         """Returns the Proxmox cluster name, or this node's hostname for standalone nodes."""
@@ -1880,6 +1957,16 @@ class ProxmoxAgent:
                             asyncio.create_task(
                                 self._vnc_teardown(session_id, send_disconnect=False))
                         result = {"status": "OK", "session_id": session_id}
+
+                    elif cmd_type == "INSTALL_CERT":
+                        # Hub-brokered cert distribution: the le spoke issued/
+                        # renewed a Let's Encrypt cert and the hub pushes it
+                        # here to install on this node's pveproxy. We install on
+                        # the LOCAL node (pvenode is inherently local); the spoke
+                        # routed this to us because we own `identifier`/node.
+                        result = await self.install_cert(
+                            data.get("fullchain", ""), data.get("privkey", ""),
+                            node=data.get("identifier") or data.get("node") or "")
 
                     resp = {
                         "header": {
