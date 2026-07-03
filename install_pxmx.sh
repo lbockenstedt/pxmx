@@ -20,17 +20,38 @@ SPOKE_ID_PINNED=0
 SPOKE_SECRET="lm-secret"
 
 # Parse arguments
+# TLS cert verification is OFF by default (self-signed hub cert → encrypt
+# without auth). Pass --tls-verify --tls-ca-cert <path> to make this spoke
+# verify the hub cert. A standalone pxmx spoke is on a different box than the
+# hub, so the hub CA cert MUST be supplied (--tls-ca-cert) — there is no local
+# hub cert to default to.
+TLS_VERIFY=false
+TLS_CA_CERT=""
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --hub) HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
         --id|--name) SPOKE_ID="$2"; SPOKE_ID_PINNED=1; shift ;;
         --secret) SPOKE_SECRET="$2"; shift ;;
         --hub-secret) HUB_SECRET="$2"; shift ;;
+        --tls-verify)  TLS_VERIFY=true ;;
+        --tls-ca-cert) shift; TLS_CA_CERT="$1" ;;
         --all-prereqs) ;;  # no-op (system prereqs are always installed); accepted so the Hub's install-module call doesn't abort
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
+
+if $TLS_VERIFY && [ -z "$TLS_CA_CERT" ]; then
+    echo "❌ --tls-verify requires --tls-ca-cert <path> on a standalone spoke (the hub CA cert is not on this box)."
+    exit 1
+fi
+if $TLS_VERIFY; then
+    HUB_TLS_VERIFY_ENV=1
+    HUB_TLS_CA_ENV="$TLS_CA_CERT"
+else
+    HUB_TLS_VERIFY_ENV=0
+    HUB_TLS_CA_ENV=""
+fi
 
 if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
     SPOKE_SECRET=""
@@ -156,8 +177,21 @@ if ! grep -q "^LM_TLS_CERT=" .env 2>/dev/null; then
         echo "LM_TLS_CERT=$PXMX_CERT"
         echo "LM_TLS_KEY=$PXMX_KEY"
         echo "LM_PXMX_AGENT_PORT=443"
-        echo "LM_HUB_TLS_VERIFY=0"
+        echo "LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV"
+        [ -n "$HUB_TLS_CA_ENV" ] && echo "LM_HUB_CA_CERT=$HUB_TLS_CA_ENV"
     } >> .env
+fi
+# A re-install toggling --tls-verify should update an existing .env, not leave
+# a stale setting from a prior install.
+if [ -f .env ]; then
+    sed -i "s|^LM_HUB_TLS_VERIFY=.*|LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV|" .env 2>/dev/null || true
+    if [ -n "$HUB_TLS_CA_ENV" ]; then
+        grep -q "^LM_HUB_CA_CERT=" .env 2>/dev/null \
+            && sed -i "s|^LM_HUB_CA_CERT=.*|LM_HUB_CA_CERT=$HUB_TLS_CA_ENV|" .env \
+            || echo "LM_HUB_CA_CERT=$HUB_TLS_CA_ENV" >> .env
+    else
+        sed -i "/^LM_HUB_CA_CERT=/d" .env 2>/dev/null || true
+    fi
 fi
 
 # --- Agent Secret (shared with local Proxmox agent on this machine) ---
@@ -202,6 +236,10 @@ SECRET_ARG=""
 HUB_SECRET_ARG=""
 [ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret=$HUB_SECRET"
 
+# Build the verify fragment for the unit Environment line (empty when off).
+_TLS_CA_UNIT=""
+[ -n "$HUB_TLS_CA_ENV" ] && _TLS_CA_UNIT=" LM_HUB_CA_CERT=$HUB_TLS_CA_ENV"
+
 cat <<EOF > /etc/systemd/system/lm-pxmx.service
 [Unit]
 Description=Lab Manager Spoke - Proxmox Manager
@@ -214,8 +252,10 @@ WorkingDirectory=$INSTALL_DIR/pxmx
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/pxmx/src"
 EnvironmentFile=$INSTALL_DIR/pxmx/.env
 # TLS: the pxmx agent listener serves wss on LM_PXMX_AGENT_PORT (443 for a
-# standalone pxmx spoke). AmbientCapabilities lets svc_lm bind 443 non-root.
-Environment=LM_PXMX_AGENT_PORT=443 LM_HUB_TLS_VERIFY=0
+# standalone pxmx spoke). Cert verification OFF by default; --tls-verify at
+# install sets LM_HUB_TLS_VERIFY=1 + LM_HUB_CA_CERT so this spoke verifies the
+# hub. AmbientCapabilities lets svc_lm bind 443 non-root.
+Environment=LM_PXMX_AGENT_PORT=443 LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV$_TLS_CA_UNIT
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ExecStart=$INSTALL_DIR/pxmx/venv/bin/python3 -m src.control_plane $ID_ARG --hub "\${HUB_URL}" $SECRET_ARG $HUB_SECRET_ARG
