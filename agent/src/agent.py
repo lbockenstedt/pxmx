@@ -1513,7 +1513,14 @@ class ProxmoxAgent:
                     ssl_ctx = _ssl.create_default_context(cafile=os.environ["LM_HUB_CA_CERT"].strip())
                     _tls_mode = f"TLS verified (CA={os.environ['LM_HUB_CA_CERT'].strip()})"
                 else:
-                    ssl_ctx = _ssl.create_unverified_context()
+                    # NOTE: the public name is ssl.create_default_context(); the
+                    # unverified builder is the PRIVATE ssl._create_unverified_context()
+                    # (leading underscore). Calling ssl.create_unverified_context()
+                    # raises AttributeError → ssl_ctx=None → websockets rejects
+                    # ssl=None on a wss:// URI ("ssl=None is incompatible with a
+                    # wss:// URI") and the agent retry-loops forever. Mirrors
+                    # BaseControlPlane._client_ssl_ctx in lm core.
+                    ssl_ctx = _ssl._create_unverified_context()
                     _tls_mode = "TLS unverified (self-signed cert)"
             except Exception as e:
                 logger.warning(f"wss SSL context build failed: {e}; connecting without TLS")
