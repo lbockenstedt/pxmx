@@ -96,13 +96,14 @@ fi
 # When --spoke-url was not given (and no SPOKE_URL env), auto-locate the hub box
 # via DNS (lm-hub.<dns-suffix>) then mDNS (_lm-hub._tcp.local.) using the
 # just-installed venv + the vendored src/discovery.py, targeting the hub box's
-# agent listener on :8766 (--port-override 8766; the hub advertises 8765 with an
-# agent_port=8766 TXT record). If nothing is found, leave SPOKE_URL empty — the
-# agent re-discovers at startup (agent _resolve_spoke_url sentinel) once the hub
-# is up. cwd is $INSTALL_DIR so `src.discovery` imports (src/ is a package dir).
+# agent listener (--agent-listener reads the agent_port TXT; the hub advertises
+# 8443 when TLS is on, 8766 legacy, and returns wss:// when the hub has a cert).
+# If nothing is found, leave SPOKE_URL empty — the agent re-discovers at startup
+# (agent _resolve_spoke_url sentinel) once the hub is up. cwd is $INSTALL_DIR so
+# `src.discovery` imports (src/ is a package dir).
 if [ "$SPOKE_URL_PINNED" != "1" ]; then
-    echo "🔎 No --spoke-url given; auto-discovering the LM hub box (DNS lm-hub.* / mDNS, port 8766)…"
-    DISCOVERED=$(cd "$INSTALL_DIR" && "./venv/bin/python3" -m src.discovery --timeout 5 --port-override 8766 2>/dev/null || echo NONE)
+    echo "🔎 No --spoke-url given; auto-discovering the LM hub box (DNS lm-hub.* / mDNS, agent listener)…"
+    DISCOVERED=$(cd "$INSTALL_DIR" && "./venv/bin/python3" -m src.discovery --timeout 5 --agent-listener 2>/dev/null || echo NONE)
     if [ -n "$DISCOVERED" ] && [ "$DISCOVERED" != "NONE" ]; then
         SPOKE_URL="$DISCOVERED"
         echo "✅ Discovered hub box: $SPOKE_URL"

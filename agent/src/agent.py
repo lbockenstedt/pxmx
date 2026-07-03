@@ -1336,7 +1336,7 @@ class ProxmoxAgent:
                 logger.warning("discovery module unavailable — cannot auto-discover "
                                "the hub; pass --spoke-url or set SPOKE_URL.")
                 return
-        url = discover_hub_url(timeout=5.0, port_override=8766)
+        url = discover_hub_url(timeout=5.0, agent_listener=True)
         if url:
             self.spoke_url = url
             logger.info(f"Auto-discovered hub (agent listener) at {url}")
@@ -1420,7 +1420,23 @@ class ProxmoxAgent:
         import websockets
         logger.info(f"pxmx-agent {version} connecting to {self.spoke_url}...")
 
-        async with websockets.connect(self.spoke_url) as websocket:
+        # TLS: a wss:// spoke_url gets an SSL context (verify-off by default for
+        # the hub box's self-signed cert; LM_HUB_TLS_VERIFY=1 + LM_HUB_CA_CERT
+        # verifies). ws:// stays plaintext. Mirrors BaseControlPlane._client_ssl_ctx.
+        ssl_ctx = None
+        if self.spoke_url.lower().startswith("wss://"):
+            try:
+                import ssl as _ssl
+                if os.environ.get("LM_HUB_TLS_VERIFY", "0").strip() in ("1", "true", "yes") \
+                        and os.environ.get("LM_HUB_CA_CERT", "").strip():
+                    ssl_ctx = _ssl.create_default_context(cafile=os.environ["LM_HUB_CA_CERT"].strip())
+                else:
+                    ssl_ctx = _ssl.create_unverified_context()
+            except Exception as e:
+                logger.warning(f"wss SSL context build failed: {e}; connecting without TLS")
+                ssl_ctx = None
+
+        async with websockets.connect(self.spoke_url, ssl=ssl_ctx) as websocket:
             self.websocket = websocket
 
             # 1. Agent → Spoke handshake

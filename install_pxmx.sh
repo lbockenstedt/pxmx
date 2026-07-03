@@ -126,6 +126,40 @@ SPOKE_SECRET=$SPOKE_SECRET
 HUB_SECRET=$HUB_SECRET
 EOF
 
+# ── TLS for the pxmx agent listener (remote Proxmox agents report in) ──────
+# A standalone pxmx spoke serves wss on LM_PXMX_AGENT_PORT (443 here — this box
+# isn't the hub, so 443 is free). The cert is self-signed; agents skip
+# verification by default (set LM_HUB_TLS_VERIFY=1 + LM_HUB_CA_CERT to verify).
+# Skip gracefully if openssl is absent → listener stays plaintext on :8766.
+PXMX_CERT_DIR="$INSTALL_DIR/pxmx/certs"
+PXMX_CERT="$PXMX_CERT_DIR/hub.crt"
+PXMX_KEY="$PXMX_CERT_DIR/hub.key"
+mkdir -p "$PXMX_CERT_DIR"
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "⚠️  openssl not found — skipping pxmx TLS cert (agent listener stays plaintext :8766)."
+elif [ -f "$PXMX_CERT" ] && [ -f "$PXMX_KEY" ]; then
+    echo "🔒 pxmx TLS cert already present at $PXMX_CERT — preserving."
+else
+    echo "🔒 Generating self-signed pxmx TLS cert at $PXMX_CERT…"
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$PXMX_KEY" -out "$PXMX_CERT" -days 3650 \
+        -subj "/CN=lm-pxmx" -addext "subjectAltName=IP:127.0.0.1,DNS:lm-hub,DNS:lm-hub.local" \
+        >/dev/null 2>&1 || echo "⚠️  openssl cert generation failed — agent listener stays plaintext."
+fi
+if [ -f "$PXMX_KEY" ]; then
+    chmod 600 "$PXMX_KEY"
+    chown svc_lm:svc_lm "$PXMX_KEY" "$PXMX_CERT" 2>/dev/null || true
+fi
+# Persist the TLS knobs into .env (the unit's EnvironmentFile loads these).
+if ! grep -q "^LM_TLS_CERT=" .env 2>/dev/null; then
+    {
+        echo "LM_TLS_CERT=$PXMX_CERT"
+        echo "LM_TLS_KEY=$PXMX_KEY"
+        echo "LM_PXMX_AGENT_PORT=443"
+        echo "LM_HUB_TLS_VERIFY=0"
+    } >> .env
+fi
+
 # --- Agent Secret (shared with local Proxmox agent on this machine) ---
 # Preserve an existing agent_secret so a re-install doesn't break a running agent.
 AGENT_CONFIG="/etc/lm-agent/config.json"
@@ -179,6 +213,11 @@ User=svc_lm
 WorkingDirectory=$INSTALL_DIR/pxmx
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/pxmx/src"
 EnvironmentFile=$INSTALL_DIR/pxmx/.env
+# TLS: the pxmx agent listener serves wss on LM_PXMX_AGENT_PORT (443 for a
+# standalone pxmx spoke). AmbientCapabilities lets svc_lm bind 443 non-root.
+Environment=LM_PXMX_AGENT_PORT=443 LM_HUB_TLS_VERIFY=0
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ExecStart=$INSTALL_DIR/pxmx/venv/bin/python3 -m src.control_plane $ID_ARG --hub "\${HUB_URL}" $SECRET_ARG $HUB_SECRET_ARG
 StandardOutput=append:/var/log/lm/lm-pxmx.log
 StandardError=append:/var/log/lm/lm-pxmx.log

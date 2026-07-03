@@ -38,6 +38,7 @@ import logging
 import hmac
 import argparse
 import os
+import ssl
 from typing import Any, Dict, List, Optional
 try:
     from core.src.messaging.control_plane import BaseControlPlane
@@ -166,14 +167,32 @@ class PxmxControlPlane(BaseControlPlane):
     # ── Agent WebSocket server ────────────────────────────────────────────────
 
     async def run_agent_server(self):
-        """Serve the pxmx agent listener on :8766 (retries up to 10× on EADDRINUSE)."""
-        port = 8766
+        """Serve the pxmx agent listener.
+
+        When the hub box has a TLS cert (``LM_TLS_CERT``/``LM_TLS_KEY``) the
+        listener is ``wss`` on ``LM_PXMX_AGENT_PORT`` (default 8443 — avoids
+        colliding with the hub's 443 when co-located; a standalone pxmx spoke
+        sets it to 443). The hub advertises this port in mDNS TXT ``agent_port``
+        so pxmx agents discover it. Without a cert the listener stays plaintext
+        on the legacy :8766. Retries up to 10× on EADDRINUSE."""
+        cert = os.environ.get("LM_TLS_CERT", "").strip()
+        key = os.environ.get("LM_TLS_KEY", "").strip()
+        if cert and key:
+            port = int(os.environ.get("LM_PXMX_AGENT_PORT", "8443"))
+            server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_ctx.load_cert_chain(cert, key)
+            serve_kwargs = {"ssl": server_ctx}
+            scheme = "wss"
+        else:
+            port = int(os.environ.get("LM_PXMX_AGENT_PORT", "8766"))
+            serve_kwargs = {}
+            scheme = "ws"
         for attempt in range(10):
             try:
                 async with websockets.serve(
-                    self._agent_handler, "0.0.0.0", port,
+                    self._agent_handler, "0.0.0.0", port, **serve_kwargs,
                 ):
-                    logger.info(f"Agent listener on :{port}")
+                    logger.info(f"Agent listener on {scheme}://0.0.0.0:{port}")
                     await asyncio.Future()
                 return
             except OSError as e:
