@@ -82,8 +82,30 @@ async def _terminal(agent, cs_cmd_id: str, action: str, status: str,
 # ── core destroy (shared by delete_vm / reclone / provision-loop teardown) ──
 
 
+async def _expire_pending_commands(agent, vmid: int, kind: str) -> None:
+    """Best-effort: purge any commands still queued for this VM's guest
+    hostname BEFORE destroying it (bash ``_expire_vm_pending_commands`` +
+    ``destroy_vm``, proxmox-agent.sh:2138-2157). Without this a stale command
+    (e.g. a queued reboot) sits in the cs spoke's inbox and gets delivered to
+    whatever guest reuses this vmid slot next, causing a surprise reboot on a
+    brand-new VM. The spoke's ``CS_CLEAR_COMMANDS`` handler already supports
+    a ``target``-scoped purge for exactly this (cs_spoke.py's comment there
+    literally calls out "pre-teardown-expire") — it was just never invoked
+    from the agent side. Relayed hub-side via the CS_* ingest map (main.py
+    ``_CS_INGEST_MAP``); never raises — a failed purge must not block the
+    destroy that follows."""
+    try:
+        cfg = await (pve_cmds.pct_config(vmid) if kind == "lxc" else pve_cmds.qm_config(vmid))
+        hostname = cfg.get("hostname" if kind == "lxc" else "name")
+        if hostname:
+            await agent.send_cs_event("CS_EXPIRE_PENDING_COMMANDS", {"target": hostname})
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"destroy_vm {vmid}: pending-command expire failed: {e}")
+
+
 async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
-                     protected: Optional[set] = None) -> Dict[str, Any]:
+                     protected: Optional[set] = None,
+                     exclude_bus_after: bool = False) -> Dict[str, Any]:
     """Stop + destroy a sim VM (bash ``_destroy_guest_only`` 1740-1816 +
     ``destroy_vm`` 2147-2183). Returns ``{ok, orphaned, bus, kind, fails?}``.
 
@@ -92,11 +114,23 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
     the VM is declared an orphan (bus released for re-provisioning). Used by the
     ``delete_vm`` long-op, the reclone flow, and the USB provision loop's
     missing-dongle teardown (which passes ``bus`` from state).
+
+    ``exclude_bus_after``: mirrors bash's ``destroy_vm "$vmid" "" "1" "1"``
+    (the ``exclude_bus=1`` arg, proxmox-agent.sh:4066-4073) — an explicit
+    admin delete (not a reclone, not the provision loop's own missing-dongle
+    teardown) marks the bus excluded so the NEXT provision tick doesn't just
+    reclone a fresh VM for the same still-plugged-in dongle. Without this the
+    delete_vm long-op cleared the assignment and nothing else, so a dongle
+    that was never unplugged got silently reprovisioned within one tick.
+    The exclusion self-clears once the dongle is actually unplugged
+    (usb_provision's reconcile step, "Clear exclusions ... for buses no
+    longer present") — it is not a permanent ban.
     """
     prot = protected if protected is not None else _protected(agent)
     vid = assert_sim_vm(vmid, prot)  # GuardError if invalid → caller handles
     kind = await pve_cmds.detect_guest_type(vid)
     bus = bus or usb_provision.bus_for_vmid(vid)
+    await _expire_pending_commands(agent, vid, kind)
     if kind == "lxc":
         await pve_cmds.pct_stop(vid, prot)
         ok = await pve_cmds.pct_destroy(vid, prot)
@@ -107,10 +141,14 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
         usb_provision.clear_assignment(vid, bus)
         usb_provision.clear_destroy_fails(vid)
         usb_provision.remove_orphan_vm(vid)
+        if exclude_bus_after and bus:
+            usb_provision.exclude_bus(bus)
         return {"ok": True, "orphaned": False, "bus": bus, "kind": kind}
     res = usb_provision.record_destroy_fail(vid, bus or "")
     if res["orphaned"]:
         usb_provision.clear_assignment(vid, bus)
+        if exclude_bus_after and bus:
+            usb_provision.exclude_bus(bus)
     return {"ok": False, "orphaned": res["orphaned"], "bus": bus,
             "kind": kind, "fails": res["count"]}
 
@@ -123,7 +161,7 @@ async def _delete_vm(agent, data, cs_cmd_id) -> None:
     prot = _protected(agent)
     vid = assert_sim_vm(vmid, prot)  # raises → run_long_op emits terminal failed
     await _progress(agent, cs_cmd_id, "delete_vm", "running", "stopping", 10, vmid=vid)
-    r = await destroy_vm(agent, vid, protected=prot)
+    r = await destroy_vm(agent, vid, protected=prot, exclude_bus_after=True)
     if r["ok"]:
         await _terminal(agent, cs_cmd_id, "delete_vm", "completed",
                         f"VM {vid} destroyed", vmid=vid, kind=r["kind"])

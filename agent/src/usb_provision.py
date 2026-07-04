@@ -227,6 +227,19 @@ async def sample_resources(agent) -> None:
         logger.debug("sample_resources failed: %s", exc)
 
 
+async def _current_cpu_pct(agent) -> Optional[float]:
+    """Fresh CPU% from the same Proxmox node-stats source as sample_resources
+    (not /proc/stat, not psutil — see sample_resources' docstring for why).
+    Used only by the reclone-concurrency pacing gate to recheck load between
+    staggered clone starts within a single provisioning batch."""
+    try:
+        stats = await agent.get_node_stats()
+        nodes = (stats or {}).get("nodes", []) or []
+        return float(nodes[0].get("cpu_usage", 0) or 0) if nodes else None
+    except Exception:
+        return None
+
+
 def _resource_1h_average(samples: Deque[Tuple[float, float]]) -> Optional[float]:
     if not samples:
         return None
@@ -581,7 +594,8 @@ QUARANTINE_MAX_FAILS = 3  # bash line 1217: a bus is quarantined after 3 fails
 
 def _new_usb_state() -> Dict[str, Any]:
     return {"vmid_to_bus": {}, "bus_to_vmid": {}, "vmid_to_image": {},
-            "excluded_buses": {}, "quarantined": {}, "missing_since": {}}
+            "excluded_buses": {}, "quarantined": {}, "missing_since": {},
+            "vidpid_by_bus": {}, "post_prov_retry": {}}
 
 
 def load_usb_state() -> Dict[str, Any]:
@@ -920,8 +934,14 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     certified_types = _certified_types(agent)
     sim_phy = str(usb_cfg.get("sim_phy") or "any").lower()
     use_all = bool(usb_cfg.get("use_all_dongles", False))
-    img1 = usb_cfg.get("image1_template_id")
-    img2 = usb_cfg.get("image2_template_id")
+    # Validate the configured template ids are actually runnable Proxmox
+    # templates before trusting them as clone sources — a stale/deleted
+    # template id would otherwise fail every clone silently (bash
+    # resolve_template_vmid, proxmox-agent.sh:901-944). Falls back to the
+    # lowest-numbered valid template on the cluster if the configured one no
+    # longer checks out; stays None (as before) when nothing is configured.
+    img1 = await _resolve_template_vmid(usb_cfg.get("image1_template_id"))
+    img2 = await _resolve_template_vmid(usb_cfg.get("image2_template_id"))
     img1_pct = int(usb_cfg.get("image1_pct", 50) or 50)
     # Per-host VMID batch: the cs speak emits vmid_start/vmid_end in usb_config
     # (defaults 90000/99999). When those are at the default the agent derives
@@ -945,7 +965,12 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     missing_timeout = int(_cfg_first(usb_cfg,
                                      ("usb_missing_timeout_seconds", "usb_missing_timeout",
                                       "missing_timeout"), 0) or 0)
-    concurrency = max(1, int(usb_cfg.get("reclone_concurrency", 2) or 2))
+    # Default 1 (sequential), matching bash's explicit safety default
+    # (RECLONE_CONCURRENCY=1, proxmox-agent.sh:114) — parallel clones are an
+    # explicit admin opt-in, not the out-of-the-box behavior; N simultaneous
+    # `qm clone` disk copies can swamp host I/O/CPU on a box already running
+    # sim VMs.
+    concurrency = max(1, int(usb_cfg.get("reclone_concurrency", 1) or 1))
 
     # Config snapshot for telemetry: lets the UI show WHICH precondition is missing
     # (dongle_vidpids count, template ids set, slot cap, vmid range). active_usb_vms
@@ -976,15 +1001,42 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             state["bus_to_vmid"].pop(bus, None)
             state["vmid_to_bus"].pop(vmid, None)
             state["vmid_to_image"].pop(vmid, None)
+            state.setdefault("vidpid_by_bus", {}).pop(bus, None)
+    # Remember each tracked bus's vidpid while it's actually present, so a
+    # dongle that later moves to a different bus path (unplugged/replugged
+    # into a different physical port) can still be matched by vidpid below
+    # (bash build_usb_state_json 1565-1572: "use live-scanned vidpid... update
+    # stored value so it persists after the dongle goes physically missing").
+    for bus in list(state["bus_to_vmid"]):
+        if bus in present:
+            state.setdefault("vidpid_by_bus", {})[bus] = present[bus].get("vidpid")
     # Clear exclusions/quarantine for buses no longer present.
     for bus in list(state["excluded_buses"]):
         if bus not in present:
             state["excluded_buses"].pop(bus, None)
+    # Auto-clear quarantine only after it's been BOTH absent AND quarantined
+    # for >= 2x missing_timeout (bash load_usb_quarantine, proxmox-agent.sh:
+    # 1231-1244) — clearing the instant a quarantined dongle is merely
+    # unplugged defeated the point of quarantine: a flaky/bad dongle bouncing
+    # in and out would get a fresh provisioning attempt on every replug.
     quarantine = _read_quarantine()
     for bus in list(quarantine):
-        if bus not in present:
+        if bus in present:
+            continue
+        since = (quarantine[bus] or {}).get("since")
+        if missing_timeout > 0 and since is not None and \
+                now - float(since) >= missing_timeout * 2:
             quarantine.pop(bus, None)
+            logger.info(f"provision loop: quarantine auto-cleared for {bus} "
+                       f"(absent >= {missing_timeout * 2}s since last failure)")
     _save_quarantine(quarantine)
+
+    # 1c. Post-provisioning retry queue — runs unconditionally (matches bash
+    # calling _run_post_prov_retry_queue independently of the AUTO_PROVISION
+    # toggle, proxmox-agent.sh:5068): a VM already cloned before the toggle
+    # was switched off still deserves its update.sh retry / 1h reclone.
+    if await _run_post_prov_retry_queue(agent, state):
+        save_usb_state(state)
 
     torn_down: List[int] = []
 
@@ -1072,6 +1124,39 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             except Exception as e:  # noqa: BLE001
                 logger.warning("auto-provision delete gate: destroy %s failed: %s",
                                target_vmid, e)
+
+    # 4b. Bus-migration reconciliation (bash reconcile_present_usb_state,
+    # proxmox-agent.sh:1509-1556, called right before the missing-dongle scan
+    # below). A dongle unplugged and replugged into a DIFFERENT physical port
+    # gets a new bus path from the kernel, even though it's the exact same
+    # device (same vidpid). Without this, the old bus just starts accumulating
+    # missing_since and eventually tears down + reprovisions a VM the dongle
+    # never actually left — while the new bus sits there unrecognized. Follow
+    # the vidpid to its new bus instead, as long as that bus isn't already
+    # claimed by a different tracked VM.
+    vidpid_by_bus = state.setdefault("vidpid_by_bus", {})
+    for old_bus, vmid in list(state["bus_to_vmid"].items()):
+        if old_bus in present:
+            continue  # still on the same bus — nothing to migrate
+        vidpid = vidpid_by_bus.get(old_bus)
+        if not vidpid:
+            continue
+        new_bus = next((b for b, info in present.items()
+                        if info.get("vidpid") == vidpid and b != old_bus), None)
+        if not new_bus:
+            continue
+        other_vmid = state["bus_to_vmid"].get(new_bus)
+        if other_vmid and other_vmid != vmid:
+            continue  # new bus already claimed by a different tracked VM
+        state["bus_to_vmid"].pop(old_bus, None)
+        state["missing_since"].pop(old_bus, None)
+        vidpid_by_bus.pop(old_bus, None)
+        state["vmid_to_bus"][vmid] = new_bus
+        state["bus_to_vmid"][new_bus] = vmid
+        state["missing_since"].pop(new_bus, None)
+        vidpid_by_bus[new_bus] = vidpid
+        logger.info(f"provision loop: USB dongle {vidpid} moved from {old_bus} "
+                   f"to {new_bus}, following assignment for VM {vmid}")
 
     # 5. Missing-dongle teardown (only when the toggle is on).
     if missing_timeout > 0:
@@ -1198,8 +1283,20 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
 
     existing_after = set(await pve_cmds.list_all_vmids())
     img1_count = sum(1 for v in state["vmid_to_image"].values() if v == 1)
+    protected = _protected_vmids(agent)
 
     sem = asyncio.Semaphore(concurrency)
+    # Stagger + CPU-ramp-ceiling pacing (bash 2786-2819) — only matters when an
+    # admin explicitly raises reclone_concurrency above the sequential default,
+    # so N parallel `qm clone`s don't all pile onto the host CPU at once. A
+    # shared admission counter (not just the semaphore) gives every clone in
+    # the batch a stable "am I the 1st/2nd/3rd..." position regardless of
+    # gather()'s scheduling order, and a shared halt flag stops any clone not
+    # yet admitted once the ceiling is crossed (bash reverts the whole
+    # remaining batch for the same reason).
+    _admission_lock = asyncio.Lock()
+    _admitted = [0]
+    _pacing_halted = [False]
 
     # prov_run live state (cs _default_provision_run_state 3576-3586): one item
     # per dongle, status provisioning → done/failed as each clone settles.
@@ -1213,6 +1310,23 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     async def _do(bus: str) -> bool:
         info = present[bus]
         async with sem:
+            if _pacing_halted[0]:
+                item_by_bus[bus]["status"] = "failed"
+                return False
+            async with _admission_lock:
+                my_slot = _admitted[0]
+                _admitted[0] += 1
+            if my_slot > 0 and concurrency > 1:
+                await asyncio.sleep(14)
+                cpu_now = await _current_cpu_pct(agent)
+                if cpu_now is not None and cpu_now >= cpu_prov_ceil:
+                    _pacing_halted[0] = True
+                    logger.warning(
+                        "provision loop: pacing — CPU %.0f%% >= ramp ceiling %s%% "
+                        "— stopping batch after %d clone(s)",
+                        cpu_now, cpu_prov_ceil, my_slot)
+                    item_by_bus[bus]["status"] = "failed"
+                    return False
             # The clone-source templates (image1/2_template_id) must stay OUTSIDE
             # the allocation pool: a sim VM must never grab a template's VMID
             # (cloning "from" a sim VM, or colliding when a deleted template's
@@ -1228,12 +1342,25 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                         templates.add(_tv)
                 except (TypeError, ValueError):
                     pass
-            # Find a free vmid in the sim range.
+            # Find a free vmid in the sim range. A vid that's in Proxmox
+            # (existing_after) but NOT in our own vmid_to_bus tracking is a
+            # zombie — a leftover from a prior failed clone/destroy that
+            # never fully cleaned up (bash clone_vm_for_usb's pre-clone
+            # zombie cleanup, proxmox-agent.sh:1900-1949). Reclaim it via a
+            # force stop+destroy instead of permanently losing that VMID
+            # from the pool; give up on this vid (not the whole dongle) if
+            # reclamation fails and move to the next candidate.
             vid = start
-            while vid <= end and (str(vid) in state["vmid_to_bus"]
-                                  or vid in existing_after
-                                  or vid in templates):
-                vid += 1
+            while vid <= end:
+                if str(vid) in state["vmid_to_bus"] or vid in templates:
+                    vid += 1
+                    continue
+                if vid in existing_after:
+                    if vid in protected or not await _reclaim_zombie_vmid(agent, vid):
+                        vid += 1
+                        continue
+                    existing_after.discard(vid)
+                break
             if vid > end:
                 logger.info("provision loop: no free VM slot — stopping")
                 item_by_bus[bus]["status"] = "failed"
@@ -1249,7 +1376,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 return False
             try:
                 await _clone_and_provision(agent, vid, bus, info, int(template),
-                                            image_num)
+                                            image_num, state)
                 state["vmid_to_bus"][str(vid)] = bus
                 state["bus_to_vmid"][bus] = str(vid)
                 state["vmid_to_image"][str(vid)] = image_num
@@ -1332,9 +1459,16 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
 
 async def _clone_and_provision(agent, vmid: int, bus: str,
                                 info: Dict[str, Any], template: int,
-                                image_num: int) -> None:
+                                image_num: int, state: Dict[str, Any]) -> None:
     """Clone a template → vmid, attach the USB dongle, start, wait for the guest
-    agent, set the hostname (bash ``clone_vm_for_usb`` 1943-2098, slimmed)."""
+    agent, set the hostname (bash ``clone_vm_for_usb`` 1943-2098, slimmed).
+
+    ``state`` is the caller's in-memory usb_state (shared, not reloaded from
+    disk here) — a post-prov-retry entry is written straight into it rather
+    than through its own load/save round trip, because the caller's `_do()`
+    saves the WHOLE state object once at the end of the tick; a separate
+    load+save here would get silently overwritten by that later blanket save.
+    """
     from . import pve_cmds
     protected = _protected_vmids(agent)
     name = _vm_name(vmid) or f"sim-{vmid}-{info.get('type', 'wireless')}"
@@ -1373,13 +1507,176 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
         await asyncio.sleep(5)
     # Best-effort: tell the guest's startup.sh which USB phy type it's bound to
     # (bash 2046). Best-effort — /usr/local/scripts may not exist on every image.
-    pve_cmds.qm_guest_exec_shell(
+    # qm_guest_exec_shell is a coroutine — missing await here meant this was
+    # created and immediately discarded, so the guest never actually received
+    # this write and startup.sh could never see which phy type it was bound to.
+    await pve_cmds.qm_guest_exec_shell(
         vmid, f"echo 'sim_phy={dtype}' > /usr/local/scripts/usb-phy-override.conf",
         exec_timeout=60, outer_timeout=90, protected=protected)
     set_assignment(vmid, bus, image_num)
     remove_orphan_vm(vmid)
 
+    # Reboot so the guest picks up the hostname/sim_phy changes, then run
+    # update.sh once it comes back — it needs the latest scripts before
+    # startup.sh runs for the first time (bash clone_vm_for_usb 2050-2097).
+    # `qm guest exec ... reboot` never replies (the guest agent dies with the
+    # reboot), so this is fire-and-forget like bash's `|| true`.
+    try:
+        await pve_cmds.qm_guest_exec(vmid, "reboot", protected=protected)
+    except Exception:
+        pass
+    came_back = False
+    deadline = time.time() + 300  # bash's 5-minute reboot deadline
+    while time.time() < deadline:
+        await asyncio.sleep(5)
+        if await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10):
+            came_back = True
+            break
+    if came_back:
+        try:
+            await pve_cmds.qm_guest_exec_shell(
+                vmid, "bash /usr/local/scripts/update.sh",
+                exec_timeout=300, outer_timeout=360, protected=protected)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"provision loop: update.sh failed on VM {vmid} "
+                          f"(will retry on next boot): {e}")
+    else:
+        # Guest didn't come back in time — queue for the post-prov retry loop
+        # instead of failing the whole provision (bash 2086-2097): check every
+        # 10 min, reclone after 1h if it never responds.
+        now_ts = time.time()
+        state.setdefault("post_prov_retry", {})[str(vmid)] = {
+            "start_ts": now_ts, "last_ts": now_ts, "bus": bus,
+            "image_num": image_num, "device_type": dtype,
+        }
+        logger.warning(f"provision loop: VM {vmid} did not come back after reboot "
+                       "— queued for post-prov retry (10-min interval, reclone after 1h)")
+
+
+async def _run_post_prov_retry_queue(agent, state: Dict[str, Any]) -> bool:
+    """Retry VMs whose post-clone reboot didn't come back in time (bash
+    ``_run_post_prov_retry_queue``, proxmox-agent.sh:2188-2272). Every 10
+    minutes: ping the guest again; if it responds, run update.sh and clear
+    the retry entry; past 1 hour unresponsive, destroy the VM so the normal
+    provisioning pass reclones it fresh. Returns True if ``state`` was
+    mutated (caller should persist it)."""
+    retry = state.get("post_prov_retry") or {}
+    if not retry:
+        return False
+    from . import cs_sim
+    protected = _protected_vmids(agent)
+    now = time.time()
+    mutated = False
+    for vmid_s, entry in list(retry.items()):
+        vmid = int(vmid_s)
+        if now - float(entry.get("last_ts", 0)) < 600:
+            continue
+        bus = entry.get("bus")
+        if state["vmid_to_bus"].get(vmid_s) != bus:
+            logger.info(f"post-prov retry: VM {vmid} bus mismatch (stale entry) — dropping")
+            retry.pop(vmid_s, None)
+            mutated = True
+            continue
+        cfg = await pve_cmds.qm_config(vmid)
+        if not cfg:
+            logger.info(f"post-prov retry: VM {vmid} no longer exists — dropping retry entry")
+            retry.pop(vmid_s, None)
+            mutated = True
+            continue
+        elapsed = now - float(entry.get("start_ts", now))
+        responded = await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10)
+        if responded:
+            logger.info(f"post-prov retry: VM {vmid} guest agent responded after "
+                       f"{int(elapsed)}s — running update.sh")
+            try:
+                await pve_cmds.qm_guest_exec_shell(
+                    vmid, "bash /usr/local/scripts/update.sh",
+                    exec_timeout=300, outer_timeout=360, protected=protected)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"post-prov retry: update.sh failed on VM {vmid}: {e}")
+            retry.pop(vmid_s, None)
+            mutated = True
+        elif elapsed > 3600:
+            logger.warning(f"post-prov retry: VM {vmid} unresponsive for >1h — "
+                           "destroying; provision loop will reclone")
+            retry.pop(vmid_s, None)
+            mutated = True
+            try:
+                await cs_sim.destroy_vm(agent, vmid, bus=bus, protected=protected)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"post-prov retry: destroy of {vmid} failed: {e}")
+            # destroy_vm persists its own clear_assignment write independently;
+            # mirror it into OUR in-memory state too so the caller's very next
+            # save_usb_state(state) call doesn't stomp that write with a stale
+            # copy that still shows this vmid assigned (same pattern as the
+            # out-of-range batch-migration teardown above).
+            state["bus_to_vmid"].pop(bus, None)
+            state["vmid_to_bus"].pop(vmid_s, None)
+            state["vmid_to_image"].pop(vmid_s, None)
+            state["missing_since"].pop(bus, None)
+            state.get("vidpid_by_bus", {}).pop(bus, None)
+        else:
+            entry["last_ts"] = now
+            mutated = True
+    return mutated
+
 
 def _protected_vmids(agent) -> Set[int]:
     from .cs_guard import resolve_protected_vmids
     return resolve_protected_vmids(agent.config.get("client_simulation"))
+
+
+async def _is_runnable_template(vmid: int) -> bool:
+    """True if ``vmid`` exists and is marked as a Proxmox template (bash
+    vmid_is_runnable_template: ``qm status`` succeeds + ``template: 1`` in
+    config). ``qm_config`` already returns ``{}`` for a nonexistent vmid, so
+    a missing/deleted template id falls straight through to False."""
+    cfg = await pve_cmds.qm_config(vmid)
+    return cfg.get("template") == "1"
+
+
+async def _resolve_template_vmid(configured: Any) -> Optional[int]:
+    """Validate a configured template vmid before trusting it as a clone
+    source; fall back to the lowest-numbered valid template on the cluster
+    if it no longer checks out (bash resolve_template_vmid, proxmox-agent.sh:
+    933-944). Returns None, unchanged, when nothing is configured — callers'
+    existing "no template configured" gates still apply."""
+    try:
+        cvid = int(configured) if configured else None
+    except (TypeError, ValueError):
+        cvid = None
+    if cvid is None:
+        return None
+    if await _is_runnable_template(cvid):
+        return cvid
+    logger.warning(f"provision loop: configured template vmid {cvid} is not a "
+                   "runnable template (deleted or no longer a template) — "
+                   "searching the cluster for a fallback")
+    for vid in sorted(await pve_cmds.list_qemu_vmids()):
+        if vid != cvid and await _is_runnable_template(vid):
+            logger.warning(f"provision loop: falling back to template vmid {vid}")
+            return vid
+    logger.error(f"provision loop: template vmid {cvid} is invalid and no "
+                "fallback template exists on the cluster — clones using it will fail")
+    return None
+
+
+async def _reclaim_zombie_vmid(agent, vid: int) -> bool:
+    """Force-destroy a leftover VM config at ``vid`` that Proxmox still has
+    but our own state no longer tracks — almost always a zombie left behind
+    by a prior failed clone/destroy (bash clone_vm_for_usb's pre-clone
+    zombie cleanup, proxmox-agent.sh:1900-1949). Returns True if ``vid`` is
+    now free to clone into; False to leave it alone and try the next vmid
+    (mirrors bash giving up on this one vmid, not the whole dongle)."""
+    from . import cs_sim
+    try:
+        r = await cs_sim.destroy_vm(agent, vid)
+    except Exception as e:  # noqa: BLE001 — GuardError or a pve_cmds failure
+        logger.warning(f"provision loop: zombie reclaim of {vid} failed: {e}")
+        return False
+    if r.get("ok"):
+        logger.warning(f"provision loop: reclaimed zombie VMID {vid} "
+                       "(existed in Proxmox with no tracked assignment)")
+        return True
+    logger.warning(f"provision loop: could not destroy zombie VMID {vid} — skipping")
+    return False
