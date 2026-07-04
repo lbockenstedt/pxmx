@@ -48,6 +48,7 @@ import os
 import socket
 import tempfile
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 from .security_utils import MessageSigner
 from . import cs_commands
 from . import cs_sim
@@ -145,6 +146,47 @@ logger = logging.getLogger("PxmxAgent")
 # pending manifest + healthy marker here and rolls back a failed self-update.
 AGENT_STATE_DIR = os.environ.get("LM_PXMX_STATE_DIR", "/var/lib/pxmx/update-state")
 
+_AGENT_WS_PATH = "/ws/agent"
+_AGENT_DEFAULT_SCHEME = "wss"
+_AGENT_DEFAULT_PORT = "443"
+
+
+def _normalize_spoke_url(url: Optional[str]) -> Optional[str]:
+    """Fill in a pinned ``spoke_url``'s scheme/port/path with sane defaults.
+
+    ``websockets.connect()`` dials whatever URL it's given verbatim — no
+    rewriting. Auto-discovery (``discovery.discover_hub_url``) already builds a
+    fully-formed ``wss://host:443/ws/agent`` URL itself, but a manually-pinned
+    ``--spoke-url``/``SPOKE_URL`` is often given as just a bare host or
+    ``host:port`` (missing scheme and/or the ``/ws/agent`` path). Rather than
+    connect to the wrong thing and fail with a cryptic
+    ``1008 policy violation: unexpected path`` (or a bare-TCP scheme error),
+    default each missing piece: scheme -> ``wss``, port -> ``443``,
+    path -> ``/ws/agent``. Fixing it up front means it's simply never wrong to
+    begin with, instead of retrying reactively after a connection failure.
+    Idempotent: an already-fully-specified URL passes through unchanged;
+    ``None``/``""``/``"auto"`` are left alone (the auto-discovery sentinel).
+    """
+    if not url or url == "auto":
+        return url
+    raw = url.strip()
+    if "://" not in raw:
+        raw = f"{_AGENT_DEFAULT_SCHEME}://{raw}"
+    parts = urlsplit(raw)
+    scheme = parts.scheme or _AGENT_DEFAULT_SCHEME
+    netloc = parts.netloc
+    # No port on the netloc (ignoring a bracketed IPv6 host's own colons) ->
+    # default to 443. A bare "host" with no "://" at all lands here too, since
+    # urlsplit puts everything after a missing scheme into .path, not .netloc
+    # — handled above by prepending the default scheme first.
+    host_part = netloc.rsplit("]", 1)[-1] if netloc else netloc
+    if netloc and ":" not in host_part:
+        netloc = f"{netloc}:{_AGENT_DEFAULT_PORT}"
+    path = parts.path.rstrip("/")
+    if not path.endswith(_AGENT_WS_PATH):
+        path = _AGENT_WS_PATH
+    return urlunsplit((scheme, netloc, path, "", ""))
+
 
 # Matches a MAC in either colon or dash form (case-insensitive): aa:bb:cc:dd:ee:ff
 _MAC_RE = re.compile(r"^[0-9a-f]{2}([:-]?[0-9a-f]{2}){5}$", re.IGNORECASE)
@@ -218,7 +260,7 @@ class ProxmoxAgent:
     """
 
     def __init__(self, spoke_url: str, agent_id: str, secret: Optional[str] = None):
-        self.spoke_url = spoke_url
+        self.spoke_url = _normalize_spoke_url(spoke_url)
         self.agent_id = agent_id
         self.secret = secret or self._load_secret()
         # No secret is OK — we will connect without one and wait for approval.
@@ -1418,8 +1460,8 @@ class ProxmoxAgent:
                 return
         url = discover_hub_url(timeout=5.0, agent_listener=True)
         if url:
-            self.spoke_url = url
-            logger.info(f"Auto-discovered hub (agent listener) at {url}")
+            self.spoke_url = _normalize_spoke_url(url)
+            logger.info(f"Auto-discovered hub (agent listener) at {self.spoke_url}")
         else:
             logger.warning("Hub auto-discovery found no hub (no lm-hub DNS record / "
                            "mDNS broadcast); will retry on reconnect. Pass --spoke-url to pin.")
