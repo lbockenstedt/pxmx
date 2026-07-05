@@ -1780,7 +1780,11 @@ class ProxmoxAgent:
                     data     = payload.get("data", {})
                     corr_id  = msg_data.get("header", {}).get("correlation_id")
 
-                    logger.info(f"Command: {cmd_type}")
+                    # DEBUG, not INFO: routine per-command trace (polls arrive
+                    # continuously); meaningful commands log their own INFO line
+                    # (e.g. UPDATE_CONFIG → "client_simulation enabled=true").
+                    # See logging-observability-contract.md (normalization).
+                    logger.debug(f"Command: {cmd_type}")
                     result = {"status": "ERROR", "message": "Unknown command"}
 
                     if cmd_type == "UPDATE_CONFIG":
@@ -2201,7 +2205,9 @@ class ProxmoxAgent:
                 if nodes.get("error"):
                     logger.error(f"get_node_stats error: {nodes['error']}")
 
-                logger.info(f"Telemetry: {len(vms.get('vms', []))} VMs, {len(nodes.get('nodes', []))} nodes")
+                # DEBUG, not INFO: emitted every telemetry tick (~60-65s) — pure
+                # steady-state noise at INFO. See logging-observability-contract.md.
+                logger.debug(f"Telemetry: {len(vms.get('vms', []))} VMs, {len(nodes.get('nodes', []))} nodes")
 
                 msg = {
                     "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
