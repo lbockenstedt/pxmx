@@ -22,7 +22,7 @@ A **bridge spoke**: connects the LM hub to one or more **pxmx host agents** runn
 
 The pxmx spoke's agent listener has two modes. **Which mode is deployed determines the whole agent path** — get this right or the agent gets `Connection refused`:
 
-- **Standalone (DEFAULT — agent → spoke → hub).** The pxmx spoke lives on its **own box**, separate from the hub. It serves `wss://0.0.0.0:443` (self-signed cert) and a Proxmox agent dials `wss://<spoke>:443/ws/agent` **directly**; the spoke then talks to the hub outbound. This is the design across the board. `install_pxmx.sh` (run directly on the spoke box) defaults to this — **no `--loopback`**. Because a standalone spoke does **not** broadcast `_lm-hub` mDNS (only the hub does), the agent **cannot auto-discover it** — the agent install must be **pinned**: `agent/install_agent.sh --spoke-url wss://<spoke-host>:443/ws/agent`. The installer prints this pinned command.
+- **Standalone (DEFAULT — agent → spoke → hub).** The pxmx spoke lives on its **own box**, separate from the hub. It serves `wss://0.0.0.0:443` (self-signed cert) and a Proxmox agent dials `wss://<spoke>:443/ws/agent` **directly**; the spoke then talks to the hub outbound. This is the design across the board. `install_pxmx.sh` (run directly on the spoke box) defaults to this — **no `--loopback`**. Because a standalone spoke does **not** broadcast `_lm-hub` mDNS (only the hub does), the agent **cannot auto-discover it** — the agent install must be **pinned**: `agent/install_agent.sh --spoke-ip <spoke-host>`. The installer prints this pinned command.
 - **Loopback (opt-in — agent → hub → spoke).** The pxmx spoke is **co-located with the hub on the same box** (all-in-one). The hub already owns `:443`, so the pxmx agent listener binds `127.0.0.1:8443` **plaintext**; a Proxmox agent dials `wss://<hub>:443/ws/agent` (auto-discovered via `_lm-hub` mDNS / `lm-hub` DNS) and the hub `/ws/agent` route byte-proxies to the loopback listener. `--loopback` is passed **only by `install_all.sh`** (the rare co-located all-in-one path); a standalone install never sets it.
 
 > **If a remote agent reports `[Errno 111] Connect call failed (<spoke>, 443)`**, the spoke is almost certainly in loopback mode (bound `127.0.0.1:8443`, refuses remote) when it should be standalone — i.e. `install_all.sh` was used on a box that is actually a standalone spoke, or `LM_PXMX_AGENT_LOOPBACK=1` is set in `/opt/lm/pxmx/.env`. Fix: reinstall with the standalone `install_pxmx.sh` (no `--loopback`) and pin the agent to `wss://<spoke>:443/ws/agent`. Check with `journalctl -u lm-pxmx | grep 'Agent listener on'` — standalone shows `wss://0.0.0.0:443`, loopback shows `ws://127.0.0.1:8443`.
@@ -36,7 +36,7 @@ The pxmx spoke's agent listener has two modes. **Which mode is deployed determin
 ## Install flags
 
 - `install_pxmx.sh`: `--hub`, `--id`/`--name`, `--secret`, `--hub-secret`, `--tls-verify` (+ `--tls-ca-cert`; **required** on standalone), `--loopback` (opt-in co-located/all-in-one mode — passed only by `install_all.sh`; default is standalone `agent → spoke → hub`), `--all-prereqs` (no-op). IDs default `<hostname>-spoke`.
-- `agent/install_agent.sh`: `--spoke-url`, `--id`, `--secret` (all optional; auto-discovers when `--spoke-url` absent).
+- `agent/install_agent.sh`: `--spoke-ip` (preferred; just the spoke's IP, the agent auto-determines the scheme/port/`/ws/agent` path by probing), `--spoke-url` (advanced full-URL pin), `--id`, `--secret`.
 
 ## Key commands / handlers
 

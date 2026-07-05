@@ -33,7 +33,7 @@ sudo ./install_pxmx.sh --hub ws://<hub-host>:8765 --id pxmx-spoke-1 [--secret <p
 
 ### Ports
 - LM Hub control plane: **443** wss (`/ws/spoke` — the spoke connects to this).
-- pxmx agent listener: **443** wss **standalone (default)** — the spoke (on its own box) serves `wss://0.0.0.0:443` and a Proxmox agent dials `wss://<spoke>:443/ws/agent` directly (**agent → spoke → hub**; agent pinned via `--spoke-url` — a standalone spoke does not broadcast `_lm-hub` mDNS). **8443** loopback (co-located all-in-one, `--loopback`/`install_all.sh` only — `agent → hub → spoke`, hub `/ws/agent` byte-proxies to it). **8766** is the legacy no-cert plaintext fallback. See [docs/pxmx.md](docs/pxmx.md).
+- pxmx agent listener: **443** wss **standalone (default)** — the spoke (on its own box) serves `wss://0.0.0.0:443` and a Proxmox agent dials `wss://<spoke>:443/ws/agent` directly (**agent → spoke → hub**; agent pinned via `--spoke-ip` — just the spoke's IP; the agent auto-determines the scheme/port/`/ws/agent` path by probing; a standalone spoke does not broadcast `_lm-hub` mDNS). **8443** loopback (co-located all-in-one, `--loopback`/`install_all.sh` only — `agent → hub → spoke`, hub `/ws/agent` byte-proxies to it). **8766** is the legacy no-cert plaintext fallback. See [docs/pxmx.md](docs/pxmx.md).
 
 ### Notable fix
 A recurring **agent-blackout** bug (the agent-server task died and the spoke
