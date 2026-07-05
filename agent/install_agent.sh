@@ -9,14 +9,17 @@ set -e
 # A pinned --id is honored as-is. We only bake AGENT_ID into .env + the unit
 # when it was explicitly pinned; otherwise Python owns the id. INSTALL_UUID is
 # never written here — the agent mints it at first start.
+# Where the agent reports in. The normal way is --spoke-ip: supply ONLY the
+# spoke's IP (or hostname) and the agent works out the rest (scheme + port +
+# /ws/agent) by probing that host's known listener endpoints. --spoke-url is the
+# legacy/power-user form (a fully-pinned ws(s)://host:port/ws/agent) and wins if
+# both are given. When NEITHER is supplied the installer auto-discovers the hub
+# box via DNS (lm-hub.<dns-suffix>) then mDNS, and if that also finds nothing the
+# agent keeps re-discovering at startup.
+SPOKE_IP="${SPOKE_IP:-}"
 SPOKE_URL="${SPOKE_URL:-}"
-# Track whether the spoke URL was explicitly given (arg or env). When NOT pinned
-# the installer auto-discovers the hub box via DNS (lm-hub.<dns-suffix>) then
-# mDNS (_lm-hub._tcp.local.) and targets its agent-WS leg via the service's
-# agent_port TXT record (443 — the unified external surface, under the
-# unified-443 merge) after the venv is ready; the discovered URL appends
-# /ws/agent (wss://<hub>:443/ws/agent). If nothing is found SPOKE_URL is left
-# empty and the agent re-discovers at startup (agent _resolve_spoke_url sentinel).
+# Track whether a target was explicitly given (arg or env). When NOT pinned the
+# installer falls back to hub auto-discovery after the venv is ready.
 SPOKE_URL_PINNED=0
 [ -n "$SPOKE_URL" ] && SPOKE_URL_PINNED=1
 AGENT_ID=""
@@ -26,6 +29,9 @@ AGENT_SECRET=""
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
+        # Preferred: just an IP. The agent auto-determines scheme/port/path.
+        --spoke-ip)  SPOKE_IP="$2"; shift ;;
+        # Legacy/advanced: a fully-formed ws(s)://host:port/ws/agent URL.
         --spoke-url) SPOKE_URL="$2"; SPOKE_URL_PINNED=1; shift ;;
         --id) AGENT_ID="$2"; AGENT_ID_PINNED=1; shift ;;
         --secret) AGENT_SECRET="$2"; shift ;;
@@ -33,6 +39,16 @@ while [[ "$#" -gt 0 ]]; do
     esac
     shift
 done
+
+# A bare IP accidentally passed to --spoke-url (no scheme) is really a --spoke-ip.
+# Reclassify it so the operator gets the auto-determine behavior either way.
+if [ "$SPOKE_URL_PINNED" = "1" ] && [ -n "$SPOKE_URL" ] && \
+   [ -z "$SPOKE_IP" ] && [[ "$SPOKE_URL" != *"://"* ]]; then
+    echo "ℹ️  --spoke-url '$SPOKE_URL' has no scheme; treating it as --spoke-ip (auto-determining the WS URL)."
+    SPOKE_IP="$SPOKE_URL"
+    SPOKE_URL=""
+    SPOKE_URL_PINNED=0
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "⚠️  This script must be run as root."
@@ -94,27 +110,35 @@ if [ -f "$INSTALL_DIR/requirements.txt" ]; then
     "$INSTALL_DIR/venv/bin/python3" -m pip install -r "$INSTALL_DIR/requirements.txt" -q
 fi
 
-# ── Hub auto-discovery ──────────────────────────────────────────────────────
-# When --spoke-url was not given (and no SPOKE_URL env), auto-locate the hub box
-# via DNS (lm-hub.<dns-suffix>) then mDNS (_lm-hub._tcp.local.) using the
-# just-installed venv + the vendored src/discovery.py, targeting the hub's
-# agent-WS leg (--agent-listener reads the agent_port TXT; under the unified-443
-# merge the hub advertises agent_port=443 and the discovery appends /ws/agent,
-# returning wss://<hub>:443/ws/agent when the hub has a cert).
-# If nothing is found, leave SPOKE_URL empty — the agent re-discovers at startup
-# (agent _resolve_spoke_url sentinel) once the hub is up. cwd is $INSTALL_DIR so
-# `src.discovery` imports (src/ is a package dir).
-if [ "$SPOKE_URL_PINNED" != "1" ]; then
-    echo "🔎 No --spoke-url given; auto-discovering the LM hub box (DNS lm-hub.* / mDNS, agent listener)…"
+# ── Resolve where the agent reports in ──────────────────────────────────────
+# Precedence: --spoke-ip (probe the given host) > --spoke-url (verbatim pin) >
+# hub auto-discovery (DNS lm-hub.* / mDNS). All probing uses the just-installed
+# venv + the vendored src/discovery.py. cwd is $INSTALL_DIR so `src.discovery`
+# imports (src/ is a package dir).
+if [ -n "$SPOKE_IP" ]; then
+    # Operator supplied only an IP. Probe its known /ws/agent endpoints so we can
+    # confirm reachability now and show the resolved URL — but the agent is baked
+    # with --spoke-ip (not the resolved URL) so it re-probes at runtime and keeps
+    # working if the spoke is still booting or later changes scheme/port.
+    echo "🔎 Probing $SPOKE_IP for an LM agent listener (auto-determining scheme/port/path)…"
+    RESOLVED=$(cd "$INSTALL_DIR" && "./venv/bin/python3" -m src.discovery --resolve-agent "$SPOKE_IP" --timeout 6 2>/dev/null || echo NONE)
+    if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "NONE" ]; then
+        echo "✅ Found agent listener: $RESOLVED"
+    else
+        echo "⚠️  No agent listener answered at $SPOKE_IP yet — the agent will keep"
+        echo "    re-probing at startup. Check the spoke is up and reachable, then it"
+        echo "    connects on its own (no reinstall needed)."
+    fi
+elif [ "$SPOKE_URL_PINNED" != "1" ]; then
+    echo "🔎 No --spoke-ip/--spoke-url given; auto-discovering the LM hub box (DNS lm-hub.* / mDNS, agent listener)…"
     DISCOVERED=$(cd "$INSTALL_DIR" && "./venv/bin/python3" -m src.discovery --timeout 5 --agent-listener 2>/dev/null || echo NONE)
     if [ -n "$DISCOVERED" ] && [ "$DISCOVERED" != "NONE" ]; then
         SPOKE_URL="$DISCOVERED"
         echo "✅ Discovered hub box: $SPOKE_URL"
     else
-        echo "⚠️  Hub box not found via DNS/mDNS. Leaving SPOKE_URL empty — the agent will"
+        echo "⚠️  Hub box not found via DNS/mDNS. Leaving the target empty — the agent will"
         echo "    retry auto-discovery at startup. To pin it now, re-run with"
-        echo "    --spoke-url wss://HUBBOX:443/ws/agent  (both all-in-one hub and"
-        echo "    standalone pxmx spoke expose the agent-WS leg on :443.)"
+        echo "    --spoke-ip <SPOKE_IP>  (just the IP; scheme/port/path are auto-determined)."
         echo "    (Or create an 'lm-hub' DNS record / enable mDNS on the hub.)"
         SPOKE_URL=""
     fi
@@ -132,21 +156,30 @@ if [ "$AGENT_ID_PINNED" = "1" ]; then
 fi
 
 # ── Write .env (preserving secret) ────────────────────────────────────────────
+# SPOKE_IP/SPOKE_URL are recorded here for reference; the authoritative runtime
+# value is the flag baked into the unit's ExecStart below (systemd does not
+# source this file — only the agent reads it, and only for the secret).
 cat <<EOF > "$INSTALL_DIR/.env"
+SPOKE_IP=$SPOKE_IP
 SPOKE_URL=$SPOKE_URL
 ${AGENT_ID_LINE}
 AGENT_SECRET=$FINAL_SECRET
 EOF
 
 # ── Systemd service ───────────────────────────────────────────────────────────
-# Build the --spoke-url arg conditionally: when SPOKE_URL is empty (discovery
-# found nothing and nothing was pinned) we OMIT the flag entirely so argparse
-# falls back to its default (os.getenv("SPOKE_URL") or None → None) and the
-# agent's run() sentinel re-discovers at startup. Passing `--spoke-url ""`
-# would instead make argparse error ("expected one argument") and crash-loop the
-# unit. A concrete discovered/pinned URL is baked into the unit directly.
+# Build the spoke-target arg conditionally, preferring --spoke-ip (the agent
+# auto-determines scheme/port/path and re-probes on failure) over a concrete
+# --spoke-url. When BOTH are empty (nothing pinned and hub discovery found
+# nothing) we OMIT the flag entirely so argparse falls back to its default and
+# the agent's run() sentinel re-discovers at startup — passing an empty-valued
+# flag would instead make argparse error ("expected one argument") and
+# crash-loop the unit.
 SPOKE_URL_ARG=""
-[ -n "$SPOKE_URL" ] && SPOKE_URL_ARG="--spoke-url $SPOKE_URL"
+if [ -n "$SPOKE_IP" ]; then
+    SPOKE_URL_ARG="--spoke-ip $SPOKE_IP"
+elif [ -n "$SPOKE_URL" ]; then
+    SPOKE_URL_ARG="--spoke-url $SPOKE_URL"
+fi
 cat <<EOF > /etc/systemd/system/lm-pxmx-agent.service
 [Unit]
 Description=Lab Manager - Local Proxmox Agent
@@ -425,7 +458,9 @@ else
 fi
 
 echo "🎉 Proxmox Local Agent installation complete!"
-if [ -n "$SPOKE_URL" ]; then
+if [ -n "$SPOKE_IP" ]; then
+    echo "🌐 Target Spoke: $SPOKE_IP  (scheme/port/path auto-determined at startup)"
+elif [ -n "$SPOKE_URL" ]; then
     echo "🌐 Target Spoke: $SPOKE_URL"
 else
     echo "🌐 Target Spoke: (auto-discover at startup — no lm-hub DNS/mDNS found yet)"

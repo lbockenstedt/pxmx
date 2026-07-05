@@ -323,8 +323,24 @@ class ProxmoxAgent:
     telemetry/USB-provision/cs-command/watchdog loops. See the module docstring.
     """
 
-    def __init__(self, spoke_url: str, agent_id: str, secret: Optional[str] = None):
-        self.spoke_url = _normalize_spoke_url(spoke_url)
+    def __init__(self, spoke_url: str, agent_id: str, secret: Optional[str] = None,
+                 spoke_ip: Optional[str] = None):
+        # Two ways to point the agent at its spoke:
+        #   * spoke_ip  — the operator supplies ONLY an IP/host; the agent probes
+        #     the known /ws/agent listener endpoints (wss:443, ws:8767, …) at
+        #     startup and picks the live one, so scheme/port/path are auto-
+        #     determined (see _resolve_spoke_url → discovery.resolve_agent_url).
+        #   * spoke_url — a fully-pinned ws(s)://host:port/ws/agent (legacy /
+        #     power-user). A concrete spoke_url always wins over spoke_ip.
+        # When only spoke_ip is given we start on the resolve sentinel ("") so
+        # run() → _resolve_spoke_url does the probing (and re-probes on failure).
+        self.spoke_ip = (spoke_ip or "").strip() or None
+        if spoke_url:
+            self.spoke_url = _normalize_spoke_url(spoke_url)   # explicit pin wins
+        elif self.spoke_ip:
+            self.spoke_url = ""                                 # probe in _resolve_spoke_url
+        else:
+            self.spoke_url = _normalize_spoke_url(spoke_url)    # None/"" → hub auto-discovery
         self.agent_id = agent_id
         self.secret = secret or self._load_secret()
         # No secret is OK — we will connect without one and wait for approval.
@@ -1574,29 +1590,52 @@ class ProxmoxAgent:
             await asyncio.sleep(interval)
 
     async def _resolve_spoke_url(self) -> None:
-        """When ``self.spoke_url`` is empty/``auto``/None, auto-discover the hub
-        box via DNS (``lm-hub.<suffix>``) then mDNS and target its pxmx-agent
-        listener (:8766). Lets an agent install/launch with no ``--spoke-url`` and
-        still find the hub. Best-effort: on no result it leaves the sentinel so the
-        next reconnect retries — discovery is never fatal to the agent."""
+        """Turn the resolve sentinel (``""``/``"auto"``/``None``) into a concrete
+        ``ws(s)://host:port/ws/agent`` URL.
+
+        Two sources, in order:
+          1. ``self.spoke_ip`` — the operator gave ONLY an IP. Probe its known
+             agent-listener endpoints (wss:443, ws:8767, wss:8443, ws:8766) and
+             use the first that answers a WebSocket upgrade, so scheme/port/path
+             are auto-determined. If nothing answers yet (spoke still booting) we
+             leave the sentinel so the next reconnect re-probes — never fatal.
+          2. Otherwise auto-discover the hub box via DNS (``lm-hub.<suffix>``)
+             then mDNS and target its pxmx-agent listener.
+        Best-effort throughout: on no result the sentinel is left in place so
+        run()'s reconnect loop retries."""
         if self.spoke_url not in ("", "auto", None):
             return
         try:
-            from .discovery import discover_hub_url
+            from .discovery import discover_hub_url, resolve_agent_url
         except ImportError:
             try:
-                from discovery import discover_hub_url
+                from discovery import discover_hub_url, resolve_agent_url
             except ImportError:
-                logger.warning("discovery module unavailable — cannot auto-discover "
-                               "the hub; pass --spoke-url or set SPOKE_URL.")
+                logger.warning("discovery module unavailable — cannot resolve the "
+                               "spoke; pass --spoke-ip/--spoke-url or set SPOKE_IP/SPOKE_URL.")
                 return
-        url = discover_hub_url(timeout=5.0, agent_listener=True)
+
+        # 1. Operator supplied only an IP → probe its /ws/agent endpoints.
+        if self.spoke_ip:
+            url = await asyncio.to_thread(resolve_agent_url, self.spoke_ip, 5.0)
+            if url:
+                self.spoke_url = url
+                logger.info(f"Resolved spoke agent listener at {self.spoke_url} "
+                            f"(from --spoke-ip {self.spoke_ip})")
+            else:
+                logger.warning(
+                    f"No agent listener answered at {self.spoke_ip} yet "
+                    "(spoke still booting, or wrong IP) — will re-probe on reconnect.")
+            return
+
+        # 2. No IP given → fall back to hub auto-discovery.
+        url = await asyncio.to_thread(discover_hub_url, 5.0, None, True)
         if url:
             self.spoke_url = _normalize_spoke_url(url)
             logger.info(f"Auto-discovered hub (agent listener) at {self.spoke_url}")
         else:
             logger.warning("Hub auto-discovery found no hub (no lm-hub DNS record / "
-                           "mDNS broadcast); will retry on reconnect. Pass --spoke-url to pin.")
+                           "mDNS broadcast); will retry on reconnect. Pass --spoke-ip to pin.")
 
     # ── Update-recovery healthy marker ──────────────────────────────────────
     def _clear_healthy_marker(self) -> None:
@@ -1670,6 +1709,12 @@ class ProxmoxAgent:
                 await asyncio.sleep(5)
             except (OSError, websockets.exceptions.WebSocketException) as e:
                 logger.warning(f"Connection to {self.spoke_url} failed: {e} — retrying in {backoff}s")
+                # If the operator pinned only an IP, a failure may mean the spoke
+                # restarted on a different scheme/port (e.g. gained/lost its TLS
+                # cert). Drop back to the resolve sentinel so the next pass
+                # re-probes its endpoints instead of hammering a now-stale URL.
+                if self.spoke_ip:
+                    self.spoke_url = ""
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
             except Exception as e:
@@ -2507,11 +2552,19 @@ class ProxmoxAgent:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # --spoke-url is OPTIONAL: when neither --spoke-url nor SPOKE_URL env is
-    # supplied the agent auto-discovers the hub box via DNS (lm-hub.<dns-suffix>)
-    # then mDNS (_lm-hub._tcp.local.) and targets its agent listener (:8766) —
-    # see _resolve_spoke_url + src.discovery. A pinned --spoke-url wins.
-    parser.add_argument("--spoke-url", default=os.getenv("SPOKE_URL") or None)
+    # --spoke-ip is the normal way to pin the agent: supply ONLY the spoke's IP
+    # (or hostname) and the agent probes its known /ws/agent endpoints to work
+    # out the scheme + port + path itself (see _resolve_spoke_url →
+    # discovery.resolve_agent_url). No need to know wss-vs-ws or 443-vs-8767.
+    parser.add_argument("--spoke-ip", default=os.getenv("SPOKE_IP") or None,
+                        help="spoke IP/host to dial; scheme+port+/ws/agent are auto-determined")
+    # --spoke-url is the OPTIONAL power-user / legacy form: a fully-pinned
+    # ws(s)://host:port/ws/agent. It wins over --spoke-ip. When neither is
+    # supplied (and no SPOKE_IP/SPOKE_URL env) the agent auto-discovers the hub
+    # box via DNS (lm-hub.<dns-suffix>) then mDNS and targets its agent listener.
+    parser.add_argument("--spoke-url", default=os.getenv("SPOKE_URL") or None,
+                        help="fully-pinned ws(s)://host:port/ws/agent (advanced; "
+                             "prefer --spoke-ip)")
     # --id is OPTIONAL: when not supplied the agent derives its id from the
     # current OS hostname at startup, so a cloned+renamed Proxmox node reconnects
     # under a new id (correlated to the old one via the install UUID by the hub)
@@ -2524,7 +2577,8 @@ if __name__ == "__main__":
         args.id = f"{socket.gethostname()}-agent"
 
     try:
-        agent = ProxmoxAgent(args.spoke_url, args.id, args.secret)
+        agent = ProxmoxAgent(args.spoke_url, args.id, args.secret,
+                             spoke_ip=args.spoke_ip)
         asyncio.run(agent.run())
     except KeyboardInterrupt:
         pass

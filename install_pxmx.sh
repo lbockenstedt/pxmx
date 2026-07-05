@@ -520,12 +520,14 @@ if [ "$PXMX_LOOPBACK" = "1" ]; then
     echo "   _lm-hub._tcp and dials wss://<hub>:443/ws/agent; the hub /ws/agent route"
     echo "   byte-proxies to this spoke's loopback :8443 — agent → hub → spoke.)"
     if [ -n "$LM_HOST" ]; then
-        echo "  To pin instead:  --spoke-url wss://${LM_HOST}:443/ws/agent"
+        echo "  To pin instead:  --spoke-ip ${LM_HOST}   (just the IP; scheme/port/path auto-determined)"
     fi
 else
-    echo "    | sudo bash -s -- --spoke-url wss://${SPOKE_HOST}:443/ws/agent"
+    echo "    | sudo bash -s -- --spoke-ip ${SPOKE_HOST}"
     echo "  (standalone spoke: the agent dials THIS spoke directly — agent → spoke → hub."
-    echo "   A standalone spoke does not broadcast _lm-hub mDNS, so --spoke-url is REQUIRED.)"
+    echo "   Supply just this spoke's IP with --spoke-ip; the agent auto-determines the"
+    echo "   scheme/port/path by probing. A standalone spoke does not broadcast _lm-hub"
+    echo "   mDNS, so a pinned --spoke-ip is REQUIRED.)"
 fi
 echo "  (omitting --id derives <hostname>-agent; clone+rename auto-correlates via install UUID)"
 echo ""

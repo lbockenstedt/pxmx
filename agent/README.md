@@ -10,9 +10,12 @@ The agent follows a "Push-Pull" model:
 ## 🚀 Installation
 
 ### One-Liner Installation (Recommended)
-The fastest way to install the agent and connect it to your Spoke:
+The fastest way to install the agent and connect it to your Spoke — supply just
+the spoke's IP; the agent auto-determines the scheme, port, and `/ws/agent` path
+by probing (`--spoke-ip` works for cs spokes on `:443`/`:8767` and pxmx spokes
+alike):
 ```bash
-curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh | bash -s -- --spoke-url ws://<SPOKE_IP>:8766 --id pxmx-agent-1 --secret pxmx-agent-secret
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh | bash -s -- --spoke-ip <SPOKE_IP>
 ```
 
 ### Local Installation (Same Host)
@@ -22,10 +25,14 @@ bash install_agent.sh
 ```
 
 ### Remote Installation
-If the agent is on a separate host from the Spoke:
+If the agent is on a separate host from the Spoke — just the IP:
 ```bash
-bash install_agent.sh --spoke-url ws://<SPOKE_IP>:8766
+bash install_agent.sh --spoke-ip <SPOKE_IP>
 ```
+
+> Advanced: `--spoke-url ws(s)://<host>:<port>/ws/agent` still pins a fully-formed
+> URL verbatim (and wins over `--spoke-ip`). Prefer `--spoke-ip` unless you have a
+> reason to override the scheme/port yourself.
 
 ## ⚙️ Configuration
 - **Port**: The agent connects to the Proxmox Spoke on port `8766`.
