@@ -37,6 +37,7 @@ del _os, _ensure_requirements, _req
 
 import asyncio
 import base64
+import collections
 import json
 import re
 import uuid
@@ -46,6 +47,7 @@ import psutil
 import argparse
 import os
 import socket
+import sys
 import tempfile
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -60,7 +62,16 @@ class _AuthError(Exception):
     """Raised when the spoke rejects our credentials (wrong secret)."""
 
 class WebSocketLogHandler(logging.Handler):
-    """Relays agent log records (INFO+, own loggers only) over the WebSocket connection."""
+    """Relays agent log records (INFO+, own loggers only) to the hub via
+    AGENT_LOG — so Setup → Agent Logs shows them AND the BugFixer module can
+    read agent errors without anyone touching the box's CLI. This is a hard
+    requirement: once the agent is connected, the hub must see its logs.
+
+    Installed ONCE for the agent's lifetime (not per-connection). While the
+    socket is down (startup, between reconnects) records are buffered in a
+    bounded ring and flushed on the next connect, so nothing logged during a
+    gap is lost — the previous per-connection add/remove dropped every record
+    outside an active connection (startup + disconnect windows)."""
 
     # Only relay records from loggers whose names start with these prefixes.
     # HubDiscovery is included so the agent's same-box-vs-remote / ws-vs-wss
@@ -68,22 +79,43 @@ class WebSocketLogHandler(logging.Handler):
     # not just the local pxmx-agent.log.
     _RELAY_PREFIXES = ("PxmxAgent", "ProxmoxAgent", "HubDiscovery")
 
-    def __init__(self, agent):
+    def __init__(self, agent, buffer_size: int = 1000):
         super().__init__(level=logging.INFO)
         self.agent = agent
+        self._buffer: "collections.deque" = collections.deque(maxlen=buffer_size)
 
     def emit(self, record):
         if not record.name.startswith(self._RELAY_PREFIXES):
             return
         try:
-            msg = self.format(record)
-            if self.agent.websocket:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self.agent.send_log(msg, record.levelname))
-        except RuntimeError:
-            pass  # no running event loop — connection not yet up
+            item = (self.format(record), record.levelname)
         except Exception:
             self.handleError(record)
+            return
+        # Connected → send now; disconnected (or no running loop yet) → buffer
+        # for flush on the next connect so the hub still receives it.
+        if self.agent.websocket is not None:
+            if not self._dispatch(item):
+                self._buffer.append(item)
+        else:
+            self._buffer.append(item)
+
+    def _dispatch(self, item) -> bool:
+        """Schedule a send on the running loop. Returns False (caller buffers)
+        when there is no running loop."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        loop.create_task(self.agent.send_log(item[0], item[1]))
+        return True
+
+    def flush_buffered(self) -> None:
+        """Drain buffered records after a (re)connect. Called from the async
+        connect flow (running loop present). Best-effort: send_log itself never
+        raises, so a still-flaky socket just re-drops rather than blocking."""
+        while self._buffer:
+            self._dispatch(self._buffer.popleft())
 
 def get_log_path():
     """Resolve the agent log file path.
@@ -313,6 +345,17 @@ class ProxmoxAgent:
         self._vnc_sessions: Dict[str, Dict[str, Any]] = {}
         self._console_token: Optional[str] = None
 
+        # Hub log relay — installed ONCE here (not per-connection) so records
+        # from the very first startup line onward are captured; buffered while
+        # the socket is down and flushed on each connect. Requirement: the hub
+        # must have every agent's logs (Setup → Agent Logs + BugFixer) without
+        # needing the box's CLI.
+        self._ws_log_handler = WebSocketLogHandler(self)
+        self._ws_log_handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(self._ws_log_handler)
+        self._install_uncaught_exception_relay()
+
     def _load_secret(self) -> Optional[str]:
         # 1. Prefer the hub-provisioned secret persisted to .env. This is the
         #    authoritative secret — it is the control plane's own agent_secret,
@@ -412,6 +455,35 @@ class ProxmoxAgent:
             os.replace(tmp, AGENT_CONFIG_FILE)
         except OSError as e:
             logger.warning(f"Could not persist config {AGENT_CONFIG_FILE}: {e}")
+
+    def _install_uncaught_exception_relay(self) -> None:
+        """Route uncaught *synchronous* exceptions through the PxmxAgent logger
+        (which relays to the hub) before the interpreter's default handler runs,
+        so a crash's traceback reaches Setup → Agent Logs + BugFixer, not only
+        the local file via systemd stderr capture. The asyncio-task counterpart
+        is installed in run() once the loop exists."""
+        _prev = sys.excepthook
+
+        def _hook(exc_type, exc, tb):
+            try:
+                if not issubclass(exc_type, KeyboardInterrupt):
+                    logger.error("Uncaught exception", exc_info=(exc_type, exc, tb))
+            finally:
+                _prev(exc_type, exc, tb)
+
+        sys.excepthook = _hook
+
+    def _asyncio_exception_relay(self, loop, context) -> None:
+        """asyncio loop exception handler — logs unhandled task exceptions via
+        the PxmxAgent logger so they relay to the hub, then defers to the
+        default handler for local reporting."""
+        exc = context.get("exception")
+        msg = context.get("message") or "unhandled asyncio exception"
+        if exc is not None:
+            logger.error("Uncaught asyncio exception: %s", msg, exc_info=exc)
+        else:
+            logger.error("asyncio error: %s", msg)
+        loop.default_exception_handler(context)
 
     def _ensure_install_uuid(self) -> str:
         """Return this agent's stable install UUID, minting + persisting it on first start.
@@ -1531,6 +1603,13 @@ class ProxmoxAgent:
         on repeated auth failure so a bad secret doesn't spin forever.
         """
         import websockets
+        # Route uncaught asyncio-task exceptions through the PxmxAgent logger so
+        # their tracebacks relay to the hub (Setup → Agent Logs + BugFixer),
+        # not just the local file. Set here because the loop is now running.
+        try:
+            asyncio.get_running_loop().set_exception_handler(self._asyncio_exception_relay)
+        except Exception:  # noqa: BLE001
+            pass
         # Clear any stale healthy marker from a prior boot — a fresh start must
         # re-prove health (re-auth with the spoke) before the update watchdog
         # treats it as the "new code booted OK" signal. Without this a
@@ -1667,9 +1746,11 @@ class ProxmoxAgent:
             # signal; its absence past the deadline triggers a rollback.
             self._touch_healthy_marker()
 
-            log_handler = WebSocketLogHandler(self)
-            log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-            logging.getLogger().addHandler(log_handler)
+            # Flush anything logged while the socket was down (startup,
+            # reconnect gap) now that we're connected + authed, then continue
+            # streaming live. The handler itself stays installed for the
+            # process lifetime (added in __init__).
+            self._ws_log_handler.flush_buffered()
 
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             telemetry_task = asyncio.create_task(self._telemetry_loop())
@@ -2083,7 +2164,9 @@ class ProxmoxAgent:
             finally:
                 heartbeat_task.cancel()
                 telemetry_task.cancel()
-                logging.getLogger().removeHandler(log_handler)
+                # Handler stays installed (added in __init__) so records logged
+                # during the disconnect gap are buffered and flushed on the next
+                # connect, instead of being dropped.
 
     async def _heartbeat_loop(self):
         while True:
