@@ -2205,9 +2205,29 @@ class ProxmoxAgent:
                 if nodes.get("error"):
                     logger.error(f"get_node_stats error: {nodes['error']}")
 
-                # DEBUG, not INFO: emitted every telemetry tick (~60-65s) — pure
-                # steady-state noise at INFO. See logging-observability-contract.md.
-                logger.debug(f"Telemetry: {len(vms.get('vms', []))} VMs, {len(nodes.get('nodes', []))} nodes")
+                _vm_n = len(vms.get('vms', []))
+                _node_n = len(nodes.get('nodes', []))
+                # Per-tick detail stays DEBUG (chatty, every ~60s).
+                logger.debug(f"Telemetry: {_vm_n} VMs, {_node_n} nodes")
+                # Throttled INFO liveness+state line (~every 5 min) so the operator
+                # can see CS mode + VM count + why provisioning is/isn't running
+                # from the INFO log and the hub (Setup → Agent Logs) WITHOUT
+                # enabling DEBUG — the normalization demoted the per-tick line, so
+                # this restores a periodic heartbeat that also surfaces the #1
+                # question ("is CS mode on?"). cs_mode=off → VM Server will be empty.
+                _now = time.time()
+                if _now - getattr(self, "_last_status_log", 0.0) >= 300:
+                    self._last_status_log = _now
+                    _reason = None
+                    if self.cs_enabled:
+                        try:
+                            from . import usb_provision as _up
+                            _reason = _up.current_provision_reason()
+                        except Exception:
+                            _reason = None
+                    logger.info("status: cs_mode=%s vms=%d nodes=%d%s",
+                                "on" if self.cs_enabled else "off", _vm_n, _node_n,
+                                f" provision={_reason}" if _reason else "")
 
                 msg = {
                     "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
