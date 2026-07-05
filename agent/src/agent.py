@@ -237,6 +237,30 @@ def _looks_like_mac(s: str) -> bool:
     return bool(_MAC_RE.match((s or "").strip()))
 
 
+def _deep_merge_config(base, incoming):
+    """Recursively merge ``incoming`` into a copy of ``base``: nested dicts are
+    merged key-by-key, every other value (scalars, lists) is replaced wholesale.
+
+    UPDATE_CONFIG arrives from TWO sources with DIFFERENT partial payloads — the
+    UI/agent-config save (``{client_simulation:{enabled,tenant_id}}``) and the
+    hub CS bridge (``{client_simulation:{enabled,tenant_id,usb_config:{...}}}``).
+    A blind ``self.config = data`` let each push clobber the other's keys — the
+    enabled/tenant-only save wiped ``client_simulation.usb_config.vidpids`` and
+    the provision loop then reported "no dongle_vidpids configured" until the
+    next bridge push. Merging keeps sibling sub-trees intact; ``vidpids`` (a
+    list) is still replaced whole, so removing a dongle type still takes effect.
+    """
+    if not isinstance(base, dict) or not isinstance(incoming, dict):
+        return incoming
+    out = dict(base)
+    for k, v in incoming.items():
+        if isinstance(out.get(k), dict) and isinstance(v, dict):
+            out[k] = _deep_merge_config(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def _sd_notify(state: str) -> None:
     """Best-effort systemd notification (READY=1 / WATCHDOG=1).
 
@@ -1789,10 +1813,17 @@ class ProxmoxAgent:
 
                     if cmd_type == "UPDATE_CONFIG":
                         old_cs = bool((self.config.get("client_simulation") or {}).get("enabled"))
-                        self.config = data
-                        # Persist so a restart resumes from last-known config.
-                        self._save_persisted_config(data)
-                        new_cs = bool((data.get("client_simulation") or {}).get("enabled"))
+                        # Deep-merge, don't wholesale-replace: partial pushes from
+                        # the UI save (enabled/tenant only) and the CS bridge
+                        # (full usb_config) otherwise clobber each other, wiping
+                        # client_simulation.usb_config.vidpids → the provision
+                        # loop reports "no dongle_vidpids configured". See
+                        # _deep_merge_config.
+                        self.config = _deep_merge_config(self.config, data)
+                        # Persist the MERGED config so a restart resumes from the
+                        # full last-known config (not just the last partial push).
+                        self._save_persisted_config(self.config)
+                        new_cs = bool((self.config.get("client_simulation") or {}).get("enabled"))
                         if old_cs != new_cs:
                             await self._set_cs_enabled(new_cs)
                         result = {"status": "SUCCESS", "message": "Config updated"}
