@@ -1563,7 +1563,7 @@ async def _run_post_prov_retry_queue(agent, state: Dict[str, Any]) -> bool:
     retry = state.get("post_prov_retry") or {}
     if not retry:
         return False
-    from . import cs_sim
+    from . import cs_sim, pve_cmds  # local: pve_cmds is imported per-function
     protected = _protected_vmids(agent)
     now = time.time()
     mutated = False
@@ -1631,6 +1631,7 @@ async def _is_runnable_template(vmid: int) -> bool:
     vmid_is_runnable_template: ``qm status`` succeeds + ``template: 1`` in
     config). ``qm_config`` already returns ``{}`` for a nonexistent vmid, so
     a missing/deleted template id falls straight through to False."""
+    from . import pve_cmds  # local: pve_cmds is imported per-function
     cfg = await pve_cmds.qm_config(vmid)
     return cfg.get("template") == "1"
 
@@ -1648,6 +1649,7 @@ async def _resolve_template_vmid(configured: Any) -> Optional[int]:
     configured vmid EXISTS we use it as-is. Only a truly missing (deleted/typo)
     id triggers the template fallback search; requiring template:1 here would
     (and did) break every setup whose golden image isn't template-flagged."""
+    from . import pve_cmds  # local: pve_cmds is imported per-function
     try:
         cvid = int(configured) if configured else None
     except (TypeError, ValueError):
