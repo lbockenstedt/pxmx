@@ -40,10 +40,12 @@ If ``zeroconf`` is not importable the mDNS branch is skipped and DNS-only is
 used, so a missing optional dep never breaks discovery (or the hub broadcast).
 """
 
+import base64
 import concurrent.futures
 import logging
 import os
 import socket
+import ssl
 import sys
 import time
 from typing import Dict, List, Optional, Tuple
@@ -74,8 +76,107 @@ AGENT_WS_PATH = "/ws/agent"
 # value NOT advertised.
 DEFAULT_AGENT_PORT = 8766
 
+# Agent-listener endpoints an agent may dial, in priority order — the (scheme,
+# port) pairs that a cs spoke / pxmx spoke / all-in-one hub exposes ``/ws/agent``
+# on. ``resolve_agent_url()`` probes these when the operator supplies only a
+# spoke IP, so the scheme/port/path are auto-determined and never have to be
+# typed. The order is "most likely first" so the common case resolves on probe 1:
+#   443  wss — cs spoke standalone + all-in-one hub with a cert (install_cs.sh's
+#              default; AGENT_WSS_PORT / the unified-443 external surface)
+#   8767 ws  — cs spoke plaintext fallback (install_cs.sh when openssl is absent)
+#   8443 wss — loopback/wss default (AGENT_LOOPBACK_PORT), rare externally
+#   8766 ws  — pxmx legacy plaintext listener (AGENT_FALLBACK_PORT)
+_AGENT_LISTENER_CANDIDATES: List[Tuple[str, int]] = [
+    ("wss", 443),
+    ("ws", 8767),
+    ("wss", 8443),
+    ("ws", 8766),
+]
+
 # Overridable for tests; production reads /etc/resolv.conf.
 _RESOLV_CONF = "/etc/resolv.conf"
+
+
+def _strip_to_host(value: str) -> str:
+    """Reduce ``value`` to a bare host — so a pasted ``wss://1.2.3.4:443/ws/agent``
+    and a bare ``1.2.3.4`` both collapse to ``1.2.3.4``. IPv4/hostnames only
+    (bracketed IPv6 is unwrapped best-effort)."""
+    host = (value or "").strip()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0]          # drop any /ws/agent path
+    host = host.strip()
+    if host.startswith("["):              # [::1]:443 → ::1
+        return host[1:].split("]", 1)[0]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def _probe_ws_upgrade(host: str, port: int, use_tls: bool,
+                      path: str = AGENT_WS_PATH, timeout: float = 2.0) -> bool:
+    """True if a WebSocket server answers an Upgrade handshake at ``host:port``
+    over the given transport (TLS or plain).
+
+    Dependency-free (raw socket + ssl, no ``websockets`` import) so it works in
+    any environment discovery runs in. It stops at the HTTP ``101 Switching
+    Protocols`` line and closes — it never sends the agent handshake, so it
+    leaves no pending-approval registration on the spoke. Probing ``wss`` vs
+    ``ws`` on the right port disambiguates the scheme: a TLS wrap only completes
+    against a cert-bearing listener, and a plain GET only gets ``101`` from a
+    plaintext one.
+    """
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+        if use_tls:
+            # cs/hub use self-signed certs → verify off (mirrors the agent's
+            # own ssl._create_unverified_context() dial path).
+            ctx = ssl._create_unverified_context()
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(req.encode())
+        status_line = sock.recv(64)
+        return b" 101 " in status_line
+    except Exception:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def resolve_agent_url(host: str, timeout: float = 5.0) -> Optional[str]:
+    """Given only a spoke IP/host, return the full agent-WS URL to dial
+    (e.g. ``wss://1.2.3.4:443/ws/agent``) by probing the known listener
+    endpoints in priority order, or ``None`` if none answer.
+
+    This is what lets an operator supply just an IP (``--spoke-ip``) and have
+    the scheme + port + ``/ws/agent`` path determined automatically — the
+    WebSocket contract lives here in code, not in the operator's hands.
+    """
+    host = _strip_to_host(host)
+    if not host:
+        return None
+    per_probe = max(1.0, min(2.0, timeout / max(1, len(_AGENT_LISTENER_CANDIDATES))))
+    for scheme, port in _AGENT_LISTENER_CANDIDATES:
+        if _probe_ws_upgrade(host, port, use_tls=(scheme == "wss"),
+                             timeout=per_probe):
+            url = f"{scheme}://{host}:{port}{AGENT_WS_PATH}"
+            logger.info("resolved agent listener: %s", url)
+            return url
+    logger.warning("no agent listener answered at %s (tried %s)", host,
+                   ", ".join(f"{s}:{p}" for s, p in _AGENT_LISTENER_CANDIDATES))
+    return None
 
 
 def _resolv_search_domains() -> List[str]:
@@ -353,7 +454,15 @@ def _main() -> int:
     parser.add_argument("--agent-listener", action="store_true",
                         help="target the hub box's pxmx agent listener "
                              "(reads the agent_port TXT) instead of the spoke-WS port")
+    parser.add_argument("--resolve-agent", metavar="HOST", default=None,
+                        help="given only a spoke IP/host, probe its known agent-listener "
+                             "endpoints and print the full ws(s)://HOST:PORT/ws/agent URL "
+                             "to dial (auto-determines scheme + port + path)")
     args = parser.parse_args()
+    if args.resolve_agent:
+        url = resolve_agent_url(args.resolve_agent, args.timeout)
+        print(url if url else "NONE")
+        return 0
     url = discover_hub_url(args.timeout, args.port_override,
                            agent_listener=args.agent_listener)
     print(url if url else "NONE")
