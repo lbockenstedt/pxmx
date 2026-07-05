@@ -146,6 +146,14 @@ logger = logging.getLogger("PxmxAgent")
 # pending manifest + healthy marker here and rolls back a failed self-update.
 AGENT_STATE_DIR = os.environ.get("LM_PXMX_STATE_DIR", "/var/lib/pxmx/update-state")
 
+# Last hub-pushed agent config, persisted so a self-update restart (or any
+# restart) re-enters client-simulation mode from last-known config instead of
+# sitting idle until the hub happens to re-push UPDATE_CONFIG — which, on a
+# co-located/loaded box, can be lost in the spoke's request backlog and leave
+# auto-provisioning silently off. Root-only (same dir as usb_state.json).
+AGENT_CONFIG_FILE = os.environ.get(
+    "LM_PXMX_CONFIG_FILE", "/var/lib/pxmx/agent_config.json")
+
 _AGENT_WS_PATH = "/ws/agent"
 _AGENT_DEFAULT_SCHEME = "wss"
 _AGENT_DEFAULT_PORT = "443"
@@ -266,7 +274,10 @@ class ProxmoxAgent:
         # No secret is OK — we will connect without one and wait for approval.
 
         self.websocket = None
-        self.config: Dict[str, Any] = {}
+        # Seed from the last hub-pushed config so a restart (esp. a self-update)
+        # can resume client-simulation mode immediately instead of idling until
+        # the hub re-pushes UPDATE_CONFIG. Refreshed on every UPDATE_CONFIG.
+        self.config: Dict[str, Any] = self._load_persisted_config()
         self.signer = MessageSigner(self.secret or "")
         self.hostname = socket.gethostname()
         self.agent_type = "pxmx-agent"
@@ -376,6 +387,31 @@ class ProxmoxAgent:
     def _env_path(self) -> str:
         """Absolute path to the agent .env (/opt/lm/pxmx/agent/.env in production)."""
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+    def _load_persisted_config(self) -> Dict[str, Any]:
+        """Load the last hub-pushed agent config from disk (empty dict if none
+        or unreadable). Lets a restart resume client-simulation mode without
+        waiting for the hub to re-push UPDATE_CONFIG."""
+        try:
+            if os.path.exists(AGENT_CONFIG_FILE) and os.path.getsize(AGENT_CONFIG_FILE) > 0:
+                with open(AGENT_CONFIG_FILE) as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not load persisted config {AGENT_CONFIG_FILE}: {e}")
+        return {}
+
+    def _save_persisted_config(self, config: Dict[str, Any]) -> None:
+        """Persist the latest hub-pushed agent config (best-effort, root-only)."""
+        try:
+            os.makedirs(os.path.dirname(AGENT_CONFIG_FILE), exist_ok=True)
+            tmp = AGENT_CONFIG_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(config, f)
+            os.replace(tmp, AGENT_CONFIG_FILE)
+        except OSError as e:
+            logger.warning(f"Could not persist config {AGENT_CONFIG_FILE}: {e}")
 
     def _ensure_install_uuid(self) -> str:
         """Return this agent's stable install UUID, minting + persisting it on first start.
@@ -1638,6 +1674,18 @@ class ProxmoxAgent:
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             telemetry_task = asyncio.create_task(self._telemetry_loop())
 
+            # Resume client-simulation mode from persisted config if the hub
+            # hasn't (re-)pushed UPDATE_CONFIG this session. Without this a
+            # self-update restart drops CS mode — and auto-provisioning with
+            # it — until the hub happens to re-push, which can be lost in a
+            # loaded spoke's request backlog. The websocket is up here, so
+            # telemetry/CS frames can flow. A later UPDATE_CONFIG just refreshes
+            # self.config (same enabled state → no redundant restart).
+            if not self.cs_enabled and bool(
+                    (self.config.get("client_simulation") or {}).get("enabled")):
+                logger.info("Resuming client_simulation mode from persisted config")
+                await self._set_cs_enabled(True)
+
             try:
                 async for message in websocket:
                     msg_data = json.loads(message)
@@ -1657,6 +1705,8 @@ class ProxmoxAgent:
                     if cmd_type == "UPDATE_CONFIG":
                         old_cs = bool((self.config.get("client_simulation") or {}).get("enabled"))
                         self.config = data
+                        # Persist so a restart resumes from last-known config.
+                        self._save_persisted_config(data)
                         new_cs = bool((data.get("client_simulation") or {}).get("enabled"))
                         if old_cs != new_cs:
                             await self._set_cs_enabled(new_cs)
