@@ -28,6 +28,14 @@ SPOKE_SECRET="lm-secret"
 # standalone install never sets it. See docs/pxmx.md "Agent listener modes".
 PXMX_LOOPBACK=0
 
+# --infra-only: run ONLY the host/OS-level agent-host prep (setup_pxmx_host) and
+# early-exit — no venv, no clone, no .env, no lm-pxmx unit. This is the entry
+# point the generic agent's proxmox-role install calls
+# (`bash /opt/lm/pxmx/install_pxmx.sh --infra-only`) when it hosts the pxmx spoke
+# IN-PROCESS: the agent owns the spoke code, venv, .env, updates and unit, so
+# --infra-only must NOT touch any of those. Idempotent + non-interactive.
+INFRA_ONLY=0
+
 # Parse arguments
 # TLS cert verification is OFF by default (self-signed hub cert → encrypt
 # without auth). Pass --tls-verify --tls-ca-cert <path> to make this spoke
@@ -45,6 +53,7 @@ while [[ "$#" -gt 0 ]]; do
         --tls-verify)  TLS_VERIFY=true ;;
         --tls-ca-cert) shift; TLS_CA_CERT="$1" ;;
         --loopback) PXMX_LOOPBACK=1 ;;
+        --infra-only) INFRA_ONLY=1 ;;
         --all-prereqs) ;;  # no-op (system prereqs are always installed); accepted so the Hub's install-module call doesn't abort
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
@@ -73,6 +82,86 @@ echo "🚀 Installing Proxmox Manager Module (Native)..."
 if [ "$(id -u)" -ne 0 ]; then
     echo "⚠️  This script must be run as root."
     exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# setup_pxmx_host — host/OS-level infrastructure the pxmx spoke needs to act as
+# an AGENT-HOST (accept the local Proxmox NODE agent dialing its listener). This
+# is the ONLY part the generic agent's proxmox-role install needs from this
+# installer: the agent owns the in-process spoke code, venv, updates, .env and
+# the lm-pxmx unit, so this function deliberately touches NONE of those. It is
+# idempotent + non-interactive so `install_pxmx.sh --infra-only` can call it
+# repeatedly. Called by BOTH the full install (below) and the --infra-only path.
+#
+# Loopback vs standalone agent-listener mode is NOT decided here. It is selected
+# at spoke startup by two env vars the pxmx spoke reads (src/control_plane.py:
+# AGENT_LOOPBACK_ENV / AGENT_PORT_ENV):
+#     LM_PXMX_AGENT_LOOPBACK=1  → listener binds 127.0.0.1:8443 plaintext and the
+#                                 co-located hub /ws/agent route byte-proxies to
+#                                 it; NO cert needed (TLS terminates at hub :443).
+#     LM_PXMX_AGENT_PORT=8443   → the loopback listener port.
+# Standalone (LM_PXMX_AGENT_LOOPBACK unset/0) serves wss on :443 and needs the
+# self-signed cert the FULL installer generates — that cert step is standalone-
+# only and is intentionally excluded from --infra-only. Under the agent-hosted /
+# hub-colocated topology loopback is the relevant mode, so the agent (the lm-side
+# wiring) must export LM_PXMX_AGENT_LOOPBACK=1 + LM_PXMX_AGENT_PORT=8443 into the
+# in-process spoke's environment; this function only preps the host for it.
+setup_pxmx_host() {
+    # Shared host dirs: spoke agent-listener/runtime state (/var/lib/pxmx) and
+    # the log dir the lm-pxmx unit / agent-hosted role append to (/var/log/lm).
+    mkdir -p /var/log/lm /var/lib/pxmx
+
+    # Agent secret shared with the local Proxmox NODE agent that dials this
+    # spoke's agent listener. The spoke reads it from AGENT_CONFIG_PATH
+    # (/etc/lm-agent/config.json). Preserve an existing secret so a re-run /
+    # re-install doesn't break an already-registered node agent.
+    local agent_config="/etc/lm-agent/config.json"
+    local existing_secret=""
+    if [ -f "$agent_config" ]; then
+        existing_secret=$(python3 -c "import json; print(json.load(open('$agent_config')).get('agent_secret',''))" 2>/dev/null || true)
+    fi
+    if [ -z "$existing_secret" ]; then
+        if command -v openssl >/dev/null 2>&1; then
+            AGENT_SECRET=$(openssl rand -base64 32 | tr -d '/+=\n')
+        else
+            AGENT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+        fi
+        echo "🔑 Generated new agent_secret."
+    else
+        AGENT_SECRET="$existing_secret"
+        echo "🔑 Preserved existing agent_secret."
+    fi
+    mkdir -p /etc/lm-agent
+    python3 -c "
+import json
+path = '$agent_config'
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data['agent_secret'] = '$AGENT_SECRET'
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+"
+    chmod 600 "$agent_config"
+    chown svc_lm:svc_lm "$agent_config" 2>/dev/null || true
+    echo "✅ Agent secret written to $agent_config"
+}
+
+# --infra-only: host prep only, then stop. Runs BEFORE apt/clone/venv/.env/unit
+# because the agent (which invokes this) owns all of that for the in-process
+# spoke. Everything above (arg parse, root check) has already run.
+if [ "$INFRA_ONLY" = "1" ]; then
+    echo "🧱 pxmx --infra-only: host-level agent-host prep only."
+    echo "   (agent owns the in-process spoke code, venv, .env, self-updates and unit.)"
+    setup_pxmx_host
+    echo "ℹ️  Agent-listener mode is selected by env the pxmx spoke reads at startup:"
+    echo "    loopback (hub-colocated): export LM_PXMX_AGENT_LOOPBACK=1 LM_PXMX_AGENT_PORT=8443"
+    echo "    standalone: leave LM_PXMX_AGENT_LOOPBACK unset (serves wss :443; needs the"
+    echo "    self-signed cert the FULL installer generates — not created in --infra-only)."
+    echo "✅ pxmx host infra ready."
+    exit 0
 fi
 
 apt-get update
@@ -224,38 +313,10 @@ if [ -f .env ]; then
     fi
 fi
 
-# --- Agent Secret (shared with local Proxmox agent on this machine) ---
-# Preserve an existing agent_secret so a re-install doesn't break a running agent.
-AGENT_CONFIG="/etc/lm-agent/config.json"
-EXISTING_AGENT_SECRET=""
-if [ -f "$AGENT_CONFIG" ]; then
-    EXISTING_AGENT_SECRET=$(python3 -c "import json,sys; d=json.load(open('$AGENT_CONFIG')); print(d.get('agent_secret',''))" 2>/dev/null || true)
-fi
-
-if [ -z "$EXISTING_AGENT_SECRET" ]; then
-    AGENT_SECRET=$(openssl rand -base64 32 | tr -d '/+=\n')
-    echo "🔑 Generated new agent_secret."
-else
-    AGENT_SECRET="$EXISTING_AGENT_SECRET"
-    echo "🔑 Preserved existing agent_secret."
-fi
-
-mkdir -p /etc/lm-agent
-python3 -c "
-import json, sys
-path = '$AGENT_CONFIG'
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    data = {}
-data['agent_secret'] = '$AGENT_SECRET'
-with open(path, 'w') as f:
-    json.dump(data, f, indent=2)
-"
-chmod 600 "$AGENT_CONFIG"
-chown svc_lm:svc_lm "$AGENT_CONFIG" 2>/dev/null || true
-echo "✅ Agent secret written to $AGENT_CONFIG"
+# --- Agent Secret + host dirs (shared with local Proxmox agent on this machine) ---
+# Host/OS-level agent-host prep (dirs + /etc/lm-agent/config.json agent_secret),
+# extracted into setup_pxmx_host so the agent's --infra-only path reuses it.
+setup_pxmx_host
 
 # --- Systemd Service (For Remote/Independent Deployment) ---
 echo "⚙️ Creating systemd service for auto-start..."
