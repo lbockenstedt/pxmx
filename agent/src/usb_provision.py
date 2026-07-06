@@ -1259,26 +1259,47 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # that match sim_phy (preferred) — plus overflow if use_all_dongles.
     quarantine = _read_quarantine()
     preferred, overflow = [], []
+    # Per-bus cull reasons so "no eligible dongles" names WHICH gate dropped each
+    # dongle (assigned / excluded / quarantined / type-mismatch) instead of a
+    # generic label — the exact diagnosability fix the resource gate already got.
+    culled: Dict[str, List[str]] = {"assigned": [], "excluded": [],
+                                    "quarantined": [], "type": []}
     for bus, info in present.items():
         if state["bus_to_vmid"].get(bus):
+            culled["assigned"].append(bus)
             continue
         if state["excluded_buses"].get(bus):
+            culled["excluded"].append(bus)
             continue
-        if bus in quarantine:
+        # Only skip a bus once it has actually reached QUARANTINE_MAX_FAILS — mere
+        # membership in the quarantine file means fails=1..2 (record_usb_failure
+        # writes an entry on the FIRST failure), and skipping on membership made a
+        # single transient clone failure permanently sideline a good dongle even
+        # though the documented threshold is 3. Gate on the count, not presence.
+        qentry = quarantine.get(bus) or {}
+        if int(qentry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
+            culled["quarantined"].append(f"{bus}({qentry.get('fails')})")
             continue
         dtype = info["type"]
         if _sim_phy_accepts(sim_phy, dtype):
             preferred.append(bus)
         elif use_all and sim_phy in ("wireless", "ethernet"):
             overflow.append(bus)
+        else:
+            culled["type"].append(f"{bus}:{dtype}")
 
     ordered = preferred + overflow
     if not ordered:
-        # Silent gate made loud — every dongle is assigned/excluded/quarantined or
-        # none is present. Previously returned with no log line.
-        _provision_reason = "no eligible dongles"
-        logger.info("auto-provision: no eligible dongles "
-                    "(all assigned/excluded/quarantined or none present)")
+        # Silent gate made loud — every dongle is assigned/excluded/quarantined,
+        # type-mismatched, or none is present. Name the per-bus cause so the card
+        # + log are self-diagnosing (previously an un-diagnosable generic label).
+        detail = "; ".join(f"{k}={v}" for k, v in culled.items() if v)
+        if not present:
+            detail = "none present"
+        elif not detail:
+            detail = f"none match sim_phy={sim_phy}"
+        _provision_reason = f"no eligible dongles ({detail})"
+        logger.info("auto-provision: no eligible dongles (%s)", detail)
         return {"provisioned": 0, "torn_down": len(torn_down)}
 
     existing_after = set(await pve_cmds.list_all_vmids())

@@ -293,9 +293,14 @@ async def _clone_lxc(agent, data, cs_cmd_id) -> None:
 
 
 async def _provision_unassigned(agent, data, cs_cmd_id) -> None:
-    # Unconditionally clear all bus exclusions, then run one provision pass
-    # (bash ``provision_unassigned`` dispatch 4078-4084 + ``usb_provision_loop``).
+    # Unconditionally clear all bus exclusions AND quarantine, then run one
+    # provision pass (bash ``provision_unassigned`` dispatch 4078-4084 +
+    # ``usb_provision_loop``). Clearing quarantine too makes this the single
+    # operator "unstick this host" action — without it a quarantined dongle had
+    # NO clear path (quarantine only auto-clears after the dongle is unplugged
+    # for 2x missing_timeout), so a manual Provision left it silently skipped.
     cleared = usb_provision.clear_excluded_buses()
+    usb_provision.clear_quarantine()
     await _progress(agent, cs_cmd_id, "provision_unassigned", "running", "provisioning", 30,
                     cleared_exclusions=cleared)
     try:
