@@ -1196,6 +1196,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     )
     if threshold_exceeded and now >= cooldown_until:
         provisioning = _provisioning_vmids()
+        # Candidates are dongle-backed VMs (bus_to_vmid) = T2 clients. T1 (no
+        # dongle) is never here, and T3 is an RPi (not a VM), so today the gate
+        # only sheds T2. TODO: once T1/T2/T3 classification is reliable end-to-end,
+        # gate EXPLICITLY on tier == T2 (hard-exclude T1 AND T3) rather than
+        # relying on the bus_to_vmid proxy. See memory todo-delete-gate-tier-t2-only.
         candidates = [int(v) for v in state["bus_to_vmid"].values()
                      if str(v).lstrip("-").isdigit() and int(v) not in provisioning]
         candidates = sorted(set(candidates))
