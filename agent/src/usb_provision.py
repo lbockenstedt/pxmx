@@ -26,8 +26,7 @@ import logging
 import os
 import re
 import time
-from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("PxmxAgent")
 
@@ -144,9 +143,24 @@ EXCLUDE_COOLDOWN_S = 900
 DELETE_GATE_FILE = f"{PXMLIB}/delete_gate.json"
 VMID_AUDIT_FILE = f"{PXMLIB}/vmid_audit.json"
 
-# Rolling resource samples pruned to the 1h window: [(ts, pct), ...].
-_cpu_samples: Deque[Tuple[float, float]] = deque()
-_mem_samples: Deque[Tuple[float, float]] = deque()
+# Rolling resource samples pruned to the 1h window: [(ts, pct), ...]. Plain
+# lists (NOT deque): the prune below is a slice-assignment (`samples[:] = [...]`)
+# which deque does not support — as a deque it raised TypeError every call, so
+# CPU never pruned and mem was never recorded (mem_avg stuck None). Lists also
+# match the cs original (server.py _cpu_samples/_mem_samples are list[tuple]).
+_cpu_samples: List[Tuple[float, float]] = []
+_mem_samples: List[Tuple[float, float]] = []
+_resource_samples_started: float = 0.0   # epoch of first sample (cs _resource_samples_started)
+
+# Persist the 1h samples so an agent restart doesn't reset the rolling window
+# (and with it the provision/delete-gate warmup). Faithful port of the cs
+# webui-spoke resource_cache (README: "a spoke restart does not reset the warmup
+# countdown"). Without this, frequent agent restarts keep cpu_avg cold and the
+# 1h-average delete gate can never warm up to its threshold.
+_RESOURCE_CACHE_FILE = f"{PXMLIB}/resource_cache.json"
+_RESOURCE_CACHE_SAVE_INTERVAL = 60.0     # persist at most once/min (cs _RESOURCE_CACHE_SAVE_INTERVAL)
+_resource_cache_last_saved: float = 0.0
+_resource_cache_loaded: bool = False
 
 # In-process brain state, reported up via telemetry (rebuilt each pass).
 _provision_halt: Optional[Dict[str, Any]] = None
@@ -195,14 +209,61 @@ def _pct_setting(usb_cfg: Dict[str, Any], key: str, default: int) -> int:
         return default
 
 
+def _load_resource_cache() -> None:
+    """Restore CPU/mem samples from disk so an agent restart doesn't reset the
+    1-hour rolling window. Faithful port of cs webui-spoke ``_load_resource_cache``
+    — the original persists to resource_cache.json for exactly this reason. Stale
+    samples (outside the 1h window) are dropped on load."""
+    global _resource_samples_started
+    try:
+        if not os.path.exists(_RESOURCE_CACHE_FILE):
+            return
+        with open(_RESOURCE_CACHE_FILE) as f:
+            data = json.load(f)
+        cutoff = time.time() - _RESOURCE_SAMPLE_WINDOW
+        _cpu_samples[:] = [(float(ts), float(v))
+                           for ts, v in (data.get("cpu_samples") or []) if float(ts) >= cutoff]
+        _mem_samples[:] = [(float(ts), float(v))
+                           for ts, v in (data.get("mem_samples") or []) if float(ts) >= cutoff]
+        started = float(data.get("started") or 0)
+        _resource_samples_started = started if started > 0 else 0.0
+        logger.info("Loaded resource cache: %d CPU / %d mem samples (started %.0fs ago)",
+                    len(_cpu_samples), len(_mem_samples),
+                    time.time() - _resource_samples_started if _resource_samples_started else 0)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        logger.debug("Could not load resource cache from %s", _RESOURCE_CACHE_FILE, exc_info=True)
+
+
+def _save_resource_cache(force: bool = False) -> None:
+    """Persist CPU/mem samples so the 1-hour window survives restarts. Throttled
+    to once per minute (cs _RESOURCE_CACHE_SAVE_INTERVAL); atomic replace so a
+    crash mid-write can't leave a truncated cache."""
+    global _resource_cache_last_saved
+    now = time.time()
+    if not force and (now - _resource_cache_last_saved) < _RESOURCE_CACHE_SAVE_INTERVAL:
+        return
+    _resource_cache_last_saved = now
+    try:
+        os.makedirs(PXMLIB, exist_ok=True)
+        tmp = _RESOURCE_CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"cpu_samples": _cpu_samples,
+                       "mem_samples": _mem_samples,
+                       "started": _resource_samples_started}, f)
+        os.replace(tmp, _RESOURCE_CACHE_FILE)
+    except OSError:
+        logger.debug("Could not save resource cache to %s", _RESOURCE_CACHE_FILE, exc_info=True)
+
+
 async def sample_resources(agent) -> None:
-    """Append a CPU + memory sample to the rolling 1h deques, sourced from the
+    """Append a CPU + memory sample to the rolling 1h lists, sourced from the
     SAME Proxmox node figures the CS telemetry displays (``get_node_stats`` →
     /cluster/resources: ``cpu_usage`` + ``mem_pct``). Called once per
-    ``_usb_provision_loop`` tick. Best-effort — a failure leaves the deques
-    untouched (averages degrade to None/cold-start, which the gate treats as
-    "no data yet → don't block", matching the card's "applies only after a full
-    hour" help text).
+    ``_usb_provision_loop`` tick. Best-effort — a failure leaves the sample
+    lists untouched (averages degrade to None/cold-start, which the gate treats
+    as "no data yet → don't block", matching the card's "applies only after a
+    full hour" help text). Samples are persisted (resource_cache.json) so a
+    restart doesn't reset the 1h window — the cache is lazy-loaded on first call.
 
     Why Proxmox not psutil: the gate used to read ``psutil.virtual_memory()`` /
     ``cpu_percent`` (the agent OS view), but the user-visible CPU/Mem 1h tiles
@@ -213,6 +274,10 @@ async def sample_resources(agent) -> None:
     same Proxmox figures makes "below threshold" mean below threshold. Uses
     ``nodes[0]`` to mirror ``_cs_telemetry_body`` so the gate sees exactly what
     the card renders."""
+    global _resource_samples_started, _resource_cache_loaded
+    if not _resource_cache_loaded:
+        _resource_cache_loaded = True
+        _load_resource_cache()
     try:
         stats = await agent.get_node_stats()
         nodes = (stats or {}).get("nodes", []) or []
@@ -223,10 +288,13 @@ async def sample_resources(agent) -> None:
         mem_pct = float(n.get("mem_pct", 0) or 0)
         now = time.time()
         cutoff = now - _RESOURCE_SAMPLE_WINDOW
+        if not _resource_samples_started:
+            _resource_samples_started = now
         _cpu_samples.append((now, cpu_pct))
         _cpu_samples[:] = [(ts, v) for ts, v in _cpu_samples if ts >= cutoff]
         _mem_samples.append((now, mem_pct))
         _mem_samples[:] = [(ts, v) for ts, v in _mem_samples if ts >= cutoff]
+        _save_resource_cache()
     except Exception as exc:  # noqa: BLE001
         logger.debug("sample_resources failed: %s", exc)
 
@@ -244,7 +312,7 @@ async def _current_cpu_pct(agent) -> Optional[float]:
         return None
 
 
-def _resource_1h_average(samples: Deque[Tuple[float, float]]) -> Optional[float]:
+def _resource_1h_average(samples: List[Tuple[float, float]]) -> Optional[float]:
     if not samples:
         return None
     cutoff = time.time() - _RESOURCE_SAMPLE_WINDOW
