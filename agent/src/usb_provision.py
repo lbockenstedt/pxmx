@@ -878,8 +878,15 @@ def _sim_phy_accepts(sim_phy: str, device_type: str) -> bool:
     # LM usb_vidpids `type` field (wireless | wired | storage | other). A sim
     # requiring "ethernet" wants a *wired* dongle — map wired <-> ethernet so
     # the wired/wireless selector the tenant sets in LM is actually enforced.
-    # "storage"/"other" only match sim_phy == "any".
+    # "storage" (a real, known-incompatible class) only matches sim_phy == "any".
     if sim_phy == "any":
+        return True
+    # An UNCLASSIFIED dongle ("other"/unknown/empty) is not filtered out on type:
+    # the admin certified it, so provision it regardless of sim_phy. Only a KNOWN
+    # mismatch (e.g. a "wired"/"storage" dongle when the sim wants "wireless") is
+    # excluded. This stops a wireless dongle that got certified as "other" (the
+    # certify UI's per-row type inference) from being wrongly rejected.
+    if device_type in ("other", "unknown", ""):
         return True
     if sim_phy == device_type:
         return True
