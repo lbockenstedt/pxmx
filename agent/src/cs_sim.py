@@ -161,14 +161,12 @@ async def _delete_vm(agent, data, cs_cmd_id) -> None:
     prot = _protected(agent)
     vid = assert_sim_vm(vmid, prot)  # raises → run_long_op emits terminal failed
     await _progress(agent, cs_cmd_id, "delete_vm", "running", "stopping", 10, vmid=vid)
-    # Do NOT bus-exclude the dongle on delete. Dongle provisioning is controlled
-    # by VID:PID (the certified / ignored vidpid lists), never by physical bus:
-    # bus-excluding on delete stranded certified dongles (their bus stayed in
-    # excluded_buses and never provisioned again) and surprised operators who
-    # "only excluded a VID:PID". To keep a dongle from (re)provisioning, ignore
-    # its vid:pid; to stop the churn of an auto-recreated VM, disable
-    # auto-provision. (Was exclude_bus_after=True.)
-    r = await destroy_vm(agent, vid, protected=prot, exclude_bus_after=False)
+    # Admin delete bus-excludes the dongle (anti-churn: don't immediately
+    # re-provision a just-deleted dongle). The exclusion is TIME-LIMITED — the
+    # provision loop auto-returns the bus after usb_exclude_cooldown (default
+    # 900s / 15 min); see usb_provision.exclude_bus + the reconcile cooldown
+    # clear. Previously the exclusion was PERMANENT (stranded the dongle forever).
+    r = await destroy_vm(agent, vid, protected=prot, exclude_bus_after=True)
     if r["ok"]:
         await _terminal(agent, cs_cmd_id, "delete_vm", "completed",
                         f"VM {vid} destroyed", vmid=vid, kind=r["kind"])

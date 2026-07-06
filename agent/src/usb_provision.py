@@ -136,6 +136,10 @@ def _ignored_vidpids(agent) -> Set[str]:
 _RESOURCE_SAMPLE_WINDOW = 3600  # 1h rolling window (cs _RESOURCE_SAMPLE_WINDOW)
 DELETE_GATE_COOLDOWN_S = 300    # cs line 3615
 VMID_AUDIT_INTERVAL_S = 300    # cs line 3619
+# A dongle bus-excluded on admin VM delete (anti-churn) auto-returns to service
+# after this cooldown, so an exclusion is never permanent. Configurable per
+# tenant via usb_config usb_exclude_cooldown / exclude_cooldown.
+EXCLUDE_COOLDOWN_S = 900
 
 DELETE_GATE_FILE = f"{PXMLIB}/delete_gate.json"
 VMID_AUDIT_FILE = f"{PXMLIB}/vmid_audit.json"
@@ -656,8 +660,11 @@ def clear_excluded_buses() -> int:
 
 
 def exclude_bus(bus: str) -> None:
+    # Store the exclusion TIMESTAMP (not a bare 1) so the provision loop can
+    # auto-return the bus after EXCLUDE_COOLDOWN_S. Legacy bare-1 values are
+    # treated as already-expired by the reconcile cooldown clear.
     st = load_usb_state()
-    st["excluded_buses"][bus] = 1
+    st["excluded_buses"][bus] = time.time()
     save_usb_state(st)
 
 
@@ -965,6 +972,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     missing_timeout = int(_cfg_first(usb_cfg,
                                      ("usb_missing_timeout_seconds", "usb_missing_timeout",
                                       "missing_timeout"), 0) or 0)
+    # How long a dongle stays bus-excluded after an admin VM delete before the
+    # loop auto-returns it to service (never permanent). Tenant-configurable.
+    exclude_cooldown = int(_cfg_first(usb_cfg,
+                                      ("usb_exclude_cooldown", "exclude_cooldown"),
+                                      EXCLUDE_COOLDOWN_S) or EXCLUDE_COOLDOWN_S)
     # Default 1 (sequential), matching bash's explicit safety default
     # (RECLONE_CONCURRENCY=1, proxmox-agent.sh:114) — parallel clones are an
     # explicit admin opt-in, not the out-of-the-box behavior; N simultaneous
@@ -1010,10 +1022,19 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     for bus in list(state["bus_to_vmid"]):
         if bus in present:
             state.setdefault("vidpid_by_bus", {})[bus] = present[bus].get("vidpid")
-    # Clear exclusions/quarantine for buses no longer present.
+    # Bus exclusions (set on admin delete, anti-churn) are TIME-LIMITED: clear a
+    # bus once it goes absent (unplugged) OR the exclude cooldown elapses, so a
+    # deleted dongle returns to service automatically instead of staying excluded
+    # forever. A legacy bare-1 value (pre-timestamp) has since=0 → treated as
+    # already expired, so old permanent exclusions self-heal on the next pass.
     for bus in list(state["excluded_buses"]):
-        if bus not in present:
+        v = state["excluded_buses"].get(bus)
+        since = float(v) if isinstance(v, (int, float)) and float(v) > 1e9 else 0.0
+        if bus not in present or now - since >= exclude_cooldown:
             state["excluded_buses"].pop(bus, None)
+            logger.info("provision loop: bus exclusion cleared for %s (%s)", bus,
+                        "unplugged" if bus not in present
+                        else f"cooldown {exclude_cooldown}s elapsed")
     # Auto-clear quarantine only after it's been BOTH absent AND quarantined
     # for >= 2x missing_timeout (bash load_usb_quarantine, proxmox-agent.sh:
     # 1231-1244) — clearing the instant a quarantined dongle is merely
