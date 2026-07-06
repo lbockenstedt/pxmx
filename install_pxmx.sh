@@ -111,6 +111,23 @@ setup_pxmx_host() {
     # the log dir the lm-pxmx unit / agent-hosted role append to (/var/log/lm).
     mkdir -p /var/log/lm /var/lib/pxmx
 
+    # Circular logging: cap /var/log/lm/*.log so it can't fill the disk
+    # (copytruncate keeps the inode → the running O_APPEND FileHandler + systemd
+    # stderr keep appending). Belt-and-suspenders alongside logging_setup's
+    # RotatingFileHandler (LM_LOG_MAX_BYTES).
+    cat > /etc/logrotate.d/lm <<'LOGROTATE'
+/var/log/lm/*.log /var/log/client-sim-*.log {
+    su root root
+    size 50M
+    rotate 5
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+LOGROTATE
+
     # Agent secret shared with the local Proxmox NODE agent that dials this
     # spoke's agent listener. The spoke reads it from AGENT_CONFIG_PATH
     # (/etc/lm-agent/config.json). Preserve an existing secret so a re-run /

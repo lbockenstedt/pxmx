@@ -68,6 +68,24 @@ mkdir -p "$INSTALL_DIR"
 # FileHandler here and the systemd unit appends stderr to the same file.
 mkdir -p /var/log/lm
 
+# Circular logging: cap /var/log/lm/*.log (+ legacy client-sim logs) so they
+# can't fill the disk. copytruncate keeps the same inode so the running
+# spoke/agent FileHandler + systemd StandardError=append: writers keep appending
+# (both O_APPEND → no sparse files). Belt-and-suspenders alongside the app's
+# RotatingFileHandler (LM_LOG_MAX_BYTES) in logging_setup.py.
+cat > /etc/logrotate.d/lm <<'LOGROTATE'
+/var/log/lm/*.log /var/log/client-sim-*.log {
+    su root root
+    size 50M
+    rotate 5
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+LOGROTATE
+
 # ── Preserve existing AGENT_SECRET across reinstalls ──────────────────────────
 # Precedence: --secret arg > existing .env value > empty (zero-touch)
 EXISTING_SECRET=""
