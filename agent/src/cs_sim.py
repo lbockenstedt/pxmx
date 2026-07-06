@@ -129,6 +129,15 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
     prot = protected if protected is not None else _protected(agent)
     vid = assert_sim_vm(vmid, prot)  # GuardError if invalid → caller handles
     kind = await pve_cmds.detect_guest_type(vid)
+    # Never destroy a TEMPLATE (the clone source), regardless of caller. This is
+    # the execution-layer twin of the assert_sim_vm floor/protected-set guard:
+    # every teardown path (delete gate, missing-dongle, batch migration, admin
+    # delete, reclone) funnels through here, so one check covers them all — a
+    # template can never be torn down even if it somehow holds a dongle or lands
+    # in a delete candidate set. Mirrors the bash agent's guest_is_template skip.
+    if await pve_cmds.is_template(vid, kind):
+        raise GuardError(
+            f"vmid {vid} is a template (clone source) — refusing to destroy")
     bus = bus or usb_provision.bus_for_vmid(vid)
     await _expire_pending_commands(agent, vid, kind)
     if kind == "lxc":
@@ -261,6 +270,13 @@ async def _clone_lxc(agent, data, cs_cmd_id) -> None:
     source_vmid = data.get("source_vmid") or data.get("template_id")
     prot = _protected(agent)
     vid = assert_sim_vm(vmid, prot)
+    # This path destroys the reclone TARGET (vid) directly, bypassing
+    # destroy_vm's choke-point guard — so re-assert the template rule here: never
+    # destroy a template, even as the destroy-then-clone step of a reclone.
+    if await pve_cmds.is_template(vid, "lxc"):
+        await _terminal(agent, cs_cmd_id, "clone_lxc", "failed",
+                        f"CT {vid} is a template — refusing to destroy", vmid=vid)
+        return
     if not source_vmid:
         await _terminal(agent, cs_cmd_id, "clone_lxc", "failed",
                         "no source_vmid provided", vmid=vid)

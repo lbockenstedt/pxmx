@@ -73,6 +73,32 @@ async def vm_status(vmid: int) -> Dict[str, Any]:
     return {"vmid": vmid, "kind": kind, "running": "running" in text, "raw": text}
 
 
+async def is_template(vmid: Any, kind: Optional[str] = None) -> bool:
+    """True if ``vmid`` is a Proxmox TEMPLATE (a clone source), not a runnable
+    guest. Templates carry ``template: 1`` in ``qm config`` / ``pct config``.
+    Read-only and unguarded (a template's VMID may sit below the sim floor).
+    Mirrors the bash agent's ``guest_is_template`` — the single detector every
+    delete path uses so a source image can never be destroyed. Best-effort: on
+    any probe failure returns ``False`` (unknown → treat as a normal guest; the
+    90000-floor + protected-set guard still applies)."""
+    try:
+        vid = int(vmid)
+    except (TypeError, ValueError):
+        return False
+    k = (kind or "").lower()
+    if k not in ("qemu", "lxc"):
+        k = await detect_guest_type(vid)
+    bin_ = "pct" if k == "lxc" else "qm"
+    rc, out, _ = await _run([bin_, "config", str(vid)], check=False, timeout=15)
+    if rc != 0:
+        return False
+    for line in out.decode(errors="replace").splitlines():
+        s = line.strip().lower()
+        if s.startswith("template:"):
+            return s.split(":", 1)[1].strip() in ("1", "true", "yes")
+    return False
+
+
 # ── Single-VM mutating commands (all guarded) ───────────────────────────────
 
 async def start_vm(vmid: Any, protected: Set[int]) -> Dict[str, Any]:

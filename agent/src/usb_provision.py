@@ -1199,10 +1199,23 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         candidates = [int(v) for v in state["bus_to_vmid"].values()
                      if str(v).lstrip("-").isdigit() and int(v) not in provisioning]
         candidates = sorted(set(candidates))
-        if candidates:
-            target_vmid = max(candidates)  # newest = highest VMID
-            bus = state["bus_to_vmid"].get(str(target_vmid))
-            from . import cs_sim  # deferred — cs_sim imports usb_provision
+        from . import cs_sim  # deferred — cs_sim imports usb_provision
+        from . import pve_cmds  # local: pve_cmds is imported per-function
+        # Walk highest → lowest and pick the newest candidate that is NOT a
+        # template. Templates (clone sources) must never be torn down: destroy_vm
+        # refuses them at the choke point, but excluding them here means the gate
+        # sheds a real sim VM instead of stalling on the same template every tick.
+        # Mirrors the cs original's `not is_template` candidate filter (server.py).
+        target_vmid = None
+        bus = None
+        for _cand in sorted(candidates, reverse=True):
+            if await pve_cmds.is_template(_cand):
+                logger.info("delete gate: skipping template VMID %s (never torn down)", _cand)
+                continue
+            target_vmid = _cand
+            bus = state["bus_to_vmid"].get(str(_cand))
+            break
+        if target_vmid is not None:
             try:
                 await cs_sim.destroy_vm(agent, target_vmid, bus=bus)
                 torn_down.append(target_vmid)
