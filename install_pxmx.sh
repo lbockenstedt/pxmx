@@ -204,6 +204,13 @@ else
     git clone https://github.com/lbockenstedt/pxmx.git
 fi
 
+# The git clone/pull above ran as root; the spoke runs as svc_lm and
+# self-updates via `git pull`/`git reset --hard` as that user — root-owned
+# .git/objects → "insufficient permission for adding an object" → self-update
+# fails. Hand the repo to svc_lm + trust the dir (mirrors cs/netbox installers).
+chown -R svc_lm:svc_lm "$INSTALL_DIR/pxmx" 2>/dev/null || true
+runuser -u svc_lm -- git config --global --add safe.directory "$INSTALL_DIR/pxmx" 2>/dev/null || true
+
 echo "🛠️ Setting up Proxmox Manager..."
 cd pxmx
 
