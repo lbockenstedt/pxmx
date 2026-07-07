@@ -148,6 +148,56 @@ def _t3_pci_vidpids(agent) -> Set[str]:
     return _pci_vidpid_set(_usb_cfg(agent).get("t3_pci_vidpids"))
 
 
+# Cache the per-VM tier map — passthrough rarely changes, and resolving PCI
+# (qm config + lspci) for every VM on each ~60s telemetry tick is wasteful.
+_vm_tier_cache: Dict[str, Any] = {"ts": 0.0, "tiers": {}}
+_VM_TIER_TTL = 60.0
+
+
+async def compute_vm_tiers(agent, vms) -> Dict[str, str]:
+    """Authoritative per-VM tier map ``{str(vmid): 't1'|'t2'|'t3'}``, classified by
+    PASSTHROUGH — the reliable signal, independent of any guest self-report:
+      * PCI passthrough matching t3_pci_vidpids → ``t3`` (protected)
+      * PCI passthrough matching t1_pci_vidpids → ``t1`` (protected)
+      * a USB dongle (vmid in usb_state) and no protecting PCI device → ``t2``
+    PCI wins over USB so a T1/T3 device is never mislabeled T2. VMs with no
+    determinable tier are omitted (the UI keeps its default). Cached ``_VM_TIER_TTL``
+    seconds; templates are skipped. Consumed by ``_cs_telemetry_body`` (stamped
+    per VM → cs spoke → Clients tab badge)."""
+    now = time.time()
+    if _vm_tier_cache["tiers"] and (now - _vm_tier_cache["ts"]) < _VM_TIER_TTL:
+        return dict(_vm_tier_cache["tiers"])
+    from . import pve_cmds
+    t1_set = _t1_pci_vidpids(agent)
+    t3_set = _t3_pci_vidpids(agent)
+    st = load_usb_state()
+    usb_vmids = {str(v) for v in (st.get("bus_to_vmid") or {}).values()
+                 if str(v).lstrip("-").isdigit()}
+    tiers: Dict[str, str] = {}
+    for v in (vms or []):
+        vid = v.get("vmid") if isinstance(v, dict) else v
+        if vid in (None, ""):
+            continue
+        svid = str(vid)
+        tier = None
+        if (t1_set or t3_set) and not (isinstance(v, dict) and v.get("is_template")):
+            try:
+                pci = await pve_cmds.pci_passthrough_vidpids(
+                    vid, v.get("type") if isinstance(v, dict) else None)
+            except Exception:  # noqa: BLE001
+                pci = set()
+            if pci & t3_set:
+                tier = "t3"
+            elif pci & t1_set:
+                tier = "t1"
+        if tier is None and svid in usb_vmids:
+            tier = "t2"
+        if tier:
+            tiers[svid] = tier
+    _vm_tier_cache.update({"ts": now, "tiers": tiers})
+    return dict(tiers)
+
+
 # ── auto-provisioning brain (cs webui-spoke/server.py brain-loop port) ────
 # The cs spoke's brain gates cloning on the ``usb_auto_provision`` toggle and
 # host resource thresholds, and can auto-delete the newest sim VM under load
@@ -1485,6 +1535,10 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     item_by_bus = {b: items[i] for i, b in enumerate(ordered)}
 
     async def _do(bus: str) -> bool:
+        # _provision_halt is a module global; declare it so the pacing branch
+        # below can publish a 'pacing' halt (else the assignment would create a
+        # _do-local and never reach telemetry).
+        global _provision_halt
         info = present[bus]
         async with sem:
             if _pacing_halted[0]:
@@ -1498,6 +1552,25 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 cpu_now = await _current_cpu_pct(agent)
                 if cpu_now is not None and cpu_now >= cpu_prov_ceil:
                     _pacing_halted[0] = True
+                    # Surface pacing in telemetry so the WebUI AUTO-PROV cell's
+                    # 'pacing' branch fires (csProvThrottleBadge r==='pacing').
+                    # Pacing is a transient in-batch ramp abort, not a sustained
+                    # halt; the next provision-loop cycle re-evaluates cpu/mem and
+                    # reassigns _provision_halt, so this shows for ~1 cycle.
+                    # cpu_threshold is the ramp ceiling (cpu_prov_ceil), matching
+                    # the bash agent (proxmox-agent.sh:2803). Pacing can fire on an
+                    # instantaneous spike above the ceiling even when the 1h avg is
+                    # below the provision threshold — in that case this is the ONLY
+                    # halt signal, which is exactly when the pacing badge should show.
+                    _provision_halt = {
+                        "halted": True,
+                        "reason": "pacing",
+                        "cpu_pct": round(cpu_now, 1),
+                        "cpu_threshold": cpu_prov_ceil,
+                        "mem_pct": round(mem_avg, 1) if mem_avg is not None else None,
+                        "mem_threshold": mem_prov_thr,
+                        "ts": int(time.time()),
+                    }
                     logger.warning(
                         "provision loop: pacing — CPU %.0f%% >= ramp ceiling %s%% "
                         "— stopping batch after %d clone(s)",
