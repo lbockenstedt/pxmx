@@ -1203,11 +1203,22 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     mem_del_thr = _pct_setting(usb_cfg, "mem_delete_threshold", 90)
 
     # provision_halt: over the provision threshold → halt (cs agent.sh 2648-2666).
+    # The published dict must carry the four numeric fields the WebUI
+    # AUTO-PROV cell reads (csProvThrottleBadge: cpu_pct/cpu_threshold/mem_pct/
+    # mem_threshold) — the bash agent emits these (proxmox-agent.sh:2514-2526);
+    # omitting them renders "CPU ?% ≥ ?%" placeholders in the Overview column.
     cpu_over_prov = cpu_avg is not None and cpu_avg >= cpu_prov_thr
     mem_over_prov = mem_avg is not None and mem_avg >= mem_prov_thr
     if cpu_over_prov or mem_over_prov:
-        _provision_halt = {"halted": True,
-                            "reason": "cpu" if cpu_over_prov else "mem"}
+        _provision_halt = {
+            "halted": True,
+            "reason": "cpu" if cpu_over_prov else "mem",
+            "cpu_pct": round(cpu_avg, 1) if cpu_avg is not None else None,
+            "cpu_threshold": cpu_prov_thr,
+            "mem_pct": round(mem_avg, 1) if mem_avg is not None else None,
+            "mem_threshold": mem_prov_thr,
+            "ts": int(now),
+        }
     else:
         _provision_halt = None
 
