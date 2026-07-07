@@ -263,11 +263,27 @@ if [ "$SPOKE_ID_PINNED" = "1" ]; then
     SPOKE_ID_LINE="SPOKE_ID=$SPOKE_ID"
     ID_ARG="--id \$SPOKE_ID"
 fi
+
+# Preserve the minted INSTALL_UUID across a re-install / update so the hub-side
+# fingerprint (install_uuid) stays stable. The cat > below truncates .env, so
+# without this the existing UUID line is wiped and the spoke mints a fresh one
+# on next start → hub records a `reimaged` (fingerprint-changed) event for a box
+# that was only updated. _ensure_install_uuid mints on first start only when
+# this line is absent, so omitting it on a fresh install is unchanged.
+INSTALL_UUID_LINE=""
+if [ -f .env ] && grep -q "^INSTALL_UUID=" .env; then
+    EXISTING_UUID=$(grep "^INSTALL_UUID=" .env | cut -d= -f2-)
+    if [ -n "$EXISTING_UUID" ]; then
+        INSTALL_UUID_LINE="INSTALL_UUID=$EXISTING_UUID"
+        echo "Preserving existing install UUID (hub fingerprint)."
+    fi
+fi
 cat <<EOF > .env
 HUB_URL=$HUB_URL
 ${SPOKE_ID_LINE}
 SPOKE_SECRET=$SPOKE_SECRET
 HUB_SECRET=$HUB_SECRET
+${INSTALL_UUID_LINE}
 EOF
 
 # ── Agent-listener TLS (standalone mode only) ──────────────────────────────
