@@ -2337,7 +2337,15 @@ class ProxmoxAgent:
                 # gives ample margin). send_cs_event injects hostname + agent_id.
                 if self.cs_enabled:
                     try:
-                        cs_body = self._cs_telemetry_body(vms, nodes)
+                        # Classify each VM's tier by passthrough (cached ~60s) in
+                        # this async context, then stamp it into the sync body.
+                        try:
+                            tiers = await usb_provision.compute_vm_tiers(
+                                self, (vms or {}).get("vms", []) or [])
+                        except Exception as _te:
+                            logger.debug(f"compute_vm_tiers failed: {_te}")
+                            tiers = {}
+                        cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         await self.send_cs_event("CS_TELEMETRY", cs_body)
                     except Exception as e:
                         logger.debug(f"CS_TELEMETRY emit failed: {e}")
@@ -2348,7 +2356,8 @@ class ProxmoxAgent:
                 await asyncio.sleep(10)
 
     def _cs_telemetry_body(self, vms_resp: Dict[str, Any],
-                           nodes_resp: Dict[str, Any]) -> Dict[str, Any]:
+                           nodes_resp: Dict[str, Any],
+                           tiers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """Build the Client-Simulation telemetry body for this host.
 
         Shaped to mirror the legacy cs bash agent's telemetry body (consumed by
@@ -2389,6 +2398,7 @@ class ProxmoxAgent:
             name = str(v.get("name", "")).lower()
             return name.startswith(("template-", "tmpl-"))
 
+        tiers = tiers or {}
         vms = []
         for v in (vms_resp or {}).get("vms", []) or []:
             v = v or {}
@@ -2403,6 +2413,11 @@ class ProxmoxAgent:
                 "is_template":     _is_template(v),
                 "tags":            v.get("tags", []),
                 "node":            v.get("node", ""),
+                # Authoritative tier (t1/t2/t3) by passthrough — the cs spoke maps
+                # this vmid → client hostname and stamps it on the Clients row so
+                # csClassifyClient renders the correct badge (T3 especially, which
+                # has no USB dongle and would otherwise fall to the T1 default).
+                "tier":            tiers.get(str(v.get("vmid"))),
                 "_agent_hostname": self.hostname,
             })
 
