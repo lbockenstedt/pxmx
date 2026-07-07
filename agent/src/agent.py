@@ -363,6 +363,15 @@ class ProxmoxAgent:
         # Proxmox cluster name — resolved on first telemetry push; defaults to hostname.
         self.cluster_name: str = self.hostname
         self._cluster_resolved: bool = False
+        # 5s TTL memo for /cluster/resources: the telemetry loop calls
+        # get_vm_list() and get_node_stats() back-to-back every ~60s, and BOTH
+        # issued a separate pvesh /cluster/resources round-trip — doubling the
+        # work each tick. The 5s TTL is short enough to expire before the next
+        # 60s tick (no cross-tick staleness) but long enough to let the second
+        # caller in a tick reuse the first's fetch.
+        self._cluster_resources_cache: Optional[list] = None
+        self._cluster_resources_ts: float = 0.0
+        self._cluster_resources_ttl: float = 5.0
 
         # ── Client Simulation mode (unified agent) ──────────────────────────────
         # When self.config["client_simulation"]["enabled"] is true, the agent
@@ -710,6 +719,22 @@ class ProxmoxAgent:
             "timestamp":    time.time(),
         }
 
+    async def _cluster_resources(self) -> list:
+        """``/cluster/resources`` with a 5s TTL — get_vm_list + get_node_stats
+        both consume this view and previously each issued its own pvesh round-
+        trip per telemetry tick. On a hit the cached list is returned without a
+        pvesh call; the 5s TTL expires before the next ~60s tick so cross-tick
+        reads always re-fetch fresh data. Raises on failure so callers fall
+        through to their per-node fallback paths (same as a bare _pvesh error)."""
+        now = time.time()
+        if (self._cluster_resources_cache is not None
+                and (now - self._cluster_resources_ts) < self._cluster_resources_ttl):
+            return self._cluster_resources_cache
+        resources = await self._pvesh("/cluster/resources")
+        self._cluster_resources_cache = resources
+        self._cluster_resources_ts = now
+        return resources
+
     async def get_node_stats(self) -> Dict[str, Any]:
         """Per-node stats via local pvesh — no API credentials required.
 
@@ -720,7 +745,7 @@ class ProxmoxAgent:
         try:
             # Primary: /cluster/resources filtered for nodes — cpu from pvestatd (always live)
             try:
-                resources = await self._pvesh("/cluster/resources")
+                resources = await self._cluster_resources()
                 nodes = []
                 for r in (resources if isinstance(resources, list) else []):
                     if r.get("type") != "node":
@@ -1151,7 +1176,7 @@ class ProxmoxAgent:
             # Primary: /cluster/resources — single call, Proxmox keeps this view
             # up-to-date for its own summary UI; works on standalone nodes too.
             try:
-                resources = await self._pvesh("/cluster/resources")
+                resources = await self._cluster_resources()
                 all_vms = [
                     _vm_entry(r, r.get("node", ""), r.get("type"), r.get("vmid"))
                     for r in (resources if isinstance(resources, list) else [])
