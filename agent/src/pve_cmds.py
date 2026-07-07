@@ -15,6 +15,7 @@ unfiltered ``qm list | awk 'NR>1{print $1}'``.
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional, Set
 
@@ -97,6 +98,46 @@ async def is_template(vmid: Any, kind: Optional[str] = None) -> bool:
         if s.startswith("template:"):
             return s.split(":", 1)[1].strip() in ("1", "true", "yes")
     return False
+
+
+async def pci_passthrough_vidpids(vmid: Any, kind: Optional[str] = None) -> Set[str]:
+    """Set of PCI-passthrough device VID:PIDs (lowercased ``vvvv:pppp``) attached
+    to ``vmid`` via ``hostpciN:`` lines in ``qm config``, each resolved with
+    ``lspci -n``. This is the T1/T3 tier signal (T1 and T3 are PCI passthrough;
+    T2 is USB). Read-only. Mirrors the bash agent (proxmox-agent.sh:3313 hostpci
+    scrape + lspci -n resolve). Best-effort — returns whatever resolves, empty on
+    any failure; LXC (no PCI passthrough) short-circuits to empty. Resource-mapping
+    passthroughs (``hostpci0: mapping=...``) are skipped (no raw address to resolve)."""
+    try:
+        vid = int(vmid)
+    except (TypeError, ValueError):
+        return set()
+    k = (kind or "").lower()
+    if k not in ("qemu", "lxc"):
+        k = await detect_guest_type(vid)
+    if k == "lxc":
+        return set()
+    rc, out, _ = await _run(["qm", "config", str(vid)], check=False, timeout=15)
+    if rc != 0:
+        return set()
+    # hostpciN: <addr>[,opt=val,...] — capture the first token (the PCI address).
+    addrs: Set[str] = set()
+    for m in re.finditer(r"(?mi)^hostpci\d+:\s*([^\s,]+)", out.decode(errors="replace")):
+        tok = m.group(1).strip()
+        if not tok or "=" in tok:  # skip resource-mapping form (mapping=...)
+            continue
+        addrs.add(tok)
+    vidpids: Set[str] = set()
+    for addr in addrs:
+        rc2, o2, _ = await _run(["lspci", "-n", "-s", addr], check=False, timeout=10)
+        if rc2 != 0:
+            continue
+        # e.g. "01:00.0 0280: 168c:0034 (rev 01)" — vendor:device is the
+        # contiguous 4hex:4hex (the class code "0280:" is followed by a space).
+        m = re.search(r"\b([0-9a-f]{4}:[0-9a-f]{4})\b", o2.decode(errors="replace").lower())
+        if m:
+            vidpids.add(m.group(1))
+    return vidpids
 
 
 # ── Single-VM mutating commands (all guarded) ───────────────────────────────

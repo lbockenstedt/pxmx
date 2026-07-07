@@ -123,6 +123,31 @@ def _ignored_vidpids(agent) -> Set[str]:
     return out
 
 
+def _pci_vidpid_set(raw: Any) -> Set[str]:
+    """Coerce a t1/t3_pci_vidpids config value (JSON array of bare ``vid:pid``
+    strings, list, or comma-string) into a lowercased, regex-validated set."""
+    out: Set[str] = set()
+    for v in _parse_vidpid_items(raw):
+        vp = (v.get("vidpid") if isinstance(v, dict) else v)
+        s = str(vp or "").strip().lower()
+        if _VIDPID_RE.match(s):
+            out.add(s)
+    return out
+
+
+def _t1_pci_vidpids(agent) -> Set[str]:
+    """T1 PCI-passthrough VID:PID set (configurable, Setup → Proxmox). A VM whose
+    hostpci device matches one of these is T1 — never torn down. Empty until the
+    hub delivers usb_config."""
+    return _pci_vidpid_set(_usb_cfg(agent).get("t1_pci_vidpids"))
+
+
+def _t3_pci_vidpids(agent) -> Set[str]:
+    """T3 PCI-passthrough VID:PID set (configurable, Setup → Proxmox). A VM whose
+    hostpci device matches one of these is T3 — never torn down."""
+    return _pci_vidpid_set(_usb_cfg(agent).get("t3_pci_vidpids"))
+
+
 # ── auto-provisioning brain (cs webui-spoke/server.py brain-loop port) ────
 # The cs spoke's brain gates cloning on the ``usb_auto_provision`` toggle and
 # host resource thresholds, and can auto-delete the newest sim VM under load
@@ -1196,27 +1221,33 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     )
     if threshold_exceeded and now >= cooldown_until:
         provisioning = _provisioning_vmids()
-        # Candidates are dongle-backed VMs (bus_to_vmid) = T2 clients. T1 (no
-        # dongle) is never here, and T3 is an RPi (not a VM), so today the gate
-        # only sheds T2. TODO: once T1/T2/T3 classification is reliable end-to-end,
-        # gate EXPLICITLY on tier == T2 (hard-exclude T1 AND T3) rather than
-        # relying on the bus_to_vmid proxy. See memory todo-delete-gate-tier-t2-only.
+        # Candidates start as dongle-backed VMs (bus_to_vmid). The delete gate may
+        # tear down ONLY T2. Tier is gated on the CONFIGURED PCI VID:PIDs (Setup →
+        # Proxmox): a VM whose PCI passthrough matches t1_pci_vidpids is T1, or
+        # t3_pci_vidpids is T3 — both PROTECTED, never torn down. Having a USB
+        # dongle (in bus_to_vmid) marks T2, but a protecting PCI device wins, so a
+        # VM that is BOTH is treated as T1/T3 and excluded. Templates are excluded
+        # too (destroy_vm also refuses them at the choke point).
         candidates = [int(v) for v in state["bus_to_vmid"].values()
                      if str(v).lstrip("-").isdigit() and int(v) not in provisioning]
         candidates = sorted(set(candidates))
         from . import cs_sim  # deferred — cs_sim imports usb_provision
         from . import pve_cmds  # local: pve_cmds is imported per-function
-        # Walk highest → lowest and pick the newest candidate that is NOT a
-        # template. Templates (clone sources) must never be torn down: destroy_vm
-        # refuses them at the choke point, but excluding them here means the gate
-        # sheds a real sim VM instead of stalling on the same template every tick.
-        # Mirrors the cs original's `not is_template` candidate filter (server.py).
+        protected_pci = _t1_pci_vidpids(agent) | _t3_pci_vidpids(agent)
+        # Walk highest → lowest and pick the newest candidate that is a pure T2
+        # (not a template, no protecting T1/T3 PCI passthrough).
         target_vmid = None
         bus = None
         for _cand in sorted(candidates, reverse=True):
             if await pve_cmds.is_template(_cand):
                 logger.info("delete gate: skipping template VMID %s (never torn down)", _cand)
                 continue
+            if protected_pci:
+                _pci = await pve_cmds.pci_passthrough_vidpids(_cand)
+                if _pci & protected_pci:
+                    logger.info("delete gate: skipping VMID %s — protected PCI passthrough %s "
+                                "(T1/T3, never torn down)", _cand, sorted(_pci & protected_pci))
+                    continue
             target_vmid = _cand
             bus = state["bus_to_vmid"].get(str(_cand))
             break
