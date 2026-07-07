@@ -241,6 +241,16 @@ _resource_cache_loaded: bool = False
 _provision_halt: Optional[Dict[str, Any]] = None
 _prov_run: Dict[str, Any] = {"running": False, "items": []}
 
+# VMIDs currently being torn down by the delete gate, mapped to the epoch the
+# destroy was issued. A destroy completes fast and the VM then vanishes from the
+# `vms` list, so without this the "deleting" transition is invisible between two
+# ~10s telemetry ticks. We stamp the vmid just before destroy and keep it for a
+# short TTL (current_deleting_vmids) so at least one telemetry frame surfaces the
+# 🔴 deleting state to the WebUI VM list. Mirrors the original's
+# usb_state[].prov_status == "tearing_down".
+_deleting: Dict[int, float] = {}
+_DELETING_TTL_S = 30.0
+
 # Auto-provision diagnostic state — WHY the last pass provisioned nothing (or did).
 # Surfaced in CS_TELEMETRY → WebUI Auto-Provisioning card so a silent gate (no
 # dongle_vidpids / no template ids / no eligible dongles) is visible in the UI
@@ -406,6 +416,18 @@ def current_prov_run() -> Dict[str, Any]:
     """Live provision-run state (``{running, items:[{vmid,vidpid,status}]}``)
     for the telemetry body (cs ``_default_provision_run_state`` 3576-3586)."""
     return dict(_prov_run)
+
+
+def current_deleting_vmids() -> List[int]:
+    """VMIDs the delete gate is currently tearing down (TTL-pruned).
+
+    Stamped just before ``destroy_vm`` and kept for ``_DELETING_TTL_S`` so the
+    brief deleting window survives at least one telemetry tick; the WebUI VM
+    list renders these as 🔴 deleting. Prunes expired entries as a side effect."""
+    now = time.time()
+    for vmid in [v for v, ts in _deleting.items() if now - ts > _DELETING_TTL_S]:
+        _deleting.pop(vmid, None)
+    return sorted(_deleting.keys())
 
 
 def current_provision_reason() -> Optional[str]:
@@ -1313,6 +1335,10 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             bus = state["bus_to_vmid"].get(str(_cand))
             break
         if target_vmid is not None:
+            # Stamp the transient "deleting" state BEFORE the destroy so the very
+            # next telemetry frame surfaces it (the VM disappears from `vms`
+            # moments later). Dropped again if the destroy raises.
+            _deleting[int(target_vmid)] = now
             try:
                 await cs_sim.destroy_vm(agent, target_vmid, bus=bus)
                 torn_down.append(target_vmid)
@@ -1328,6 +1354,9 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                     "(cpu_avg=%.1f mem_avg=%.1f) — 300s cooldown",
                     target_vmid, cpu_avg or 0.0, mem_avg or 0.0)
             except Exception as e:  # noqa: BLE001
+                # Destroy failed — the VM still exists, so don't leave it flagged
+                # as deleting (it would show 🔴 for the TTL erroneously).
+                _deleting.pop(int(target_vmid), None)
                 logger.warning("auto-provision delete gate: destroy %s failed: %s",
                                target_vmid, e)
 
