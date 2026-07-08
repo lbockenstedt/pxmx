@@ -467,7 +467,8 @@ async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
         (cpu_avg is not None and cpu_avg >= cpu_del_thr)
         or (mem_avg is not None and mem_avg >= mem_del_thr)
     )
-    target_vmid = None
+    target_vmid = None      # the VM actually shed (None if none / destroy failed)
+    destroy_failed = None    # a VMID we tried to shed but destroy_vm returned not-ok
     candidate_count = None  # eligible T2 count (only computed when the gate runs)
     if threshold_exceeded and now >= cooldown_until:
         provisioning = _provisioning_vmids()
@@ -493,34 +494,57 @@ async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
             bus = state["bus_to_vmid"].get(str(_cand))
             break
         if target_vmid is not None:
+            _cand_vmid = target_vmid
             # Stamp the transient "deleting" state BEFORE the destroy so the next
-            # telemetry frame surfaces it; dropped if the destroy raises.
-            _deleting[int(target_vmid)] = now
+            # telemetry frame surfaces it; dropped if the destroy doesn't succeed.
+            _deleting[int(_cand_vmid)] = now
             try:
-                await cs_sim.destroy_vm(agent, target_vmid, bus=bus)
-                state["bus_to_vmid"].pop(bus, None)
-                state["vmid_to_bus"].pop(str(target_vmid), None)
-                state["vmid_to_image"].pop(str(target_vmid), None)
-                (state.get("missing_since") or {}).pop(bus, None)
-                save_usb_state(state)
+                result = await cs_sim.destroy_vm(agent, _cand_vmid, bus=bus)
+            except Exception as e:  # noqa: BLE001 — GuardError (template/protected) etc.
+                result = {"ok": False, "error": str(e)}
+                logger.warning("auto-provision delete gate: destroy of %s raised: %s",
+                               _cand_vmid, e)
+            # CRITICAL: destroy_vm returns {"ok": bool} and only RAISES on a guard
+            # (template/protected) — a plain destroy failure (VM locked/busy,
+            # wait_guest_gone timeout, disk still purging) returns ok=False WITHOUT
+            # raising. Arming the cooldown on ok=False was the "went into cooldown
+            # but the VM is still there" bug: it masked the failure as a success
+            # for 300s. Only arm the cooldown + count the shed when ok is True.
+            # destroy_vm.clear_assignment already dropped the bus assignment from
+            # persisted state on success (and on orphan) — the gate no longer
+            # double-manages state.
+            if result.get("ok"):
                 cooldown_until = now + DELETE_GATE_COOLDOWN_S
                 _save_delete_gate_cooldown(cooldown_until)
                 logger.warning(
                     "auto-provision delete gate: destroyed newest USB VM %s "
                     "(cpu_avg=%.1f mem_avg=%.1f) — 300s cooldown",
-                    target_vmid, cpu_avg or 0.0, mem_avg or 0.0)
-            except Exception as e:  # noqa: BLE001
-                _deleting.pop(int(target_vmid), None)
+                    _cand_vmid, cpu_avg or 0.0, mem_avg or 0.0)
+            else:
+                # NOT destroyed — do NOT arm the cooldown (retry next tick).
+                # destroy_vm tracks its own fail count → orphan after
+                # DESTROY_MAX_FAILS, which releases the bus.
+                _deleting.pop(int(_cand_vmid), None)
                 target_vmid = None
-                logger.warning("auto-provision delete gate: destroy failed: %s", e)
+                destroy_failed = _cand_vmid
+                logger.warning(
+                    "auto-provision delete gate: VMID %s did NOT destroy "
+                    "(fails=%s err=%s) — no cooldown, retrying next tick",
+                    _cand_vmid, result.get("fails"), result.get("error"))
 
     # Decision trace → telemetry → WebUI (what it decided on + WHY it did/didn't
-    # shed — previously invisible; it just silently held under threshold).
+    # shed — previously invisible; it just silently held under threshold). Reload
+    # state so tracked reflects destroy_vm's own clear_assignment.
+    state = load_usb_state()
     tracked = len(state.get("bus_to_vmid") or {})
     _cpu_s = f"{round(cpu_avg, 1)}" if cpu_avg is not None else "—"
     _mem_s = f"{round(mem_avg, 1)}" if mem_avg is not None else "—"
     if target_vmid is not None:
         reason = f"shed VMID {target_vmid} (CPU {_cpu_s}% ≥ {cpu_del_thr}%)"
+    elif destroy_failed is not None:
+        reason = (f"over threshold — tried to shed VMID {destroy_failed} but the "
+                  f"destroy did NOT complete (VM locked/busy or purge timeout; see "
+                  f"agent log) — retrying, no cooldown armed")
     elif not threshold_exceeded:
         reason = (f"holding — CPU {_cpu_s}%/{cpu_del_thr}% · Mem {_mem_s}%/"
                   f"{mem_del_thr}% (1h avg under delete threshold)")
