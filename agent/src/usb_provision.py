@@ -1585,6 +1585,15 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                         _bus, _n, _DMESG_USB_WINDOW_S)
 
     # 5. Missing-dongle teardown (only when the toggle is on).
+    if missing_timeout <= 0 and state["bus_to_vmid"]:
+        # missing_timeout=0 DISABLES the dongle-missing shed entirely — a removed/
+        # unapproved dongle would never tear down its VM. Surface it so it isn't
+        # silently off (Setup → Proxmox → "Destroy after N minutes"; 0 = never).
+        logger.warning(
+            "auto-provision: usb_missing_timeout is 0 — dongle-missing teardown is "
+            "DISABLED; a removed/unapproved dongle will NOT shed its VM. Set a "
+            "non-zero 'Destroy after' timeout to enable it. (%d tracked dongles)",
+            len(state["bus_to_vmid"]))
     if missing_timeout > 0:
         from . import cs_sim  # deferred — cs_sim imports usb_provision
         for bus, vmid in list(state["bus_to_vmid"].items()):
