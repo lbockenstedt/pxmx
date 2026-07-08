@@ -1047,11 +1047,48 @@ def prune_ghost_vms(existing: Set[int]) -> List[int]:
 
 def set_assignment(vmid: int, bus: str, image_num: int) -> None:
     st = load_usb_state()
-    st["vmid_to_bus"][str(int(vmid))] = bus
-    st["bus_to_vmid"][bus] = str(int(vmid))
-    st["vmid_to_image"][str(int(vmid))] = int(image_num)
+    v = str(int(vmid))
+    # Clear this VM's PRIOR bus from the reverse map before re-pointing it, else a
+    # re-provision onto a new bus/dongle leaves a stale bus_to_vmid entry — which
+    # made the VM show under TWO vid:pids in the certified-USB "Active VMs" column
+    # (it reads bus_to_vmid). vmid_to_bus is single-bus-per-VM (authoritative), so
+    # the old reverse entry is pure cruft. Also detach any OTHER vmid that somehow
+    # held THIS bus so the maps stay a clean bijection.
+    old_bus = st["vmid_to_bus"].get(v)
+    if old_bus and old_bus != bus:
+        st["bus_to_vmid"].pop(old_bus, None)
+        st.get("missing_since", {}).pop(old_bus, None)
+        st.get("vidpid_by_bus", {}).pop(old_bus, None)
+    prev_vmid = st["bus_to_vmid"].get(bus)
+    if prev_vmid is not None and str(prev_vmid) != v:
+        st["vmid_to_bus"].pop(str(prev_vmid), None)
+        st.get("vmid_to_image", {}).pop(str(prev_vmid), None)
+    st["vmid_to_bus"][v] = bus
+    st["bus_to_vmid"][bus] = v
+    st["vmid_to_image"][v] = int(image_num)
     st["missing_since"].pop(bus, None)
     save_usb_state(st)
+
+
+def reconcile_bus_map() -> List[int]:
+    """Drop bus_to_vmid entries that disagree with vmid_to_bus (the authoritative
+    current bus per VM). A VM re-provisioned onto a new bus left its old reverse
+    entry behind (set_assignment didn't clear it), so the VM showed under two
+    vid:pids. Returns the vmids whose stale reverse entries were removed. Run each
+    provision pass alongside prune_ghost_vms."""
+    st = load_usb_state()
+    v2b = st.get("vmid_to_bus") or {}
+    fixed: List[int] = []
+    for bus, vmid in list((st.get("bus_to_vmid") or {}).items()):
+        if str(v2b.get(str(vmid), "")) != str(bus):
+            st["bus_to_vmid"].pop(bus, None)
+            st.get("missing_since", {}).pop(bus, None)
+            st.get("vidpid_by_bus", {}).pop(bus, None)
+            if str(vmid).lstrip("-").isdigit():
+                fixed.append(int(vmid))
+    if fixed:
+        save_usb_state(st)
+    return sorted(set(fixed))
 
 
 def bus_for_vmid(vmid: int) -> Optional[str]:
@@ -1494,6 +1531,14 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # fixated on that ghost forever. Reload after a prune so the rest of the pass
     # sees the cleaned state.
     if prune_ghost_vms(existing):
+        state = load_usb_state()
+    # 1a. Bijection reconcile: drop bus_to_vmid entries that disagree with
+    # vmid_to_bus (a VM re-provisioned onto a new bus left its old reverse entry,
+    # so it showed under two vid:pids in the certified-USB table). Self-heals the
+    # existing stale entries; set_assignment now prevents new ones.
+    _busfix = reconcile_bus_map()
+    if _busfix:
+        logger.info("provision reconcile: cleared stale bus_to_vmid entries for VMID(s) %s", _busfix)
         state = load_usb_state()
     # Remember each tracked bus's vidpid while it's actually present, so a
     # dongle that later moves to a different bus path (unplugged/replugged
