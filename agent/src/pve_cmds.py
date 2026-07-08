@@ -559,30 +559,48 @@ async def qm_stop_force(vmid: Any, protected: Optional[Set[int]] = None) -> None
 
 
 async def qm_destroy(vmid: Any, protected: Optional[Set[int]] = None,
-                     timeout: int = 300) -> bool:
+                     timeout: int = 300) -> "tuple[bool, str]":
     """``qm destroy --skiplock --purge --destroy-unreferenced-disks``. On failure,
-    emergency-kill QEMU and retry once (bash 1796-1807). Returns True on success."""
+    emergency-kill QEMU and retry once (bash 1796-1807).
+
+    Returns ``(ok, reason)`` — ``reason`` is ``""`` on success, else the actual
+    ``qm`` stderr (or a "config still present after purge" note). Previously this
+    dropped stderr (``rc, _, _``), so a failed shed could only be reported as a
+    generic "locked/busy or purge timeout" guess; now the real cause is logged +
+    surfaced to the delete-gate trace on the auto-prov card."""
     vid = assert_sim_vm(vmid, protected or set())
-    rc, _, _ = await _run(
-        ["qm", "destroy", str(vid), "--skiplock", "--purge",
-         "--destroy-unreferenced-disks"], check=False, timeout=timeout)
+    argv = ["qm", "destroy", str(vid), "--skiplock", "--purge",
+            "--destroy-unreferenced-disks"]
+    rc, _, err = await _run(argv, check=False, timeout=timeout)
+    reason = err.decode(errors="replace").strip()
     if rc == 0:
         # Post-destroy gate (bash _wait_guest_gone 1811-1814): don't claim
         # success until the config/disk is actually gone, so a reclone at the
         # same VMID can't race a still-purging disk.
-        return await wait_guest_gone(vid, "qemu", 360)
+        if await wait_guest_gone(vid, "qemu", 360):
+            return True, ""
+        msg = f"`qm destroy` returned 0 but VM {vid} config still present after 360s (disk purge stuck?)"
+        logger.error("destroy VM %s: %s", vid, msg)
+        return False, msg
+    logger.warning("destroy VM %s: first `qm destroy` rc=%s: %s",
+                   vid, rc, reason or "(no stderr)")
     pid = await _qemu_pid(vid)
     if pid:
         await _run(["kill", "-9", str(pid)], check=False, timeout=5)
     await _run(["systemctl", "kill", "--signal=SIGKILL",
                 f"qemu-server@{vid}.service"], check=False, timeout=10)
     await asyncio.sleep(5)
-    rc, _, _ = await _run(
-        ["qm", "destroy", str(vid), "--skiplock", "--purge",
-         "--destroy-unreferenced-disks"], check=False, timeout=timeout)
+    rc, _, err = await _run(argv, check=False, timeout=timeout)
+    reason = err.decode(errors="replace").strip() or reason
     if rc != 0:
-        return False
-    return await wait_guest_gone(vid, "qemu", 360)
+        logger.error("destroy VM %s: retry `qm destroy` rc=%s: %s",
+                     vid, rc, reason or "(no stderr)")
+        return False, reason or f"qm destroy exited {rc}"
+    if await wait_guest_gone(vid, "qemu", 360):
+        return True, ""
+    msg = f"`qm destroy` (retry) returned 0 but VM {vid} config still present after 360s"
+    logger.error("destroy VM %s: %s", vid, msg)
+    return False, msg
 
 
 async def pct_stop(vmid: Any, protected: Optional[Set[int]] = None) -> None:
@@ -595,17 +613,28 @@ async def pct_stop(vmid: Any, protected: Optional[Set[int]] = None) -> None:
 
 
 async def pct_destroy(vmid: Any, protected: Optional[Set[int]] = None,
-                      timeout: int = 300) -> bool:
-    """``pct destroy`` with the bash fallback ladder (1755-1761)."""
+                      timeout: int = 300) -> "tuple[bool, str]":
+    """``pct destroy`` with the bash fallback ladder (1755-1761).
+
+    Returns ``(ok, reason)`` — the last ``pct`` stderr across the flag ladder on
+    failure (previously dropped), so a failed shed reports the real cause."""
     vid = assert_sim_vm(vmid, protected or set())
+    reason = ""
     for flag in (["--skiplock", "--purge", "--force"], ["--purge", "--force"],
                  ["--skiplock", "--purge"], ["--skiplock"], []):
-        rc, _, _ = await _run(["pct", "destroy", str(vid), *flag],
-                              check=False, timeout=timeout)
+        rc, _, err = await _run(["pct", "destroy", str(vid), *flag],
+                                check=False, timeout=timeout)
         if rc == 0:
             # Post-destroy gate (bash _wait_guest_gone 1811-1814).
-            return await wait_guest_gone(vid, "lxc", 360)
-    return False
+            if await wait_guest_gone(vid, "lxc", 360):
+                return True, ""
+            msg = f"`pct destroy` returned 0 but CT {vid} config still present after 360s"
+            logger.error("destroy CT %s: %s", vid, msg)
+            return False, msg
+        reason = err.decode(errors="replace").strip() or reason
+    logger.error("destroy CT %s: all `pct destroy` variants failed: %s",
+                 vid, reason or "(no stderr)")
+    return False, reason or "pct destroy failed (all variants)"
 
 
 async def wait_stopped(vmid: int, kind: str, timeout: int) -> bool:

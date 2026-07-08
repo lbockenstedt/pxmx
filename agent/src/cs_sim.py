@@ -142,10 +142,10 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
     await _expire_pending_commands(agent, vid, kind)
     if kind == "lxc":
         await pve_cmds.pct_stop(vid, prot)
-        ok = await pve_cmds.pct_destroy(vid, prot)
+        ok, reason = await pve_cmds.pct_destroy(vid, prot)
     else:
         await pve_cmds.qm_stop_force(vid, prot)
-        ok = await pve_cmds.qm_destroy(vid, prot)
+        ok, reason = await pve_cmds.qm_destroy(vid, prot)
     if ok:
         usb_provision.clear_assignment(vid, bus)
         usb_provision.clear_destroy_fails(vid)
@@ -158,8 +158,11 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
         usb_provision.clear_assignment(vid, bus)
         if exclude_bus_after and bus:
             usb_provision.exclude_bus(bus)
+    # ``reason`` carries the actual qm/pct stderr so the delete-gate trace on the
+    # auto-prov card shows WHY the shed didn't complete (locked/busy/purge/…)
+    # instead of a generic guess.
     return {"ok": False, "orphaned": res["orphaned"], "bus": bus,
-            "kind": kind, "fails": res["count"]}
+            "kind": kind, "fails": res["count"], "reason": reason}
 
 
 # ── per-action handlers ────────────────────────────────────────────────────
@@ -297,9 +300,10 @@ async def _clone_lxc(agent, data, cs_cmd_id) -> None:
 
     await _progress(agent, cs_cmd_id, "clone_lxc", "running", "destroying", 20, vmid=vid)
     await pve_cmds.pct_stop(vid, prot)
-    if not await pve_cmds.pct_destroy(vid, prot):
+    ok, reason = await pve_cmds.pct_destroy(vid, prot)
+    if not ok:
         await _terminal(agent, cs_cmd_id, "clone_lxc", "failed",
-                        f"destroy of CT {vid} before clone failed", vmid=vid)
+                        f"destroy of CT {vid} before clone failed: {reason}", vmid=vid)
         return
 
     await _progress(agent, cs_cmd_id, "clone_lxc", "running", "cloning", 50, vmid=vid)

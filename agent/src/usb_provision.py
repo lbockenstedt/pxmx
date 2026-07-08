@@ -469,6 +469,7 @@ async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
     )
     target_vmid = None      # the VM actually shed (None if none / destroy failed)
     destroy_failed = None    # a VMID we tried to shed but destroy_vm returned not-ok
+    destroy_fail_reason = ""  # the actual qm/pct stderr for that failure (card trace)
     candidate_count = None  # eligible T2 count (only computed when the gate runs)
     if threshold_exceeded and now >= cooldown_until:
         provisioning = _provisioning_vmids()
@@ -527,10 +528,11 @@ async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
                 _deleting.pop(int(_cand_vmid), None)
                 target_vmid = None
                 destroy_failed = _cand_vmid
+                destroy_fail_reason = result.get("reason") or ""
                 logger.warning(
                     "auto-provision delete gate: VMID %s did NOT destroy "
-                    "(fails=%s err=%s) — no cooldown, retrying next tick",
-                    _cand_vmid, result.get("fails"), result.get("error"))
+                    "(fails=%s reason=%s) — no cooldown, retrying next tick",
+                    _cand_vmid, result.get("fails"), destroy_fail_reason or "(none)")
 
     # Decision trace → telemetry → WebUI (what it decided on + WHY it did/didn't
     # shed — previously invisible; it just silently held under threshold). Reload
@@ -542,9 +544,10 @@ async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
     if target_vmid is not None:
         reason = f"shed VMID {target_vmid} (CPU {_cpu_s}% ≥ {cpu_del_thr}%)"
     elif destroy_failed is not None:
+        _why = f": {destroy_fail_reason}" if destroy_fail_reason else \
+               " (VM locked/busy or purge timeout; see agent log)"
         reason = (f"over threshold — tried to shed VMID {destroy_failed} but the "
-                  f"destroy did NOT complete (VM locked/busy or purge timeout; see "
-                  f"agent log) — retrying, no cooldown armed")
+                  f"destroy did NOT complete{_why} — retrying, no cooldown armed")
     elif not threshold_exceeded:
         reason = (f"holding — CPU {_cpu_s}%/{cpu_del_thr}% · Mem {_mem_s}%/"
                   f"{mem_del_thr}% (1h avg under delete threshold)")
