@@ -190,10 +190,12 @@ async def snapshot_vm(vmid: Any, protected: Set[int],
 # when known (the hub has the VM's type) to avoid a detect_guest_type round-trip.
 
 async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
-                        snapshot_name: Optional[str] = None) -> Dict[str, Any]:
-    """Unguarded start/stop/reboot/snapshot of ANY vmid (qemu or lxc).
+                        snapshot_name: Optional[str] = None,
+                        backup_opts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Unguarded start/stop/reboot/snapshot/backup of ANY vmid (qemu or lxc).
 
     Returns ``{vmid, action, kind[, snapshot]}``. Raises ``PveError`` on failure.
+    ``backup_opts`` (storage/mode/keep) is required for the ``backup`` action.
     """
     vid = int(vmid)
     k = (kind or "").lower()
@@ -212,6 +214,36 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
         snap = snapshot_name or f"auto-{time.strftime('%Y%m%d%H%M')}"
         await _run([bin_, "snapshot", str(vid), snap, "--description", "lm-hub"])
         return {"vmid": vid, "action": "snapshot", "snapshot": snap, "kind": k}
+    elif act == "backup":
+        # Node-level vzdump (not qm/pct). vzdump can run for minutes, so this is
+        # FIRE-AND-FORGET: spawn it detached and return {started:true} promptly so
+        # the command RPC doesn't time out — completion/failure surfaces in the
+        # Proxmox node task log. The storage MUST be configured (Setup →
+        # Hypervisors); mode defaults to snapshot (no downtime). keep>0 prunes to
+        # keep-last=N. Validate the storage exists first so an obvious misconfig
+        # fails fast with a clear message instead of a silent task-log error.
+        opts = backup_opts or {}
+        storage = str(opts.get("storage") or "").strip()
+        if not storage:
+            raise PveError("backup: no storage configured — set one in Setup → Hypervisors")
+        rc, out, _ = await _run(["pvesm", "status", "--storage", storage],
+                                check=False, timeout=15)
+        if rc != 0 or storage not in out.decode(errors="replace"):
+            raise PveError(f"backup: storage '{storage}' not found on this host")
+        mode = str(opts.get("mode") or "snapshot").lower()
+        if mode not in ("snapshot", "suspend", "stop"):
+            mode = "snapshot"
+        argv = ["vzdump", str(vid), "--mode", mode, "--storage", storage, "--compress", "zstd"]
+        try:
+            keep = int(opts.get("keep") or 0)
+        except (TypeError, ValueError):
+            keep = 0
+        if keep > 0:
+            argv += ["--prune-backups", f"keep-last={keep}"]
+        await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        return {"vmid": vid, "action": "backup", "storage": storage,
+                "mode": mode, "keep": keep, "kind": k, "started": True}
     else:
         raise PveError(f"unknown vm action: {action}")
     return {"vmid": vid, "action": act, "kind": k}

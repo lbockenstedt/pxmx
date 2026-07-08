@@ -1956,7 +1956,8 @@ class ProxmoxAgent:
                             res = await pve_cmds.vm_action_any(
                                 data.get("vmid"), data.get("action"),
                                 kind=data.get("type"),
-                                snapshot_name=data.get("snapshot_name"))
+                                snapshot_name=data.get("snapshot_name"),
+                                backup_opts=data.get("backup"))
                             result = {"status": "SUCCESS", **res}
                         except pve_cmds.PveError as e:
                             result = {"status": "ERROR", "message": str(e)}
