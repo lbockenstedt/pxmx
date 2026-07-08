@@ -540,18 +540,30 @@ _HANDLERS = {
 }
 
 
+# Bound concurrent long-ops (destroy/clone/…). A bulk "delete all" spawns one
+# create_task per VM; unbounded, N concurrent destroys each hammer the SYNCHRONOUS
+# usb_state.json read/write (clear_assignment / record_destroy_fail) + fire N
+# concurrent qm subprocesses, starving the event loop so it can't return ACCEPTED
+# for NEW commands within the 15s relay window → "Agent response timeout" and the
+# whole batch fails. 2 at a time keeps the loop responsive; the rest queue behind
+# the semaphore (they were already ACCEPTED, so the UI shows them running).
+_LONG_OP_SEM = asyncio.Semaphore(2)
+
+
 async def run_long_op(agent, action: str, data: Dict[str, Any],
                       cs_cmd_id: str) -> None:
     """Dispatch a long op as a background task. Emits a terminal
     CS_COMMAND_RESULT for every outcome (success, logical failure, or an
-    unexpected exception) so the cs queue command is always acked."""
+    unexpected exception) so the cs queue command is always acked. Bounded by
+    _LONG_OP_SEM so a bulk action can't starve the event loop."""
     handler = _HANDLERS.get(action)
     if not handler:
         await _terminal(agent, cs_cmd_id, action, "failed",
                         f"unknown long op: {action}")
         return
     try:
-        await handler(agent, data, cs_cmd_id)
+        async with _LONG_OP_SEM:
+            await handler(agent, data, cs_cmd_id)
     except asyncio.CancelledError:
         # Best-effort: tell the cs spoke the op was abandoned so the queue
         # command doesn't sit delivered forever.
