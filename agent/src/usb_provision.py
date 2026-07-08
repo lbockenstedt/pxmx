@@ -1116,6 +1116,65 @@ def reconcile_bus_map() -> List[int]:
     return sorted(set(pruned))
 
 
+async def _vm_usb_bus(vid: int) -> Optional[str]:
+    """The host USB BUS PATH a qemu VM passes through (``usbN: host=<bus>`` →
+    ``<bus>``), or None. Only the bus-path form (e.g. ``5-1.4``) counts — a
+    ``host=<vid>:<pid>`` vidpid passthrough isn't our bus-tracked model."""
+    from . import pve_cmds
+    try:
+        cfg = await pve_cmds.qm_config(vid)
+    except Exception:  # noqa: BLE001
+        return None
+    for k, v in (cfg or {}).items():
+        if str(k).startswith("usb") and "host=" in str(v):
+            val = str(v).split("host=", 1)[1].split(",", 1)[0].strip()
+            if val and ":" not in val:
+                return val
+    return None
+
+
+async def reconcile_vm_configs(agent, start: int, end: int,
+                               present, now: float, existing) -> bool:
+    """Rebuild bus_to_vmid from each sim VM's ACTUAL usb passthrough (source of
+    truth = ``qm config``), so a dongle-backed VM that fell out of the state file
+    is re-tracked instead of stranded (a stranded VM is invisible to the
+    missing-dongle teardown, which only iterates bus_to_vmid — the "12 VMs, 4
+    tracked, nothing sheds" case). Only UNTRACKED sim-range VMs are inspected
+    (one ``qm config`` each — ~zero cost once everything is tracked). A present
+    dongle → active tracking; an absent dongle → tracked + missing_since=now so
+    the teardown counts it down and sheds it. Non-passthrough VMs are never
+    touched. Returns True if anything was re-tracked."""
+    from . import pve_cmds
+    st = load_usb_state()
+    tracked = {int(v) for v in (st.get("bus_to_vmid") or {}).values()
+               if str(v).lstrip("-").isdigit()}
+    changed = False
+    for vid in sorted(int(x) for x in existing if str(x).lstrip("-").isdigit()):
+        if vid < start or vid > end or vid in tracked:
+            continue
+        if await pve_cmds.is_template(vid):
+            continue
+        bus = await _vm_usb_bus(vid)
+        if not bus:
+            continue  # not a dongle VM — never auto-track/shed it
+        image = int((st.get("vmid_to_image") or {}).get(str(vid), 1) or 1)
+        st.setdefault("bus_to_vmid", {})[bus] = str(vid)
+        st.setdefault("vmid_to_bus", {})[str(vid)] = bus
+        st.setdefault("vmid_to_image", {})[str(vid)] = image
+        if bus in present:
+            st.setdefault("missing_since", {}).pop(bus, None)
+            _label = "present"
+        else:
+            st.setdefault("missing_since", {}).setdefault(bus, now)
+            _label = "MISSING — shed countdown started"
+        changed = True
+        logger.info("reconcile_vm_configs: re-tracked VM %s → bus %s [%s]",
+                    vid, bus, _label)
+    if changed:
+        save_usb_state(st)
+    return changed
+
+
 def bus_for_vmid(vmid: int) -> Optional[str]:
     return load_usb_state()["vmid_to_bus"].get(str(int(vmid)))
 
@@ -1564,6 +1623,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     _busfix = reconcile_bus_map()
     if _busfix:
         logger.info("provision reconcile: cleared stale bus_to_vmid entries for VMID(s) %s", _busfix)
+        state = load_usb_state()
+    # 1b. Re-track from source of truth: rebuild bus_to_vmid from each sim VM's
+    # actual usb passthrough (qm config), so a dongle-backed VM that fell out of
+    # the state file is re-tracked (present → active; absent dongle → missing +
+    # countdown) instead of stranded/invisible to the teardown. Self-heals the
+    # "N VMs but only M tracked, nothing sheds" case.
+    if await reconcile_vm_configs(agent, start, end, present, now, existing):
         state = load_usb_state()
     # Remember each tracked bus's vidpid while it's actually present, so a
     # dongle that later moves to a different bus path (unplugged/replugged
