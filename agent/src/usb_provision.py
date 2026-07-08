@@ -251,6 +251,20 @@ _prov_run: Dict[str, Any] = {"running": False, "items": []}
 _deleting: Dict[int, float] = {}
 _DELETING_TTL_S = 30.0
 
+# The 1h-average CPU/mem the delete + provision gates actually ACT ON (from the
+# persisted resource ring each tick). Surfaced separately from the spoke's own
+# display average so the operator can see BOTH: the CPU 1H tile (display) AND the
+# exact number the auto-prov gate decides on.
+_cpu_1h_avg: Optional[float] = None
+_mem_1h_avg: Optional[float] = None
+
+# Delete-gate decision trace — surfaced every tick so the WebUI can show WHY the
+# gate did or didn't shed a VM (the operator couldn't tell before: it silently
+# held at cpu_avg < delete-threshold, or skipped on cooldown / no eligible T2).
+# Shape: {cpu_avg, cpu_threshold, mem_avg, mem_threshold, threshold_exceeded,
+#         cooldown_remaining_s, tracked_usb_vms, reason, last_torn_down}.
+_delete_gate: Optional[Dict[str, Any]] = None
+
 # Auto-provision diagnostic state — WHY the last pass provisioned nothing (or did).
 # Surfaced in CS_TELEMETRY → WebUI Auto-Provisioning card so a silent gate (no
 # dongle_vidpids / no template ids / no eligible dongles) is visible in the UI
@@ -410,6 +424,127 @@ def current_provision_halt() -> Optional[Dict[str, Any]]:
     telemetry body. Set by ``run_provision_loop`` when cpu/mem cross the
     provision threshold (cs ``proxmox-agent.sh`` 2648-2666 writes the cache)."""
     return _provision_halt
+
+
+def current_delete_gate() -> Optional[Dict[str, Any]]:
+    """The delete-gate decision trace (cpu_avg vs delete threshold, cooldown,
+    eligible-candidate count, and the human reason it did/didn't shed a VM) so
+    the WebUI can show what auto-prov is deciding on. None until the first pass."""
+    return _delete_gate
+
+
+def current_gate_averages() -> Dict[str, Any]:
+    """The 1h averages the gates ACT on (distinct from the spoke's display avg)
+    so the UI can show what the auto-prov decision uses."""
+    return {"cpu_1h_avg": _cpu_1h_avg, "mem_1h_avg": _mem_1h_avg}
+
+
+async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
+    """Resource delete gate — shed the newest T2 (USB) sim VM when the 1h-avg
+    CPU or mem is over the delete threshold and not in the post-delete cooldown.
+
+    Runs on EVERY tick whenever auto-provision is ON, and is called BEFORE the
+    provisioning preconditions (dongle_vidpids / templates) so a provisioning
+    config gap can never disable the safety shed. Self-contained: loads + saves
+    its own usb state, and publishes the ``_delete_gate`` decision trace + the
+    gate's 1h averages so the WebUI can show what it decided on and WHY. Returns
+    the torn-down VMID (so the caller can count it) or None.
+
+    ONLY the resource gate lives here — the missing-dongle teardown stays in the
+    main loop (it needs the live dongle scan, which needs dongle_vidpids)."""
+    global _delete_gate, _cpu_1h_avg, _mem_1h_avg
+    from . import cs_sim, pve_cmds  # deferred — cs_sim imports usb_provision
+    now = time.time()
+    cpu_avg = _resource_1h_average(_cpu_samples)
+    mem_avg = _resource_1h_average(_mem_samples)
+    _cpu_1h_avg = round(cpu_avg, 1) if cpu_avg is not None else None
+    _mem_1h_avg = round(mem_avg, 1) if mem_avg is not None else None
+    cpu_del_thr = _pct_setting(usb_cfg, "cpu_delete_threshold", 90)
+    mem_del_thr = _pct_setting(usb_cfg, "mem_delete_threshold", 90)
+    state = load_usb_state()
+    cooldown_until = _load_delete_gate_cooldown()
+    threshold_exceeded = (
+        (cpu_avg is not None and cpu_avg >= cpu_del_thr)
+        or (mem_avg is not None and mem_avg >= mem_del_thr)
+    )
+    target_vmid = None
+    candidate_count = None  # eligible T2 count (only computed when the gate runs)
+    if threshold_exceeded and now >= cooldown_until:
+        provisioning = _provisioning_vmids()
+        # Candidates = dongle-backed VMs (bus_to_vmid), newest first. Shed ONLY a
+        # pure T2: skip templates and any VM with a protecting T1/T3 PCI
+        # passthrough (destroy_vm also refuses templates at the choke point).
+        candidates = sorted({int(v) for v in state["bus_to_vmid"].values()
+                             if str(v).lstrip("-").isdigit() and int(v) not in provisioning})
+        candidate_count = len(candidates)
+        protected_pci = _t1_pci_vidpids(agent) | _t3_pci_vidpids(agent)
+        bus = None
+        for _cand in sorted(candidates, reverse=True):
+            if await pve_cmds.is_template(_cand):
+                logger.info("delete gate: skipping template VMID %s (never torn down)", _cand)
+                continue
+            if protected_pci:
+                _pci = await pve_cmds.pci_passthrough_vidpids(_cand)
+                if _pci & protected_pci:
+                    logger.info("delete gate: skipping VMID %s — protected PCI passthrough %s "
+                                "(T1/T3, never torn down)", _cand, sorted(_pci & protected_pci))
+                    continue
+            target_vmid = _cand
+            bus = state["bus_to_vmid"].get(str(_cand))
+            break
+        if target_vmid is not None:
+            # Stamp the transient "deleting" state BEFORE the destroy so the next
+            # telemetry frame surfaces it; dropped if the destroy raises.
+            _deleting[int(target_vmid)] = now
+            try:
+                await cs_sim.destroy_vm(agent, target_vmid, bus=bus)
+                state["bus_to_vmid"].pop(bus, None)
+                state["vmid_to_bus"].pop(str(target_vmid), None)
+                state["vmid_to_image"].pop(str(target_vmid), None)
+                (state.get("missing_since") or {}).pop(bus, None)
+                save_usb_state(state)
+                cooldown_until = now + DELETE_GATE_COOLDOWN_S
+                _save_delete_gate_cooldown(cooldown_until)
+                logger.warning(
+                    "auto-provision delete gate: destroyed newest USB VM %s "
+                    "(cpu_avg=%.1f mem_avg=%.1f) — 300s cooldown",
+                    target_vmid, cpu_avg or 0.0, mem_avg or 0.0)
+            except Exception as e:  # noqa: BLE001
+                _deleting.pop(int(target_vmid), None)
+                target_vmid = None
+                logger.warning("auto-provision delete gate: destroy failed: %s", e)
+
+    # Decision trace → telemetry → WebUI (what it decided on + WHY it did/didn't
+    # shed — previously invisible; it just silently held under threshold).
+    tracked = len(state.get("bus_to_vmid") or {})
+    _cpu_s = f"{round(cpu_avg, 1)}" if cpu_avg is not None else "—"
+    _mem_s = f"{round(mem_avg, 1)}" if mem_avg is not None else "—"
+    if target_vmid is not None:
+        reason = f"shed VMID {target_vmid} (CPU {_cpu_s}% ≥ {cpu_del_thr}%)"
+    elif not threshold_exceeded:
+        reason = (f"holding — CPU {_cpu_s}%/{cpu_del_thr}% · Mem {_mem_s}%/"
+                  f"{mem_del_thr}% (1h avg under delete threshold)")
+    elif now < cooldown_until:
+        reason = f"over threshold but in cooldown ({int(cooldown_until - now)}s left)"
+    elif (candidate_count or 0) == 0:
+        reason = (f"over threshold but NO eligible T2 VMs to shed "
+                  f"({tracked} USB VM(s) tracked in bus_to_vmid)")
+    else:
+        reason = ("over threshold but all candidates are templates or "
+                  "protected T1/T3 (never torn down)")
+    _delete_gate = {
+        "cpu_avg": round(cpu_avg, 1) if cpu_avg is not None else None,
+        "cpu_threshold": cpu_del_thr,
+        "mem_avg": round(mem_avg, 1) if mem_avg is not None else None,
+        "mem_threshold": mem_del_thr,
+        "threshold_exceeded": threshold_exceeded,
+        "cooldown_remaining_s": max(0, int(cooldown_until - now)),
+        "tracked_usb_vms": tracked,
+        "eligible_candidates": candidate_count,
+        "reason": reason,
+        "last_torn_down": [target_vmid] if target_vmid is not None else [],
+    }
+    return target_vmid
 
 
 def current_prov_run() -> Dict[str, Any]:
@@ -1085,7 +1220,8 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     Returns a summary the ``provision_unassigned`` long-op reports as its result.
     """
     global _provision_halt, _prov_run, _provision_reason, _provision_cfg_snapshot, \
-        _provision_loop_last_run, _auto_provision_on
+        _provision_loop_last_run, _auto_provision_on, _cpu_1h_avg, _mem_1h_avg, \
+        _delete_gate
     from . import pve_cmds  # local to avoid a top-level import cycle
     cs_cfg = agent.config.get("client_simulation") or {}
     usb_cfg = cs_cfg.get("usb_config") or {}
@@ -1094,6 +1230,15 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # current_provision_loop_running() flips true on the very first tick (lets the
     # UI distinguish "loop not running" from "loop running but gated").
     _provision_loop_last_run = time.time()
+
+    # Safety resource delete gate runs FIRST, before the provisioning
+    # preconditions (dongle_vidpids / templates) below — a provisioning config
+    # gap must NEVER disable the CPU/mem shed. Only when auto-provision is on.
+    # Returns the VMID it shed (or None); counted into torn_down below.
+    ap_on = _toggle_on(usb_cfg)
+    _auto_provision_on = ap_on
+    _early_shed = await _run_delete_gate(agent, usb_cfg) if ap_on else None
+
     if not dongle_vidpids:
         # Silent gate made loud — this is the #1 cause of "nothing provisions" and
         # previously left no log line at all. Surface it in the log + telemetry.
@@ -1103,9 +1248,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                                     "vmid_range": {}, "active_usb_vms": None}
         logger.warning("auto-provision: no dongle_vidpids configured — certify USB "
                        "vid:pid values in the Simulations UI so dongles can be matched")
-        return {"provisioned": 0, "torn_down": 0, "reason": "no dongle_vidpids configured"}
+        return {"provisioned": 0,
+                "torn_down": 1 if _early_shed is not None else 0,
+                "reason": "no dongle_vidpids configured"}
 
-    ap_on = _toggle_on(usb_cfg)
+    # ap_on already computed above (before the early delete gate).
     # The cs spoke emits the certified list as ``vidpids`` (a list of
     # {vidpid, type} dicts), not a ``certified_types`` {vidpid: type} map — so
     # build the map via the accessor (which reads ``vidpids``) instead of the
@@ -1173,6 +1320,10 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     cpu_avg = _resource_1h_average(_cpu_samples)
     mem_avg = _resource_1h_average(_mem_samples)
     cpu_instant = _cpu_samples[-1][1] if _cpu_samples else None
+    # Surface the exact 1h averages the gates decide on (WebUI shows these next
+    # to the display CPU 1H / Mem 1H so the operator sees what auto-prov uses).
+    _cpu_1h_avg = round(cpu_avg, 1) if cpu_avg is not None else None
+    _mem_1h_avg = round(mem_avg, 1) if mem_avg is not None else None
 
     state = load_usb_state()
     existing = set(await pve_cmds.list_all_vmids())
@@ -1232,6 +1383,8 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         save_usb_state(state)
 
     torn_down: List[int] = []
+    if _early_shed is not None:
+        torn_down.append(_early_shed)
 
     # 2. Toggle gate — off = telemetry-only (no VM mutations).
     if not ap_on:
@@ -1267,12 +1420,12 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             torn_down.append(vmid)
         save_usb_state(state)
 
-    # 3. Thresholds (cs defaults: prov 80 / delete 90 / ceiling 90).
+    # 3. Provision thresholds (cs defaults: prov 80 / ceiling 90). The DELETE
+    #    thresholds are read inside _run_delete_gate — the resource shed runs
+    #    early now (before these provisioning preconditions).
     cpu_prov_thr = _pct_setting(usb_cfg, "cpu_provision_threshold", 80)
-    cpu_del_thr = _pct_setting(usb_cfg, "cpu_delete_threshold", 90)
     cpu_prov_ceil = _pct_setting(usb_cfg, "cpu_provision_ceiling", 90)
     mem_prov_thr = _pct_setting(usb_cfg, "mem_provision_threshold", 80)
-    mem_del_thr = _pct_setting(usb_cfg, "mem_delete_threshold", 90)
 
     # provision_halt: over the provision threshold → halt (cs agent.sh 2648-2666).
     # The published dict must carry the four numeric fields the WebUI
@@ -1294,71 +1447,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     else:
         _provision_halt = None
 
-    # 4. Delete gate — shed the newest USB VM when over the delete threshold,
-    #    unless a delete is already in the cooldown window (cs 10055-10110).
+    # 4. Resource delete gate ALREADY RAN early (before the provisioning
+    #    preconditions) in _run_delete_gate, which also published the
+    #    _delete_gate decision trace. Reload the cooldown it may have set so the
+    #    provision gate below still respects "don't clone right after a shed",
+    #    and mark delete_queued from that early result.
     cooldown_until = _load_delete_gate_cooldown()
-    delete_queued = False
-    threshold_exceeded = (
-        (cpu_avg is not None and cpu_avg >= cpu_del_thr)
-        or (mem_avg is not None and mem_avg >= mem_del_thr)
-    )
-    if threshold_exceeded and now >= cooldown_until:
-        provisioning = _provisioning_vmids()
-        # Candidates start as dongle-backed VMs (bus_to_vmid). The delete gate may
-        # tear down ONLY T2. Tier is gated on the CONFIGURED PCI VID:PIDs (Setup →
-        # Proxmox): a VM whose PCI passthrough matches t1_pci_vidpids is T1, or
-        # t3_pci_vidpids is T3 — both PROTECTED, never torn down. Having a USB
-        # dongle (in bus_to_vmid) marks T2, but a protecting PCI device wins, so a
-        # VM that is BOTH is treated as T1/T3 and excluded. Templates are excluded
-        # too (destroy_vm also refuses them at the choke point).
-        candidates = [int(v) for v in state["bus_to_vmid"].values()
-                     if str(v).lstrip("-").isdigit() and int(v) not in provisioning]
-        candidates = sorted(set(candidates))
-        from . import cs_sim  # deferred — cs_sim imports usb_provision
-        from . import pve_cmds  # local: pve_cmds is imported per-function
-        protected_pci = _t1_pci_vidpids(agent) | _t3_pci_vidpids(agent)
-        # Walk highest → lowest and pick the newest candidate that is a pure T2
-        # (not a template, no protecting T1/T3 PCI passthrough).
-        target_vmid = None
-        bus = None
-        for _cand in sorted(candidates, reverse=True):
-            if await pve_cmds.is_template(_cand):
-                logger.info("delete gate: skipping template VMID %s (never torn down)", _cand)
-                continue
-            if protected_pci:
-                _pci = await pve_cmds.pci_passthrough_vidpids(_cand)
-                if _pci & protected_pci:
-                    logger.info("delete gate: skipping VMID %s — protected PCI passthrough %s "
-                                "(T1/T3, never torn down)", _cand, sorted(_pci & protected_pci))
-                    continue
-            target_vmid = _cand
-            bus = state["bus_to_vmid"].get(str(_cand))
-            break
-        if target_vmid is not None:
-            # Stamp the transient "deleting" state BEFORE the destroy so the very
-            # next telemetry frame surfaces it (the VM disappears from `vms`
-            # moments later). Dropped again if the destroy raises.
-            _deleting[int(target_vmid)] = now
-            try:
-                await cs_sim.destroy_vm(agent, target_vmid, bus=bus)
-                torn_down.append(target_vmid)
-                state["bus_to_vmid"].pop(bus, None)
-                state["vmid_to_bus"].pop(str(target_vmid), None)
-                state["vmid_to_image"].pop(str(target_vmid), None)
-                state["missing_since"].pop(bus, None)
-                delete_queued = True
-                cooldown_until = now + DELETE_GATE_COOLDOWN_S
-                _save_delete_gate_cooldown(cooldown_until)
-                logger.warning(
-                    "auto-provision delete gate: destroyed newest USB VM %s "
-                    "(cpu_avg=%.1f mem_avg=%.1f) — 300s cooldown",
-                    target_vmid, cpu_avg or 0.0, mem_avg or 0.0)
-            except Exception as e:  # noqa: BLE001
-                # Destroy failed — the VM still exists, so don't leave it flagged
-                # as deleting (it would show 🔴 for the TTL erroneously).
-                _deleting.pop(int(target_vmid), None)
-                logger.warning("auto-provision delete gate: destroy %s failed: %s",
-                               target_vmid, e)
+    delete_queued = _early_shed is not None
 
     # 4b. Bus-migration reconciliation (bash reconcile_present_usb_state,
     # proxmox-agent.sh:1509-1556, called right before the missing-dongle scan

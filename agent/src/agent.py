@@ -2488,6 +2488,8 @@ class ProxmoxAgent:
             "effective_vm_set": max(1, int(cs_cfg.get("effective_vm_set", 1) or 1)),
             "template_lock":    str(cs_cfg.get("template_lock", "") or ""),
             "provision_halt":   usb_provision.current_provision_halt(),
+            "delete_gate":      usb_provision.current_delete_gate(),
+            "gate_averages":    usb_provision.current_gate_averages(),
             "prov_run":         usb_provision.current_prov_run(),
             "deleting_vmids":   usb_provision.current_deleting_vmids(),
             "usb_state":        usb.get("usb_state") or [],
