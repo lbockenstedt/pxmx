@@ -1301,15 +1301,27 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
             logger.debug("cs_usb_telemetry: load_usb_state failed: %s", exc)
             st = _new_usb_state()
         missing_since = st.get("missing_since") or {}
+        # Missing-dongle shed deadline for the WebUI countdown: the teardown fires
+        # when now - missing_since >= missing_timeout, so shed_at = missing_since +
+        # missing_timeout (same units the teardown compares — accurate regardless
+        # of the min/sec relay convention). 0 = teardown disabled (no deadline).
+        usb_cfg = _usb_cfg(agent)
+        missing_timeout = int(_cfg_first(usb_cfg,
+                              ("usb_missing_timeout_seconds", "usb_missing_timeout",
+                               "missing_timeout"), 0) or 0)
         for bus, vmid in (st.get("bus_to_vmid") or {}).items():
             pe = present_by_bus.get(bus) or {}
+            ms = missing_since.get(bus)
             usb_state.append({
                 "vmid": vmid,
                 "bus_path": bus,
-                "missing_since": missing_since.get(bus),
+                "missing_since": ms,
+                "missing_timeout_s": missing_timeout,
+                "shed_at": (float(ms) + missing_timeout)
+                           if (ms is not None and missing_timeout > 0) else None,
                 "name": pe.get("product") or bus,
                 "vidpid": pe.get("vidpid") or "",
-                "prov_status": "missing" if missing_since.get(bus) is not None else "active",
+                "prov_status": "missing" if ms is not None else "active",
             })
         return {"usb_state": usb_state, "present_usb": present, "unknown_usb": unknown}
     except Exception as exc:  # noqa: BLE001
