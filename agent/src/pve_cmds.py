@@ -579,11 +579,12 @@ async def qm_destroy(vmid: Any, protected: Optional[Set[int]] = None,
         # same VMID can't race a still-purging disk.
         if await wait_guest_gone(vid, "qemu", 360):
             return True, ""
-        msg = f"`qm destroy` returned 0 but VM {vid} config still present after 360s (disk purge stuck?)"
-        logger.error("destroy VM %s: %s", vid, msg)
-        return False, msg
-    logger.warning("destroy VM %s: first `qm destroy` rc=%s: %s",
-                   vid, rc, reason or "(no stderr)")
+    elif not await guest_exists(vid, "qemu"):
+        return True, ""          # rc!=0 because the VM is ALREADY gone → success
+    else:
+        logger.warning("destroy VM %s: first `qm destroy` rc=%s: %s",
+                       vid, rc, reason or "(no stderr)")
+    # Still present → emergency-kill QEMU + retry once (bash 1796-1807).
     pid = await _qemu_pid(vid)
     if pid:
         await _run(["kill", "-9", str(pid)], check=False, timeout=5)
@@ -592,14 +593,12 @@ async def qm_destroy(vmid: Any, protected: Optional[Set[int]] = None,
     await asyncio.sleep(5)
     rc, _, err = await _run(argv, check=False, timeout=timeout)
     reason = err.decode(errors="replace").strip() or reason
-    if rc != 0:
-        logger.error("destroy VM %s: retry `qm destroy` rc=%s: %s",
-                     vid, rc, reason or "(no stderr)")
-        return False, reason or f"qm destroy exited {rc}"
-    if await wait_guest_gone(vid, "qemu", 360):
+    if rc == 0 and await wait_guest_gone(vid, "qemu", 360):
         return True, ""
-    msg = f"`qm destroy` (retry) returned 0 but VM {vid} config still present after 360s"
-    logger.error("destroy VM %s: %s", vid, msg)
+    if not await guest_exists(vid, "qemu"):
+        return True, ""          # gone after the kill/retry → success
+    msg = reason or f"`qm destroy` exited {rc}; VM {vid} config still present"
+    logger.error("destroy VM %s failed: %s", vid, msg)
     return False, msg
 
 
@@ -632,6 +631,8 @@ async def pct_destroy(vmid: Any, protected: Optional[Set[int]] = None,
             logger.error("destroy CT %s: %s", vid, msg)
             return False, msg
         reason = err.decode(errors="replace").strip() or reason
+        if not await guest_exists(vid, "lxc"):
+            return True, ""          # already gone → idempotent success
     logger.error("destroy CT %s: all `pct destroy` variants failed: %s",
                  vid, reason or "(no stderr)")
     return False, reason or "pct destroy failed (all variants)"
@@ -663,6 +664,20 @@ async def qm_agent_ping(vmid: Any, protected: Optional[Set[int]] = None,
     """Return True if the qemu guest-agent on ``vmid`` responds to ``qm agent ping`` (guest is up + agent live)."""
     vid = assert_sim_vm(vmid, protected or set())
     rc, _, _ = await _run(["qm", "agent", str(vid), "ping"], check=False, timeout=timeout)
+    return rc == 0
+
+
+async def guest_exists(vmid: int, kind: str) -> bool:
+    """One-shot: True if the guest's config still exists (``qm/pct config`` rc 0).
+
+    A destroy that fails because the guest is ALREADY GONE (a concurrent shed, a
+    prior tick, an admin delete, or a slow purge that finished after the
+    wait_guest_gone window) is an IDEMPOTENT SUCCESS — "gone" is the goal state.
+    Treating it as a failure was the "did NOT complete but the VM is actually
+    deleted" bug: the delete gate then skipped clear_assignment and retried a
+    ghost VMID every tick, racking up destroy-fails toward a bogus orphan."""
+    bin_ = "pct" if kind == "lxc" else "qm"
+    rc, _, _ = await _run([bin_, "config", str(vmid)], check=False, timeout=15)
     return rc == 0
 
 

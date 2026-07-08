@@ -470,9 +470,22 @@ async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
     target_vmid = None      # the VM actually shed (None if none / destroy failed)
     destroy_failed = None    # a VMID we tried to shed but destroy_vm returned not-ok
     destroy_fail_reason = ""  # the actual qm/pct stderr for that failure (card trace)
+    ghost_cleaned = None     # a VMID that was already gone when we went to shed it
     candidate_count = None  # eligible T2 count (only computed when the gate runs)
     if threshold_exceeded and now >= cooldown_until:
         provisioning = _provisioning_vmids()
+        # Refresh the tracked list against the LIVE host VM list BEFORE selecting:
+        # a VM deleted by ANY path (a prior shed, an admin/manual delete, a crash)
+        # is dropped from bus_to_vmid here, so the gate can't fixate on a ghost
+        # VMID and stall — the user-reported "stuck on a VMID shed hours ago,
+        # never advances to the next". Prune is by-value so a bus_to_vmid entry
+        # stranded after a partial clear is caught (the old vmid_to_bus-only
+        # reconcile missed it). Reload state after a prune.
+        _ghosts = prune_ghost_vms(set(await pve_cmds.list_all_vmids()))
+        if _ghosts:
+            logger.info("delete gate: pruned ghost VMID(s) no longer on host "
+                        "(shed/deleted earlier): %s", _ghosts)
+            state = load_usb_state()
         # Candidates = dongle-backed VMs (bus_to_vmid), newest first. Shed ONLY a
         # pure T2: skip templates and any VM with a protecting T1/T3 PCI
         # passthrough (destroy_vm also refuses templates at the choke point).
@@ -514,7 +527,18 @@ async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
             # destroy_vm.clear_assignment already dropped the bus assignment from
             # persisted state on success (and on orphan) — the gate no longer
             # double-manages state.
-            if result.get("ok"):
+            if result.get("ok") and result.get("already_gone"):
+                # The VM was already gone (deleted earlier / a race after the
+                # prune). destroy_vm cleared its state. Do NOT arm the cooldown —
+                # nothing was actually shed, so the real over-threshold shed
+                # should proceed next tick instead of idling 300s on a no-op.
+                _deleting.pop(int(_cand_vmid), None)
+                target_vmid = None
+                ghost_cleaned = _cand_vmid
+                logger.info(
+                    "auto-provision delete gate: VMID %s already gone — cleared "
+                    "stale assignment, no cooldown (real shed proceeds)", _cand_vmid)
+            elif result.get("ok"):
                 cooldown_until = now + DELETE_GATE_COOLDOWN_S
                 _save_delete_gate_cooldown(cooldown_until)
                 logger.warning(
@@ -543,6 +567,9 @@ async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
     _mem_s = f"{round(mem_avg, 1)}" if mem_avg is not None else "—"
     if target_vmid is not None:
         reason = f"shed VMID {target_vmid} (CPU {_cpu_s}% ≥ {cpu_del_thr}%)"
+    elif ghost_cleaned is not None:
+        reason = (f"cleared stale VMID {ghost_cleaned} (already deleted) — "
+                  f"real shed proceeds next tick, no cooldown")
     elif destroy_failed is not None:
         _why = f": {destroy_fail_reason}" if destroy_fail_reason else \
                " (VM locked/busy or purge timeout; see agent log)"
@@ -976,6 +1003,48 @@ def clear_assignment(vmid: int, bus: Optional[str] = None) -> None:
     save_usb_state(st)
 
 
+def prune_ghost_vms(existing: Set[int]) -> List[int]:
+    """Drop every tracked VM no longer present on the host from ALL state maps,
+    iterating ``bus_to_vmid`` BY VALUE (the vmid) so an entry stranded there
+    after a partial clear — ``vmid_to_bus`` already removed but ``bus_to_vmid``
+    retained — is still pruned.
+
+    The main-loop reconcile iterated ``vmid_to_bus`` only, but the delete gate
+    selects candidates from ``bus_to_vmid``; a ghost stranded in ``bus_to_vmid``
+    was therefore re-selected every pass and never destroyed (it no longer
+    exists), fixating the gate on a VMID shed hours earlier and never advancing
+    to the real next candidate. Called at the top of the delete gate (refresh
+    the tracked list each pass) and from the main-loop reconcile. Returns the
+    pruned VMIDs. ``existing`` = ``set(await pve_cmds.list_all_vmids())``."""
+    def _gone(v: Any) -> bool:
+        return str(v).lstrip("-").isdigit() and int(v) not in existing
+    st = load_usb_state()
+    pruned: Set[int] = set()
+    for bus, v in list(st.get("bus_to_vmid", {}).items()):
+        if _gone(v):
+            st["bus_to_vmid"].pop(bus, None)
+            st.get("missing_since", {}).pop(bus, None)
+            st.get("vidpid_by_bus", {}).pop(bus, None)
+            pruned.add(int(v))
+    for vmid, bus in list(st.get("vmid_to_bus", {}).items()):
+        if _gone(vmid):
+            st["vmid_to_bus"].pop(vmid, None)
+            st.get("missing_since", {}).pop(bus, None)
+            st.get("vidpid_by_bus", {}).pop(bus, None)
+            pruned.add(int(vmid))
+    for vmid in list(st.get("vmid_to_image", {})):
+        if _gone(vmid):
+            st["vmid_to_image"].pop(vmid, None)
+            pruned.add(int(vmid))
+    if pruned:
+        save_usb_state(st)
+        # destroy-fail counters + orphan registry live in separate files.
+        for v in pruned:
+            clear_destroy_fails(v)
+            remove_orphan_vm(v)
+    return sorted(pruned)
+
+
 def set_assignment(vmid: int, bus: str, image_num: int) -> None:
     st = load_usb_state()
     st["vmid_to_bus"][str(int(vmid))] = bus
@@ -1406,13 +1475,14 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     present = scan_present_dongles(dongle_vidpids, certified_types)
     now = time.time()
 
-    # 1. Reconcile: release buses whose VM no longer exists.
-    for vmid, bus in list(state["vmid_to_bus"].items()):
-        if int(vmid) not in existing:
-            state["bus_to_vmid"].pop(bus, None)
-            state["vmid_to_bus"].pop(vmid, None)
-            state["vmid_to_image"].pop(vmid, None)
-            state.setdefault("vidpid_by_bus", {}).pop(bus, None)
+    # 1. Reconcile: drop every tracked VM no longer on the host. Symmetric prune
+    # (bus_to_vmid by value + vmid_to_bus by key) so a ghost stranded in
+    # bus_to_vmid after a partial clear is caught — the old vmid_to_bus-only loop
+    # missed it, and the delete gate (which selects from bus_to_vmid) then
+    # fixated on that ghost forever. Reload after a prune so the rest of the pass
+    # sees the cleaned state.
+    if prune_ghost_vms(existing):
+        state = load_usb_state()
     # Remember each tracked bus's vidpid while it's actually present, so a
     # dongle that later moves to a different bus path (unplugged/replugged
     # into a different physical port) can still be matched by vidpid below

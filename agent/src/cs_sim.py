@@ -139,6 +139,19 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
         raise GuardError(
             f"vmid {vid} is a template (clone source) — refusing to destroy")
     bus = bus or usb_provision.bus_for_vmid(vid)
+    # Idempotent: if the guest is already gone (a prior tick shed it, an admin
+    # delete raced us, or it was deleted manually), don't stop/destroy a ghost —
+    # just reconcile state. ``already_gone=True`` tells the delete gate to clear
+    # the stale assignment WITHOUT arming a shed cooldown (nothing was actually
+    # removed, so the real over-threshold shed should proceed the same/next tick).
+    if not await pve_cmds.guest_exists(vid, kind):
+        usb_provision.clear_assignment(vid, bus)
+        usb_provision.clear_destroy_fails(vid)
+        usb_provision.remove_orphan_vm(vid)
+        if exclude_bus_after and bus:
+            usb_provision.exclude_bus(bus)
+        return {"ok": True, "orphaned": False, "bus": bus, "kind": kind,
+                "already_gone": True}
     await _expire_pending_commands(agent, vid, kind)
     if kind == "lxc":
         await pve_cmds.pct_stop(vid, prot)
