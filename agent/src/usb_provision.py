@@ -1071,24 +1071,49 @@ def set_assignment(vmid: int, bus: str, image_num: int) -> None:
 
 
 def reconcile_bus_map() -> List[int]:
-    """Drop bus_to_vmid entries that disagree with vmid_to_bus (the authoritative
-    current bus per VM). A VM re-provisioned onto a new bus left its old reverse
-    entry behind (set_assignment didn't clear it), so the VM showed under two
-    vid:pids. Returns the vmids whose stale reverse entries were removed. Run each
-    provision pass alongside prune_ghost_vms."""
+    """Make bus_to_vmid a clean 1:1 with vmid_to_bus WITHOUT orphaning VMs.
+
+    A VM re-provisioned onto a new bus can leave its OLD reverse entry behind, so
+    a vmid ends up mapped to TWO buses in bus_to_vmid (the "shown under two
+    vid:pids" bug). Only THOSE true duplicates are pruned — keep the bus
+    vmid_to_bus points at (else the newest), drop the rest.
+
+    A vmid with a SINGLE bus_to_vmid entry is always kept; if its vmid_to_bus is
+    missing/stale it is REPAIRED (set to that bus), never removed. The prior
+    version dropped single entries whose vmid_to_bus was absent, which orphaned
+    legitimately-tracked VMs out of bus_to_vmid so the missing-dongle teardown
+    (which iterates bus_to_vmid) could no longer shed them. Returns the vmids
+    whose duplicate reverse entries were pruned."""
     st = load_usb_state()
-    v2b = st.get("vmid_to_bus") or {}
-    fixed: List[int] = []
-    for bus, vmid in list((st.get("bus_to_vmid") or {}).items()):
-        if str(v2b.get(str(vmid), "")) != str(bus):
-            st["bus_to_vmid"].pop(bus, None)
-            st.get("missing_since", {}).pop(bus, None)
-            st.get("vidpid_by_bus", {}).pop(bus, None)
+    b2v = st.get("bus_to_vmid") or {}
+    v2b = st.setdefault("vmid_to_bus", {})
+    buses_by_vmid: Dict[str, List[str]] = {}
+    for bus, vmid in b2v.items():
+        buses_by_vmid.setdefault(str(vmid), []).append(bus)
+    pruned: List[int] = []
+    changed = False
+    for vmid, buses in buses_by_vmid.items():
+        if len(buses) == 1:
+            if v2b.get(vmid) != buses[0]:          # repair, don't orphan
+                v2b[vmid] = buses[0]
+                changed = True
+            continue
+        keep = v2b.get(vmid) if v2b.get(vmid) in buses else buses[-1]
+        for b in buses:
+            if b == keep:
+                continue
+            b2v.pop(b, None)
+            st.get("missing_since", {}).pop(b, None)
+            st.get("vidpid_by_bus", {}).pop(b, None)
+            changed = True
             if str(vmid).lstrip("-").isdigit():
-                fixed.append(int(vmid))
-    if fixed:
+                pruned.append(int(vmid))
+        if v2b.get(vmid) != keep:
+            v2b[vmid] = keep
+            changed = True
+    if changed:
         save_usb_state(st)
-    return sorted(set(fixed))
+    return sorted(set(pruned))
 
 
 def bus_for_vmid(vmid: int) -> Optional[str]:
