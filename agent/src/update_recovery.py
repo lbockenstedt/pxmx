@@ -48,6 +48,41 @@ from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger("UpdateRecovery")
 
+# Canonical LM log format (matches logging_setup.DEFAULT_FORMAT). This module
+# is stdlib-only by design (it runs during update recovery, before/around the
+# venv is usable), so the format is inlined rather than imported. The CLI
+# ``main()`` calls ``_configure_cli_logging()`` once so the snapshot/rollback/
+# clearpending/prune/markbad operations are actually emitted — without it the
+# ``UpdateRecovery`` logger has no handler and every ``logger.info(...)`` was
+# silently dropped by the root logger's lastResort handler (WARNING+ only),
+# which is why "the recovery log never logged anything". A best-effort
+# ``FileHandler`` to /var/log/lm/recovery.log gives the operator a single
+# dedicated recovery trail (the root-run watchdog otherwise redirects the
+# Python CLI's stdout/stderr to /dev/null for clearpending/prune); stderr is
+# also kept so a manual ``python3 update_recovery.py ...`` invocation shows
+# output regardless of the watchdog redirect.
+_LOG_FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+_LOG_DATEFMT = '%Y-%m-%d %H:%M:%S'
+_RECOVERY_LOG_FILE = '/var/log/lm/recovery.log'
+
+
+def _configure_cli_logging() -> None:
+    """Configure the ``UpdateRecovery`` logger for a CLI run (stdlib-only)."""
+    level = logging.INFO
+    _raw = (os.environ.get("LOG_LEVEL") or "").strip().upper()
+    _resolved = getattr(logging, _raw, None) if _raw else None
+    if isinstance(_resolved, int):
+        level = _resolved
+    handlers: list = [logging.StreamHandler()]
+    try:
+        os.makedirs(os.path.dirname(_RECOVERY_LOG_FILE) or ".", exist_ok=True)
+        handlers.append(logging.FileHandler(_RECOVERY_LOG_FILE))
+    except Exception:  # noqa: BLE001 — non-root / missing dir → stderr only
+        pass
+    logging.basicConfig(level=level, format=_LOG_FMT, datefmt=_LOG_DATEFMT,
+                        handlers=handlers, force=True)
+
+
 # ── Paths / tunables ───────────────────────────────────────────────────────
 # Default to the hub prod state dir; spokes/agents pass state_dir= explicitly
 # (and the CLI passes --state-dir). Allow an override for tests / non-standard
@@ -515,13 +550,13 @@ def _cli_prune(args) -> int:
 
 def main(argv=None) -> int:
     # Stdlib-only by design (runs during update recovery, before/around venv
-    # deps are guaranteed), so we can't import core.src.logging_setup here. A
-    # standalone run (incident operator) should still get the canonical format
-    # with timestamps; otherwise logger.info is dropped (root defaults to
-    # WARNING) and warning/error print without asctime.
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                        datefmt='%Y-%m-%d %H:%M:%S')
+    # deps are guaranteed), so we can't import core.src.logging_setup here.
+    # _configure_cli_logging (defined above) emits the canonical format with
+    # timestamps to stderr AND a best-effort /var/log/lm/recovery.log file;
+    # otherwise logger.info is dropped (root defaults to WARNING) and the
+    # root-run watchdog's >/dev/null redirect swallows everything — which is
+    # why "the recovery log never logged anything".
+    _configure_cli_logging()
     parser = argparse.ArgumentParser(prog="update_recovery", description="Update-recovery state machine CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
