@@ -1238,7 +1238,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         save_usb_state(state)
         _provision_halt = None
         _provision_reason = "auto-provision disabled"
-        logger.info("auto-provision: usb_auto_provision=off — telemetry-only pass")
+        logger.debug("auto-provision: usb_auto_provision=off — telemetry-only pass")
         return {"provisioned": 0, "torn_down": 0, "reason": "auto-provision disabled"}
 
     # 2b. Migrate to per-host batches: destroy agent-owned sim VMs whose VMIDs
