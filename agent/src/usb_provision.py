@@ -919,6 +919,19 @@ USB_QUARANTINE_FILE = f"{PXMLIB}/usb_quarantine.json"
 DESTROY_FAILS_FILE = f"{PXMLIB}/destroy_fails.json"
 QUARANTINE_MAX_FAILS = 3  # bash line 1217: a bus is quarantined after 3 fails
 
+# Kernel USB errors for a SPECIFIC device/port → quarantine that dongle so a
+# faulty port/dongle isn't re-provisioned. The kernel logs the bus id (e.g.
+# "usb 3-1.2: device descriptor read/64, error -71") — that id IS the sysfs
+# bus_path dongles are tracked by. Distinct from the watchdog's subsystem-level
+# scrape (xhci_hcd died); this is per-dongle. -71 = EPROTO, -110 = ETIMEDOUT.
+_USB_DMESG_ERROR_RE = re.compile(
+    r"usb (\d+-[\d.]+):.*?("
+    r"device descriptor read|unable to enumerate|not accepting address|"
+    r"error -71\b|error -110\b|can't set config|cannot enable port|reset .*fail"
+    r")", re.IGNORECASE)
+_DMESG_USB_WINDOW_S = 180        # look back this far in the kernel log
+_DMESG_USB_QUARANTINE_MIN = 3    # >= this many error lines in-window → quarantine
+
 
 def _new_usb_state() -> Dict[str, Any]:
     return {"vmid_to_bus": {}, "bus_to_vmid": {}, "vmid_to_image": {},
@@ -1029,6 +1042,42 @@ def _save_quarantine(d: Dict[str, Any]) -> None:
             json.dump(d, f)
     except OSError:
         pass
+
+
+async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str, int]:
+    """Kernel-log per-device USB errors → ``{bus_path: error_line_count}`` over
+    the last *window_s*. A faulty port/dongle logs ``usb 3-1.2: device
+    descriptor read/64, error -71`` etc.; the bus id (3-1.2) IS the sysfs
+    bus_path dongles are tracked by, so a persistently-erroring bus can be
+    quarantined and not re-provisioned. Best-effort via ``journalctl -k``; empty
+    dict on any failure (never quarantines on missing data)."""
+    from . import pve_cmds  # deferred — avoid a top-level import cycle
+    try:
+        rc, out, _ = await pve_cmds._run(
+            ["journalctl", "-k", "--no-pager", "-o", "cat",
+             "--since", f"-{int(window_s)}s"], check=False, timeout=10)
+    except Exception:  # noqa: BLE001
+        return {}
+    if rc != 0 or not out:
+        return {}
+    errors: Dict[str, int] = {}
+    for line in out.splitlines():
+        m = _USB_DMESG_ERROR_RE.search(line)
+        if m:
+            errors[m.group(1)] = errors.get(m.group(1), 0) + 1
+    return errors
+
+
+def quarantine_bus(bus: str, reason: str) -> None:
+    """Force a bus into quarantine (fails = QUARANTINE_MAX_FAILS) so the provision
+    loop skips it, tagged with a reason. Idempotent — no-ops if already quarantined
+    at/above the threshold. Auto-clears via the loop's absent-dongle sweep."""
+    q = _read_quarantine()
+    entry = q.get(bus) or {}
+    if int(entry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
+        return
+    q[bus] = {"fails": QUARANTINE_MAX_FAILS, "since": int(time.time()), "reason": reason}
+    _save_quarantine(q)
 
 
 def record_usb_failure(bus: str) -> int:
@@ -1511,6 +1560,29 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         vidpid_by_bus[new_bus] = vidpid
         logger.info(f"provision loop: USB dongle {vidpid} moved from {old_bus} "
                    f"to {new_bus}, following assignment for VM {vmid}")
+
+    # 4c. Faulty-dongle quarantine from kernel USB errors. A flaky port/dongle
+    #     logs 'usb 3-1.2: device descriptor read error -71' etc.; quarantine
+    #     that bus so it isn't re-provisioned. Only quarantine buses we actually
+    #     care about (currently present OR tracked with a VM) so a random USB
+    #     device's error can't strand an unrelated bus. A quarantined dongle that
+    #     also drops off enumeration is torn down by the missing-dongle sweep
+    #     below; the quarantine keeps it from being immediately re-cloned.
+    try:
+        dmesg_errs = await scan_dmesg_usb_errors()
+    except Exception as _e:  # noqa: BLE001
+        dmesg_errs = {}
+        logger.debug("provision loop: dmesg USB scan failed: %s", _e)
+    if dmesg_errs:
+        _watched = set(present) | set(state.get("bus_to_vmid") or {})
+        for _bus, _n in dmesg_errs.items():
+            if _n >= _DMESG_USB_QUARANTINE_MIN and _bus in _watched:
+                if int((_read_quarantine().get(_bus) or {}).get("fails", 0)) < QUARANTINE_MAX_FAILS:
+                    quarantine_bus(_bus, f"kernel USB errors ({_n} in {_DMESG_USB_WINDOW_S}s)")
+                    logger.warning(
+                        "auto-provision: quarantined bus %s — %d kernel USB error(s) "
+                        "in %ds (faulty port/dongle; will not be re-provisioned)",
+                        _bus, _n, _DMESG_USB_WINDOW_S)
 
     # 5. Missing-dongle teardown (only when the toggle is on).
     if missing_timeout > 0:
