@@ -158,6 +158,14 @@ def _main() -> int:
     """CLI: ``python -m dep_guard <requirements.txt> [--timeout N]`` → exit 0
     if all deps importable (after any install), 1 otherwise. For ad-hoc checks."""
     import argparse
+    # Stdlib-only by design (runs before the venv is guaranteed importable), so
+    # we can't use core.src.logging_setup here — but a standalone CLI run should
+    # still emit the canonical format/timestamps so operator output matches the
+    # journal. Without this, logger.warning/error use Python's default format
+    # (no asctime) and logger.info is dropped (root defaults to WARNING).
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S')
 
     parser = argparse.ArgumentParser(description="Self-heal missing venv deps.")
     parser.add_argument("requirements", help="path to requirements.txt")

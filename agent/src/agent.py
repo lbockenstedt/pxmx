@@ -400,8 +400,15 @@ class ProxmoxAgent:
         # must have every agent's logs (Setup → Agent Logs + BugFixer) without
         # needing the box's CLI.
         self._ws_log_handler = WebSocketLogHandler(self)
+        # Match the canonical format/datefmt used by configure_logging (see
+        # logging_setup.DEFAULT_FORMAT/DEFAULT_DATEFMT) so log lines streamed to
+        # the hub WebUI Agent Logs view are byte-identical in shape to the
+        # journal/file lines. Without datefmt, asctime falls back to the logging
+        # default which appends milliseconds (...,123) — inconsistent with every
+        # other log surface in the fleet.
         self._ws_log_handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                              datefmt='%Y-%m-%d %H:%M:%S'))
         logging.getLogger().addHandler(self._ws_log_handler)
         self._install_uncaught_exception_relay()
 

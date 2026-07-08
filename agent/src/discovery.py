@@ -446,6 +446,13 @@ def _main() -> int:
     """
     import argparse
 
+    # Standalone ``python -m discovery`` run (install scripts): emit the
+    # canonical format/timestamps so any logger output matches the journal.
+    # Without this, root defaults to WARNING and uses Python's default format.
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S')
+
     parser = argparse.ArgumentParser(description="Auto-discover the LM hub.")
     parser.add_argument("--timeout", type=float, default=5.0,
                         help="total discovery window in seconds (default 5)")

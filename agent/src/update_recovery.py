@@ -514,6 +514,14 @@ def _cli_prune(args) -> int:
 
 
 def main(argv=None) -> int:
+    # Stdlib-only by design (runs during update recovery, before/around venv
+    # deps are guaranteed), so we can't import core.src.logging_setup here. A
+    # standalone run (incident operator) should still get the canonical format
+    # with timestamps; otherwise logger.info is dropped (root defaults to
+    # WARNING) and warning/error print without asctime.
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S')
     parser = argparse.ArgumentParser(prog="update_recovery", description="Update-recovery state machine CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
