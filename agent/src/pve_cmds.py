@@ -775,6 +775,23 @@ async def qm_template(vmid: Any, protected: Optional[Set[int]] = None) -> None:
     await _run(["qm", "template", str(vid)], timeout=120)
 
 
+async def list_backup_storages() -> Dict[str, Any]:
+    """This host's Proxmox storages that can hold backups (content=backup) plus
+    the node hostname — feeds the Setup → Hypervisors backup-storage dropdown.
+    Read-only; best-effort (empty list if pvesm is unavailable)."""
+    import socket
+    host = socket.gethostname()
+    storages: List[str] = []
+    rc, out, _ = await _run(["pvesm", "status", "--content", "backup"],
+                            check=False, timeout=15)
+    if rc == 0:
+        for line in out.decode(errors="replace").splitlines()[1:]:
+            parts = line.split()
+            if parts and parts[0] not in storages:
+                storages.append(parts[0])
+    return {"hosts": [{"hostname": host, "storages": storages}]}
+
+
 async def list_all_vmids() -> List[int]:
     """All qemu + lxc VMIDs present on this host (read-only). Used by the USB
     provision loop to find free slots and reconcile stale bus state."""

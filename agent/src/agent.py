@@ -1962,6 +1962,15 @@ class ProxmoxAgent:
                         except pve_cmds.PveError as e:
                             result = {"status": "ERROR", "message": str(e)}
 
+                    elif cmd_type == "PXMX_LIST_STORAGE":
+                        # Backup-capable storages on this host for the Setup →
+                        # Hypervisors dropdown (auto-list-from-host).
+                        try:
+                            result = {"status": "SUCCESS",
+                                      **(await pve_cmds.list_backup_storages())}
+                        except Exception as e:
+                            result = {"status": "ERROR", "message": str(e)}
+
                     elif cmd_type == "PXMX_CLONE_VM":
                         # Clone-from-template: any tenant may clone a VM that
                         # lives in a configured template pool (the hub resolves
