@@ -948,6 +948,12 @@ USB_STATE_FILE = f"{PXMLIB}/usb_state.json"
 USB_QUARANTINE_FILE = f"{PXMLIB}/usb_quarantine.json"
 DESTROY_FAILS_FILE = f"{PXMLIB}/destroy_fails.json"
 QUARANTINE_MAX_FAILS = 3  # bash line 1217: a bus is quarantined after 3 fails
+# A quarantined dongle (dmesg kernel USB errors — the ONLY quarantine path now)
+# auto-recovers after this long, present OR absent: a still-plugged dongle gets a
+# fresh provisioning attempt, and if the kernel errors persist it re-quarantines.
+# 1h keeps a genuinely faulty dongle sidelined long enough to be noticed while
+# never stranding a good dongle that hit a transient kernel hiccup.
+QUARANTINE_RECOVERY_S = 3600
 
 # Kernel USB errors for a SPECIFIC device/port → quarantine that dongle so a
 # faulty port/dongle isn't re-provisioned. The kernel logs the bus id (e.g.
@@ -1273,17 +1279,6 @@ def quarantine_bus(bus: str, reason: str) -> None:
     _save_quarantine(q)
 
 
-def record_usb_failure(bus: str) -> int:
-    """Increment a bus's provision-failure count; quarantine past the threshold
-    (bash 1211-1268). Returns the new count."""
-    q = _read_quarantine()
-    entry = q.get(bus) or {"fails": 0, "since": int(time.time())}
-    entry["fails"] = int(entry.get("fails", 0)) + 1
-    entry["since"] = int(time.time())
-    q[bus] = entry
-    _save_quarantine(q)
-    return entry["fails"]
-
 
 def _read_destroy_fails() -> Dict[str, int]:
     try:
@@ -1380,7 +1375,8 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
     Best-effort: any failure returns empty lists (the cs speak tolerates
     empty). Mirrors the legacy cs bash agent's telemetry body so the cs speak's
     ``_apply_proxmox_telemetry_state`` ingests it unchanged."""
-    empty: Dict[str, List[Dict[str, Any]]] = {"usb_state": [], "present_usb": [], "unknown_usb": []}
+    empty: Dict[str, List[Dict[str, Any]]] = {"usb_state": [], "present_usb": [],
+                                              "unknown_usb": [], "quarantine": []}
     try:
         certified = _dongle_vidpids(agent)
         ignored = _ignored_vidpids(agent)
@@ -1444,7 +1440,35 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "vidpid": pe.get("vidpid") or "",
                 "prov_status": "missing" if ms is not None else "active",
             })
-        return {"usb_state": usb_state, "present_usb": present, "unknown_usb": unknown}
+        # Quarantined dongles (dmesg kernel USB errors — the ONLY quarantine path)
+        # for the WebUI badge: bus-id + reason + when, so an admin can see WHY a
+        # dongle is sidelined and that it auto-recovers after QUARANTINE_RECOVERY_S.
+        quarantined: List[Dict[str, Any]] = []
+        try:
+            qt = _read_quarantine()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cs_usb_telemetry: read quarantine failed: %s", exc)
+            qt = {}
+        _now = time.time()
+        for bus, entry in (qt or {}).items():
+            if int((entry or {}).get("fails", 0)) < QUARANTINE_MAX_FAILS:
+                continue
+            pe = present_by_bus.get(bus) or {}
+            since = (entry or {}).get("since")
+            quarantined.append({
+                "bus_path": bus,
+                "reason": (entry or {}).get("reason") or "quarantined",
+                "since": since,
+                # Seconds until the 1h auto-recovery clears it (clamped >=0).
+                "recovers_in_s": max(0, int(QUARANTINE_RECOVERY_S
+                                            - (_now - float(since))))
+                                 if since is not None else None,
+                "present": bus in present_by_bus,
+                "name": pe.get("product") or bus,
+                "vidpid": pe.get("vidpid") or "",
+            })
+        return {"usb_state": usb_state, "present_usb": present,
+                "unknown_usb": unknown, "quarantine": quarantined}
     except Exception as exc:  # noqa: BLE001
         logger.warning("cs_usb_telemetry: failed: %s", exc)
         return empty
@@ -1652,21 +1676,23 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             logger.info("provision loop: bus exclusion cleared for %s (%s)", bus,
                         "unplugged" if bus not in present
                         else f"cooldown {exclude_cooldown}s elapsed")
-    # Auto-clear quarantine only after it's been BOTH absent AND quarantined
-    # for >= 2x missing_timeout (bash load_usb_quarantine, proxmox-agent.sh:
-    # 1231-1244) — clearing the instant a quarantined dongle is merely
-    # unplugged defeated the point of quarantine: a flaky/bad dongle bouncing
-    # in and out would get a fresh provisioning attempt on every replug.
+    # Auto-clear quarantine after QUARANTINE_RECOVERY_S (1h) — present OR absent.
+    # Quarantine is now dmesg-ONLY (a real kernel USB hardware-fault signal), so a
+    # still-plugged quarantined dongle MUST be retried eventually: a transient
+    # kernel hiccup (cable jiggle, port reset) shouldn't sideline a good dongle
+    # forever. After 1h it gets a fresh provisioning attempt; if the kernel errors
+    # are still firing, scan_dmesg_usb_errors re-quarantines it next pass. Absent
+    # dongles clear on the same 1h clock so a replug starts clean.
     quarantine = _read_quarantine()
     for bus in list(quarantine):
-        if bus in present:
-            continue
         since = (quarantine[bus] or {}).get("since")
-        if missing_timeout > 0 and since is not None and \
-                now - float(since) >= missing_timeout * 2:
+        if since is not None and now - float(since) >= QUARANTINE_RECOVERY_S:
+            reason = (quarantine[bus] or {}).get("reason", "")
             quarantine.pop(bus, None)
-            logger.info(f"provision loop: quarantine auto-cleared for {bus} "
-                       f"(absent >= {missing_timeout * 2}s since last failure)")
+            logger.info("provision loop: quarantine auto-cleared for %s "
+                        "(%s — %ds elapsed, %s)",
+                        bus, reason, QUARANTINE_RECOVERY_S,
+                        "still present" if bus in present else "absent")
     _save_quarantine(quarantine)
 
     # 1c. Post-provisioning retry queue — runs unconditionally (matches bash
@@ -1829,10 +1855,6 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 try:
                     await cs_sim.destroy_vm(agent, int(vmid), bus=bus)
                     torn_down.append(int(vmid))
-                    # Bump the bus's quarantine failure counter on teardown (bash
-                    # 2615) so a flapping physical port accumulates toward
-                    # QUARANTINE_MAX_FAILS and stops being re-provisioned.
-                    record_usb_failure(bus)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"provision loop: teardown of {vmid} failed: {e}")
                 state["bus_to_vmid"].pop(bus, None)
@@ -1927,11 +1949,10 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         if state["excluded_buses"].get(bus):
             culled["excluded"].append(bus)
             continue
-        # Only skip a bus once it has actually reached QUARANTINE_MAX_FAILS — mere
-        # membership in the quarantine file means fails=1..2 (record_usb_failure
-        # writes an entry on the FIRST failure), and skipping on membership made a
-        # single transient clone failure permanently sideline a good dongle even
-        # though the documented threshold is 3. Gate on the count, not presence.
+        # Only skip a bus once it has actually reached QUARANTINE_MAX_FAILS —
+        # quarantine is now dmesg-ONLY (quarantine_bus sets fails=MAX in one shot),
+        # but gate on the count anyway so a partial/stale entry can't sideline a
+        # good dongle. Gate on the count, not mere file presence.
         qentry = quarantine.get(bus) or {}
         if int(qentry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
             culled["quarantined"].append(f"{bus}({qentry.get('fails')})")
@@ -2092,7 +2113,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                     await cs_sim.destroy_vm(agent, vid, bus=bus)
                 except Exception as te:  # noqa: BLE001
                     logger.warning(f"provision loop: teardown of partial {vid}: {te}")
-                record_usb_failure(bus)
+                # Do NOT quarantine the dongle for a clone failure — a failed clone
+                # is almost never the dongle's fault (VMID collision, missing
+                # template, lock contention, host disk/CPU, etc.). Quarantining
+                # here sidelines good dongles for non-dongle reasons and is the
+                # root of the "3 idle dongles stuck, not turning up clients" bug.
+                # A dongle is quarantined ONLY for kernel USB (dmesg) errors on its
+                # bus — a real hardware-fault signal (step 4c above).
                 item_by_bus[bus]["status"] = "failed"
                 return False
 
