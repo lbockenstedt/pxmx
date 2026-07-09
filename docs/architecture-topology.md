@@ -123,6 +123,138 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
 
 The agent-spoke role loader (`lm/agent/src/agent_spoke.py::_ROLE_MAP`) maps a `--role` to the spoke class + repo URL so a single generic agent box can morph into any of these on `LOAD_ROLE`.
 
+## The unified agent + roles model (deep dive)
+
+This is the current shape of a managed node end-to-end. It's also the answer to the most common question about the WebUI: *"why do I see so many spokes?"*
+
+**One agent per node, hosting modules as ROLES.** Every managed node runs **one** generic-agent install — the systemd unit `lm-agent`, connecting as `agent-<hostname>` (e.g. `agent-fw01`). That single agent doesn't *become* a firewall or an IPAM; it **hosts** those modules as **roles**. Each loaded role opens its **own** WebSocket connection to the hub — a "sub-spoke" named `{agent}-{role}` (e.g. `agent-fw01-firewall`) that registers with **that module's** `module_type` (`firewall`, `ipam`, …). The base agent connection stays `module_type="agent"` and is the control channel for load/unload.
+
+- The hub **parent-auto-approves** each role sub-spoke: because the parent agent (`agent-fw01`) is already approved, its children (`agent-fw01-firewall`, …) inherit approval via their `parent_spoke_id`. You approve the agent once; its roles come online without a second click.
+- A single agent can host **many** roles at once (`agent-fw01-firewall` + `agent-fw01-ipam` + …). Each is an independent hub connection with its own module traffic.
+
+**What a role maps to (`_ROLE_MAP`).** `lm/agent/src/agent_spoke.py::_ROLE_MAP` maps a role name → (spoke class, `module_type`, repo):
+
+| role | module_type | code source |
+|---|---|---|
+| `dns` | `dns` | in-tree (ships inside the lm clone) |
+| `dhcp` | `dhcp` | in-tree |
+| `console` | `console` | in-tree |
+| `network` | `nw` | `github.com/lbockenstedt/nw` |
+| `netbox` | `ipam` | `github.com/lbockenstedt/netbox` |
+| `opnsense` | `firewall` | `github.com/lbockenstedt/opnsense` |
+| `ldap` | `directory` | `github.com/lbockenstedt/ldap` |
+| `simulation` | `simulation` | `github.com/lbockenstedt/cs` |
+| `cppm` | `nac` | `github.com/lbockenstedt/cppm` |
+| `proxmox` | `hypervisor` | `github.com/lbockenstedt/pxmx` |
+| `le` | `certificates` | `github.com/lbockenstedt/le` |
+
+On a `LOAD_ROLE` the agent: clones the sibling repo (or uses the in-tree copy for `dns`/`dhcp`/`console`), `pip`-installs its `requirements.txt`, runs any host prep, then loads the real spoke class and spawns its sub-spoke connection. A role whose spoke class isn't a `BaseSpoke` subclass (today only `cppm`'s `CPPMSpoke`) is transparently wrapped by an internal `_RoleAdapter` so status/command handling stays uniform. Heavy roles (`simulation`, `proxmox`) additionally run their dedicated installer's `--infra-only` step (host prep only: certs, NICs, Kea — no unit, no `.env`) so a freshly-loaded role reaches parity with the standalone install path.
+
+**`install_agent.sh` flags (verified against source).** The generic-agent installer (`lm/agent/install_agent.sh`) accepts:
+
+- `--hub <url>` — the hub WebSocket URL (e.g. `wss://172.16.1.31:443/ws/spoke`). **Optional**: omit it (or pass `auto`) to auto-discover the hub via mDNS/DNS.
+- `--id <id>` — the agent's spoke id. Defaults to `agent-<hostname>` when omitted (omitted entirely in `--clone` mode so each clone derives its id from its own hostname at runtime).
+- `--secret <psk>` — a pre-shared onboarding secret. Omit it and the agent connects unauthenticated and waits in the WebUI approval queue.
+- `--hub-secret <psk>` — the hub root secret (optional).
+- `--role <name>` and `--roles <csv>` — **both exist**: `--roles` is the canonical comma-list (`--roles dns,dhcp`), `--role` is a backward-compat single-role alias. They are merged + de-duplicated.
+- `--clone` — stage files + enable the unit but leave the service **stopped** for disk-cloning.
+- `--loopback` — this agent is co-located with the hub (drives loopback listener modes for the pxmx/cs roles).
+- `--tls-verify` (+ optional `--tls-ca-cert <path>`) — verify the hub's TLS cert instead of the default encrypt-without-auth.
+
+> **Note on `--infra-only`:** this flag is **not** an `install_agent.sh` flag. It belongs to the *dedicated* heavy-role installers (`cs/lm-spoke/install_cs.sh`, `pxmx/install_pxmx.sh`), and the agent invokes it internally when loading the `simulation`/`proxmox` roles to do host prep only.
+
+**Boot roles vs. hub-loaded roles.** Passing `--roles` at install time **pre-stages** each role's repo + Python deps + system packages (so a boot-time load has the code locally) and seeds `LOADED_ROLES` in the agent `.env`. The agent re-spawns everything in `LOADED_ROLES` on each boot (and after a self-update restart). A **bare** agent (no `--roles`) installs with zero roles and loads them later on demand from the hub.
+
+**How a role's connection config is delivered.** A role's *connection* settings (NetBox URL + token, OPNsense host + API key, LDAP bind DN, …) are **pushed by the hub** (`UPDATE_CONFIG`, driven from the WebUI Setup page for that module) — **not** read from a per-module `.env`. Configure the module in the WebUI; the hub delivers that config down to the role sub-spoke. (The underlying *application* — e.g. the NetBox Postgres/nginx stack — is still its own separate install; the role only talks to it.)
+
+**Adding / removing a role (WebUI).**
+- **Add:** Setup → Agents → pick the agent → **Load Role**. The agent clones/installs and the new role sub-spoke appears within a few seconds, auto-approved.
+- **Remove:** **Unload** the role. Its sub-spoke disconnects and is dropped from `LOADED_ROLES` so it is not re-spawned on the next boot.
+
+**Why an agent and its roles are SEPARATE entries in the WebUI.** This is expected, not a bug. The **parent agent** shows under **Agents** (as `module_type="agent"`), and **each role** shows as its **own Spoke** of the matching module_type. So one agent hosting three roles produces **four** entries: the agent plus `…-firewall`, `…-ipam`, `…-dns`. If you're wondering "why do I have more spokes than machines," it's because each role is its own sub-spoke connection.
+
+**Legacy contrast.** The older per-module path — a dedicated `lm-<module>.service` installed by a standalone `install_<module>.sh` (e.g. `install_opnsense.sh`) that connects as its own top-level spoke — still works and is what a fully **standalone** module box uses. The unified agent+roles model above is the current default and is what a hub install (`install_all.sh`) and a menu-installed generic node both use.
+
+See [generic-agent.md](generic-agent.md) for the agent, and each module page for its role specifics.
+
+## Auto-provisioning end-to-end (deep dive)
+
+This explains why Client-Simulation VMs do — or don't — spin up. It is the single most-asked "nothing is happening" question.
+
+**Where the brain lives.** The auto-provisioning logic runs in the **pxmx host agent** (`pxmx/agent/src/usb_provision.py::run_provision_loop`, called every ~60s). The **cs spoke is relay-only** — it forwards config down and telemetry up, but it does **not** decide to clone VMs. So a stuck auto-provision is almost always diagnosed on the pxmx agent, not the cs spoke.
+
+**TWO toggles must BOTH be on.** This is the #1 trap:
+1. The **tenant** toggle `usb_auto_provision` (Simulations UI, per tenant), **and**
+2. The **per-agent** `client_simulation.enabled` for that Proxmox host.
+
+If either is off, no VMs provision — and the two live in different places, so it's easy to have one on and the other off. The agent surfaces the effective toggle reading in its telemetry so the WebUI Auto-Provisioning card can show whether the tenant toggle actually reached the host.
+
+**One provisioning pass, in order** (`run_provision_loop`):
+
+1. **Reconcile** stale state — release any tracked dongle-bus whose VM no longer exists.
+2. **Toggle gate** — `usb_auto_provision` off → telemetry-only pass (no clone/teardown/delete). Reason surfaced as `auto-provision disabled`.
+3. **Dongle detection** — scan `/sys/bus/usb/devices` for USB devices whose `vid:pid` is in the hub-delivered **certified** set. No certified vid:pids configured → the pass halts with `no dongle_vidpids configured` (a formerly-silent gate, now loud in the log + card). Certify the dongle vid:pids in the Simulations UI.
+4. **Resource thresholds (1h averages)** — CPU/memory 1-hour rolling averages are compared to the provision threshold (default 80%). **Source matters:** these come from **Proxmox node stats** (`/cluster/resources`), **not** `psutil`. `psutil` counts VM RAM + page cache as "used" and reads far higher than Proxmox, which used to fire a false "resource gate." **Cold start:** with less than an hour of samples the average is `None`, which the gate treats as *no data yet → don't block* — so a freshly-booted host provisions freely until a real hour of history accrues (matches the card's "applies only after a full hour" text).
+5. **Delete gate** — over the **delete** threshold (default 90%) the agent sheds load by destroying the **newest** USB VM (highest VMID), then enters a **300-second cooldown** so it doesn't churn-delete every tick.
+6. **Missing-dongle teardown** — a VM whose passthrough dongle has physically vanished past the `missing_timeout` is destroyed (the bus is freed for re-provisioning).
+7. **Per-host VMID-gap audit** — every **300s**, the agent deletes the highest VMID above the lowest gap in its per-host block so the next pass refills the hole. Each Proxmox host owns its **own** VMID batch, derived from the host's trailing hostname number (e.g. `svr-02` → `90025-90048`, stride 24) so ranges never collide across hosts; an explicit `vmid_start`/`vmid_end` override wins.
+8. **Clone** — only when resources are under the provision threshold, not in cooldown/ceiling, no clone batch already running, and under `usb_max_slots`: the agent clones a new sim VM from the configured template for each eligible dongle.
+
+The agent reports the last pass's outcome/gate reason (`no dongle_vidpids configured`, `auto-provision disabled`, `no template ids configured`, `resource gate`, `slot cap reached`, `no eligible dongles`, or `provisioning: attempted N, provisioned M`) up through telemetry, so the WebUI Auto-Provisioning card tells you exactly which precondition stopped it.
+
+See [pxmx.md](pxmx.md) for the agent/VM lifecycle and [cs.md](cs.md) for the Simulations UI and toggles.
+
+## Tenants & scoping (deep dive)
+
+**A tenant is an isolation boundary.** It groups a slice of the lab (its subnets, VMs, firewall objects, directory tree) and controls which users can see it. Objects aren't physically separated; the hub **filters** every read so a scoped user only sees their tenant's data.
+
+**Enforcement is server-side, in `core/src/access.py`.** The filtering is applied by the hub on the API path — not just hidden in the UI — so a scoped user cannot reach another tenant's data with a hand-crafted request:
+
+- **`check_tenant_access(sess, tenant_id)`** — may this user touch this tenant at all? Admins and users with no tenant restriction pass; otherwise the tenant must be in the user's allowed `tenants` list.
+- **`effective_tenant(...)`** — which tenant a query scopes to, with **non-admin escape prevention**: an admin may pass `?tenant=` to scope to anything (or nothing = see all); a non-admin's `?tenant=` is honored **only** if it's in their allowed list, otherwise it falls back to their own session tenant. A crafted `?tenant=` can never cross the boundary.
+- **`filter_config` / `filter_enabled`** — per-module **subnet-filter** toggles. Modules whose data carries tenant IPs (`nac`, `firewall`, `netbox`, `dhcp`, `hypervisor`, `nw`) default **ON**; Simulations (`cs`) is scoped by tenant **id** instead and defaults OFF. Admins can flip each in System → General.
+- **Subnet-filter + tenant-filter** — for a scoped user the hub resolves the tenant's **NetBox prefixes** and drops records whose concrete IPs all fall outside them (`filter_session`, `filter_fw`, `filter_nw`, `filter_tenant`). Admins bypass unless they explicitly select a tenant in the switcher; a tenant with no prefixes means "can't filter" → no-op (fail-open on *visibility*, not on access).
+
+**How objects get attributed to a tenant** (per module, since each system tags differently):
+
+- **IPAM / NetBox** — by **prefix containment**: a record's IP is bucketed to the first tenant whose NetBox prefix contains it (`attribute_by_prefix`). The tenant's `netbox_tenant_slug` is the key.
+- **Hypervisor / Proxmox** — by **`proxmox_tag`**: a VM tagged for the tenant is shown to it regardless of subnet; VMs in a configured **template pool** are shared to all tenants.
+- **Firewall / OPNsense** — by subnet **and** by OPNsense **category** (matched against the tenant's display name, slug, netbox slug, or id).
+- **Directory / LDAP** — by `ldap_base_dn`.
+
+**Per-module source-of-truth.** Which side "wins" on a conflict is configurable per module (external-SoT overwrites vs. netbox-SoT add-only), so scoping and sync attribution agree. The scoping config for a tenant (`netbox_tenant_slug`, `proxmox_tag`, `ldap_base_dn`) is read via `get_tenant_scoping`.
+
+## Install model (deep dive)
+
+**Two shapes, one menu.** `install_menu.sh` is the single entry point and offers exactly two choices:
+
+1. **Hub** — this box becomes the LM hub (+ WebUI, always), optionally co-locating spokes. It runs `install_all.sh`.
+2. **Generic agent** — a role-capable node that calls home to an existing hub and morphs into roles later. It runs `agent/install_agent.sh`.
+
+**The hub install (`install_all.sh`).** Brings up the hub + WebUI (always), then stands up the co-located modules as **one unified generic agent** (`agent-<hostname>`, installed with `--loopback` because the hub owns `:443` on the same box). The spoke checklist in the menu maps to `--exclude <csv>`: any module you *didn't* pick is excluded, and the remaining ones become that agent's roles. So even the all-in-one hub follows the agent+roles model — it is not ten separate spoke services. `--tls-verify` (+ optional `--tls-ca-cert`) opts into hub-cert verification; without it the co-located clients encrypt-without-auth against the self-signed hub cert.
+
+**The mental model: one agent per node.** A managed node = **one** generic-agent install that hosts whatever roles that node needs. You don't install a separate service per module on a node; you install the agent once and load roles onto it (see the unified-agent deep dive above). The standalone per-module installers still exist for a dedicated single-purpose box, but the default is one agent per node.
+
+See [lm-hub.md](lm-hub.md) and [install-flags.md](install-flags.md) for the full flag reference.
+
+## Update & self-heal (deep dive)
+
+LM is built to pull its own updates and recover from a bad one without leaving anything dark.
+
+**Dependency self-heal (every boot).** `core/src/dep_guard.py::ensure_requirements` runs at the top of every entrypoint (hub, spoke, agent) *before* the heavy imports. It parses `requirements.txt`, checks each package is importable, and `pip install -r`s anything missing — then continues. It is stdlib-only, never raises (a pip failure is logged and the boot proceeds), and is a no-op (~milliseconds) when everything is already present. This is what heals a venv that a skewed update left short a dependency. `LM_DEP_GUARD_DISABLE=1` skips it for operators who manage the venv out-of-band.
+
+**The hub update pipeline** (`core/src/update_pipeline.py`):
+- **`perform_update`** — updates the hub itself (git pull for a git install, tarball merge for a non-git install) **and** fans `SPOKE_UPDATE` out to every approved spoke.
+- **`update_spokes_only`** — pushes updates to spokes without touching the hub (used by BugFixer after it lands a fix).
+- **`update_agents_only`** — same, filtered to `module_type="agent"` nodes.
+- **Commit-SHA gate** — since the VERSION string was reset (both ends read the same string), "is there an update?" is decided by **commit SHA**, not version string: local `HEAD` vs. the remote branch tip (git install), or remote tip vs. the last-applied commit (tarball install). VERSION comparison is only a final fallback.
+
+**The external rollback watchdog.** After a hub self-update, the hub schedules `/usr/local/bin/lm-update-restart` from a **transient systemd unit owned by PID 1** (outside the hub's own cgroup, so it survives the hub being stopped). That watchdog restarts the hub, polls `/status`, and — if the new version **fails to boot** — restores the pre-swap snapshot, marks the bad version, and restarts the rolled-back code. Crucially it rolls back **only on a crash-loop / failed-update**, *not* on an "active but no health marker" state (that's treated as connectivity, not failure), so a merely-slow-to-connect hub is never needlessly reverted.
+
+**The recovery ledger** (`core/src/update_recovery.py`) is the single source of truth for the on-disk recovery state machine (under `/var/lib/lm/state`): pre-swap code `snapshot`, `pending_update.json`, and the bad-version / bad-commit ledgers. CLI subcommands include `snapshot`, `rollback`, `markbad`, `markbadcommit`, `clearpending`, `writefailed`, and `prune`. A version marked bad is skipped by the auto-update loop until a newer version ships (or an operator forces a retry). The same ledger is vendored into the pxmx agent for file-tree restore.
+
+**How a user triggers an update.** From the WebUI Setup/Update controls: check-and-update the hub (which also fans out to spokes), or update spokes/agents only. The update is safe by construction — a failed hub boot is rolled back automatically, so triggering an update can't strand the hub.
+
 ## Related pages
 
 See the canonical index at `lm/docs/README.md` for per-module pages, `environment-variables.md`, and `install-flags.md`.
