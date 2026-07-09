@@ -1455,14 +1455,19 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 continue
             pe = present_by_bus.get(bus) or {}
             since = (entry or {}).get("since")
+            # Absolute epoch the 1h auto-recovery clears this bus — the WebUI QT
+            # badge counts down to it live (since + QUARANTINE_RECOVERY_S).
+            recovers_at = (float(since) + QUARANTINE_RECOVERY_S) \
+                if since is not None else None
             quarantined.append({
                 "bus_path": bus,
                 "reason": (entry or {}).get("reason") or "quarantined",
                 "since": since,
+                # Absolute recovery target (epoch seconds) for the live badge.
+                "recovers_at": recovers_at,
                 # Seconds until the 1h auto-recovery clears it (clamped >=0).
-                "recovers_in_s": max(0, int(QUARANTINE_RECOVERY_S
-                                            - (_now - float(since))))
-                                 if since is not None else None,
+                "recovers_in_s": max(0, int(recovers_at - _now))
+                                 if recovers_at is not None else None,
                 "present": bus in present_by_bus,
                 "name": pe.get("product") or bus,
                 "vidpid": pe.get("vidpid") or "",
