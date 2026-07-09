@@ -53,7 +53,7 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
-from .security_utils import MessageSigner
+from .security_utils import MessageSigner, encode_frame, split_frame
 from . import cs_commands
 from . import cs_sim
 from . import watchdogs
@@ -1239,8 +1239,7 @@ class ProxmoxAgent:
                              "hostname": self.hostname, "agent_type": self.agent_type},
                 },
             }
-            log_msg["signature"] = self.signer.sign(log_msg)
-            await self.websocket.send(json.dumps(log_msg))
+            await self.websocket.send(encode_frame(self.signer, log_msg))
         except Exception:
             pass
 
@@ -1265,8 +1264,7 @@ class ProxmoxAgent:
                              "agent_id": self.agent_id},
                 },
             }
-            msg["signature"] = self.signer.sign(msg)
-            await self.websocket.send(json.dumps(msg))
+            await self.websocket.send(encode_frame(self.signer, msg))
         except Exception:
             pass
 
@@ -1289,8 +1287,7 @@ class ProxmoxAgent:
                 },
                 "payload": {"type": event_type, "data": data},
             }
-            msg["signature"] = self.signer.sign(msg)
-            await self.websocket.send(json.dumps(msg))
+            await self.websocket.send(encode_frame(self.signer, msg))
         except Exception:
             pass
 
@@ -1828,7 +1825,9 @@ class ProxmoxAgent:
                     "Approve this Proxmox node agent from the LM WebUI: Setup → Spokes & Agents (Agents tile)."
                 )
                 async for raw in websocket:
-                    msg = json.loads(raw)
+                    # Onboarding status frames ({"status":...}) are raw JSON;
+                    # signed frames are <sig>.<body>. Accept either.
+                    msg = json.loads(raw if raw[:1] == "{" else split_frame(raw)[1])
                     if msg.get("status") == "APPROVED":
                         provisioned_secret = msg.get("secret")
                         if provisioned_secret:
@@ -1875,9 +1874,11 @@ class ProxmoxAgent:
 
             try:
                 async for message in websocket:
-                    msg_data = json.loads(message)
-
-                    if "signature" in msg_data and not self.signer.verify(msg_data):
+                    # Wire form <sig>.<body>: verify the RECEIVED body bytes
+                    # directly, parse once (matches the hub's new frame format).
+                    sig, body = split_frame(message)
+                    msg_data = json.loads(body)
+                    if sig and not self.signer.verify_bytes(body.encode(), sig):
                         logger.warning("Invalid signature — dropping")
                         continue
 
@@ -2285,8 +2286,7 @@ class ProxmoxAgent:
                         },
                         "payload": {"type": "AGENT_RESPONSE", "data": result},
                     }
-                    resp["signature"] = self.signer.sign(resp)
-                    await websocket.send(json.dumps(resp))
+                    await websocket.send(encode_frame(self.signer, resp))
 
             finally:
                 heartbeat_task.cancel()
@@ -2303,8 +2303,7 @@ class ProxmoxAgent:
                                "sender_id": self.agent_id, "destination_id": "pxmx-spoke"},
                     "payload": {"type": "AGENT_HEARTBEAT", "data": {}},
                 }
-                msg["signature"] = self.signer.sign(msg)
-                await self.websocket.send(json.dumps(msg))
+                await self.websocket.send(encode_frame(self.signer, msg))
                 await asyncio.sleep(30)
             except Exception as e:
                 logger.error(f"Heartbeat failed: {e}")
@@ -2372,8 +2371,7 @@ class ProxmoxAgent:
                         },
                     },
                 }
-                msg["signature"] = self.signer.sign(msg)
-                await self.websocket.send(json.dumps(msg))
+                await self.websocket.send(encode_frame(self.signer, msg))
 
                 # ── Client-Simulation telemetry (Phase D1) ───────────────────
                 # When CS is enabled, also push a CS_TELEMETRY frame carrying the
