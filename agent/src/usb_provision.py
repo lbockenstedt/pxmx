@@ -2114,9 +2114,13 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
     above the lowest gap so the next provision pass refills the hole (cs
     10256-10324). Runs at most once per ``VMID_AUDIT_INTERVAL_S``; bypasses the
     delete-gate cooldown (corrective bookkeeping, not load-shedding)."""
-    if now - _load_vmid_gap_last_run() < VMID_AUDIT_INTERVAL_S:
+    # Offload the vmid-gap state file I/O off the event loop — on a busy
+    # Proxmox host with contended storage even this tiny read/write can stall
+    # the loop long enough to miss the ACCEPTED window for a relayed command
+    # (py-spy caught the loop parked in json.load here during a bulk delete).
+    if now - await asyncio.to_thread(_load_vmid_gap_last_run) < VMID_AUDIT_INTERVAL_S:
         return
-    _save_vmid_gap_last_run(now)
+    await asyncio.to_thread(_save_vmid_gap_last_run, now)
     try:
         assigned = sorted(int(v) for v in state["vmid_to_bus"].keys()
                           if start <= int(v) <= end)
