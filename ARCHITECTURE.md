@@ -5,7 +5,7 @@
 ```
                        ┌──────────────────────────┐
                        │        LM Hub            │
-                       │  (vscode/lm, port 8765)  │
+                       │  (vscode/lm, port 443)   │
                        │  control plane + state   │
                        └─────────────┬────────────┘
                                      │ signed WS
@@ -13,7 +13,7 @@
                           ┌──────────┴───────────┐
                           │   pxmx spoke         │
                           │  src/proxmox_spoke.py │   ← multi-agent bridge
-                          │  src/control_plane.py │   ← accepts agents on :8766
+                          │  src/control_plane.py │   ← accepts agents on :443 (standalone default)
                           └──────────┬───────────┘
                                      │ signed WS
                   ┌──────────────────┼──────────────────┐
@@ -28,9 +28,15 @@
 - The **pxmx spoke** (`src/proxmox_spoke.py`) is the bridge between the LM Hub
   and one or more **pxmx agents** running on Proxmox hosts. It owns the
   canonical identity key `<cluster_name>/<node>/<vmid>` for every VM.
-- The **pxmx control plane** (`src/control_plane.py`) listens on **:8766** for
-  agents and runs the spoke self-update. It guarantees :8766 is released
-  before a new instance starts (the v2.0.3 blackout fix).
+- The **pxmx control plane** (`src/control_plane.py`) runs the agent listener
+  (`run_agent_server`) and the spoke self-update. The listener default is
+  **`wss://0.0.0.0:443`** (standalone — the spoke lives on its own box; a
+  Proxmox agent dials `wss://<spoke>:443/ws/agent` directly, agent → spoke →
+  hub). `--loopback` (co-located all-in-one, `install_all.sh` only) binds
+  `127.0.0.1:8443` plaintext, reached via the hub `/ws/agent` byte-proxy. The
+  legacy no-cert fallback is `ws://0.0.0.0:8766`. The spoke guarantees the
+  listener port is released before a new instance starts (the agent-blackout
+  fix — the agent-server task is kept alive and self-heals on exit).
 - The **pxmx agent** (`agent/src/agent.py`, `ProxmoxAgent`) runs **on** the
   Proxmox host. It is the only component with `qm`/`pct` clone/destroy access,
   so all VM-mutating work happens here, not in the Hub or the spoke.

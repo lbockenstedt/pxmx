@@ -25,11 +25,14 @@ For the topology and where the brain lives, see [ARCHITECTURE.md](ARCHITECTURE.m
 
 ### Install
 ```bash
-sudo ./install_pxmx.sh --hub ws://<hub-host>:8765 --id pxmx-spoke-1 [--secret <psk>]
+sudo ./install_pxmx.sh --hub wss://<hub-host>:443/ws/spoke [--id <spoke-id>] [--secret <psk>]
 ```
+- The hub serves the spoke WebSocket on the unified `:443` uvicorn (`/ws/spoke`,
+  wss when a cert is configured). Omit `--hub` to auto-discover via mDNS/DNS.
 - Without `--secret`, the spoke connects unauthenticated and awaits admin
-  approval in the LM WebUI.
-- Installs to `/opt/lm`, creates a systemd service, and starts it.
+  approval in the LM WebUI. IDs default to `<hostname>-spoke`.
+- Installs to `/opt/lm/pxmx`, creates the `lm-pxmx.service` systemd unit, and
+  starts it.
 
 ### Ports
 - LM Hub control plane: **443** wss (`/ws/spoke` — the spoke connects to this).
@@ -37,8 +40,9 @@ sudo ./install_pxmx.sh --hub ws://<hub-host>:8765 --id pxmx-spoke-1 [--secret <p
 
 ### Notable fix
 A recurring **agent-blackout** bug (the agent-server task died and the spoke
-stopped relaying to agents) was fixed in **v2.0.3** — the agent-server task is
-now kept alive and self-heals on exit (`93f09df`). Current version: see `VERSION`.
+stopped relaying to agents) was fixed — the agent-server task is now kept alive
+and self-heals on exit, and the spoke guarantees the agent-listener port is
+released before a new instance starts. Current version: see `VERSION`.
 
 ## Developers
 
@@ -82,5 +86,5 @@ The cs spokes do **not** self-update — they are manually redeployed. pxmx
 self-updates from GitHub on a Hub `SPOKE_UPDATE`.
 
 ### Related
-- LM Hub repo: `vscode/lm` — see `docs/modules/core.md` and `docs/architecture.md`.
+- LM Hub repo: `vscode/lm` — see `lm/docs/architecture-topology.md`, `lm/docs/pxmx.md`, and `lm/docs/README.md` for the full canonical doc set.
 - cs source: `github.com/solutions-hpe`.

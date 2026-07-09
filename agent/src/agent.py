@@ -2,7 +2,9 @@
 
 Runs **on** a Proxmox node and is the only component with ``qm``/``pct``
 clone/destroy access, so all VM-mutating work happens here. It connects (over
-WS, via the pxmx spoke/control plane on :8766) and:
+WS, via the pxmx spoke/control plane — ``wss://<spoke>:443/ws/agent`` standalone
+default; ``ws://127.0.0.1:8443`` loopback via the hub ``/ws/agent`` byte-proxy;
+``ws://:8766`` legacy no-cert fallback) and:
 
 - Emits the cs telemetry body (``_cs_telemetry_body``) shaped to mirror the
   legacy cs bash agent's telemetry, consumed by the cs spoke's
@@ -319,8 +321,11 @@ version = get_version()
 class ProxmoxAgent:
     """The pxmx host agent — runs on a Proxmox node and owns all VM-mutating work.
 
-    Connects to the pxmx spoke (over WS on :8766), authenticates, then runs the
-    telemetry/USB-provision/cs-command/watchdog loops. See the module docstring.
+    Connects to the pxmx spoke agent listener (``wss://<spoke>:443/ws/agent``
+    standalone default, or ``ws://127.0.0.1:8443`` loopback reached via the
+    hub ``/ws/agent`` byte-proxy; ``ws://:8766`` is the legacy no-cert
+    fallback), authenticates, then runs the telemetry/USB-provision/cs-
+    command/watchdog loops. See the module docstring.
     """
 
     def __init__(self, spoke_url: str, agent_id: str, secret: Optional[str] = None,
