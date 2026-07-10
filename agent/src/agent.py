@@ -1928,6 +1928,23 @@ class ProxmoxAgent:
                     elif cmd_type == "SHELLEXEC":
                         result = {"status": "ERROR", "message": "SHELLEXEC is disabled"}
 
+                    elif cmd_type == "RUN_COMMAND":
+                        # Remote Console: the hub relayed a signed RUN_COMMAND
+                        # down through the owning spoke (Global-Admin gated +
+                        # audit-logged at the hub). allow_shell mirrors the WebUI
+                        # Debug knob; the runner enforces the allowlist otherwise,
+                        # a timeout, and an output cap. Off the loop (subprocess).
+                        try:
+                            from command_runner import run_local_command
+                            result = await asyncio.to_thread(
+                                run_local_command,
+                                data.get("command", ""),
+                                bool(data.get("allow_shell", False)),
+                                float(data.get("timeout", 30.0) or 30.0))
+                        except Exception as _rce:
+                            result = {"ok": False, "rc": None, "stdout": "", "stderr": "",
+                                      "truncated": False, "error": f"runner error: {_rce}"}
+
                     elif cmd_type == "CS_COMMAND":
                         # Client-Simulation command. Fast commands (start/stop/
                         # reboot/snapshot vm, batches, unlock_template,
