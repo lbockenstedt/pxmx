@@ -398,6 +398,11 @@ class ProxmoxAgent:
         # lifetime — its secret is NEVER logged (only its existence).
         self._vnc_sessions: Dict[str, Dict[str, Any]] = {}
         self._console_token: Optional[str] = None
+        # Cached root@pam!cs-hub Proxmox API token (created locally via pvesh,
+        # relayed up for the cs spoke's sim-tag sync). Provisioned once + cached
+        # for the agent's lifetime, re-emitted on later triggers. See
+        # _ensure_cs_hub_token.
+        self._cs_hub_token: Optional[str] = None
 
         # Hub log relay — installed ONCE here (not per-connection) so records
         # from the very first startup line onward are captured; buffered while
@@ -1539,15 +1544,27 @@ class ProxmoxAgent:
     # NEVER logged here and is zeroized after forwarding (the local `secret`
     # var is dropped when the task returns).
 
-    async def _provision_proxmox_token(self, request_id: str) -> None:
-        """Create (idempotent) the cs-hub token and emit CS_TOKEN_RESULT.
+    async def _ensure_cs_hub_token(self, request_id: str = "auto", *, force: bool = False) -> None:
+        """Provision (once, cached) the ``root@pam!cs-hub`` Proxmox API token and
+        relay it up as ``CS_TOKEN_RESULT`` so the cs spoke (which has no pvesh)
+        can call the Proxmox API for sim-tag sync — with NO manual key setup.
 
-        Mirrors bash ``handle_create_proxmox_token`` (4466-4503): pvesh delete
-        (ignore failure) → pvesh create --privsep 0 → parse ``value`` → emit
-        ``root@pam!cs-hub=<secret>``. The token is forwarded best-effort; the
-        secret is never logged."""
+        Mirrors ``_ensure_console_token``: Proxmox never re-reveals a token secret
+        after creation, so we delete+create ONCE (via local pvesh, as root on the
+        Proxmox host) and cache the value for the agent's lifetime; later triggers
+        (CS re-enable / cs-spoke reconnect / hub re-request) just RE-EMIT the
+        cached value rather than rotating it — a rotation would invalidate the
+        token the cs spoke is already using. ``force=True`` rotates. Best-effort;
+        the secret is never logged. Mirrors bash ``handle_create_proxmox_token``."""
         TOKEN_ID = "cs-hub"
         USER = "root@pam"
+        if self._cs_hub_token and not force:
+            # Already have it — re-send so a freshly-(re)connected cs spoke picks
+            # it up. No pvesh, no rotation.
+            await self.send_cs_event("CS_TOKEN_RESULT",
+                                     {"request_id": request_id, "status": "provisioned",
+                                      "token": self._cs_hub_token})
+            return
         try:
             try:
                 await self._pvesh_action("delete",
@@ -1562,23 +1579,29 @@ class ProxmoxAgent:
             if isinstance(data, dict):
                 secret = str(data.get("value") or "").strip()
             if not secret:
-                logger.error(f"token provision {request_id}: pvesh returned no value")
+                logger.error(f"cs-hub token provision {request_id}: pvesh returned no value")
                 await self.send_cs_event("CS_TOKEN_RESULT",
                                           {"request_id": request_id, "status": "error",
                                            "error": "pvesh returned no token value"})
                 return
-            token = f"{USER}!{TOKEN_ID}={secret}"
+            self._cs_hub_token = f"{USER}!{TOKEN_ID}={secret}"
             await self.send_cs_event("CS_TOKEN_RESULT",
                                      {"request_id": request_id, "status": "provisioned",
-                                      "token": token})
-            # Drop the secret reference; nothing else holds it after the send.
-            del token, secret
-            logger.info(f"token provisioned for request_id={request_id} (value not logged)")
+                                      "token": self._cs_hub_token})
+            del secret
+            logger.info(f"Proxmox cs-hub token root@pam!cs-hub provisioned + relayed "
+                        f"(request_id={request_id}, value not logged)")
         except Exception as e:  # noqa: BLE001
-            logger.error(f"token provision {request_id} failed: {e}")
+            logger.error(f"cs-hub token provision {request_id} failed: {e}")
             await self.send_cs_event("CS_TOKEN_RESULT",
                                       {"request_id": request_id, "status": "error",
                                        "error": str(e)[:300]})
+
+    # Back-compat: the hub's CS_CREATE_PROXMOX_TOKEN path calls this name. Route
+    # it through the cached provisioner so a re-request re-emits the SAME token
+    # instead of rotating one the cs spoke is already using.
+    async def _provision_proxmox_token(self, request_id: str) -> None:
+        await self._ensure_cs_hub_token(request_id)
 
     async def _update_check_loop(self):
         """Check for new versions every 10 minutes and self-update when found."""
@@ -2554,6 +2577,13 @@ class ProxmoxAgent:
             cs_cfg = self.config.get("client_simulation") or {}
             logger.info(f"client_simulation enabled=true (tenant={cs_cfg.get('tenant_id')})")
             await self._start_cs_tasks()
+            # Auto-provision + relay the cs-hub Proxmox API token so the cs spoke
+            # can sim-tag VMs with NO manual key setup. Background (pvesh create
+            # takes a couple seconds) so it never delays CS startup; cached +
+            # re-emitted on later enables (see _ensure_cs_hub_token).
+            _tok_task = asyncio.create_task(self._ensure_cs_hub_token("auto"))
+            self._cs_long_ops.add(_tok_task)
+            _tok_task.add_done_callback(self._cs_long_ops.discard)
         elif not enabled and self.cs_enabled:
             self.cs_enabled = False
             logger.info("client_simulation disabled")
