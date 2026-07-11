@@ -1906,11 +1906,21 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 state["missing_since"].pop(bus, None)
 
     # 6. VMID-gap audit (every VMID_AUDIT_INTERVAL_S; bypasses delete cooldown).
+    #    Compaction: shed the highest VMID above the lowest gap so the next pass
+    #    refills the hole — but ONLY when every present dongle is already assigned
+    #    (full-but-sparse). When a present dongle is unassigned the allocator
+    #    refills the lowest gap on its own, so shedding here would only churn a
+    #    legit high VM (the "delete 90001 → 90008 destroyed-then-recloned" bug).
     #    May delete a VM and mutate state — persist before the early returns
     #    below so the audit's bookkeeping isn't lost on a "no templates"/"not
     #    ordered"/"resource gate" exit (the next pass's reconcile would
     #    otherwise self-heal it, but saving keeps the state honest immediately).
-    await _vmid_gap_audit(agent, state, start, end, now)
+    # Refresh the host VM list — steps 1-5 above may have destroyed VMs (missing-
+    # dongle teardown / batch-range migration), so the existing snapshot from the
+    # top of the pass is stale; the audit needs the live list to tell a real
+    # untracked dongle VM (occupied → not a gap) from a truly free slot.
+    existing = set(await pve_cmds.list_all_vmids())
+    await _vmid_gap_audit(agent, state, start, end, now, existing, present)
     save_usb_state(state)
 
     if not img1 and not img2:
@@ -2232,11 +2242,32 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
 
 
 async def _vmid_gap_audit(agent, state: Dict[str, Any],
-                          start: int, end: int, now: float) -> None:
+                          start: int, end: int, now: float,
+                          existing: Set[int],
+                          present: Dict[str, Any]) -> None:
     """Detect VMID gaps in the assigned sim range and delete the highest VMID
     above the lowest gap so the next provision pass refills the hole (cs
     10256-10324). Runs at most once per ``VMID_AUDIT_INTERVAL_S``; bypasses the
-    delete-gate cooldown (corrective bookkeeping, not load-shedding)."""
+    delete-gate cooldown (corrective bookkeeping, not load-shedding).
+
+    Two guards keep this a true compaction toward a dense prefix from ``start``
+    (N dongles → 90001…9000N) instead of legit-VM churn:
+
+    - **No shed when a dongle can refill the gap.** If any present dongle is
+      unassigned, the allocator refills the lowest gap on its own — now if the
+      dongle is eligible, or once a bus exclusion/quarantine on it clears. The
+      shed is only needed when EVERY present dongle is already assigned
+      (full-but-sparse, e.g. 8 dongles all on 90010-90017 with 90001-90009
+      empty): the only way to fill the low gap is to free a high slot. Spares
+      (dongles > max_slots) and a dongle shortage (dongles < max_slots) both
+      fall out of the same "unassigned present dongle → refill, don't shed" rule.
+
+    - **An occupied-but-untracked low vid is not a gap.** A vid on the host with
+      a USB passthrough but absent from ``vmid_to_bus`` is a real (untracked
+      vidpid-form) dongle VM the allocator now SKIPS (pxmx 96d2144). Counting it
+      as a gap made the audit shed the highest tracked VM every pass trying to
+      "fill" an occupied slot — perpetual churn. It's filled, not a gap (same
+      ``_vm_has_usb_passthrough`` test the allocator uses)."""
     # Offload the vmid-gap state file I/O off the event loop — on a busy
     # Proxmox host with contended storage even this tiny read/write can stall
     # the loop long enough to miss the ACCEPTED window for a relayed command
@@ -2244,6 +2275,16 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
     if now - await asyncio.to_thread(_load_vmid_gap_last_run) < VMID_AUDIT_INTERVAL_S:
         return
     await asyncio.to_thread(_save_vmid_gap_last_run, now)
+    # Guard 1 — don't churn a legit high VM when a dongle can refill the gap. A
+    # present dongle whose bus isn't in bus_to_vmid is unassigned; the allocator
+    # will refill the lowest gap from it (now if eligible, or when an
+    # exclusion/quarantine on it clears). Only compact when every present dongle
+    # is already assigned. A bus still in bus_to_vmid counts as assigned
+    # (missing-dongle teardown only drops it after missing_timeout, not same
+    # tick), so a dongle that just unplugged doesn't read as "unassigned" here.
+    bus_to_vmid = state.get("bus_to_vmid") or {}
+    if any(bus not in bus_to_vmid for bus in present):
+        return
     try:
         assigned = sorted(int(v) for v in state["vmid_to_bus"].keys()
                           if start <= int(v) <= end)
@@ -2258,9 +2299,18 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
     gap_max = active[-1]
     lowest_gap: Optional[int] = None
     for chk in range(start, gap_max):
-        if chk not in active_set:
-            lowest_gap = chk
-            break
+        if chk in active_set:
+            continue
+        # Guard 2 — a vid on the host with a USB passthrough but NOT tracked is a
+        # real untracked (vidpid-form) dongle VM: occupied, not a fillable gap.
+        # Skip it (the allocator skips it too); otherwise the audit sheds the
+        # highest tracked VM every pass trying to fill an occupied slot. A vid
+        # not on the host is truly free → a real gap. Only on-host vids cost a
+        # qm_config, so the stale-existing race is limited to a 1-tick miss.
+        if chk in existing and await _vm_has_usb_passthrough(chk):
+            continue
+        lowest_gap = chk
+        break
     if lowest_gap is None:
         return
     above_gap = [v for v in active if v > lowest_gap]
