@@ -241,6 +241,17 @@ _resource_cache_loaded: bool = False
 _provision_halt: Optional[Dict[str, Any]] = None
 _prov_run: Dict[str, Any] = {"running": False, "items": []}
 
+# Stuck-run watchdog: if a provision pass's asyncio.gather never returns (a
+# clone/reclaim hung — e.g. destroy_vm blocked on a VM that won't stop), the
+# _provision_loop body never advances past `await run_provision_loop`, so
+# _provision_loop_last_run goes stale AND _prov_run.running stays True → the
+# "prov_run active" gate short-circuits every subsequent tick → permanent
+# wedge ("under threshold but not deploying"). When a run is older than this,
+# the next pass force-clears it and proceeds. The orphaned gather (still
+# pending) writes to its OWN captured run dict (see this_run in
+# run_provision_loop), not the global, so it can't clobber the fresh run.
+PROV_RUN_STUCK_S = 600.0
+
 # VMIDs currently being torn down by the delete gate, mapped to the epoch the
 # destroy was issued. A destroy completes fast and the VM then vanishes from the
 # `vms` list, so without this the "deleting" transition is invisible between two
@@ -1139,6 +1150,34 @@ async def _vm_usb_bus(vid: int) -> Optional[str]:
     return None
 
 
+async def _vm_has_usb_passthrough(vid: int) -> bool:
+    """True if the VM has ANY usb passthrough — ``host=<bus>`` OR
+    ``host=<vid:pid>`` — i.e. it's a real dongle VM, NOT a half-cloned zombie.
+
+    Distinct from ``_vm_usb_bus`` (which returns None for the vidpid form): the
+    VMID allocator uses this to tell a legit-but-untracked dongle VM (skip it —
+    never destroy a real client just because tracking was lost) from a true
+    zombie clone (no usb → safe to reclaim). A vidpid-passthrough dongle VM is
+    invisible to ``reconcile_bus_map``/``reconcile_vm_configs`` (they re-track
+    via ``_vm_usb_bus``), so without this check the allocator would destroy it
+    every pass — the 'legit running client keeps getting killed / the reclaim
+    hangs and wedges the loop' bug.
+
+    Conservative on uncertainty: a ``qm_config`` failure returns True (treat as
+    'might be a real VM, don't destroy') — destroying a real client because a
+    transient Proxmox RPC failed is far worse than skipping a real zombie for
+    one tick (the next pass retries once the RPC is back)."""
+    from . import pve_cmds
+    try:
+        cfg = await pve_cmds.qm_config(vid)
+    except Exception:  # noqa: BLE001 — conservative: assume real, skip reclaim
+        return True
+    for k, v in (cfg or {}).items():
+        if str(k).startswith("usb") and "host=" in str(v):
+            return True
+    return False
+
+
 async def reconcile_vm_configs(agent, start: int, end: int,
                                present, now: float, existing) -> bool:
     """Rebuild bus_to_vmid from each sim VM's ACTUAL usb passthrough (source of
@@ -1925,10 +1964,25 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         return {"provisioned": 0, "torn_down": len(torn_down),
                 "reason": _provision_reason}
     if _prov_run.get("running"):
-        _provision_reason = "prov_run active"
-        logger.info("auto-provision gate: prov_run already active — skipping trigger")
-        return {"provisioned": 0, "torn_down": len(torn_down),
-                "reason": "prov_run active"}
+        # Stuck-run watchdog: a prior pass that never completed (a clone/reclaim
+        # hung) leaves _prov_run.running=True, which would short-circuit this and
+        # every future tick at this gate → permanent wedge. If the run is older
+        # than PROV_RUN_STUCK_S, force-clear it and let this tick proceed. The
+        # orphaned gather writes to its captured run dict, not the global.
+        _st = _prov_run.get("started_at")
+        if _st and (now - _st) > PROV_RUN_STUCK_S:
+            logger.warning(
+                "provision loop: prior run stuck %ss (started %s) — force-clearing "
+                "to un-wedge (a clone/reclaim likely hung). The orphaned gather's "
+                "late writes go to its own run dict, not this fresh one.",
+                int(now - _st), _st)
+            _prov_run = {"running": False, "items": [], "started_at": 0,
+                         "total": 0, "completed": 0, "failed": 0}
+        else:
+            _provision_reason = "prov_run active"
+            logger.info("auto-provision gate: prov_run already active — skipping trigger")
+            return {"provisioned": 0, "torn_down": len(torn_down),
+                    "reason": "prov_run active"}
     active_usb_vms = len(state["vmid_to_bus"])
     _provision_cfg_snapshot["active_usb_vms"] = active_usb_vms
     if active_usb_vms >= max_slots:
@@ -1989,6 +2043,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     protected = _protected_vmids(agent)
 
     sem = asyncio.Semaphore(concurrency)
+    # Serializes the find-a-free-VMID + reserve step across concurrent _do calls
+    # (reclone_concurrency > 1) so two dongles can't both pick the same vid — the
+    # "two dongles both got 90078" race that desyncs bus_to_vmid/vmid_to_bus and
+    # wedges the loop on a colliding clone. The clone itself runs OUTSIDE the lock
+    # (only the pick+reserve is the critical section); the reservation is rolled
+    # back on clone failure so the vid stays reusable.
+    _alloc_lock = asyncio.Lock()
     # Stagger + CPU-ramp-ceiling pacing (bash 2786-2819) — only matters when an
     # admin explicitly raises reclone_concurrency above the sequential default,
     # so N parallel `qm clone`s don't all pile onto the host CPU at once. A
@@ -2005,9 +2066,10 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # per dongle, status provisioning → done/failed as each clone settles.
     items = [{"vmid": None, "vidpid": present[b].get("vidpid", ""),
               "bus": b, "status": "provisioning"} for b in ordered]
-    _prov_run = {"running": True, "items": items,
-                 "started_at": int(now), "total": len(ordered),
-                 "completed": 0, "failed": 0}
+    this_run = {"running": True, "items": items,
+                "started_at": int(now), "total": len(ordered),
+                "completed": 0, "failed": 0}
+    _prov_run = this_run   # publish for telemetry
     item_by_bus = {b: items[i] for i, b in enumerate(ordered)}
 
     async def _do(bus: str) -> bool:
@@ -2068,25 +2130,46 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                         templates.add(_tv)
                 except (TypeError, ValueError):
                     pass
-            # Find a free vmid in the sim range. A vid that's in Proxmox
-            # (existing_after) but NOT in our own vmid_to_bus tracking is a
-            # zombie — a leftover from a prior failed clone/destroy that
-            # never fully cleaned up (bash clone_vm_for_usb's pre-clone
-            # zombie cleanup, proxmox-agent.sh:1900-1949). Reclaim it via a
-            # force stop+destroy instead of permanently losing that VMID
-            # from the pool; give up on this vid (not the whole dongle) if
-            # reclamation fails and move to the next candidate.
-            vid = start
-            while vid <= end:
-                if str(vid) in state["vmid_to_bus"] or vid in templates:
-                    vid += 1
-                    continue
-                if vid in existing_after:
-                    if vid in protected or not await _reclaim_zombie_vmid(agent, vid):
+            # Find a free vmid in the sim range AND reserve it atomically BEFORE
+            # the clone. A vid in Proxmox (existing_after) but NOT in our own
+            # vmid_to_bus tracking is either a true zombie (a leftover from a
+            # prior failed clone/destroy — bash clone_vm_for_usb's pre-clone
+            # zombie cleanup, proxmox-agent.sh:1900-1949) OR a legit dongle VM
+            # that fell out of the state file (e.g. a vidpid-passthrough VM
+            # invisible to reconcile_bus_map/reconcile_vm_configs, which re-track
+            # via _vm_usb_bus — bus-path form only). Reclaim ONLY a true zombie
+            # (no usb passthrough); a real dongle VM is SKIPPED so the allocator
+            # moves to the next vid and leaves the running client alone —
+            # destroying it every pass was the "legit client keeps getting killed
+            # / the reclaim hangs and wedges the loop" bug. The reserve-before-
+            # clone (under _alloc_lock) stops two concurrent _do calls both
+            # picking the same vid (the "two dongles both got 90078" race); the
+            # reservation is rolled back on clone failure so the vid stays
+            # reusable next pass.
+            async with _alloc_lock:
+                vid = start
+                while vid <= end:
+                    if str(vid) in state["vmid_to_bus"] or vid in templates:
                         vid += 1
                         continue
-                    existing_after.discard(vid)
-                break
+                    if vid in existing_after:
+                        if vid in protected:
+                            vid += 1
+                            continue
+                        if await _vm_has_usb_passthrough(vid):
+                            # Real dongle VM, just untracked — DON'T destroy.
+                            # Skip to the next vid; reconcile will eventually
+                            # re-track it (or it stays harmlessly untracked).
+                            vid += 1
+                            continue
+                        if not await _reclaim_zombie_vmid(agent, vid):
+                            vid += 1
+                            continue
+                        existing_after.discard(vid)
+                    # Reserve now, before the clone, so a concurrent _do can't
+                    # grab the same vid. Rolled back on clone failure below.
+                    state["vmid_to_bus"][str(vid)] = bus
+                    break
             if vid > end:
                 logger.info("provision loop: no free VM slot — stopping")
                 item_by_bus[bus]["status"] = "failed"
@@ -2098,12 +2181,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             image_num = 2 if img1_count >= target_img1 and img2 else 1
             template = img1 if image_num == 1 else (img2 or img1)
             if not template:
+                # Roll back the pre-clone reservation — no VM was created.
+                state["vmid_to_bus"].pop(str(vid), None)
                 item_by_bus[bus]["status"] = "failed"
                 return False
             try:
                 await _clone_and_provision(agent, vid, bus, info, int(template),
                                             image_num, state)
-                state["vmid_to_bus"][str(vid)] = bus
                 state["bus_to_vmid"][bus] = str(vid)
                 state["vmid_to_image"][str(vid)] = image_num
                 existing_after.add(vid)
@@ -2111,6 +2195,9 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 return True
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"provision loop: clone {vid} on {bus} failed: {e}")
+                # Roll back the pre-clone reservation so the vid is reusable next
+                # pass (the clone never produced a tracked VM).
+                state["vmid_to_bus"].pop(str(vid), None)
                 # Tear down the half-cloned VM so it doesn't linger as a zombie
                 # (bash _teardown 1880-1906 stops+destroys+clears state on failure).
                 from . import cs_sim
@@ -2131,10 +2218,14 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     results = await asyncio.gather(*[_do(b) for b in ordered], return_exceptions=True)
     save_usb_state(state)
     provisioned = sum(1 for r in results if r is True)
-    _prov_run["running"] = False
-    _prov_run["completed"] = provisioned
-    _prov_run["failed"] = len(ordered) - provisioned
-    _prov_run["completed_at"] = int(time.time())
+    # Write to THIS run's dict (captured at publish), not the global _prov_run.
+    # If the stuck-run watchdog reassigns the global to a fresh run while this
+    # gather was hung, writing to the global here would clobber the fresh run;
+    # this_run keeps the orphan's late writes isolated.
+    this_run["running"] = False
+    this_run["completed"] = provisioned
+    this_run["failed"] = len(ordered) - provisioned
+    this_run["completed_at"] = int(time.time())
     _provision_reason = f"provisioning: attempted {len(ordered)}, provisioned {provisioned}"
     return {"provisioned": provisioned, "torn_down": len(torn_down),
             "attempted": len(ordered)}
