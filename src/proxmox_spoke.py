@@ -9,7 +9,6 @@ connect/auth/dispatch loop. Audience: pxmx developers; see the repo
 the canonical VM identity key.
 """
 
-import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 

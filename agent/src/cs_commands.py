@@ -22,7 +22,7 @@ come back as ``{status: ERROR, message: ...}`` so the hub can ACK them.
 import asyncio
 import logging
 import uuid
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Set
 
 from . import pve_cmds
 from . import cs_sim
