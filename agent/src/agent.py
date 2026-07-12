@@ -61,6 +61,7 @@ from . import cs_sim
 from . import watchdogs
 from . import usb_provision
 from . import pve_cmds
+from . import managed_crontab
 
 class _AuthError(Exception):
     """Raised when the spoke rejects our credentials (wrong secret)."""
@@ -2074,6 +2075,13 @@ class ProxmoxAgent:
                         new_cs = bool((self.config.get("client_simulation") or {}).get("enabled"))
                         if old_cs != new_cs:
                             await self._set_cs_enabled(new_cs)
+                        # Managed crontab: apply immediately when the operator's
+                        # pasted content is part of this push (idempotent; the
+                        # telemetry loop also drift-corrects periodically).
+                        if "managed_crontab" in data:
+                            self._managed_crontab_status = await managed_crontab.apply_managed_crontab(
+                                self.config.get("managed_crontab") or "")
+                            self._last_cron_reconcile = time.time()
                         result = {"status": "SUCCESS", "message": "Config updated"}
 
                     elif cmd_type == "GET_VM_LIST":
@@ -2533,6 +2541,19 @@ class ProxmoxAgent:
                                 "on" if self.cs_enabled else "off", _vm_n, _node_n,
                                 f" provision={_reason}" if _reason else "")
 
+                # Managed-crontab drift-correct — re-reconcile every ~10 min so a
+                # hand-edited block is restored to the pushed content (also runs on
+                # the first tick → applies the persisted config after a restart).
+                # config.get is None until the operator has ever set it, so we
+                # NEVER touch root's crontab on a node that doesn't use this.
+                _cron = self.config.get("managed_crontab")
+                if _cron is not None and (_now - getattr(self, "_last_cron_reconcile", 0.0) >= 600):
+                    self._last_cron_reconcile = _now
+                    try:
+                        self._managed_crontab_status = await managed_crontab.apply_managed_crontab(_cron or "")
+                    except Exception:  # noqa: BLE001 — telemetry must not die on a cron error
+                        pass
+
                 msg = {
                     "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
                                "sender_id": self.agent_id, "destination_id": "pxmx-spoke"},
@@ -2688,6 +2709,7 @@ class ProxmoxAgent:
             "prov_run":         usb_provision.current_prov_run(),
             "deleting_vmids":   usb_provision.current_deleting_vmids(),
             "reclone_vmids":    usb_provision.current_reclone_vmids(),
+            "managed_crontab_status": getattr(self, "_managed_crontab_status", None),
             "usb_state":        usb.get("usb_state") or [],
             "present_usb":      usb.get("present_usb") or [],
             "unknown_usb":      usb.get("unknown_usb") or [],
