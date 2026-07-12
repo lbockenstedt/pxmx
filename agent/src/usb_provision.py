@@ -262,6 +262,15 @@ PROV_RUN_STUCK_S = 600.0
 _deleting: Dict[int, float] = {}
 _DELETING_TTL_S = 30.0
 
+# Same idea for reclones — VMIDs currently being recloned (destroy + clone +
+# boot + guest-agent wait), surfaced to the WebUI VM list as a "Recloning" badge.
+# Longer TTL than deleting because a reclone runs for minutes (the guest-agent
+# wait alone is up to ~10m); the mark is REFRESHED as the reclone progresses
+# (mark_recloning is called at each phase) and cleared on completion, so the TTL
+# is only a backstop if the agent dies mid-reclone.
+_recloning: Dict[int, float] = {}
+_RECLONING_TTL_S = 180.0
+
 # The 1h-average CPU/mem the delete + provision gates actually ACT ON (from the
 # persisted resource ring each tick). Surfaced separately from the spoke's own
 # display average so the operator can see BOTH: the CPU 1H tile (display) AND the
@@ -628,6 +637,32 @@ def current_deleting_vmids() -> List[int]:
     for vmid in [v for v, ts in _deleting.items() if now - ts > _DELETING_TTL_S]:
         _deleting.pop(vmid, None)
     return sorted(_deleting.keys())
+
+
+def mark_recloning(vmid: int) -> None:
+    """Mark/refresh a VMID as currently recloning (called at each reclone phase
+    so the "Recloning" badge stays live for the minutes a reclone takes)."""
+    try:
+        _recloning[int(vmid)] = time.time()
+    except (TypeError, ValueError):
+        pass
+
+
+def clear_recloning(vmid: int) -> None:
+    """Drop a VMID's recloning mark (reclone finished or failed)."""
+    try:
+        _recloning.pop(int(vmid), None)
+    except (TypeError, ValueError):
+        pass
+
+
+def current_reclone_vmids() -> List[int]:
+    """VMIDs currently being recloned (TTL-pruned). The WebUI VM list renders
+    these as a "Recloning" badge. Prunes expired entries as a side effect."""
+    now = time.time()
+    for vmid in [v for v, ts in _recloning.items() if now - ts > _RECLONING_TTL_S]:
+        _recloning.pop(vmid, None)
+    return sorted(_recloning.keys())
 
 
 def current_provision_reason() -> Optional[str]:

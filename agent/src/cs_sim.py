@@ -66,6 +66,11 @@ async def _progress(agent, cs_cmd_id: str, action: str, status: str,
     if message:
         data["message"] = message
     data.update(extra)
+    # Keep the per-VM "Recloning" badge live: every reclone phase refreshes the
+    # mark (usb_provision prunes it by TTL), so the WebUI VM STATUS shows the op
+    # for the minutes a reclone runs. See _terminal for the clear.
+    if action == "reclone_vm" and extra.get("vmid") is not None:
+        usb_provision.mark_recloning(extra["vmid"])
     await agent.send_cs_event("CS_PROGRESS", data)
 
 
@@ -76,6 +81,10 @@ async def _terminal(agent, cs_cmd_id: str, action: str, status: str,
     data: Dict[str, Any] = {"cs_cmd_id": cs_cmd_id, "action": action,
                             "status": status, "message": message}
     data.update(extra)
+    # Reclone finished (completed/failed) → drop the "Recloning" badge now
+    # instead of waiting for the TTL backstop to expire.
+    if action == "reclone_vm" and extra.get("vmid") is not None:
+        usb_provision.clear_recloning(extra["vmid"])
     await agent.send_cs_event("CS_COMMAND_RESULT", data)
 
 
@@ -259,6 +268,7 @@ async def _reclone_vm(agent, data, cs_cmd_id) -> None:
     for _ in range(40):
         if await pve_cmds.qm_agent_ping(vid, protected=prot):
             break
+        usb_provision.mark_recloning(vid)  # keep the badge live through the ~10m wait
         await asyncio.sleep(5)
     # Set the hostname inside the guest. Write /etc/hostname + /etc/hosts +
     # cloud-init preserve_hostname via `qm guest exec --timeout 60 -- bash -c`

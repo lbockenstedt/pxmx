@@ -2687,6 +2687,7 @@ class ProxmoxAgent:
             "gate_averages":    usb_provision.current_gate_averages(),
             "prov_run":         usb_provision.current_prov_run(),
             "deleting_vmids":   usb_provision.current_deleting_vmids(),
+            "reclone_vmids":    usb_provision.current_reclone_vmids(),
             "usb_state":        usb.get("usb_state") or [],
             "present_usb":      usb.get("present_usb") or [],
             "unknown_usb":      usb.get("unknown_usb") or [],
