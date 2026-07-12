@@ -726,6 +726,22 @@ class ProxmoxAgent:
                            "pvenode installs on the local node only",
                            node, self.hostname)
 
+        # Idempotent: if pveproxy is ALREADY serving this exact cert (fingerprint
+        # match), skip pvenode + the pveproxy restart entirely and report SUCCESS
+        # now. A re-push — the hub retrying after a lost ack on a flaky link, or
+        # an overlapping target hitting the same node — then costs nothing and,
+        # crucially, does NOT restart pveproxy again. That removes the "always
+        # deploying / keeps restarting" churn, and the fast SUCCESS is far more
+        # likely to reach the hub before the connection blips (settling the le
+        # ledger so the retry loop stops). Only a genuinely NEW cert runs
+        # `pvenode cert set --restart` below.
+        if self._pveproxy_cert_matches(fullchain):
+            logger.info("INSTALL_CERT: pveproxy already serving this cert on %s — "
+                        "no-op (idempotent, no restart)", self.hostname)
+            return {"status": "SUCCESS",
+                    "message": f"cert already deployed on {self.hostname} "
+                               f"(unchanged — no restart)"}
+
         cert_fd, cert_path = tempfile.mkstemp(prefix="pve-cert-", suffix=".pem")
         key_fd, key_path = tempfile.mkstemp(prefix="pve-key-", suffix=".pem")
         try:

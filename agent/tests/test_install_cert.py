@@ -108,6 +108,28 @@ def test_install_cert_runs_pvenode_force_restart_writes_0600_then_unlinks():
     assert not os.path.exists(captured["key_path"])
 
 
+def test_install_cert_idempotent_skips_pvenode_when_cert_already_deployed():
+    # If pveproxy is already serving this exact cert, install_cert must be a fast
+    # no-op — no pvenode, no restart — so a re-push (lost ack / overlapping
+    # target) doesn't bounce pveproxy again. Returns SUCCESS "unchanged".
+    a = ProxmoxAgent(spoke_url="ws://x", agent_id="a1", secret="s")
+    a._pveproxy_cert_matches = lambda fc: True
+    called = []
+
+    async def fake_exec(*args, **kwargs):
+        called.append(True)
+        return _FakeProc(0)
+
+    real = _patch_exec(fake_exec)
+    try:
+        res = _run(a.install_cert(_FC, _FK))
+    finally:
+        agent.asyncio.create_subprocess_exec = real
+    assert res["status"] == "SUCCESS"
+    assert "unchanged" in res["message"]
+    assert called == []  # pvenode never ran — no pveproxy restart
+
+
 def test_install_cert_missing_fullchain_errors_without_subprocess():
     a = ProxmoxAgent(spoke_url="ws://x", agent_id="a1", secret="s")
     called = []
@@ -175,7 +197,10 @@ def test_install_cert_pvenode_nonzero_exit_but_cert_on_disk_reports_success():
     # cert IS already on disk. The fingerprint check is authoritative — deployed
     # cert → SUCCESS, so the spoke/hub don't mark a successful deploy as failed.
     a = ProxmoxAgent(spoke_url="ws://x", agent_id="a1", secret="s")
-    a._pveproxy_cert_matches = lambda fc: True
+    # False at the top idempotency guard (cert not yet deployed), True at the
+    # post-pvenode verify (pvenode wrote it before the failing restart).
+    _mc = {"n": 0}
+    a._pveproxy_cert_matches = lambda fc: (_mc.__setitem__("n", _mc["n"] + 1) or _mc["n"] > 1)
 
     async def fake_exec(bin_, *args, **kwargs):
         return _FakeProc(24, stderr=b"command 'systemctl restart pveproxy' failed: exit code 1")
@@ -234,7 +259,10 @@ def test_install_cert_slow_restart_with_cert_on_disk_reports_success():
     a = ProxmoxAgent(spoke_url="ws://x", agent_id="a1", secret="s")
     _patch_wait_timeout(a)
     # Simulate "pvenode wrote the cert, restart still going" → fingerprint match.
-    a._pveproxy_cert_matches = lambda fc: True
+    # False at the top idempotency guard (not yet deployed), True at the post-
+    # timeout verify.
+    _mc = {"n": 0}
+    a._pveproxy_cert_matches = lambda fc: (_mc.__setitem__("n", _mc["n"] + 1) or _mc["n"] > 1)
 
     async def fake_exec(*args, **kwargs):
         return _SlowProc(delay=10.0)
