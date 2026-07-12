@@ -193,8 +193,13 @@ class ProxmoxSpoke(BaseSpoke):
         # cert and the hub pushes INSTALL_CERT here to apply it to a Proxmox
         # node's pveproxy. Routed to the agent that owns the target node
         # (agent_id from the hub, or resolved from `identifier`/`node`); the
-        # agent runs `pvenode cert set` on its local node. 120s covers the
-        # pveproxy restart. The spoke never touches Proxmox directly.
+        # agent runs `pvenode cert set` on its local node. We can't predict how
+        # fast the cert will install or how long pveproxy's restart will take on
+        # a loaded node, so give the agent a generous window — 620s > the
+        # agent's 600s pvenode wait so the relay never times out first and masks
+        # a successful deploy. The agent verifies the deployed cert by
+        # fingerprint on its own timeout, so a slow restart still reports SUCCESS.
+        # The spoke never touches Proxmox directly.
         if cmd == "INSTALL_CERT":
             agent_id = data.get("agent_id")
             if not agent_id:
@@ -203,7 +208,7 @@ class ProxmoxSpoke(BaseSpoke):
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for cert install"}
             r = await self.control_plane.send_to_agent(
-                "INSTALL_CERT", data, agent_id=agent_id, timeout=120.0)
+                "INSTALL_CERT", data, agent_id=agent_id, timeout=620.0)
             r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
             return r if isinstance(r, dict) else {"status": "ERROR", "message": "agent returned no result"}
 

@@ -40,8 +40,10 @@ del _os, _ensure_requirements, _req
 import asyncio
 import base64
 import collections
+import hashlib
 import json
 import re
+import ssl
 import uuid
 import time
 import logging
@@ -649,6 +651,47 @@ class ProxmoxAgent:
                 return candidate
         return "pvenode"
 
+    # pvenode writes the cert files FIRST, then restarts pveproxy. On a loaded
+    # node the restart can take many minutes — we can't predict how fast the
+    # cert will install/restart, so we (a) give pvenode a generous wait, and
+    # (b) on timeout verify the deployed cert by fingerprint instead of trusting
+    # the process exit. The cert is "deployed" once it's on disk; pveproxy
+    # finishes reloading on its own. See _pveproxy_cert_matches.
+    _PVEPROXY_CERT_PATH = "/etc/pve/local/pveproxy-ssl.pem"
+    _PVENODE_WAIT_TIMEOUT = 600.0  # 10 min — generous upper bound for a slow pveproxy restart
+
+    @staticmethod
+    def _leaf_der_fingerprint(pem_text: str) -> Optional[str]:
+        """SHA256 of the first (leaf) cert's DER in a PEM cert/chain, or None.
+        Comparing fingerprints (not raw bytes) is robust to any whitespace /
+        newline normalization pvenode does when it writes pveproxy-ssl.pem."""
+        try:
+            m = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                          pem_text, re.S)
+            if not m:
+                return None
+            der = ssl.PEM_cert_to_DER_cert(m.group(0))
+            return hashlib.sha256(der).hexdigest() if der else None
+        except Exception:
+            return None
+
+    def _pveproxy_cert_matches(self, fullchain: str) -> bool:
+        """True if the deployed pveproxy cert matches ``fullchain``'s leaf (by
+        SHA256 of the DER). pvenode writes the cert file BEFORE restarting
+        pveproxy, so this is the authoritative 'is the cert actually deployed'
+        check — independent of whether the pvenode process finished or timed
+        out during a slow restart. Returns False if the file is absent or
+        unreadable (not a Proxmox node, or pvenode hasn't written it yet)."""
+        want = self._leaf_der_fingerprint(fullchain)
+        if not want:
+            return False
+        try:
+            with open(self._PVEPROXY_CERT_PATH, "rb") as f:
+                got = self._leaf_der_fingerprint(f.read().decode(errors="replace"))
+        except OSError:
+            return False
+        return bool(got) and want == got
+
     async def install_cert(self, fullchain: str, privkey: str,
                            node: str = "") -> Dict[str, Any]:
         """Install a custom TLS cert on this node's pveproxy (the Proxmox web UI
@@ -665,7 +708,13 @@ class ProxmoxAgent:
 
         The private key is written to a 0600 temp file pvenode reads, then
         unlinked — it is never logged (mirrors the Proxmox-token-secret rule).
-        """
+
+        Success detection: we can't predict how fast the cert will transfer or
+        how long pveproxy's restart will take, so we don't fail a deploy solely
+        on a timeout. pvenode writes the cert files BEFORE restarting pveproxy,
+        so if the wait times out during a slow restart we verify the deployed
+        cert by fingerprint — SUCCESS if it matches (pveproxy finishes reloading
+        on its own), ERROR only if the cert genuinely isn't on disk."""
         fullchain = (fullchain or "").strip()
         privkey = (privkey or "").strip()
         if not fullchain or "BEGIN CERTIFICATE" not in fullchain:
@@ -692,7 +741,30 @@ class ProxmoxAgent:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=self._PVENODE_WAIT_TIMEOUT)
+            except asyncio.TimeoutError:
+                # Slow pveproxy restart. The cert files are written before the
+                # restart, so verify the deploy instead of trusting the wait:
+                # if the cert is on disk, pveproxy will finish reloading on its
+                # own — report SUCCESS. Kill the lingering pvenode so it can't
+                # wedge a subsequent install.
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                if self._pveproxy_cert_matches(fullchain):
+                    logger.info("INSTALL_CERT: pveproxy cert installed on %s "
+                                "(fingerprint verified after slow restart)", self.hostname)
+                    return {"status": "SUCCESS",
+                            "message": f"cert installed on {self.hostname} "
+                                       f"(pveproxy cert verified on disk; restart was slow)"}
+                logger.warning("INSTALL_CERT: pvenode timed out on %s and cert not on disk",
+                               self.hostname)
+                return {"status": "ERROR",
+                        "message": "pvenode cert set timed out and cert not on disk "
+                                   "(pveproxy restart hung?)"}
             if proc.returncode != 0:
                 err = (stderr.decode().strip() or stdout.decode().strip()
                        or f"pvenode exited {proc.returncode}")
@@ -702,9 +774,6 @@ class ProxmoxAgent:
                         self.hostname)
             return {"status": "SUCCESS",
                     "message": f"cert installed on {self.hostname} (pveproxy restarted)"}
-        except asyncio.TimeoutError:
-            return {"status": "ERROR",
-                    "message": "pvenode cert set timed out (pveproxy restart?)"}
         except FileNotFoundError:
             return {"status": "ERROR", "message": "pvenode not found (not a Proxmox node?)"}
         except Exception as e:  # noqa: BLE001

@@ -179,3 +179,125 @@ def test_install_cert_pvenode_missing_reports_clear_error():
         agent.asyncio.create_subprocess_exec = real
     assert res["status"] == "ERROR"
     assert "pvenode not found" in res["message"]
+
+
+# ── slow pveproxy restart: verify deployed cert by fingerprint ───────────────
+# pvenode writes the cert files BEFORE restarting pveproxy; on a loaded node the
+# restart can outlive our wait. Success can't hinge on a fixed timeout (we can't
+# predict install/restart time), so on timeout the agent verifies the deployed
+# cert by fingerprint — SUCCESS if it's on disk, ERROR only if it genuinely isn't.
+
+class _SlowProc:
+    """A fake pvenode whose communicate() never returns within the wait window,
+    simulating a pveproxy restart that outlives the timeout."""
+    def __init__(self, delay=10.0):
+        self._delay = delay
+        self.returncode = None
+
+    async def communicate(self):
+        await asyncio.sleep(self._delay)
+        return b"", b""
+
+    def kill(self):
+        pass
+
+
+def _patch_wait_timeout(agent_instance, seconds=0.05):
+    """Lower the pvenode wait window so the timeout path fires fast in tests."""
+    agent_instance._PVENODE_WAIT_TIMEOUT = seconds
+
+
+def test_install_cert_slow_restart_with_cert_on_disk_reports_success():
+    a = ProxmoxAgent(spoke_url="ws://x", agent_id="a1", secret="s")
+    _patch_wait_timeout(a)
+    # Simulate "pvenode wrote the cert, restart still going" → fingerprint match.
+    a._pveproxy_cert_matches = lambda fc: True
+
+    async def fake_exec(*args, **kwargs):
+        return _SlowProc(delay=10.0)
+
+    real = _patch_exec(fake_exec)
+    try:
+        res = _run(a.install_cert(_FC, _FK))
+    finally:
+        agent.asyncio.create_subprocess_exec = real
+    assert res["status"] == "SUCCESS"
+    assert "verified" in res["message"]
+
+
+def test_install_cert_slow_restart_without_cert_reports_error():
+    a = ProxmoxAgent(spoke_url="ws://x", agent_id="a1", secret="s")
+    _patch_wait_timeout(a)
+    # pvenode timed out AND the cert never landed on disk.
+    a._pveproxy_cert_matches = lambda fc: False
+
+    async def fake_exec(*args, **kwargs):
+        return _SlowProc(delay=10.0)
+
+    real = _patch_exec(fake_exec)
+    try:
+        res = _run(a.install_cert(_FC, _FK))
+    finally:
+        agent.asyncio.create_subprocess_exec = real
+    assert res["status"] == "ERROR"
+    assert "timed out" in res["message"]
+
+
+def test_install_cert_wait_is_generous_ten_minutes():
+    # Regression guard: the wait must stay generous (10 min) so a slow pveproxy
+    # restart isn't falsely failed. A typo to e.g. 60s would re-introduce the
+    # "cert deployed but reported ERROR" bug.
+    assert ProxmoxAgent._PVENODE_WAIT_TIMEOUT == 600.0
+
+
+def test_leaf_der_fingerprint_garbage_returns_none():
+    # No PEM cert block at all → no regex match → None (must not raise).
+    assert ProxmoxAgent._leaf_der_fingerprint("not a pem at all") is None
+    assert ProxmoxAgent._leaf_der_fingerprint("") is None
+    assert ProxmoxAgent._leaf_der_fingerprint("-----BEGIN PRIVATE KEY-----\nX\n-----END PRIVATE KEY-----\n") is None
+
+
+def _real_cert_pair():
+    """Generate a real self-signed cert+key PEM (for fingerprint round-trip).
+    Skips the test if `cryptography` isn't installed."""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+        import datetime
+    except Exception:
+        import pytest
+        pytest.skip("cryptography not installed")
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "lm-test")])
+    now = datetime.datetime.utcnow()
+    cert = (x509.CertificateBuilder()
+            .subject_name(subj).issuer_name(subj)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now).not_valid_after(now + datetime.timedelta(days=1))
+            .sign(key, hashes.SHA256()))
+    fullchain = cert.public_bytes(serialization.Encoding.PEM).decode()
+    privkey = key.private_bytes(serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption()).decode()
+    return fullchain, privkey
+
+
+def test_pveproxy_cert_matches_real_cert_round_trip(tmp_path):
+    fullchain, _ = _real_cert_pair()
+    a = ProxmoxAgent(spoke_url="ws://x", agent_id="a1", secret="s")
+    # Point the helper at a temp file and confirm a matching cert → True,
+    # a different cert → False.
+    deployed = tmp_path / "pveproxy-ssl.pem"
+    deployed.write_text(fullchain)
+    a._PVEPROXY_CERT_PATH = str(deployed)
+    assert a._pveproxy_cert_matches(fullchain) is True
+    # A different cert on disk → no match.
+    other, _ = _real_cert_pair()
+    deployed.write_text(other)
+    assert a._pveproxy_cert_matches(fullchain) is False
+    # Missing file → False (not an exception).
+    a._PVEPROXY_CERT_PATH = str(tmp_path / "does-not-exist.pem")
+    assert a._pveproxy_cert_matches(fullchain) is False
