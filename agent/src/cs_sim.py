@@ -516,7 +516,7 @@ async def _reseed(agent, data, cs_cmd_id) -> None:
 
 async def _update_agent(agent, data, cs_cmd_id) -> None:
     """Trigger an immediate self-update (pull + sync + restart). The agent's
-    ``_apply_update`` os._exit(0)s after the restart, so the terminal result is
+    ``_apply_update`` os._exit(3)s after the restart, so the terminal result is
     only reached when there was no new version to apply."""
     await _progress(agent, cs_cmd_id, "update_agent", "running", "applying_update", 50)
     try:

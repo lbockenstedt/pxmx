@@ -1518,14 +1518,20 @@ class ProxmoxAgent:
             )
         except Exception as e:  # pragma: no cover - script missing / not executable
             logger.debug(f"could not schedule update watchdog: {e}")
-        logger.info("Self-update applied — restarting service")
-        subprocess.Popen(["systemctl", "restart", "lm-pxmx-agent"])
-        os._exit(0)
+        logger.info("Self-update applied — exiting so systemd relaunches on the new code")
+        # Exit NON-ZERO (3) and let systemd relaunch us. We deliberately do NOT
+        # `systemctl restart` ourselves: that runs inside our own cgroup, so
+        # systemd's stop-phase SIGTERM kills the `systemctl` child mid-transaction
+        # and can strand the agent offline (the anti-pattern lm core removed). The
+        # unit's Restart=always relaunches on any exit; the nonzero code also keeps
+        # us correct if the unit ever moves to Restart=on-failure, matching core's
+        # BaseControlPlane restart contract (os._exit(3)).
+        os._exit(3)
 
     async def trigger_update(self) -> None:
         """Force an immediate self-update check (Phase E ``update_agent`` long op).
         Runs the blocking git pull + sync + restart in an executor; returns if
-        there is no repo or no new version (``_apply_update`` os._exit(0)s when
+        there is no repo or no new version (``_apply_update`` os._exit(3)s when
         it actually applies, so the caller's terminal result is only reached
         when the agent was already current)."""
         import pathlib
