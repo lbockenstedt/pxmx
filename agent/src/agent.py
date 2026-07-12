@@ -1854,36 +1854,69 @@ class ProxmoxAgent:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
 
+    def _wss_ssl_context(self, spoke_url: str):
+        """Build the SSL context for a ``wss://`` connect to the spoke.
+
+        Returns ``(ssl_ctx, mode_str)``. ``ssl_ctx`` is None only on a build
+        failure or a misconfigured CA path — the caller then connects with
+        ``ssl=None`` and ``websockets`` refuses a ``wss://`` URI ("ssl=None is
+        incompatible with a wss:// URI"), so the agent retry-loops with the
+        error logged rather than silently degrading security.
+
+        Modes (mirror ``BaseControlPlane._client_ssl_ctx`` in lm core):
+          * verify OFF (default) — ``ssl._create_unverified_context()``:
+            encrypted but the spoke cert is NOT authenticated (lab default
+            while cert deployment is in progress).
+          * verify ON (``LM_HUB_TLS_VERIFY=1``):
+            - ``LM_HUB_CA_CERT`` set + readable → ``create_default_context(
+              cafile=…)`` pins the spoke CA (self-signed / private-CA case).
+            - no CA path → ``create_default_context()`` trusts the SYSTEM
+              store (public-CA / Let's Encrypt case) — so an LE-signed spoke
+              cert verifies with ``LM_HUB_TLS_VERIFY=1`` alone, no CA file
+              (previously the agent required a pinned CA even for public CAs,
+              so the agent→spoke leg couldn't verify an LE cert without one).
+            - CA path set but MISSING → log ERROR + return ``(None, …)``:
+              never silently downgrade an operator who asked for verification
+              to an unverified context (the footgun: they'd believe the spoke
+              cert is authenticated when it isn't).
+        """
+        import ssl as _ssl
+        if not (spoke_url or "").lower().startswith("wss://"):
+            return None, "plaintext (loopback/legacy)"
+        try:
+            if os.environ.get("LM_HUB_TLS_VERIFY", "0").strip() in ("1", "true", "yes"):
+                ca = os.environ.get("LM_HUB_CA_CERT", "").strip()
+                if ca and not os.path.isfile(ca):
+                    logger.error("wss: LM_HUB_TLS_VERIFY=1 but CA path %s does not "
+                                 "exist — refusing to silently downgrade to "
+                                 "unverified. Fix the path or unset LM_HUB_TLS_VERIFY.", ca)
+                    return None, "TLS disabled (CA path missing)"
+                if ca:
+                    ctx = _ssl.create_default_context(cafile=ca)
+                    return ctx, f"TLS verified (CA={ca})"
+                # No pinned CA → system trust store (public-CA / Let's Encrypt).
+                ctx = _ssl.create_default_context()
+                return ctx, "TLS verified (system trust store)"
+            # NOTE: the public name is ssl.create_default_context(); the
+            # unverified builder is the PRIVATE ssl._create_unverified_context()
+            # (leading underscore). Calling ssl.create_unverified_context()
+            # raises AttributeError → ssl_ctx=None → websockets rejects
+            # ssl=None on a wss:// URI and the agent retry-loops forever.
+            ctx = _ssl._create_unverified_context()
+            return ctx, "TLS unverified (self-signed cert)"
+        except Exception as e:
+            logger.warning(f"wss SSL context build failed: {e}; connecting without TLS")
+            return None, "TLS disabled (context build failed)"
+
     async def _connect_once(self):
         import websockets
         logger.info(f"pxmx-agent {version} connecting to {self.spoke_url}...")
 
-        # TLS: a wss:// spoke_url gets an SSL context (verify-off by default for
-        # the hub box's self-signed cert; LM_HUB_TLS_VERIFY=1 + LM_HUB_CA_CERT
-        # verifies). ws:// stays plaintext. Mirrors BaseControlPlane._client_ssl_ctx.
-        ssl_ctx = None
-        _tls_mode = "plaintext (loopback/legacy)"
-        if self.spoke_url.lower().startswith("wss://"):
-            try:
-                import ssl as _ssl
-                if os.environ.get("LM_HUB_TLS_VERIFY", "0").strip() in ("1", "true", "yes") \
-                        and os.environ.get("LM_HUB_CA_CERT", "").strip():
-                    ssl_ctx = _ssl.create_default_context(cafile=os.environ["LM_HUB_CA_CERT"].strip())
-                    _tls_mode = f"TLS verified (CA={os.environ['LM_HUB_CA_CERT'].strip()})"
-                else:
-                    # NOTE: the public name is ssl.create_default_context(); the
-                    # unverified builder is the PRIVATE ssl._create_unverified_context()
-                    # (leading underscore). Calling ssl.create_unverified_context()
-                    # raises AttributeError → ssl_ctx=None → websockets rejects
-                    # ssl=None on a wss:// URI ("ssl=None is incompatible with a
-                    # wss:// URI") and the agent retry-loops forever. Mirrors
-                    # BaseControlPlane._client_ssl_ctx in lm core.
-                    ssl_ctx = _ssl._create_unverified_context()
-                    _tls_mode = "TLS unverified (self-signed cert)"
-            except Exception as e:
-                logger.warning(f"wss SSL context build failed: {e}; connecting without TLS")
-                ssl_ctx = None
-                _tls_mode = "TLS disabled (context build failed)"
+        # TLS: a wss:// spoke_url gets an SSL context (verify-off by default;
+        # LM_HUB_TLS_VERIFY=1 verifies — pinned CA via LM_HUB_CA_CERT, else the
+        # system trust store for a public-CA / Let's Encrypt spoke cert). ws://
+        # stays plaintext. Mirrors BaseControlPlane._client_ssl_ctx in lm core.
+        ssl_ctx, _tls_mode = self._wss_ssl_context(self.spoke_url)
         # INFO so the mode reaches the hub via the WebSocketLogHandler relay
         # (PxmxAgent prefix); pairs with the "Connection to ... failed" warning
         # in run() to form a TLS troubleshooting trail.
