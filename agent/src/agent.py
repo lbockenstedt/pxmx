@@ -768,6 +768,24 @@ class ProxmoxAgent:
             if proc.returncode != 0:
                 err = (stderr.decode().strip() or stdout.decode().strip()
                        or f"pvenode exited {proc.returncode}")
+                # pvenode writes the cert files BEFORE restarting pveproxy, so a
+                # non-zero exit is usually a slow/among-warning pveproxy restart
+                # (e.g. `command 'systemctl restart pveproxy' failed` while the
+                # cert IS already on disk), not a failed cert write. Verify by
+                # fingerprint before failing — same authoritative check as the
+                # timeout path: if the cert is deployed, pveproxy finishes
+                # reloading on its own, so report SUCCESS (the deploy succeeded).
+                # This is the "cert landed on the node but the UI shows failed"
+                # symptom. Only a cert that genuinely isn't on disk is an ERROR.
+                if self._pveproxy_cert_matches(fullchain):
+                    logger.info("INSTALL_CERT: pvenode exited %s on %s but cert "
+                                "verified on disk — treating as installed (%s)",
+                                proc.returncode, self.hostname, err[:200])
+                    return {"status": "SUCCESS",
+                            "message": f"cert installed on {self.hostname} "
+                                       f"(verified on disk; pvenode reported: {err[:200]})"}
+                logger.warning("INSTALL_CERT: pvenode failed on %s and cert not on "
+                               "disk — %s", self.hostname, err[:200])
                 return {"status": "ERROR",
                         "message": f"pvenode cert set failed: {err[:300]}"}
             logger.info("INSTALL_CERT: pveproxy cert installed on %s (pvenode restart)",

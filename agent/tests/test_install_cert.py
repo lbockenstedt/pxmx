@@ -148,6 +148,8 @@ def test_install_cert_missing_privkey_errors_without_subprocess():
 
 def test_install_cert_pvenode_nonzero_exit_reports_stderr_and_cleans_up():
     a = ProxmoxAgent(spoke_url="ws://x", agent_id="a1", secret="s")
+    # pvenode exited non-zero AND the cert is not on disk → a genuine failure.
+    a._pveproxy_cert_matches = lambda fc: False
     paths = {}
 
     async def fake_exec(bin_, *args, **kwargs):
@@ -164,6 +166,27 @@ def test_install_cert_pvenode_nonzero_exit_reports_stderr_and_cleans_up():
     # Temp files still cleaned up on the error path.
     assert not os.path.exists(paths["cert"])
     assert not os.path.exists(paths["key"])
+
+
+def test_install_cert_pvenode_nonzero_exit_but_cert_on_disk_reports_success():
+    # The "cert deployed but UI shows failed" bug: pvenode writes the cert files
+    # BEFORE restarting pveproxy, so a slow/among-warning restart can make pvenode
+    # exit non-zero (e.g. "command 'systemctl restart pveproxy' failed") while the
+    # cert IS already on disk. The fingerprint check is authoritative — deployed
+    # cert → SUCCESS, so the spoke/hub don't mark a successful deploy as failed.
+    a = ProxmoxAgent(spoke_url="ws://x", agent_id="a1", secret="s")
+    a._pveproxy_cert_matches = lambda fc: True
+
+    async def fake_exec(bin_, *args, **kwargs):
+        return _FakeProc(24, stderr=b"command 'systemctl restart pveproxy' failed: exit code 1")
+
+    real = _patch_exec(fake_exec)
+    try:
+        res = _run(a.install_cert(_FC, _FK))
+    finally:
+        agent.asyncio.create_subprocess_exec = real
+    assert res["status"] == "SUCCESS"
+    assert "verified on disk" in res["message"]
 
 
 def test_install_cert_pvenode_missing_reports_clear_error():
