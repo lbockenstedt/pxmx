@@ -72,6 +72,13 @@ async def handle_cs_command(agent, action: str,
         return {"status": "ACCEPTED", "message": f"{action} accepted",
                 "cs_cmd_id": cs_cmd_id, "action": action}
 
+    # ── Fast op: stop a running fleet reclone. Must be handled here (not via
+    # run_long_op) so it isn't blocked behind the batch holding _LONG_OP_SEM.
+    if action == "proxmox_reclone_stop":
+        stopped = cs_sim.request_reclone_stop()
+        return {"status": "SUCCESS", "stopped": stopped,
+                "message": "reclone stop requested" if stopped else "no reclone running"}
+
     protected = _protected(agent)
 
     try:

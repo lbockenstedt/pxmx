@@ -372,6 +372,11 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
     async def _one(c: Dict[str, Any]) -> None:
         vid = c["vmid"]; vname = c["name"]
         async with sem:
+            # Stop requested (Stop button → proxmox_reclone_stop): skip this VM
+            # and every one still queued behind the semaphore. In-flight reclones
+            # are allowed to finish (a half-destroyed VM would be left broken).
+            if usb_provision.reclone_stop_requested():
+                return
             usb_provision.mark_reclone_progress(vid, "destroying", vname)
             await _progress(agent, cs_cmd_id, "proxmox_reclone_all", "running",
                             "recloning", None, vmid=vid, name=vname)
@@ -398,10 +403,15 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
     st = usb_provision.current_reclone_state()
     completed = int(st.get("completed", 0))
     failed = int(st.get("failed", 0))
-    status = "completed" if failed == 0 else ("failed" if completed == 0 else "completed")
-    usb_provision.end_reclone_batch(status)
-    await _terminal(agent, cs_cmd_id, "proxmox_reclone_all", status,
-                    f"fleet reclone done: {completed} completed, {failed} failed",
+    stopped = usb_provision.reclone_stop_requested()
+    batch_status = "interrupted" if stopped else (
+        "completed" if failed == 0 else ("failed" if completed == 0 else "completed"))
+    usb_provision.end_reclone_batch(batch_status)
+    term_status = "failed" if (stopped or (failed and not completed)) else "completed"
+    msg = (f"fleet reclone stopped: {completed} completed, {failed} failed "
+           f"({len(candidates) - completed - failed} skipped)" if stopped
+           else f"fleet reclone done: {completed} completed, {failed} failed")
+    await _terminal(agent, cs_cmd_id, "proxmox_reclone_all", term_status, msg,
                     total=st.get("total", len(candidates)),
                     completed=completed, failed=failed)
 
@@ -652,6 +662,13 @@ async def _update_agent(agent, data, cs_cmd_id) -> None:
         return
     await _terminal(agent, cs_cmd_id, "update_agent", "completed",
                     "update applied; agent restarting (or already current)")
+
+
+def request_reclone_stop() -> bool:
+    """Fast op (NOT a long op — must not queue behind _LONG_OP_SEM, which the
+    running batch holds): signal the fleet-reclone batch to stop. Returns whether
+    a batch was running to stop."""
+    return usb_provision.request_reclone_stop()
 
 
 _HANDLERS = {

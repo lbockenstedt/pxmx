@@ -280,6 +280,9 @@ _RECLONING_TTL_S = 180.0
 # Published to telemetry by ``current_reclone_state`` (mirrors
 # ``current_prov_run`` / ``current_reclone_vmids``).
 _reclone_state: Dict[str, Any] = {}
+# Set by request_reclone_stop(); the fleet-reclone batch loop checks it before
+# starting each remaining VM and aborts the rest. Cleared on start_reclone_batch.
+_reclone_stop: bool = False
 
 # Auto-provisioning pause during a destructive template refresh
 # (agent REFRESH_TEMPLATE): the agent wipes the host's sim VMs + template and
@@ -704,9 +707,10 @@ def start_reclone_batch(total: int, rtype: str = "manual") -> bool:
     """Begin a fleet-reclone batch. Returns False (refuses) if one is already
     running — the handler treats that as a 409/conflict so a second click while
     a batch is active is rejected, not interleaved."""
-    global _reclone_state
+    global _reclone_state, _reclone_stop
     if _reclone_state.get("status") == "running":
         return False
+    _reclone_stop = False
     _reclone_state = {
         "status": "running",
         "current_vm": None,
@@ -719,6 +723,21 @@ def start_reclone_batch(total: int, rtype: str = "manual") -> bool:
         "log": [],
     }
     return True
+
+
+def request_reclone_stop() -> bool:
+    """Signal a running fleet-reclone batch to stop after its in-flight VMs
+    finish. Returns False (no-op) when no batch is running."""
+    global _reclone_stop
+    if _reclone_state.get("status") != "running":
+        return False
+    _reclone_stop = True
+    return True
+
+
+def reclone_stop_requested() -> bool:
+    """True once request_reclone_stop() fired for the current batch."""
+    return _reclone_stop
 
 
 def mark_reclone_progress(vmid: int, phase: str, name: str = "") -> None:
