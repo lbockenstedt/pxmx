@@ -820,6 +820,109 @@ class ProxmoxAgent:
                 except OSError:
                     pass
 
+    # ── template backup (hub-triggered) ──────────────────────────────────────
+    def _start_template_backup(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Kick off a hub-triggered template backup and ACK immediately.
+
+        vzdump + the upload of a multi-GB archive take minutes, so we spawn the
+        work in a background thread and return ACCEPTED right away (the hub's
+        START_BACKUP request_response must not block that long). Progress + the
+        terminal result flow back over the token'd ``/progress`` + ``/upload``
+        endpoints on the hub (routes/templates.py)."""
+        vmid = data.get("vmid")
+        upload_url = str(data.get("upload_url") or "")
+        token = str(data.get("upload_token") or "")
+        if vmid is None or not upload_url or not token:
+            return {"status": "ERROR",
+                    "message": "START_BACKUP requires vmid, upload_url and upload_token"}
+        asyncio.create_task(asyncio.to_thread(self._do_template_backup, dict(data)))
+        return {"status": "ACCEPTED",
+                "message": f"vzdump of VM {vmid} started; streaming to the hub template repo"}
+
+    def _do_template_backup(self, data: Dict[str, Any]) -> None:
+        """Blocking backup worker (runs in a thread): vzdump the VM to a temp dir,
+        then stream the archive to the hub. Reports progress/failure via the
+        token'd progress endpoint; the hub finalizes size+sha256 on the upload."""
+        import glob
+        import shutil
+        import subprocess
+        import tempfile
+        try:
+            import httpx
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("START_BACKUP: httpx not available: %s", exc)
+            return
+
+        vmid = data.get("vmid")
+        upload_url = str(data.get("upload_url") or "")
+        token = str(data.get("upload_token") or "")
+        progress_url = upload_url.rsplit("/upload", 1)[0] + "/progress"
+        headers = {"x-upload-token": token}
+
+        def _report(status: str, progress=None, error: str = "") -> None:
+            body = {"status": status}
+            if progress is not None:
+                body["progress"] = progress
+            if error:
+                body["error"] = error
+            try:
+                with httpx.Client(verify=False, timeout=15) as c:
+                    c.post(progress_url, headers=headers, json=body)
+            except Exception:  # noqa: BLE001 — progress is best-effort
+                pass
+
+        tmpdir = tempfile.mkdtemp(prefix="lm-tmpl-backup-")
+        try:
+            _report("dumping", 0)
+            vzdump = shutil.which("vzdump") or "/usr/bin/vzdump"
+            # --mode stop is safe for a template (not running); --dumpdir keeps the
+            # archive local so we can stream it ourselves. zstd = Proxmox default.
+            proc = subprocess.run(
+                [vzdump, str(vmid), "--compress", "zstd", "--mode", "stop",
+                 "--dumpdir", tmpdir],
+                capture_output=True, text=True)
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or f"vzdump exited {proc.returncode}").strip()
+                logger.warning("START_BACKUP: vzdump failed for %s: %s", vmid, err[:200])
+                _report("failed", error=f"vzdump failed: {err[:300]}")
+                return
+            archives = glob.glob(os.path.join(tmpdir, "vzdump-*.vma.zst")) \
+                or [p for p in glob.glob(os.path.join(tmpdir, "vzdump-*")) if os.path.isfile(p)]
+            if not archives:
+                _report("failed", error="vzdump produced no archive")
+                return
+            path = max(archives, key=os.path.getsize)
+            size = os.path.getsize(path)
+            logger.info("START_BACKUP: vzdump of %s done (%d bytes) — uploading", vmid, size)
+            _report("uploading", 0)
+
+            def _chunks():
+                with open(path, "rb") as fh:
+                    while True:
+                        b = fh.read(4 * 1024 * 1024)
+                        if not b:
+                            break
+                        yield b
+
+            # Content-Length lets the hub enforce its size cap + disk-space guard
+            # and compute upload progress. verify=False: the hub may still be on a
+            # self-signed cert (pre-LE), same as the spoke/agent WS legs.
+            with httpx.Client(verify=False, timeout=None) as c:
+                resp = c.put(upload_url, content=_chunks(),
+                             headers={**headers, "content-length": str(size),
+                                      "content-type": "application/octet-stream"})
+            if resp.status_code == 200:
+                logger.info("START_BACKUP: upload complete for %s", vmid)
+            else:
+                msg = f"hub upload rejected: HTTP {resp.status_code} {resp.text[:200]}"
+                logger.warning("START_BACKUP: %s", msg)
+                _report("failed", error=msg)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("START_BACKUP: backup of %s failed: %s", vmid, e)
+            _report("failed", error=str(e)[:300])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     async def _fetch_cluster_name(self) -> str:
         """Returns the Proxmox cluster name, or this node's hostname for standalone nodes."""
         try:
@@ -2465,6 +2568,13 @@ class ProxmoxAgent:
                         result = await self.install_cert(
                             data.get("fullchain", ""), data.get("privkey", ""),
                             node=data.get("identifier") or data.get("node") or "")
+
+                    elif cmd_type == "START_BACKUP":
+                        # Hub-triggered template backup: vzdump this VM and stream
+                        # the archive to the hub's template repo. ACK immediately;
+                        # the long vzdump+upload runs in the background and reports
+                        # progress via the token'd /progress endpoint on the hub.
+                        result = self._start_template_backup(data)
 
                     resp = {
                         "header": {
