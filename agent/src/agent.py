@@ -2930,7 +2930,25 @@ class ProxmoxAgent:
                     except Exception as e:
                         logger.debug(f"CS_TELEMETRY emit failed: {e}")
 
-                await asyncio.sleep(60)
+                # Adaptive cadence: the auto-prov / delete / reclone state rides
+                # the CS_TELEMETRY frame, so a fixed 60s tick made the WebUI lag
+                # (or miss) VMs coming up. While auto-prov is ACTIVELY provisioning,
+                # deleting, or recloning, tick fast (~3s, the old bash cadence) so
+                # the UI shows VMs in near real time; fall back to 60s when idle.
+                interval = 60
+                if self.cs_enabled:
+                    try:
+                        pr = usb_provision.current_prov_run()
+                        active = (bool(pr.get("running"))
+                                  or any(str(it.get("status") or "") == "provisioning"
+                                         for it in (pr.get("items") or []))
+                                  or bool(usb_provision.current_deleting_vmids())
+                                  or usb_provision.current_reclone_state().get("status") == "running")
+                        if active:
+                            interval = 3
+                    except Exception:  # noqa: BLE001 — cadence hint only
+                        pass
+                await asyncio.sleep(interval)
             except Exception as e:
                 logger.error(f"Telemetry push failed: {e}")
                 await asyncio.sleep(10)
