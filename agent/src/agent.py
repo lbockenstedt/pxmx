@@ -840,9 +840,17 @@ class ProxmoxAgent:
                 "message": f"vzdump of VM {vmid} started; streaming to the hub template repo"}
 
     def _do_template_backup(self, data: Dict[str, Any]) -> None:
-        """Blocking backup worker (runs in a thread): vzdump the VM to a temp dir,
-        then stream the archive to the hub. Reports progress/failure via the
-        token'd progress endpoint; the hub finalizes size+sha256 on the upload."""
+        """Blocking backup worker (runs in a thread): vzdump the VM, then stream
+        the archive to the hub. Reports progress/failure via the token'd progress
+        endpoint; the hub finalizes size+sha256 on the upload.
+
+        If ``data['storage']`` names a backup-capable Proxmox storage, vzdump
+        targets it (``--storage``) so the dump lands on the admin-chosen storage
+        (NFS/ZFS/dir/...) instead of the node's root-disk temp dir — and the
+        produced archive is ALWAYS deleted after streaming (success OR failure)
+        so it doesn't consume storage space. Without ``storage`` (back-compat with
+        an older hub) it falls back to a local temp dir whose cleanup is rmtree.
+        """
         import glob
         import shutil
         import subprocess
@@ -854,6 +862,7 @@ class ProxmoxAgent:
             return
 
         vmid = data.get("vmid")
+        storage = str(data.get("storage") or "").strip()
         upload_url = str(data.get("upload_url") or "")
         token = str(data.get("upload_token") or "")
         progress_url = upload_url.rsplit("/upload", 1)[0] + "/progress"
@@ -871,27 +880,87 @@ class ProxmoxAgent:
             except Exception:  # noqa: BLE001 — progress is best-effort
                 pass
 
-        tmpdir = tempfile.mkdtemp(prefix="lm-tmpl-backup-")
+        def _pvesm(args):
+            """Synchronous pvesm helper (we run in a thread, not an event loop).
+            Returns (rc, stdout). Best-effort: (1, '') on failure."""
+            try:
+                proc = subprocess.run(["pvesm", *args], capture_output=True,
+                                      text=True, timeout=90)
+                return proc.returncode, (proc.stdout or "")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("START_BACKUP: pvesm %s failed: %s", args, exc)
+                return 1, ""
+
+        def _volids(txt: str):
+            # pvesm list prints a header (no ':') + one volid per line
+            # (``<storage>:dump/vzdump-...vma.zst``). The ':' filter drops header.
+            return set(ln.split()[0] for ln in txt.splitlines() if ":" in ln)
+
+        tmpdir = None
+        archive_path = None       # filesystem path of the archive we stream
+        archive_volid = None       # volid (for pvesm-free fallback) when --storage
         try:
             _report("dumping", 0)
             vzdump = shutil.which("vzdump") or "/usr/bin/vzdump"
-            # --mode stop is safe for a template (not running); --dumpdir keeps the
-            # archive local so we can stream it ourselves. zstd = Proxmox default.
-            proc = subprocess.run(
-                [vzdump, str(vmid), "--compress", "zstd", "--mode", "stop",
-                 "--dumpdir", tmpdir],
-                capture_output=True, text=True)
-            if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or f"vzdump exited {proc.returncode}").strip()
-                logger.warning("START_BACKUP: vzdump failed for %s: %s", vmid, err[:200])
-                _report("failed", error=f"vzdump failed: {err[:300]}")
-                return
-            archives = glob.glob(os.path.join(tmpdir, "vzdump-*.vma.zst")) \
-                or [p for p in glob.glob(os.path.join(tmpdir, "vzdump-*")) if os.path.isfile(p)]
-            if not archives:
-                _report("failed", error="vzdump produced no archive")
-                return
-            path = max(archives, key=os.path.getsize)
+            if storage:
+                # Validate the storage exists + is backup-capable (mirror
+                # pve_cmds.vm_action_any's fast-fail) so an obvious misconfig
+                # fails before we touch vzdump. Then snapshot the current backup
+                # volids for this VM so we can diff out the new one after vzdump.
+                rc, sout = _pvesm(["status", "--content", "backup"])
+                names = [ln.split()[0] for ln in sout.splitlines()[1:]
+                         if ln.split()]
+                if storage not in names:
+                    _report("failed", error=(
+                        f"storage '{storage}' not found / not backup-capable "
+                        f"on this host"))
+                    return
+                _rc, pre = _pvesm(["list", storage, "--content", "backup",
+                                   "--vmid", str(vmid)])
+                pre_set = _volids(pre)
+                # --mode stop is safe for a non-running template; --storage lands
+                # the dump on the admin-chosen storage. zstd = Proxmox default.
+                proc = subprocess.run(
+                    [vzdump, str(vmid), "--compress", "zstd", "--mode", "stop",
+                     "--storage", storage],
+                    capture_output=True, text=True)
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout or f"vzdump exited {proc.returncode}").strip()
+                    logger.warning("START_BACKUP: vzdump failed for %s: %s", vmid, err[:200])
+                    _report("failed", error=f"vzdump failed: {err[:300]}")
+                    return
+                _rc, post = _pvesm(["list", storage, "--content", "backup",
+                                    "--vmid", str(vmid)])
+                new_vols = list(_volids(post) - pre_set)
+                if not new_vols:
+                    _report("failed", error="vzdump produced no archive on storage")
+                    return
+                archive_volid = sorted(new_vols)[-1]
+                _rc, pout = _pvesm(["path", archive_volid])
+                archive_path = pout.strip().splitlines()[0].strip() if pout.strip() else ""
+                if not archive_path or not os.path.isfile(archive_path):
+                    _report("failed", error=(
+                        f"could not resolve archive path for {archive_volid}"))
+                    return
+                path = archive_path
+            else:
+                # Back-compat (older hub, no storage in payload): local temp dir.
+                tmpdir = tempfile.mkdtemp(prefix="lm-tmpl-backup-")
+                proc = subprocess.run(
+                    [vzdump, str(vmid), "--compress", "zstd", "--mode", "stop",
+                     "--dumpdir", tmpdir],
+                    capture_output=True, text=True)
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout or f"vzdump exited {proc.returncode}").strip()
+                    logger.warning("START_BACKUP: vzdump failed for %s: %s", vmid, err[:200])
+                    _report("failed", error=f"vzdump failed: {err[:300]}")
+                    return
+                archives = glob.glob(os.path.join(tmpdir, "vzdump-*.vma.zst")) \
+                    or [p for p in glob.glob(os.path.join(tmpdir, "vzdump-*")) if os.path.isfile(p)]
+                if not archives:
+                    _report("failed", error="vzdump produced no archive")
+                    return
+                path = max(archives, key=os.path.getsize)
             size = os.path.getsize(path)
             logger.info("START_BACKUP: vzdump of %s done (%d bytes) — uploading", vmid, size)
             _report("uploading", 0)
@@ -905,8 +974,8 @@ class ProxmoxAgent:
                         yield b
 
             # Content-Length lets the hub enforce its size cap + disk-space guard
-            # and compute upload progress. verify=False: the hub may still be on a
-            # self-signed cert (pre-LE), same as the spoke/agent WS legs.
+            # and compute upload progress. verify=False: the hub may still be on
+            # a self-signed cert (pre-LE), same as the spoke/agent WS legs.
             with httpx.Client(verify=False, timeout=None) as c:
                 resp = c.put(upload_url, content=_chunks(),
                              headers={**headers, "content-length": str(size),
@@ -921,7 +990,23 @@ class ProxmoxAgent:
             logger.warning("START_BACKUP: backup of %s failed: %s", vmid, e)
             _report("failed", error=str(e)[:300])
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            # ALWAYS clean up the on-node archive (the user's space concern).
+            # --storage mode writes outside any tempdir, so rmtree wouldn't reach
+            # it — delete the resolved file best-effort, with a pvesm free
+            # fallback. Tempdir mode is handled by rmtree below. A cleanup error
+            # must never mask the real upload result, so it's logged + swallowed.
+            if archive_path:
+                try:
+                    if os.path.isfile(archive_path):
+                        os.remove(archive_path)
+                        logger.info("START_BACKUP: deleted archive %s", archive_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("START_BACKUP: os.remove failed for %s: %s — "
+                                   "trying pvesm free", archive_path, exc)
+                    if archive_volid:
+                        _pvesm(["free", archive_volid])
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
     # ── template refresh (hub-triggered, destructive) ────────────────────────
     def _start_template_refresh(self, data: Dict[str, Any]) -> Dict[str, Any]:

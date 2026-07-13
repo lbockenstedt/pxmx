@@ -782,14 +782,24 @@ async def list_backup_storages() -> Dict[str, Any]:
     import socket
     host = socket.gethostname()
     storages: List[str] = []
+    # Parallel name→type map (pvesm status cols: name type status total used
+    # avail). Lets callers filter non-file storages (e.g. ``pbs`` — vzdump-to-PBS
+    # pushes dedup chunks, not a single streamable .vma.zst). Existing consumers
+    # that only read ``storages`` (names) are unaffected.
+    storage_types: Dict[str, str] = {}
     rc, out, _ = await _run(["pvesm", "status", "--content", "backup"],
                             check=False, timeout=15)
     if rc == 0:
         for line in out.decode(errors="replace").splitlines()[1:]:
             parts = line.split()
-            if parts and parts[0] not in storages:
-                storages.append(parts[0])
-    return {"hosts": [{"hostname": host, "storages": storages}]}
+            if parts:
+                name = parts[0]
+                stype = parts[1] if len(parts) > 1 else ""
+                if name not in storages:
+                    storages.append(name)
+                    storage_types[name] = stype
+    return {"hosts": [{"hostname": host, "storages": storages,
+                       "storage_types": storage_types}]}
 
 
 async def list_all_vmids() -> List[int]:
