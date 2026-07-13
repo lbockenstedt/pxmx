@@ -271,6 +271,31 @@ _DELETING_TTL_S = 30.0
 _recloning: Dict[int, float] = {}
 _RECLONING_TTL_S = 180.0
 
+# Fleet "Reclone All" batch state — the progress bar on the hub's Fleet Reclone
+# tile. One batch at a time (a second Reclone All while one is running is
+# rejected by the handler). Shape mirrors the first-version webui-spoke
+# ``reclone_state`` (renderRecloneStatus): {status, current_vm, phase, total,
+# completed, failed, started_at, type, log:[{vmid,name,status,timestamp}],
+# last_run}. ``status`` ∈ running|completed|failed|idle. Empty dict = idle.
+# Published to telemetry by ``current_reclone_state`` (mirrors
+# ``current_prov_run`` / ``current_reclone_vmids``).
+_reclone_state: Dict[str, Any] = {}
+
+# Auto-provisioning pause during a destructive template refresh
+# (agent REFRESH_TEMPLATE): the agent wipes the host's sim VMs + template and
+# restores a backup, so the provision loop must NOT clone/teardown/shed while
+# that runs. Set by the refresh worker around the sequence.
+_refresh_paused = False
+
+
+def set_refresh_paused(value: bool) -> None:
+    global _refresh_paused
+    _refresh_paused = bool(value)
+
+
+def refresh_paused() -> bool:
+    return _refresh_paused
+
 # The 1h-average CPU/mem the delete + provision gates actually ACT ON (from the
 # persisted resource ring each tick). Surfaced separately from the spoke's own
 # display average so the operator can see BOTH: the CPU 1H tile (display) AND the
@@ -663,6 +688,91 @@ def current_reclone_vmids() -> List[int]:
     for vmid in [v for v, ts in _recloning.items() if now - ts > _RECLONING_TTL_S]:
         _recloning.pop(vmid, None)
     return sorted(_recloning.keys())
+
+
+# ── Fleet "Reclone All" batch tracker ────────────────────────────────────────
+# Mutators are called by cs_sim._reclone_all around each per-VM reclone. The
+# accessors feed the telemetry body (current_reclone_state) so the hub's Fleet
+# Reclone progress bar advances live. One batch at a time.
+def current_reclone_state() -> Dict[str, Any]:
+    """Live fleet-reclone batch state for the telemetry body → hub Fleet Reclone
+    progress bar. Empty dict when idle (no batch running/just-finished)."""
+    return dict(_reclone_state)
+
+
+def start_reclone_batch(total: int, rtype: str = "manual") -> bool:
+    """Begin a fleet-reclone batch. Returns False (refuses) if one is already
+    running — the handler treats that as a 409/conflict so a second click while
+    a batch is active is rejected, not interleaved."""
+    global _reclone_state
+    if _reclone_state.get("status") == "running":
+        return False
+    _reclone_state = {
+        "status": "running",
+        "current_vm": None,
+        "phase": "",
+        "total": int(total or 0),
+        "completed": 0,
+        "failed": 0,
+        "started_at": time.time(),
+        "type": rtype or "manual",
+        "log": [],
+    }
+    return True
+
+
+def mark_reclone_progress(vmid: int, phase: str, name: str = "") -> None:
+    """Set the current VM + phase (destroying/cloning/starting/...) for the
+    live progress bar. Refreshes the per-VM "Recloning" badge too."""
+    if _reclone_state.get("status") != "running":
+        return
+    _reclone_state["current_vm"] = int(vmid) if vmid is not None else None
+    _reclone_state["phase"] = str(phase or "")
+    if name:
+        _reclone_state.setdefault("_names", {})[int(vmid)] = str(name)
+
+
+def mark_reclone_vm_done(vmid: int, ok: bool, name: str = "") -> None:
+    """Record one VM's terminal outcome + bump completed/failed. ``ok`` True →
+    completed, False → failed. Called after each per-VM reclone resolves."""
+    if _reclone_state.get("status") != "running":
+        return
+    now = time.time()
+    _reclone_state["log"].append({
+        "vmid": int(vmid) if vmid is not None else None,
+        "name": str(name) if name else _reclone_state.get("_names", {}).get(int(vmid), ""),
+        "status": "completed" if ok else "failed",
+        "timestamp": now,
+    })
+    if ok:
+        _reclone_state["completed"] = int(_reclone_state.get("completed", 0)) + 1
+    else:
+        _reclone_state["failed"] = int(_reclone_state.get("failed", 0)) + 1
+    if _reclone_state.get("current_vm") == (int(vmid) if vmid is not None else None):
+        _reclone_state["current_vm"] = None
+        _reclone_state["phase"] = ""
+
+
+def end_reclone_batch(status: str = "completed") -> None:
+    """Finalize a batch: set terminal status + archive it to ``last_run`` so the
+    card can show "Last run: … · N completed · N failed". The state stays
+    populated (terminal) so the final frame surfaces; the next batch
+    start_reclone_batch overwrites it. ``status`` ∈ completed|failed|interrupted."""
+    global _reclone_state
+    if not _reclone_state:
+        return
+    st = dict(_reclone_state)
+    st["status"] = status or "completed"
+    st["ended_at"] = time.time()
+    st["last_run"] = {
+        "timestamp": st["ended_at"],
+        "completed": int(st.get("completed", 0)),
+        "failed": int(st.get("failed", 0)),
+        "type": st.get("type", ""),
+    }
+    # Drop the transient _names map before publishing.
+    st.pop("_names", None)
+    _reclone_state = st
 
 
 def current_provision_reason() -> Optional[str]:
@@ -1611,6 +1721,12 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # current_provision_loop_running() flips true on the very first tick (lets the
     # UI distinguish "loop not running" from "loop running but gated").
     _provision_loop_last_run = time.time()
+
+    # Template-refresh pause: while a REFRESH_TEMPLATE wipes + restores this host,
+    # do NOTHING (no shed/clone/teardown) so we don't fight the refresh.
+    if _refresh_paused:
+        _provision_reason = "template refresh in progress"
+        return {"provisioned": 0, "torn_down": 0, "reason": _provision_reason}
 
     # Safety resource delete gate runs FIRST, before the provisioning
     # preconditions (dongle_vidpids / templates) below — a provisioning config

@@ -923,6 +923,137 @@ class ProxmoxAgent:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    # ── template refresh (hub-triggered, destructive) ────────────────────────
+    def _start_template_refresh(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Kick off a REFRESH_TEMPLATE and ACK immediately. The destructive
+        sequence (pause auto-prov → wipe the host's sim VMs + template → download
+        the backup → qmrestore to the original VMID + re-mark template → resume
+        auto-prov) runs as a background task and reports via /refresh-progress."""
+        tid = data.get("template_id")
+        vmid = data.get("template_vmid")
+        url = str(data.get("download_url") or "")
+        token = str(data.get("refresh_token") or "")
+        if not tid or vmid is None or not url or not token:
+            return {"status": "ERROR",
+                    "message": "REFRESH_TEMPLATE requires template_id, template_vmid, download_url, refresh_token"}
+        asyncio.create_task(self._do_template_refresh(dict(data)))
+        return {"status": "ACCEPTED",
+                "message": f"Refreshing template {vmid} — auto-provisioning paused"}
+
+    async def _list_local_vmids(self) -> list:
+        """VMIDs of qemu guests on this node (`qm list`), for range filtering."""
+        import shutil
+        try:
+            qm = shutil.which("qm") or "/usr/sbin/qm"
+            proc = await asyncio.create_subprocess_exec(
+                qm, "list", stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+            ids = []
+            for line in out.decode(errors="replace").splitlines()[1:]:
+                parts = line.split()
+                if parts and parts[0].isdigit():
+                    ids.append(int(parts[0]))
+            return ids
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _download_refresh_archive(self, url: str, token: str, dest: str) -> None:
+        """Stream the backup archive from the hub to ``dest`` (blocking; called in
+        a thread). verify=False — the hub may still be self-signed pre-LE."""
+        import httpx
+        with httpx.Client(verify=False, timeout=None) as c:
+            with c.stream("GET", url, headers={"x-refresh-token": token}) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_bytes(4 * 1024 * 1024):
+                        f.write(chunk)
+
+    async def _do_template_refresh(self, data: Dict[str, Any]) -> None:
+        import os
+        import shutil
+        import tempfile
+        from . import cs_sim, usb_provision
+
+        tid = data.get("template_id")
+        template_vmid = int(data.get("template_vmid"))
+        url = str(data.get("download_url") or "")
+        token = str(data.get("refresh_token") or "")
+        progress_url = url.rsplit("/download", 1)[0] + "/refresh-progress"
+        headers = {"x-refresh-token": token}
+
+        def _report(status: str, step: str = "", error: str = "") -> None:
+            try:
+                import httpx
+                with httpx.Client(verify=False, timeout=15) as c:
+                    c.post(progress_url, headers=headers,
+                           json={"status": status, "step": step, "error": error})
+            except Exception:  # noqa: BLE001
+                pass
+
+        tmpdir = tempfile.mkdtemp(prefix="lm-tmpl-refresh-")
+        usb_provision.set_refresh_paused(True)  # stop auto-prov fighting the wipe
+        ok = False
+        try:
+            _report("pausing", "auto-provisioning paused")
+            # 1. Wipe the host's sim VMs (only the sim VMID range, protected
+            # excluded, guarded destroy). NOT the template — qmrestore --force
+            # overwrites that in step 3, avoiding a raw destroy of an arbitrary vmid.
+            prot = cs_sim._protected(self)
+            usb_cfg = (self.config.get("client_simulation") or {}).get("usb_config") or {}
+            max_slots = int(usb_cfg.get("usb_max_slots") or usb_cfg.get("max_slots") or 24)
+            start, end, _bid, _d = usb_provision._host_vmid_range(
+                getattr(self, "hostname", "") or "", max_slots,
+                usb_cfg.get("vmid_start"), usb_cfg.get("vmid_end"),
+                usb_cfg.get("vm_set_override") or 0)
+            vmids = await self._list_local_vmids()
+            sim_vmids = [v for v in vmids if start <= v <= end and v not in prot and v != template_vmid]
+            _report("killing", f"removing {len(sim_vmids)} sim VM(s)")
+            for v in sim_vmids:
+                try:
+                    await cs_sim.destroy_vm(self, v, protected=prot, exclude_bus_after=True)
+                except Exception as e:  # noqa: BLE001 — one failure shouldn't abort the refresh
+                    logger.warning("REFRESH_TEMPLATE: destroy VM %s failed: %s", v, e)
+
+            # 2. Download the backup archive from the hub.
+            _report("downloading", "pulling backup from the hub")
+            archive = os.path.join(tmpdir, "template.vma.zst")
+            await asyncio.to_thread(self._download_refresh_archive, url, token, archive)
+            if not os.path.isfile(archive) or os.path.getsize(archive) == 0:
+                raise RuntimeError("downloaded archive is empty")
+
+            # 3. Restore to the ORIGINAL template VMID (--force overwrites the old
+            # template) and re-mark it a template so clones/auto-prov are unchanged.
+            _report("restoring", f"qmrestore → VM {template_vmid}")
+            qmrestore = shutil.which("qmrestore") or "/usr/sbin/qmrestore"
+            proc = await asyncio.create_subprocess_exec(
+                qmrestore, archive, str(template_vmid), "--force",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(f"qmrestore failed: {(err.decode() or out.decode())[:300]}")
+            qm = shutil.which("qm") or "/usr/sbin/qm"
+            tproc = await asyncio.create_subprocess_exec(
+                qm, "template", str(template_vmid),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            _tout, terr = await tproc.communicate()
+            if tproc.returncode != 0:
+                # Non-fatal: the disk is restored but not flagged a template.
+                logger.warning("REFRESH_TEMPLATE: qm template %s rc=%s: %s",
+                               template_vmid, tproc.returncode, (terr.decode() or "")[:200])
+            _report("resuming", "re-enabling auto-provisioning")
+            ok = True
+            logger.info("REFRESH_TEMPLATE: template %s restored on %s", template_vmid,
+                        getattr(self, "hostname", ""))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("REFRESH_TEMPLATE failed: %s", e)
+            _report("failed", error=str(e)[:300])
+        finally:
+            usb_provision.set_refresh_paused(False)  # ALWAYS resume auto-prov
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            if ok:
+                _report("complete", "refresh complete — auto-provisioning resumed")
+
     async def _fetch_cluster_name(self) -> str:
         """Returns the Proxmox cluster name, or this node's hostname for standalone nodes."""
         try:
@@ -2575,6 +2706,12 @@ class ProxmoxAgent:
                         # the long vzdump+upload runs in the background and reports
                         # progress via the token'd /progress endpoint on the hub.
                         result = self._start_template_backup(data)
+
+                    elif cmd_type == "REFRESH_TEMPLATE":
+                        # Hub-triggered destructive refresh: pause auto-prov, wipe
+                        # this host's sim VMs, restore the backup to the template
+                        # VMID, resume auto-prov. ACK now; runs in the background.
+                        result = self._start_template_refresh(data)
 
                     resp = {
                         "header": {
