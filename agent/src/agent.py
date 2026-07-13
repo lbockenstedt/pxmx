@@ -2956,6 +2956,7 @@ class ProxmoxAgent:
             "prov_run":         usb_provision.current_prov_run(),
             "deleting_vmids":   usb_provision.current_deleting_vmids(),
             "reclone_vmids":    usb_provision.current_reclone_vmids(),
+            "reclone_state":    usb_provision.current_reclone_state(),
             "managed_crontab_status": getattr(self, "_managed_crontab_status", None),
             "usb_state":        usb.get("usb_state") or [],
             "present_usb":      usb.get("present_usb") or [],

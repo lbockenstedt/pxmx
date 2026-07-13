@@ -278,13 +278,22 @@ cat > /usr/local/bin/lm-component-update-restart <<'HELPER'
 # rolling back a good update during a hub outage would strand the component on
 # old code and mark a good commit/version bad.
 #
+# Dual-repo rollback: when the spoke update ALSO pulled the shared /opt/lm core
+# checkout (--core-repo-root + core_from_commit/core_to_commit in the pending
+# manifest), a boot failure resets BOTH repos — the spoke first, then core.
+# The core to_commit is marked bad so the next SPOKE_UPDATE skips a crash-
+# looping core. v1 is NON-ATOMIC across the two repos: a watchdog crash between
+# the two `git reset --hard`s leaves the spoke rolled back but core forward —
+# recoverable via the on-disk manifest + the `writefailed` marker. Atomic
+# two-repo rollback is deferred.
+#
 # State-file ops delegate to the Python CLI update_recovery.py (SINGLE SOURCE OF
 # TRUTH for the on-disk recovery state machine). Only poll/systemd/git logic
 # lives here. This file is the canonical source; install_cs.sh / install_pxmx.sh
 # / install_agent.sh embed it verbatim via here-doc — keep them in sync.
 set -uo pipefail
 
-UNIT="" STATE_DIR="" REPO_ROOT="" INSTALL_DIR="" DEADLINE=90
+UNIT="" STATE_DIR="" REPO_ROOT="" INSTALL_DIR="" DEADLINE=90 CORE_REPO_ROOT=""
 RECOVERY_PY="/opt/lm/core/src/update_recovery.py"
 
 # Re-exec under a transient systemd unit outside the component's cgroup so this
@@ -304,6 +313,7 @@ while [ $# -gt 0 ]; do
         --unit) UNIT="$2"; shift 2;;
         --state-dir) STATE_DIR="$2"; shift 2;;
         --repo-root) REPO_ROOT="$2"; shift 2;;
+        --core-repo-root) CORE_REPO_ROOT="$2"; shift 2;;
         --install-dir) INSTALL_DIR="$2"; shift 2;;
         --deadline) DEADLINE="$2"; shift 2;;
         --recovery-py) RECOVERY_PY="$2"; shift 2;;
@@ -354,6 +364,8 @@ bdir="$(printf '%s' "$pending" | jq -r '.backup_dir // empty' 2>/dev/null)"
 from_commit="$(printf '%s' "$pending" | jq -r '.from_commit // empty' 2>/dev/null)"
 to_commit="$(printf '%s' "$pending" | jq -r '.to_commit // empty' 2>/dev/null)"
 to_v="$(printf '%s' "$pending" | jq -r '.to_version // empty' 2>/dev/null)"
+core_from="$(printf '%s' "$pending" | jq -r '.core_from_commit // empty' 2>/dev/null)"
+core_to="$(printf '%s' "$pending" | jq -r '.core_to_commit // empty' 2>/dev/null)"
 
 echo "lm-component-update-restart: $UNIT failed to boot (crash-loop/failed); rolling back." >&2
 
@@ -374,6 +386,21 @@ elif [ -n "$INSTALL_DIR" ]; then
     fi
     if [ -n "$to_v" ]; then
         python3 "$RECOVERY_PY" markbad "$to_v" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+    fi
+fi
+
+# Dual-repo rollback: reset the shared /opt/lm core checkout AFTER the spoke
+# repo so a crash-looping core (e.g. a bad BaseControlPlane change) is rolled
+# back too. The core to_commit is marked bad so the next SPOKE_UPDATE skips it
+# (the spoke's _is_known_bad_commit guard) instead of re-pulling it. Skipped
+# entirely when no --core-repo-root / core fields were recorded — single-repo
+# behavior is unchanged.
+if [ -n "$CORE_REPO_ROOT" ] && [ -n "$core_from" ]; then
+    echo "lm-component-update-restart: rolling back shared core at $CORE_REPO_ROOT to $core_from." >&2
+    git -C "$CORE_REPO_ROOT" reset --hard "$core_from" >/dev/null 2>&1 || true
+    git -C "$CORE_REPO_ROOT" clean -fd >/dev/null 2>&1 || true
+    if [ -n "$core_to" ]; then
+        python3 "$RECOVERY_PY" markbadcommit "$core_to" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
     fi
 fi
 

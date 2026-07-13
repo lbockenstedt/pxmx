@@ -39,8 +39,8 @@ logger = logging.getLogger("PxmxAgent")
 
 # Actions handled here (the accepted+progress pattern), not in cs_commands.
 LONG_ACTIONS = frozenset({
-    "delete_vm", "reclone_vm", "clone_lxc", "provision_unassigned",
-    "backup", "reseed", "update_agent",
+    "delete_vm", "reclone_vm", "proxmox_reclone_all", "clone_lxc",
+    "provision_unassigned", "backup", "reseed", "update_agent",
 })
 
 
@@ -217,7 +217,34 @@ async def _reclone_vm(agent, data, cs_cmd_id) -> None:
     source_vmid = data.get("source_vmid") or data.get("template_id")
     prot = _protected(agent)
     vid = assert_sim_vm(vmid, prot)
+    r = await _reclone_vm_core(agent, vid, source_vmid, prot=prot,
+                                cs_cmd_id=cs_cmd_id, name=data.get("name") or "")
+    if not r["ok"]:
+        await _terminal(agent, cs_cmd_id, "reclone_vm", "failed",
+                        r.get("error") or f"reclone VM {vid} failed", vmid=vid)
+        return
+    await _terminal(agent, cs_cmd_id, "reclone_vm", "completed",
+                    f"VM {vid} recloned on {r['bus']}", vmid=vid,
+                    result={"bus": r["bus"], "image": r["image"]})
 
+
+async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
+                            *, prot: Optional[set] = None,
+                            cs_cmd_id: Optional[str] = None,
+                            name: str = "",
+                            emit_progress: bool = True) -> Dict[str, Any]:
+    """The reclone steps (destroy → clone → start → guest-agent wait →
+    set_assignment), WITHOUT the terminal CS_COMMAND_RESULT. Returns
+    ``{ok, bus, image, error?}``. Shared by ``_reclone_vm`` (which wraps it with
+    a per-VM terminal) and ``_reclone_all`` (which runs N cores under a
+    semaphore + emits ONE batch terminal). ``emit_progress`` gates the per-phase
+    CS_PROGRESS frames so a batch can drive its own overall-pct progress
+    instead of N interleaved per-VM bars."""
+    if prot is None:
+        prot = _protected(agent)
+    async def _prog(step, pct, **extra):
+        if emit_progress and cs_cmd_id:
+            await _progress(agent, cs_cmd_id, "reclone_vm", "running", step, pct, vmid=vid, **extra)
     # Recover the USB bus path: state first, then `qm config` usb0 host= (bash 2436-2451).
     bus = usb_provision.bus_for_vmid(vid)
     if not bus:
@@ -227,9 +254,7 @@ async def _reclone_vm(agent, data, cs_cmd_id) -> None:
                 bus = v.split("host=", 1)[1].split(",", 1)[0].strip()
                 break
     if not bus or not os.path.isdir(f"/sys/bus/usb/devices/{bus}"):
-        await _terminal(agent, cs_cmd_id, "reclone_vm", "failed",
-                        f"no present USB bus for VM {vid}", vmid=vid)
-        return
+        return {"ok": False, "error": f"no present USB bus for VM {vid}", "bus": bus}
 
     state = usb_provision.load_usb_state()
     image_num = int(state["vmid_to_image"].get(str(vid), 1) or 1)
@@ -238,31 +263,27 @@ async def _reclone_vm(agent, data, cs_cmd_id) -> None:
                                else usb_cfg.get("image2_template_id")) \
         or usb_cfg.get("image1_template_id")
     if not template:
-        await _terminal(agent, cs_cmd_id, "reclone_vm", "failed",
-                        "no template id configured", vmid=vid)
-        return
+        return {"ok": False, "error": "no template id configured", "bus": bus}
 
-    await _progress(agent, cs_cmd_id, "reclone_vm", "running", "destroying", 20, vmid=vid)
+    await _prog("destroying", 20)
     dr = await destroy_vm(agent, vid, bus=bus, protected=prot)
     if not dr["ok"] and not dr["orphaned"]:
-        await _terminal(agent, cs_cmd_id, "reclone_vm", "failed",
-                        f"destroy before reclone failed (attempt {dr.get('fails')}/3)",
-                        vmid=vid)
-        return
+        return {"ok": False, "error": f"destroy before reclone failed (attempt {dr.get('fails')}/3)",
+                "bus": bus}
 
-    name = f"sim-{vid}"
-    await _progress(agent, cs_cmd_id, "reclone_vm", "running", "cloning", 40, vmid=vid)
-    await pve_cmds.qm_clone(template, vid, name, protected=prot, timeout=600)
+    vm_name = name or f"sim-{vid}"
+    await _prog("cloning", 40)
+    await pve_cmds.qm_clone(template, vid, vm_name, protected=prot, timeout=600)
     await pve_cmds.qm_set(vid, "--onboot", "1", "--startup", "order=2,up=60", protected=prot)
     await pve_cmds.qm_set(vid, "-usb0", f"host={bus}", protected=prot)
     vlan = usb_cfg.get("vlan_nic")
     if vlan:
         await pve_cmds.qm_set(vid, "-net0", f"virtio,bridge={vlan}", protected=prot)
 
-    await _progress(agent, cs_cmd_id, "reclone_vm", "running", "starting", 60, vmid=vid)
+    await _prog("starting", 60)
     await pve_cmds.qm_start(vid, prot)
 
-    await _progress(agent, cs_cmd_id, "reclone_vm", "running", "waiting_guest_agent", 75, vmid=vid)
+    await _prog("waiting_guest_agent", 75)
     # Bash cadence: `timeout 10` ping + `sleep 5` ≈ 15s/iter, 40× ≈ 10 min
     # (proxmox-agent.sh 1999-2009). Use sleep(5), not 15, to match.
     for _ in range(40):
@@ -275,8 +296,8 @@ async def _reclone_vm(agent, data, cs_cmd_id) -> None:
     # (bash 2025-2036) — hostnamectl is deliberately avoided: it talks D-Bus
     # which may be unready right after boot and can hang the whole task.
     host_script = (
-        f"echo '{name}' > /etc/hostname; "
-        f"sed -i 's/^127\\.0\\.1\\.1.*/127.0.1.1\\t{name}/' /etc/hosts 2>/dev/null || true; "
+        f"echo '{vm_name}' > /etc/hostname; "
+        f"sed -i 's/^127\\.0\\.1\\.1.*/127.0.1.1\\t{vm_name}/' /etc/hosts 2>/dev/null || true; "
         "mkdir -p /etc/cloud/cloud.cfg.d; "
         "echo 'preserve_hostname: true' > /etc/cloud/cloud.cfg.d/99_preserve_hostname.cfg; "
         "rm -f /var/lib/cloud/sem/config_set_hostname 2>/dev/null || true"
@@ -286,9 +307,103 @@ async def _reclone_vm(agent, data, cs_cmd_id) -> None:
 
     usb_provision.set_assignment(vid, bus, image_num)
     usb_provision.remove_orphan_vm(vid)
-    await _terminal(agent, cs_cmd_id, "reclone_vm", "completed",
-                    f"VM {vid} recloned on {bus}", vmid=vid,
-                    result={"bus": bus, "image": image_num})
+    return {"ok": True, "bus": bus, "image": image_num}
+
+
+async def _reclone_all(agent, data, cs_cmd_id) -> None:
+    """Fleet "Reclone All" — reclone every eligible non-template qemu sim VM on
+    this host that currently has a PRESENT USB bus (reclone needs the dongle
+    plugged in; a VM with no bus would fail, so skip it rather than pad the
+    failed count). Reuses ``_reclone_vm_core`` per VM under a concurrency cap
+    (``data.args.concurrency``; 0/omit = 1) and emits ONE terminal for the batch.
+    Drives ``usb_provision``'s reclone-batch tracker so the hub's Fleet Reclone
+    progress bar advances live (current_vm / phase / done-of-total / per-VM log).
+    One batch at a time — a second while one is running is rejected (409-style
+    failed terminal) so two clicks don't interleave."""
+    args = data.get("args") or data if isinstance(data, dict) else {}
+    if not isinstance(args, dict):
+        args = {}
+    concurrency = max(1, int(args.get("concurrency", 0) or 0))
+    prot = _protected(agent)
+
+    # Refuse a second concurrent batch (the tracker stays "running" until
+    # end_reclone_batch). The hub/cs spoke long-op window is wide (60s+) but a
+    # batch runs for many minutes, so this guard is what keeps clicks serial.
+    if usb_provision.current_reclone_state().get("status") == "running":
+        await _terminal(agent, cs_cmd_id, "proxmox_reclone_all", "failed",
+                        "a fleet reclone is already running on this host")
+        return
+
+    # Enumerate qemu sim VMs (non-template) and keep only those with a present
+    # USB bus — the set a per-VM reclone would actually act on. Templates are
+    # excluded by name (sim-* VMIDs in the vmid range) + the template flag; the
+    # _reclone_vm_core / destroy_vm guards re-assert "never destroy a template".
+    try:
+        vmlist = await agent.get_vm_list()
+    except Exception as e:  # noqa: BLE001
+        await _terminal(agent, cs_cmd_id, "proxmox_reclone_all", "failed",
+                        f"failed to enumerate VMs: {e}")
+        return
+    candidates = []
+    for v in (vmlist or {}).get("vms", []) or []:
+        if str(v.get("type", "")).lower() != "qemu":
+            continue
+        if int(v.get("template", 0) or 0):
+            continue
+        try:
+            vid = assert_sim_vm(v.get("vmid"), prot)
+        except GuardError:
+            continue
+        bus = usb_provision.bus_for_vmid(vid)
+        if not bus or not os.path.isdir(f"/sys/bus/usb/devices/{bus}"):
+            continue
+        candidates.append({"vmid": vid, "name": v.get("name") or f"sim-{vid}"})
+
+    if not candidates:
+        await _terminal(agent, cs_cmd_id, "proxmox_reclone_all", "completed",
+                        "no eligible VMs with a present USB bus to reclone")
+        return
+
+    usb_provision.start_reclone_batch(len(candidates), rtype="manual")
+    await _progress(agent, cs_cmd_id, "proxmox_reclone_all", "running", "starting", 0,
+                    total=len(candidates))
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(c: Dict[str, Any]) -> None:
+        vid = c["vmid"]; vname = c["name"]
+        async with sem:
+            usb_provision.mark_reclone_progress(vid, "destroying", vname)
+            await _progress(agent, cs_cmd_id, "proxmox_reclone_all", "running",
+                            "recloning", None, vmid=vid, name=vname)
+            try:
+                r = await _reclone_vm_core(agent, vid, None, prot=prot,
+                                            cs_cmd_id=cs_cmd_id, name=vname,
+                                            emit_progress=False)
+                ok = bool(r.get("ok"))
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                r = {"error": str(e)}
+            usb_provision.mark_reclone_vm_done(vid, ok, vname)
+            done = usb_provision.current_reclone_state().get("completed", 0) + \
+                usb_provision.current_reclone_state().get("failed", 0)
+            total = usb_provision.current_reclone_state().get("total", 1) or 1
+            await _progress(agent, cs_cmd_id, "proxmox_reclone_all", "running",
+                            "recloning", int(100 * done / total),
+                            vmid=vid, name=vname,
+                            result="completed" if ok else "failed",
+                            error=(r.get("error") if not ok else None))
+
+    await asyncio.gather(*[_one(c) for c in candidates], return_exceptions=True)
+
+    st = usb_provision.current_reclone_state()
+    completed = int(st.get("completed", 0))
+    failed = int(st.get("failed", 0))
+    status = "completed" if failed == 0 else ("failed" if completed == 0 else "completed")
+    usb_provision.end_reclone_batch(status)
+    await _terminal(agent, cs_cmd_id, "proxmox_reclone_all", status,
+                    f"fleet reclone done: {completed} completed, {failed} failed",
+                    total=st.get("total", len(candidates)),
+                    completed=completed, failed=failed)
 
 
 async def _clone_lxc(agent, data, cs_cmd_id) -> None:
@@ -542,6 +657,7 @@ async def _update_agent(agent, data, cs_cmd_id) -> None:
 _HANDLERS = {
     "delete_vm": _delete_vm,
     "reclone_vm": _reclone_vm,
+    "proxmox_reclone_all": _reclone_all,
     "clone_lxc": _clone_lxc,
     "provision_unassigned": _provision_unassigned,
     "backup": _backup,
