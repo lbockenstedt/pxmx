@@ -1045,16 +1045,39 @@ class ProxmoxAgent:
         except Exception:  # noqa: BLE001
             return []
 
-    def _download_refresh_archive(self, url: str, token: str, dest: str) -> None:
+    def _download_refresh_archive(self, url: str, token: str, dest: str,
+                                  on_progress=None) -> int:
         """Stream the backup archive from the hub to ``dest`` (blocking; called in
         a thread). verify=False — the hub may still be self-signed pre-LE."""
         import httpx
-        with httpx.Client(verify=False, timeout=None) as c:
+        total = 0
+        with httpx.Client(verify=False,
+                         timeout=httpx.Timeout(connect=15.0, read=300.0,
+                                               write=None, pool=None)) as c:
             with c.stream("GET", url, headers={"x-refresh-token": token}) as r:
                 r.raise_for_status()
+                try:
+                    total = int(r.headers.get("content-length") or 0) or 0
+                except (TypeError, ValueError):
+                    total = 0
+                done = 0
+                last_report = 0
                 with open(dest, "wb") as f:
                     for chunk in r.iter_bytes(4 * 1024 * 1024):
                         f.write(chunk)
+                        done += len(chunk)
+                        if on_progress and done - last_report >= 256 * 1024 * 1024:
+                            last_report = done
+                            try:
+                                on_progress(done, total)
+                            except Exception:  # noqa: BLE001
+                                pass
+                if on_progress:
+                    try:
+                        on_progress(done, total)
+                    except Exception:  # noqa: BLE001
+                        pass
+        return total
 
     async def _do_template_refresh(self, data: Dict[str, Any]) -> None:
         import os
@@ -1069,12 +1092,20 @@ class ProxmoxAgent:
         progress_url = url.rsplit("/download", 1)[0] + "/refresh-progress"
         headers = {"x-refresh-token": token}
 
-        def _report(status: str, step: str = "", error: str = "") -> None:
+        def _report(status: str, step: str = "", error: str = "",
+                    bytes_done: int = None, total: int = None) -> None:
+            body = {"status": status, "step": step, "error": error,
+                    "host": getattr(self, "hostname", "") or "",
+                    "agent_id": getattr(self, "agent_id", "") or "",
+                    "vmid": template_vmid}
+            if bytes_done is not None:
+                body["bytes"] = int(bytes_done)
+            if total is not None:
+                body["total"] = int(total)
             try:
                 import httpx
                 with httpx.Client(verify=False, timeout=15) as c:
-                    c.post(progress_url, headers=headers,
-                           json={"status": status, "step": step, "error": error})
+                    c.post(progress_url, headers=headers, json=body)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1102,16 +1133,36 @@ class ProxmoxAgent:
                 except Exception as e:  # noqa: BLE001 — one failure shouldn't abort the refresh
                     logger.warning("REFRESH_TEMPLATE: destroy VM %s failed: %s", v, e)
 
-            # 2. Download the backup archive from the hub.
-            _report("downloading", "pulling backup from the hub")
+            # 2. Download the backup archive from the hub. Reports progress every
+            # ~256 MB so the hub/UI can show bytes transferred (not a static
+            # 'downloading'); a 300s read timeout in the downloader aborts a stalled
+            # WAN stream instead of hanging forever.
+            host = getattr(self, "hostname", "") or ""
+            _report("downloading", f"{host}: pulling backup from the hub")
             archive = os.path.join(tmpdir, "template.vma.zst")
-            await asyncio.to_thread(self._download_refresh_archive, url, token, archive)
+
+            def _on_prog(done, total):
+                mb = done // (1024 * 1024)
+                if total:
+                    _report("downloading", f"{host}: {mb} / {total // (1024 * 1024)} MB",
+                            bytes_done=done, total=total)
+                else:
+                    _report("downloading", f"{host}: {mb} MB", bytes_done=done)
+
+            total = await asyncio.to_thread(
+                self._download_refresh_archive, url, token, archive, _on_prog)
             if not os.path.isfile(archive) or os.path.getsize(archive) == 0:
                 raise RuntimeError("downloaded archive is empty")
+            # Verify the full transfer when the hub reported a Content-Length — a
+            # truncated archive would make qmrestore fail with a confusing error.
+            if total:
+                got = os.path.getsize(archive)
+                if got != total:
+                    raise RuntimeError(f"download truncated: got {got} of {total} bytes")
 
-            # 3. Restore to the ORIGINAL template VMID (--force overwrites the old
+            # 3. Restore to the target template VMID (--force overwrites the old
             # template) and re-mark it a template so clones/auto-prov are unchanged.
-            _report("restoring", f"qmrestore → VM {template_vmid}")
+            _report("restoring", f"{host}: qmrestore → VM {template_vmid}")
             qmrestore = shutil.which("qmrestore") or "/usr/sbin/qmrestore"
             proc = await asyncio.create_subprocess_exec(
                 qmrestore, archive, str(template_vmid), "--force",
