@@ -1021,6 +1021,8 @@ class ProxmoxAgent:
         if not tid or vmid is None or not url or not token:
             return {"status": "ERROR",
                     "message": "REFRESH_TEMPLATE requires template_id, template_vmid, download_url, refresh_token"}
+        logger.info("REFRESH_TEMPLATE accepted (template_id=%s template_vmid=%s) — "
+                    "wiping this host's sim VMs + restoring in the background", tid, vmid)
         asyncio.create_task(self._do_template_refresh(dict(data)))
         return {"status": "ACCEPTED",
                 "message": f"Refreshing template {vmid} — auto-provisioning paused"}
