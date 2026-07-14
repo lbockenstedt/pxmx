@@ -162,6 +162,12 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
         return {"ok": True, "orphaned": False, "bus": bus, "kind": kind,
                 "already_gone": True}
     await _expire_pending_commands(agent, vid, kind)
+    # Surface a 🔴 deleting telemetry frame for this VM the moment we begin
+    # tearing it down — every destroy path (admin delete_vm, reclone, the
+    # missing-dongle shed gate) funnels through here, so one stamp covers them
+    # all. Without it a manual mass-delete kept the VMs showing "running" until
+    # the next ~15s telemetry tick dropped them from the list.
+    usb_provision.mark_deleting(vid)
     if kind == "lxc":
         await pve_cmds.pct_stop(vid, prot)
         ok, reason = await pve_cmds.pct_destroy(vid, prot)

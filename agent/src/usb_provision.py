@@ -667,6 +667,20 @@ def current_deleting_vmids() -> List[int]:
     return sorted(_deleting.keys())
 
 
+def mark_deleting(vmid: int) -> None:
+    """Mark/refresh a VMID as currently being torn down. Called from
+    ``cs_sim.destroy_vm`` (the shared choke point for the manual ``delete_vm``
+    long-op, the reclone flow, and the missing-dongle shed gate) so EVERY
+    destroy surfaces a 🔴 deleting telemetry frame — without this an operator's
+    mass delete showed the VMs as "running" until qm actually destroyed them
+    and the next ~15s telemetry tick dropped them from the list. The shed gate
+    also stamps directly, but that's harmless (same vmid, refreshes the ts)."""
+    try:
+        _deleting[int(vmid)] = time.time()
+    except (TypeError, ValueError):
+        pass
+
+
 def mark_recloning(vmid: int) -> None:
     """Mark/refresh a VMID as currently recloning (called at each reclone phase
     so the "Recloning" badge stays live for the minutes a reclone takes)."""
