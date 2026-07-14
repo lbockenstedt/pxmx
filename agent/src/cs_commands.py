@@ -21,6 +21,7 @@ come back as ``{status: ERROR, message: ...}`` so the hub can ACK them.
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Any, Dict, Set
 
@@ -30,6 +31,14 @@ from .cs_guard import GuardError, resolve_protected_vmids
 from .pve_cmds import PveError
 
 logger = logging.getLogger("PxmxAgent")
+
+# How long a long-op's cs_cmd_id is remembered for dedup. The hub re-queues +
+# re-delivers a command it hasn't seen a terminal ACK for (e.g. the ACCEPTED
+# reply got stuck behind a congested WS under CPU pressure). Without dedup the
+# agent spawns a SECOND destroy/reclone task for the same id — duplicate heavy
+# work that deepens the overload that caused the re-queue in the first place.
+# Long enough to cover several re-queue cycles; pruned so it can't grow.
+_CS_CMD_DEDUP_TTL_S = 600.0
 
 
 def _protected(agent) -> Set[int]:
@@ -65,12 +74,28 @@ async def handle_cs_command(agent, action: str,
     # ── Long ops: spawn + accept immediately (Phase E) ───────────────────────
     if action in cs_sim.LONG_ACTIONS:
         cs_cmd_id = data.get("cs_cmd_id") or str(uuid.uuid4())
+        # Idempotency: the hub re-delivers a long op it hasn't seen an ACK for
+        # (congested WS under load). Re-ACK a cs_cmd_id we already accepted rather
+        # than spawning a DUPLICATE destroy/reclone task for it.
+        seen = getattr(agent, "_cs_seen_cmds", None)
+        if seen is None:
+            seen = agent._cs_seen_cmds = {}
+        now = time.monotonic()
+        for _k in [k for k, (_ts, _r) in seen.items() if now - _ts > _CS_CMD_DEDUP_TTL_S]:
+            seen.pop(_k, None)
+        prior = seen.get(cs_cmd_id)
+        if prior is not None:
+            logger.info("CS_COMMAND %s DUPLICATE (cs_cmd_id=%s) — re-acking, not "
+                        "re-spawning", action, cs_cmd_id)
+            return prior[1]
         task = asyncio.create_task(cs_sim.run_long_op(agent, action, data, cs_cmd_id))
         agent._cs_long_ops.add(task)
         task.add_done_callback(agent._cs_long_ops.discard)
         logger.info(f"CS_COMMAND {action} accepted (cs_cmd_id={cs_cmd_id})")
-        return {"status": "ACCEPTED", "message": f"{action} accepted",
+        resp = {"status": "ACCEPTED", "message": f"{action} accepted",
                 "cs_cmd_id": cs_cmd_id, "action": action}
+        seen[cs_cmd_id] = (now, resp)
+        return resp
 
     # ── Fast op: stop a running fleet reclone. Must be handled here (not via
     # run_long_op) so it isn't blocked behind the batch holding _LONG_OP_SEM.
