@@ -208,16 +208,21 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
     elif act == "stop":
         await _run([bin_, "stop", str(vid)])
     elif act in ("reboot", "restart"):
-        # FIRE-AND-FORGET: `qm/pct reboot` does a GRACEFUL (ACPI) shutdown+start
-        # and BLOCKS until the guest shuts down — which routinely exceeds the
-        # command timeout, so a blocking _run would be KILLED mid-reboot, leaving
-        # the VM half-stopped / "not rebooted". Spawn it detached so Proxmox runs
-        # the reboot task to completion on the node; return promptly. (Same
-        # pattern as the backup action.) Completion surfaces in the node task log.
+        # RELIABLE reboot. `qm/pct reboot` is a GRACEFUL ACPI shutdown+start: it
+        # needs the guest to honor ACPI, silently no-ops on a guest that doesn't
+        # (no qemu-guest-agent / ACPI daemon), and BLOCKS long enough to be killed
+        # mid-flight by the command timeout — which is why "reboot delivered but
+        # nothing happened". Instead:
+        #   * QEMU → `qm reset` — an immediate HARDWARE reset (the reset button):
+        #     always reboots a RUNNING VM, no guest cooperation. Not a clean
+        #     shutdown, but it actually reboots.
+        #   * LXC  → `pct reboot` — containers reboot cleanly + fast.
+        # Fire-and-forget (detached) so a slow op is never killed mid-flight.
+        reboot_argv = [bin_, "reset", str(vid)] if k == "qemu" else [bin_, "reboot", str(vid)]
         await asyncio.create_subprocess_exec(
-            bin_, "reboot", str(vid),
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        return {"vmid": vid, "action": "reboot", "kind": k, "started": True}
+            *reboot_argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        return {"vmid": vid, "action": "reboot", "kind": k,
+                "method": "reset" if k == "qemu" else "reboot", "started": True}
     elif act == "snapshot":
         snap = snapshot_name or f"auto-{time.strftime('%Y%m%d%H%M')}"
         await _run([bin_, "snapshot", str(vid), snap, "--description", "lm-hub"])
