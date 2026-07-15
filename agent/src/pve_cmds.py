@@ -208,8 +208,16 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
     elif act == "stop":
         await _run([bin_, "stop", str(vid)])
     elif act in ("reboot", "restart"):
-        await _run([bin_, "reboot", str(vid)])
-        act = "reboot"
+        # FIRE-AND-FORGET: `qm/pct reboot` does a GRACEFUL (ACPI) shutdown+start
+        # and BLOCKS until the guest shuts down — which routinely exceeds the
+        # command timeout, so a blocking _run would be KILLED mid-reboot, leaving
+        # the VM half-stopped / "not rebooted". Spawn it detached so Proxmox runs
+        # the reboot task to completion on the node; return promptly. (Same
+        # pattern as the backup action.) Completion surfaces in the node task log.
+        await asyncio.create_subprocess_exec(
+            bin_, "reboot", str(vid),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        return {"vmid": vid, "action": "reboot", "kind": k, "started": True}
     elif act == "snapshot":
         snap = snapshot_name or f"auto-{time.strftime('%Y%m%d%H%M')}"
         await _run([bin_, "snapshot", str(vid), snap, "--description", "lm-hub"])
