@@ -2530,6 +2530,33 @@ class ProxmoxAgent:
                         except pve_cmds.PveError as e:
                             result = {"status": "ERROR", "message": str(e)}
 
+                    elif cmd_type == "PXMX_VM_ACTION_BULK":
+                        # ONE message → the SAME action on MANY VMs on this node
+                        # (the Hypervisors bulk start/stop/reboot/snapshot/backup),
+                        # instead of one PXMX_VM_ACTION per VM. Run bounded-
+                        # concurrent; one VM's failure never sinks the rest. Each
+                        # item: {vmid, type?, snapshot_name?, backup?}.
+                        _items = data.get("items") or []
+                        _action = data.get("action")
+                        _sem = asyncio.Semaphore(6)
+
+                        async def _bulk_one(it):
+                            async with _sem:
+                                try:
+                                    r = await pve_cmds.vm_action_any(
+                                        it.get("vmid"), _action, kind=it.get("type"),
+                                        snapshot_name=it.get("snapshot_name"),
+                                        backup_opts=it.get("backup"))
+                                    return {"vmid": it.get("vmid"), "ok": True, **r}
+                                except pve_cmds.PveError as e:
+                                    return {"vmid": it.get("vmid"), "ok": False, "error": str(e)}
+                                except Exception as e:  # noqa: BLE001
+                                    return {"vmid": it.get("vmid"), "ok": False, "error": str(e)}
+
+                        _res = await asyncio.gather(
+                            *[_bulk_one(it) for it in _items if isinstance(it, dict)])
+                        result = {"status": "SUCCESS", "results": list(_res)}
+
                     elif cmd_type == "PXMX_LIST_STORAGE":
                         # Backup-capable storages on this host for the Setup →
                         # Hypervisors dropdown (auto-list-from-host).

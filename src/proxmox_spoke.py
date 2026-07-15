@@ -124,6 +124,13 @@ class ProxmoxSpoke(BaseSpoke):
         if cmd == "PXMX_VM_ACTION":
             return await self._route_vm_cmd("PXMX_VM_ACTION", data, timeout=30.0)
 
+        # Bulk VM lifecycle: ONE action over MANY VMs in a single hub message.
+        # The spoke groups items by owning agent (unique_id → cluster) and sends
+        # ONE PXMX_VM_ACTION_BULK per agent, then merges the per-item results —
+        # so the agent inbox gets one message per node, not one per VM.
+        if cmd == "PXMX_VM_ACTION_BULK":
+            return await self._route_vm_bulk(data, timeout=120.0)
+
         # Clone-from-template: a tenant clones a template-pool VM. Routed to the
         # agent on the template's node via the template unique_id (cluster prefix)
         # — qm/pct clone operates on the local template. Full-disk clones can
@@ -537,6 +544,47 @@ class ProxmoxSpoke(BaseSpoke):
 
         return await self.control_plane.send_to_agent(cmd, data, agent_id=agent_id,
                                                       timeout=timeout)
+
+    async def _route_vm_bulk(self, data: Dict[str, Any],
+                             timeout: float = 120.0) -> Dict[str, Any]:
+        """Group a bulk VM action by owning agent (unique_id → cluster → agent)
+        and send ONE PXMX_VM_ACTION_BULK per agent, then merge the per-item
+        results. One message per node instead of one per VM."""
+        items = [it for it in (data.get("items") or []) if isinstance(it, dict)]
+        action = data.get("action")
+        agents = (self.control_plane.connected_agents if self.control_plane else None) or {}
+        if not agents:
+            return {"status": "ERROR", "message": "No agents connected"}
+        cluster_to_agent = {}
+        for aid, info in agents.items():
+            cn = info.get("cluster_name")
+            if cn and cn not in cluster_to_agent:
+                cluster_to_agent[cn] = aid
+        default_agent = next(iter(agents))
+        groups: Dict[str, list] = {}
+        for it in items:
+            uid = it.get("unique_id", "") or ""
+            aid = it.get("agent_id")
+            if not aid and "/" in uid:
+                aid = cluster_to_agent.get(uid.split("/")[0])
+            groups.setdefault(aid or default_agent, []).append(it)
+
+        merged: list = []
+        for aid, grp in groups.items():
+            try:
+                resp = await self.control_plane.send_to_agent(
+                    "PXMX_VM_ACTION_BULK", {"action": action, "items": grp},
+                    agent_id=aid, timeout=timeout)
+            except Exception as e:  # noqa: BLE001
+                resp = {"status": "ERROR", "message": str(e)}
+            inner = resp.get("payload", {}).get("data", resp) if isinstance(resp, dict) else resp
+            rows = (inner or {}).get("results") if isinstance(inner, dict) else None
+            if rows:
+                merged.extend(rows)
+            else:
+                err = (inner or {}).get("message", "bulk relay failed") if isinstance(inner, dict) else "bulk relay failed"
+                merged.extend({"vmid": it.get("vmid"), "ok": False, "error": err} for it in grp)
+        return {"status": "SUCCESS", "results": merged}
 
     # ── Status / version ──────────────────────────────────────────────────────
 
