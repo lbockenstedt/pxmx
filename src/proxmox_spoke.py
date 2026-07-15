@@ -49,6 +49,9 @@ class ProxmoxSpoke(BaseSpoke):
         # VNC_DISCONNECT from the hub route to the agent that owns the session
         # (recorded when VNC_START passes through). Cleared on VNC_DISCONNECT.
         self.vnc_sessions: Dict[str, str] = {}
+        # Host-shell (xterm terminal): session_id → agent_id (same pattern as
+        # vnc_sessions), so SHELL_IN/RESIZE/DISCONNECT route to the owning agent.
+        self.shell_sessions: Dict[str, str] = {}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Route a Hub command to the right agent or handle spoke-local (GET_VERSION/UPDATE_CONFIG)."""
@@ -272,6 +275,46 @@ class ProxmoxSpoke(BaseSpoke):
             agent_id = self.vnc_sessions.pop(session_id, None)
             if agent_id:
                 await self.control_plane.send_raw_to_agent(agent_id, "VNC_DISCONNECT", data)
+            return {"status": "OK"}
+
+        # Host-shell (xterm terminal) — same routing as VNC. SHELL_START records
+        # session→agent (resolved from agent_id/unique_id); SHELL_IN/RESIZE are
+        # fire-and-forget (high-volume keystrokes must not block the dispatch
+        # loop); the agent emits SHELL_OUT/READY/ERROR/DISCONNECT up via AGENT_RELAY_UP.
+        if cmd == "SHELL_START":
+            session_id = data.get("session_id") or ""
+            agent_id = data.get("agent_id")
+            if not agent_id and session_id:
+                agent_id = self.shell_sessions.get(session_id)
+            if not agent_id:
+                unique_id = data.get("unique_id") or ""
+                if "/" in unique_id and self.control_plane:
+                    cluster = unique_id.split("/")[0]
+                    for aid, info in self.control_plane.connected_agents.items():
+                        if info.get("cluster_name") == cluster:
+                            agent_id = aid
+                            break
+            if not agent_id and self.control_plane and self.control_plane.connected_agents:
+                agent_id = next(iter(self.control_plane.connected_agents))
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for SHELL_START"}
+            if session_id:
+                self.shell_sessions[session_id] = agent_id
+            return await self.control_plane.send_to_agent(
+                "SHELL_START", data, agent_id=agent_id, timeout=20.0)
+
+        if cmd in ("SHELL_IN", "SHELL_RESIZE"):
+            session_id = data.get("session_id") or ""
+            agent_id = self.shell_sessions.get(session_id)
+            if agent_id:
+                await self.control_plane.send_raw_to_agent(agent_id, cmd, data)
+            return {"status": "OK"}
+
+        if cmd == "SHELL_DISCONNECT":
+            session_id = data.get("session_id") or ""
+            agent_id = self.shell_sessions.pop(session_id, None)
+            if agent_id:
+                await self.control_plane.send_raw_to_agent(agent_id, "SHELL_DISCONNECT", data)
             return {"status": "OK"}
 
         if not self.control_plane:

@@ -401,6 +401,9 @@ class ProxmoxAgent:
         # lifetime — its secret is NEVER logged (only its existence).
         self._vnc_sessions: Dict[str, Dict[str, Any]] = {}
         self._console_token: Optional[str] = None
+        # Interactive host-shell (xterm terminal) sessions — {session_id: {master_fd,
+        # proc, tasks}}. A PTY bash on THIS node, relayed to the browser like VNC.
+        self._shell_sessions: Dict[str, Dict[str, Any]] = {}
         # Cached root@pam!cs-hub Proxmox API token (created locally via pvesh,
         # relayed up for the cs spoke's sim-tag sync). Provisioned once + cached
         # for the agent's lifetime, re-emitted on later triggers. See
@@ -1889,6 +1892,120 @@ class ProxmoxAgent:
         if send_disconnect:
             await self.send_vnc_event("VNC_DISCONNECT", {"session_id": session_id})
 
+    # ── Interactive host-shell (xterm terminal) session orchestration ─────────
+    # SHELL_START spawns a PTY `bash` on THIS Proxmox node and relays it to the
+    # browser over the same agent↔spoke WS, exactly like the VNC console (SHELL_OUT
+    # = VNC_FRAME_UP, SHELL_IN = VNC_FRAME_DOWN). Runs as the agent's user (root),
+    # so the hub gates it to Global/Tenant admins + an opt-in toggle + audit.
+    async def send_shell_event(self, event_type: str, data: Dict[str, Any]):
+        """Emit a SHELL_* frame up to the spoke → hub browser WS. Mirrors
+        send_vnc_event; best-effort (a dropped frame must not kill the relay)."""
+        try:
+            msg = {
+                "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
+                           "sender_id": self.agent_id, "destination_id": "pxmx-spoke"},
+                "payload": {"type": event_type, "data": data},
+            }
+            await self.websocket.send(encode_frame(self.signer, msg))
+        except Exception:
+            pass
+
+    async def _start_shell_session(self, session_id: str) -> None:
+        """Spawn a login PTY bash on this node and start the read relay. Raises on
+        failure (the SHELL_START handler surfaces it)."""
+        import pty
+        sess = self._shell_sessions.get(session_id)
+        if not sess:
+            raise RuntimeError(f"no shell session record for {session_id}")
+        master_fd, slave_fd = pty.openpty()
+        env = {**os.environ, "TERM": "xterm-256color"}
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash", "-il", stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            start_new_session=True, env=env)
+        os.close(slave_fd)
+        sess["master_fd"] = master_fd
+        sess["proc"] = proc
+        up_task = asyncio.create_task(self._shell_pty_to_hub(session_id, master_fd))
+        wait_task = asyncio.create_task(self._shell_wait(session_id, proc))
+        sess["tasks"] = [up_task, wait_task]
+        await self.send_shell_event("SHELL_READY", {"session_id": session_id})
+        logger.info("shell session %s ready (pid=%s)", session_id, proc.pid)
+
+    def _blocking_read(self, fd: int) -> bytes:
+        try:
+            return os.read(fd, 65536)
+        except OSError:
+            return b""
+
+    async def _shell_pty_to_hub(self, session_id: str, master_fd: int) -> None:
+        """Relay PTY→browser bytes (blocking os.read in an executor so the loop
+        stays responsive). EOF / read error → tear the session down."""
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                data = await loop.run_in_executor(None, self._blocking_read, master_fd)
+                if not data:
+                    break
+                await self.send_shell_event(
+                    "SHELL_OUT", {"session_id": session_id,
+                                  "data": base64.b64encode(data).decode()})
+        except Exception:
+            pass
+        finally:
+            await self._shell_teardown(session_id, send_disconnect=True)
+
+    async def _shell_wait(self, session_id: str, proc) -> None:
+        """When bash exits (user typed `exit`), tear the session down."""
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        finally:
+            await self._shell_teardown(session_id, send_disconnect=True)
+
+    def _shell_write(self, session_id: str, data: bytes) -> None:
+        sess = self._shell_sessions.get(session_id)
+        fd = sess.get("master_fd") if sess else None
+        if fd is not None:
+            try:
+                os.write(fd, data)
+            except OSError:
+                pass
+
+    def _shell_resize(self, session_id: str, rows: int, cols: int) -> None:
+        import fcntl as _fcntl, termios as _termios, struct as _struct
+        sess = self._shell_sessions.get(session_id)
+        fd = sess.get("master_fd") if sess else None
+        if fd is not None:
+            try:
+                _fcntl.ioctl(fd, _termios.TIOCSWINSZ,
+                             _struct.pack("HHHH", int(rows) or 24, int(cols) or 80, 0, 0))
+            except OSError:
+                pass
+
+    async def _shell_teardown(self, session_id: str, send_disconnect: bool) -> None:
+        """Kill the bash proc, cancel the relay tasks, drop the session."""
+        sess = self._shell_sessions.pop(session_id, None)
+        if not sess:
+            return
+        for task in sess.get("tasks", []):
+            if not task.done():
+                task.cancel()
+        proc = sess.get("proc")
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        fd = sess.get("master_fd")
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if send_disconnect:
+            await self.send_shell_event("SHELL_DISCONNECT", {"session_id": session_id})
+
     # ── Self-update ───────────────────────────────────────────────────────────
 
     def _git_behind_count(self, repo_dir: str) -> int:
@@ -2853,6 +2970,50 @@ class ProxmoxAgent:
                         if session_id:
                             asyncio.create_task(
                                 self._vnc_teardown(session_id, send_disconnect=False))
+                        result = {"status": "OK", "session_id": session_id}
+
+                    elif cmd_type == "SHELL_START":
+                        # Hub→spoke→agent: open a PTY bash on THIS node and relay
+                        # it to the browser (agent-terminates-PTY, mirrors VNC).
+                        # Gated hub-side (admin + opt-in toggle + audit).
+                        session_id = data.get("session_id") or ""
+                        if session_id and session_id not in self._shell_sessions:
+                            self._shell_sessions[session_id] = {"master_fd": None, "tasks": []}
+                            try:
+                                await self._start_shell_session(session_id)
+                                result = {"status": "SUCCESS", "session_id": session_id}
+                            except Exception as e:
+                                logger.warning("SHELL start %s failed: %s", session_id, e)
+                                await self.send_shell_event("SHELL_ERROR",
+                                    {"session_id": session_id, "error": str(e)[:300]})
+                                self._shell_sessions.pop(session_id, None)
+                                result = {"status": "ERROR", "message": str(e)[:300],
+                                          "session_id": session_id}
+                        else:
+                            result = {"status": "SUCCESS", "session_id": session_id}
+
+                    elif cmd_type == "SHELL_IN":
+                        # Browser→PTY keystrokes. No ack (high-volume) — write to
+                        # the PTY and `continue` past the AGENT_RESPONSE send.
+                        session_id = data.get("session_id") or ""
+                        if session_id:
+                            try:
+                                self._shell_write(session_id, base64.b64decode(data.get("data") or ""))
+                            except Exception:
+                                pass
+                        continue
+
+                    elif cmd_type == "SHELL_RESIZE":
+                        session_id = data.get("session_id") or ""
+                        if session_id:
+                            self._shell_resize(session_id, data.get("rows", 24), data.get("cols", 80))
+                        continue
+
+                    elif cmd_type == "SHELL_DISCONNECT":
+                        session_id = data.get("session_id") or ""
+                        if session_id:
+                            asyncio.create_task(
+                                self._shell_teardown(session_id, send_disconnect=False))
                         result = {"status": "OK", "session_id": session_id}
 
                     elif cmd_type == "INSTALL_CERT":
