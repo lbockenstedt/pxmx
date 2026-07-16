@@ -74,27 +74,44 @@ async def handle_cs_command(agent, action: str,
     # ── Long ops: spawn + accept immediately (Phase E) ───────────────────────
     if action in cs_sim.LONG_ACTIONS:
         cs_cmd_id = data.get("cs_cmd_id") or str(uuid.uuid4())
-        # Idempotency: the hub re-delivers a long op it hasn't seen an ACK for
-        # (congested WS under load). Re-ACK a cs_cmd_id we already accepted rather
-        # than spawning a DUPLICATE destroy/reclone task for it.
+        # Idempotency + liveness: the hub re-delivers a long op it hasn't seen a
+        # terminal result for (congested WS, agent restart, or the cs spoke's
+        # verify-timeout requeue). Each seen entry is {ts, accept, task, terminal}:
+        #   - task alive  → re-ACK ACCEPTED (don't double-run a running op).
+        #   - task done + terminal recorded → return the terminal so the bridge
+        #     acks completed/failed instead of dropping the re-deliver.
+        #   - task done + NO terminal (task died without emitting CS_COMMAND_RESULT)
+        #     → RE-SPAWN. This is what makes a requeued delete actually re-run
+        #     instead of dedup-suppressing forever (the old "VM never deleted"
+        #     symptom when the agent lost the long op).
         seen = getattr(agent, "_cs_seen_cmds", None)
         if seen is None:
             seen = agent._cs_seen_cmds = {}
         now = time.monotonic()
-        for _k in [k for k, (_ts, _r) in seen.items() if now - _ts > _CS_CMD_DEDUP_TTL_S]:
+        for _k in [k for k, v in seen.items() if now - v.get("ts", 0) > _CS_CMD_DEDUP_TTL_S]:
             seen.pop(_k, None)
         prior = seen.get(cs_cmd_id)
         if prior is not None:
-            logger.info("CS_COMMAND %s DUPLICATE (cs_cmd_id=%s) — re-acking, not "
-                        "re-spawning", action, cs_cmd_id)
-            return prior[1]
+            task = prior.get("task")
+            terminal = prior.get("terminal")
+            if task is not None and not task.done():
+                logger.info("CS_COMMAND %s DUPLICATE (cs_cmd_id=%s) — re-acking, "
+                            "task still running", action, cs_cmd_id)
+                return prior["accept"]
+            if terminal is not None:
+                logger.info("CS_COMMAND %s DUPLICATE (cs_cmd_id=%s) — re-acking "
+                            "terminal %s", action, cs_cmd_id, terminal.get("status"))
+                return terminal
+            # Task died with no terminal → re-spawn (real retry).
+            logger.warning("CS_COMMAND %s RE-SPAWN (cs_cmd_id=%s) — prior task "
+                           "ended with no terminal", action, cs_cmd_id)
         task = asyncio.create_task(cs_sim.run_long_op(agent, action, data, cs_cmd_id))
         agent._cs_long_ops.add(task)
         task.add_done_callback(agent._cs_long_ops.discard)
         logger.info(f"CS_COMMAND {action} accepted (cs_cmd_id={cs_cmd_id})")
         resp = {"status": "ACCEPTED", "message": f"{action} accepted",
                 "cs_cmd_id": cs_cmd_id, "action": action}
-        seen[cs_cmd_id] = (now, resp)
+        seen[cs_cmd_id] = {"ts": now, "accept": resp, "task": task, "terminal": None}
         return resp
 
     # ── Fast op: stop a running fleet reclone. Must be handled here (not via

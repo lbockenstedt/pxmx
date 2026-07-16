@@ -52,6 +52,23 @@ def _usb_cfg(agent) -> Dict[str, Any]:
     return (agent.config.get("client_simulation") or {}).get("usb_config") or {}
 
 
+def _vm_lock(agent, vmid: int) -> "asyncio.Lock":
+    """Per-vmid lock so a re-spawned delete/reclone (the liveness-aware dedup
+    retry in cs_commands) can't race a not-yet-reaped prior run on the same
+    vmid. destroy_vm is already idempotent (already_gone → completed), so this
+    is defense-in-depth against two concurrent teardowns of a present VM."""
+    locks = getattr(agent, "_cs_vm_locks", None)
+    if locks is None:
+        locks = agent._cs_vm_locks = {}
+    # Reuse the same lock object for the life of the agent; entries are small
+    # (one per sim vmid) and pruned on agent restart.
+    lock = locks.get(vmid)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[vmid] = lock
+    return lock
+
+
 # ── progress / terminal event helpers ──────────────────────────────────────
 
 
@@ -85,6 +102,15 @@ async def _terminal(agent, cs_cmd_id: str, action: str, status: str,
     # instead of waiting for the TTL backstop to expire.
     if action == "reclone_vm" and extra.get("vmid") is not None:
         usb_provision.clear_recloning(extra["vmid"])
+    # Record the terminal on the dedup entry so a re-deliver of this cs_cmd_id
+    # re-acks the terminal (not a stale ACCEPTED) and the bridge closes the
+    # command. See cs_commands.handle_cs_command liveness-aware dedup.
+    seen = getattr(agent, "_cs_seen_cmds", None)
+    if seen is not None and cs_cmd_id in seen:
+        seen[cs_cmd_id]["terminal"] = {
+            "status": "SUCCESS" if status == "completed" else "ERROR",
+            "message": message, "cs_cmd_id": cs_cmd_id, "action": action,
+        }
     await agent.send_cs_event("CS_COMMAND_RESULT", data)
 
 
@@ -200,13 +226,14 @@ async def _delete_vm(agent, data, cs_cmd_id) -> None:
     vmid = data.get("vmid") or data.get("vm_id")
     prot = _protected(agent)
     vid = assert_sim_vm(vmid, prot)  # raises → run_long_op emits terminal failed
-    await _progress(agent, cs_cmd_id, "delete_vm", "running", "stopping", 10, vmid=vid)
-    # Admin delete bus-excludes the dongle (anti-churn: don't immediately
-    # re-provision a just-deleted dongle). The exclusion is TIME-LIMITED — the
-    # provision loop auto-returns the bus after usb_exclude_cooldown (default
-    # 900s / 15 min); see usb_provision.exclude_bus + the reconcile cooldown
-    # clear. Previously the exclusion was PERMANENT (stranded the dongle forever).
-    r = await destroy_vm(agent, vid, protected=prot, exclude_bus_after=True)
+    async with _vm_lock(agent, vid):
+        await _progress(agent, cs_cmd_id, "delete_vm", "running", "stopping", 10, vmid=vid)
+        # Admin delete bus-excludes the dongle (anti-churn: don't immediately
+        # re-provision a just-deleted dongle). The exclusion is TIME-LIMITED — the
+        # provision loop auto-returns the bus after usb_exclude_cooldown (default
+        # 900s / 15 min); see usb_provision.exclude_bus + the reconcile cooldown
+        # clear. Previously the exclusion was PERMANENT (stranded the dongle forever).
+        r = await destroy_vm(agent, vid, protected=prot, exclude_bus_after=True)
     if r["ok"]:
         await _terminal(agent, cs_cmd_id, "delete_vm", "completed",
                         f"VM {vid} destroyed", vmid=vid, kind=r["kind"])
@@ -223,8 +250,9 @@ async def _reclone_vm(agent, data, cs_cmd_id) -> None:
     source_vmid = data.get("source_vmid") or data.get("template_id")
     prot = _protected(agent)
     vid = assert_sim_vm(vmid, prot)
-    r = await _reclone_vm_core(agent, vid, source_vmid, prot=prot,
-                                cs_cmd_id=cs_cmd_id, name=data.get("name") or "")
+    async with _vm_lock(agent, vid):
+        r = await _reclone_vm_core(agent, vid, source_vmid, prot=prot,
+                                    cs_cmd_id=cs_cmd_id, name=data.get("name") or "")
     if not r["ok"]:
         await _terminal(agent, cs_cmd_id, "reclone_vm", "failed",
                         r.get("error") or f"reclone VM {vid} failed", vmid=vid)
