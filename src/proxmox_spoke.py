@@ -17,6 +17,12 @@ try:
 except ImportError:
     from core.src.base_spoke import BaseSpoke
 
+# Spoke-side Proxmox command builder (#4): the spoke constructs pvesh/qm/pct
+# command strings and sends them to the dumb Agent as RUN_COMMAND; the Agent just
+# executes them. Migrated families live in pve_cmd_builder (one family per
+# commit). The Agent's old typed handlers stay as a rollback fallback.
+import pve_cmd_builder  # noqa: E402
+
 logger = logging.getLogger("ProxmoxSpoke")
 
 
@@ -167,6 +173,13 @@ class ProxmoxSpoke(BaseSpoke):
         # Proxmox resource pool list for the clone/create-VM UI's pool dropdown.
         # Aggregated across every connected agent (each reports its cluster's
         # pools). 15s window — /pools is a fast local pvesh read.
+        #
+        # #4 migration: the spoke builds `pvesh get /pools` and sends it as
+        # RUN_COMMAND; the dumb Agent just runs it + returns stdout. The spoke
+        # parses the JSON (parse_pools) and adds the cluster field. The Agent's
+        # old typed PXMX_LIST_POOLS handler stays as a rollback fallback (a
+        # rolled-back spoke still uses the typed path; RUN_COMMAND is a generic
+        # primitive present on every agent, so a new spoke works against any).
         if cmd == "PXMX_LIST_POOLS":
             pools: list = []
             if self.control_plane:
@@ -174,9 +187,11 @@ class ProxmoxSpoke(BaseSpoke):
                     cluster = info.get("cluster_name", aid)
                     try:
                         r = await self.control_plane.send_to_agent(
-                            "PXMX_LIST_POOLS", data, agent_id=aid, timeout=15.0)
-                        r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
-                        for p in (r or {}).get("pools", []) if isinstance(r, dict) else []:
+                            "RUN_COMMAND",
+                            {"command": pve_cmd_builder.list_pools_cmd(),
+                             "allow_shell": True, "timeout": 12},
+                            agent_id=aid, timeout=15.0)
+                        for p in pve_cmd_builder.parse_pools(r):
                             pools.append({"poolid": p.get("poolid"),
                                           "comment": p.get("comment", ""),
                                           "cluster": cluster})
