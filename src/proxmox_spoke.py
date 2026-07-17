@@ -70,6 +70,29 @@ class ProxmoxSpoke(BaseSpoke):
                 return {"status": "SUCCESS", "results": results}
             return {"status": "SUCCESS", "message": "Config updated (no agents connected)"}
 
+        if cmd == "PXMX_RETAG_TENANT":
+            # Cross-tenant migration: re-tag VMs carrying old_tag -> new_tag on
+            # every managed node. Broadcast to all agents (returns a LIST of
+            # {agent_id, **res}); unwrap each agent's result + aggregate counts.
+            if not self.control_plane:
+                return {"status": "ERROR", "message": "no control plane / agents connected"}
+            results = await self.control_plane.broadcast_to_agents("PXMX_RETAG_TENANT", data)
+
+            def _agent_result(item):
+                if not isinstance(item, dict):
+                    return {}
+                p = item.get("payload")
+                if isinstance(p, dict) and isinstance(p.get("data"), dict):
+                    return p["data"]
+                return item
+
+            unwrapped = [_agent_result(r) for r in (results or [])]
+            total = sum(int(u.get("count", 0) or 0) for u in unwrapped)
+            any_err = any(u.get("status") not in ("SUCCESS", None) for u in unwrapped)
+            return {"status": "PARTIAL" if any_err else "SUCCESS",
+                    "retagged": total, "results": results,
+                    "message": f"re-tagged {total} VM(s) across {len(unwrapped)} node(s)"}
+
         if cmd == "SET_AGENT_CONFIG":
             agent_id = data.get("agent_id")
             cfg = data.get("config", {})

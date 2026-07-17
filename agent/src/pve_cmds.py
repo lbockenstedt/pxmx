@@ -334,6 +334,50 @@ async def set_tags_any(vmid: Any, kind: str, tags: List[str]) -> None:
     await _run([bin_, "set", str(vid), "--tags", joined], timeout=30)
 
 
+async def retag_tenant(old_tag: str, new_tag: str) -> Dict[str, Any]:
+    """Re-tag every VM/CT on this host that carries ``old_tag`` so it carries
+    ``new_tag`` instead — used by cross-tenant migration when a tenant's
+    ``proxmox_tag`` changes. Reads ``/cluster/resources`` for each VM's current
+    tags, swaps the tag (dedup, preserving the VM's other tags), and writes it
+    back via :func:`set_tags_any`. VMs without ``old_tag`` are skipped; a no-op
+    or empty tag pair is a no-op. Returns the changed VMs + any per-VM errors."""
+    old_tag = (old_tag or "").strip()
+    new_tag = (new_tag or "").strip()
+    if not old_tag or not new_tag or old_tag == new_tag:
+        return {"status": "SUCCESS", "retagged": [], "count": 0,
+                "message": "no tag change requested"}
+    rc, out, err = await _run(
+        ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
+        check=False, timeout=30)
+    if rc != 0:
+        return {"status": "ERROR",
+                "message": f"cluster/resources failed: {err.decode('utf-8', 'replace')[:200]}"}
+    try:
+        resources = json.loads(out.decode("utf-8", "replace") or "[]")
+    except Exception as e:  # noqa: BLE001
+        return {"status": "ERROR", "message": f"parse failed: {e}"}
+    changed: List[Dict[str, Any]] = []
+    errors: Dict[str, str] = {}
+    for r in resources:
+        tags = [t for t in str(r.get("tags", "")).split(";") if t.strip()]
+        if old_tag not in tags:
+            continue
+        vmid = r.get("vmid")
+        kind = "lxc" if r.get("type") == "lxc" else "qemu"
+        new_tags = [t for t in tags if t != old_tag]
+        if new_tag not in new_tags:
+            new_tags.append(new_tag)
+        try:
+            await set_tags_any(vmid, kind, new_tags)
+            changed.append({"vmid": vmid, "kind": kind, "tags": new_tags})
+        except Exception as e:  # noqa: BLE001 - one VM must not abort the sweep
+            errors[str(vmid)] = str(e)
+    status = "SUCCESS" if not errors else "PARTIAL"
+    return {"status": status, "retagged": changed, "count": len(changed), "errors": errors,
+            "message": (f"re-tagged {len(changed)} VM(s) {old_tag!r}→{new_tag!r}"
+                        + (f", {len(errors)} error(s)" if errors else ""))}
+
+
 # ── Batch commands (guarded filter, never unfiltered qm list) ───────────────
 
 async def list_qemu_vmids() -> List[int]:
