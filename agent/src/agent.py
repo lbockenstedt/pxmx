@@ -381,6 +381,13 @@ class ProxmoxAgent:
         self._cluster_resources_ts: float = 0.0
         self._cluster_resources_ttl: float = 5.0
 
+        # Prime psutil's non-blocking CPU sampler. cpu_percent(interval=None)
+        # measures since the PREVIOUS call, so the first post-prime reading in
+        # collect_metrics reflects usage since this prime (startup→first tick).
+        # This lets collect_metrics use interval=None instead of interval=1,
+        # which BLOCKED the whole agent event loop for 1s per telemetry tick.
+        psutil.cpu_percent(interval=None)
+
         # ── Client Simulation mode (unified agent) ──────────────────────────────
         # When self.config["client_simulation"]["enabled"] is true, the agent
         # activates the cs feature set (USB provisioning, watchdogs, reseed, etc.)
@@ -1207,9 +1214,11 @@ class ProxmoxAgent:
         return self.hostname
 
     async def collect_metrics(self) -> Dict[str, Any]:
-        """Agent host OS metrics."""
+        """Agent host OS metrics. cpu_percent uses interval=None (non-blocking,
+        since-last-call) — primed once in __init__; interval=1 stalled the event
+        loop 1s per telemetry tick."""
         return {
-            "cpu_usage":    psutil.cpu_percent(interval=1),
+            "cpu_usage":    psutil.cpu_percent(interval=None),
             "memory_usage": psutil.virtual_memory().percent,
             "disk_usage":   psutil.disk_usage('/').percent,
             "timestamp":    time.time(),
