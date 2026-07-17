@@ -174,18 +174,26 @@ async def compute_vm_tiers(agent, vms) -> Dict[str, str]:
     usb_vmids = {str(v) for v in (st.get("bus_to_vmid") or {}).values()
                  if str(v).lstrip("-").isdigit()}
     tiers: Dict[str, str] = {}
-    for v in (vms or []):
+    # Per-VM PCI resolution runs in PARALLEL under a Semaphore(4) (was serial —
+    # qm config per VM stacked linearly each cache refresh). kind comes from
+    # v["type"] (already known from the VM list) so pci_passthrough_vidpids
+    # skips its detect_guest_type probe, and the addr→vidpid lspci lookups are
+    # memoized module-level in pve_cmds (PCI topology is static while running).
+    sem = asyncio.Semaphore(4)
+
+    async def _classify(v) -> None:
         vid = v.get("vmid") if isinstance(v, dict) else v
         if vid in (None, ""):
-            continue
+            return
         svid = str(vid)
         tier = None
         if (t1_set or t3_set) and not (isinstance(v, dict) and v.get("is_template")):
-            try:
-                pci = await pve_cmds.pci_passthrough_vidpids(
-                    vid, v.get("type") if isinstance(v, dict) else None)
-            except Exception:  # noqa: BLE001
-                pci = set()
+            async with sem:
+                try:
+                    pci = await pve_cmds.pci_passthrough_vidpids(
+                        vid, v.get("type") if isinstance(v, dict) else None)
+                except Exception:  # noqa: BLE001
+                    pci = set()
             if pci & t3_set:
                 tier = "t3"
             elif pci & t1_set:
@@ -194,6 +202,8 @@ async def compute_vm_tiers(agent, vms) -> Dict[str, str]:
             tier = "t2"
         if tier:
             tiers[svid] = tier
+
+    await asyncio.gather(*[_classify(v) for v in (vms or [])])
     _vm_tier_cache.update({"ts": now, "tiers": tiers})
     return dict(tiers)
 

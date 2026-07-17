@@ -9,6 +9,7 @@ connect/auth/dispatch loop. Audience: pxmx developers; see the repo
 the canonical VM identity key.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -143,22 +144,31 @@ class ProxmoxSpoke(BaseSpoke):
 
         # Proxmox resource pool list for the clone/create-VM UI's pool dropdown.
         # Aggregated across every connected agent (each reports its cluster's
-        # pools). 15s window — /pools is a fast local pvesh read.
+        # pools). 15s window per agent — all agents queried in PARALLEL
+        # (asyncio.gather) so total wall time is ~one agent's, not N×15s.
         if cmd == "PXMX_LIST_POOLS":
             pools: list = []
             if self.control_plane:
-                for aid, info in (self.control_plane.connected_agents or {}).items():
+                agent_items = list((self.control_plane.connected_agents or {}).items())
+
+                async def _pools_one(aid, info):
                     cluster = info.get("cluster_name", aid)
+                    out: list = []
                     try:
                         r = await self.control_plane.send_to_agent(
                             "PXMX_LIST_POOLS", data, agent_id=aid, timeout=15.0)
                         r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
                         for p in (r or {}).get("pools", []) if isinstance(r, dict) else []:
-                            pools.append({"poolid": p.get("poolid"),
-                                          "comment": p.get("comment", ""),
-                                          "cluster": cluster})
+                            out.append({"poolid": p.get("poolid"),
+                                        "comment": p.get("comment", ""),
+                                        "cluster": cluster})
                     except Exception as e:
                         logger.debug("list_pools agent %s failed: %s", aid, e)
+                    return out
+
+                for chunk in await asyncio.gather(
+                        *[_pools_one(aid, info) for aid, info in agent_items]):
+                    pools.extend(chunk)
             return {"status": "SUCCESS", "pools": pools}
 
         # ISO + storage listing for the create-VM-from-ISO flow. Scoped to a
@@ -612,8 +622,10 @@ class ProxmoxSpoke(BaseSpoke):
                 aid = cluster_to_agent.get(uid.split("/")[0])
             groups.setdefault(aid or default_agent, []).append(it)
 
-        merged: list = []
-        for aid, grp in groups.items():
+        # All per-agent bulk sends run in PARALLEL (each keeps its own timeout);
+        # per-group results are merged in a stable order afterwards. One slow
+        # node no longer serializes the whole fleet's bulk action.
+        async def _bulk_one(aid, grp) -> list:
             try:
                 resp = await self.control_plane.send_to_agent(
                     "PXMX_VM_ACTION_BULK", {"action": action, "items": grp},
@@ -623,10 +635,14 @@ class ProxmoxSpoke(BaseSpoke):
             inner = resp.get("payload", {}).get("data", resp) if isinstance(resp, dict) else resp
             rows = (inner or {}).get("results") if isinstance(inner, dict) else None
             if rows:
-                merged.extend(rows)
-            else:
-                err = (inner or {}).get("message", "bulk relay failed") if isinstance(inner, dict) else "bulk relay failed"
-                merged.extend({"vmid": it.get("vmid"), "ok": False, "error": err} for it in grp)
+                return list(rows)
+            err = (inner or {}).get("message", "bulk relay failed") if isinstance(inner, dict) else "bulk relay failed"
+            return [{"vmid": it.get("vmid"), "ok": False, "error": err} for it in grp]
+
+        merged: list = []
+        for rows in await asyncio.gather(
+                *[_bulk_one(aid, grp) for aid, grp in groups.items()]):
+            merged.extend(rows)
         return {"status": "SUCCESS", "results": merged}
 
     # ── Status / version ──────────────────────────────────────────────────────

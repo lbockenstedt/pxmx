@@ -100,6 +100,30 @@ async def is_template(vmid: Any, kind: Optional[str] = None) -> bool:
     return False
 
 
+# Host PCI address → "vvvv:pppp" resolved via `lspci -n`. PCI topology is
+# static while the agent runs, so entries never expire — the cache lives for
+# the process (an agent restart naturally rebuilds it). None = address didn't
+# resolve (also cached, so a bad address isn't re-probed every call).
+_lspci_vidpid_cache: Dict[str, Optional[str]] = {}
+
+
+async def _lspci_vidpid(addr: str) -> Optional[str]:
+    """Resolve a PCI address to its lowercased ``vvvv:pppp`` via ``lspci -n``,
+    memoized module-level (see ``_lspci_vidpid_cache``)."""
+    if addr in _lspci_vidpid_cache:
+        return _lspci_vidpid_cache[addr]
+    vidpid: Optional[str] = None
+    rc, o2, _ = await _run(["lspci", "-n", "-s", addr], check=False, timeout=10)
+    if rc == 0:
+        # e.g. "01:00.0 0280: 168c:0034 (rev 01)" — vendor:device is the
+        # contiguous 4hex:4hex (the class code "0280:" is followed by a space).
+        m = re.search(r"\b([0-9a-f]{4}:[0-9a-f]{4})\b", o2.decode(errors="replace").lower())
+        if m:
+            vidpid = m.group(1)
+    _lspci_vidpid_cache[addr] = vidpid
+    return vidpid
+
+
 async def pci_passthrough_vidpids(vmid: Any, kind: Optional[str] = None) -> Set[str]:
     """Set of PCI-passthrough device VID:PIDs (lowercased ``vvvv:pppp``) attached
     to ``vmid`` via ``hostpciN:`` lines in ``qm config``, each resolved with
@@ -129,35 +153,39 @@ async def pci_passthrough_vidpids(vmid: Any, kind: Optional[str] = None) -> Set[
         addrs.add(tok)
     vidpids: Set[str] = set()
     for addr in addrs:
-        rc2, o2, _ = await _run(["lspci", "-n", "-s", addr], check=False, timeout=10)
-        if rc2 != 0:
-            continue
-        # e.g. "01:00.0 0280: 168c:0034 (rev 01)" — vendor:device is the
-        # contiguous 4hex:4hex (the class code "0280:" is followed by a space).
-        m = re.search(r"\b([0-9a-f]{4}:[0-9a-f]{4})\b", o2.decode(errors="replace").lower())
-        if m:
-            vidpids.add(m.group(1))
+        vidpid = await _lspci_vidpid(addr)  # memoized — PCI topology is static
+        if vidpid:
+            vidpids.add(vidpid)
     return vidpids
 
 
 # ── Single-VM mutating commands (all guarded) ───────────────────────────────
 
-async def start_vm(vmid: Any, protected: Set[int]) -> Dict[str, Any]:
-    """Guarded start of a sim VM (qemu or lxc). Returns ``{vmid, action, kind}``."""
+async def start_vm(vmid: Any, protected: Set[int],
+                   kind: Optional[str] = None) -> Dict[str, Any]:
+    """Guarded start of a sim VM (qemu or lxc). Returns ``{vmid, action, kind}``.
+    ``kind`` ("qemu"/"lxc") skips the detect_guest_type probe when the caller
+    already knows it (e.g. the qemu-only batch path)."""
     vid = assert_sim_vm(vmid, protected)
-    kind = await detect_guest_type(vid)
-    bin_ = "pct" if kind == "lxc" else "qm"
+    k = (kind or "").lower()
+    if k not in ("qemu", "lxc"):
+        k = await detect_guest_type(vid)
+    bin_ = "pct" if k == "lxc" else "qm"
     await _run([bin_, "start", str(vid)])
-    return {"vmid": vid, "action": "start", "kind": kind}
+    return {"vmid": vid, "action": "start", "kind": k}
 
 
-async def stop_vm(vmid: Any, protected: Set[int]) -> Dict[str, Any]:
-    """Guarded stop of a sim VM (qemu or lxc). Returns ``{vmid, action, kind}``."""
+async def stop_vm(vmid: Any, protected: Set[int],
+                  kind: Optional[str] = None) -> Dict[str, Any]:
+    """Guarded stop of a sim VM (qemu or lxc). Returns ``{vmid, action, kind}``.
+    ``kind`` skips the detect_guest_type probe when known (see start_vm)."""
     vid = assert_sim_vm(vmid, protected)
-    kind = await detect_guest_type(vid)
-    bin_ = "pct" if kind == "lxc" else "qm"
+    k = (kind or "").lower()
+    if k not in ("qemu", "lxc"):
+        k = await detect_guest_type(vid)
+    bin_ = "pct" if k == "lxc" else "qm"
     await _run([bin_, "stop", str(vid)])
-    return {"vmid": vid, "action": "stop", "kind": kind}
+    return {"vmid": vid, "action": "stop", "kind": k}
 
 
 async def reboot_vm(vmid: Any, protected: Set[int]) -> Dict[str, Any]:
@@ -170,14 +198,18 @@ async def reboot_vm(vmid: Any, protected: Set[int]) -> Dict[str, Any]:
 
 
 async def snapshot_vm(vmid: Any, protected: Set[int],
-                      name: Optional[str] = None) -> Dict[str, Any]:
-    """Guarded snapshot of a sim VM; auto-names ``auto-<YYYYmmddHHMM>`` if no name given."""
+                      name: Optional[str] = None,
+                      kind: Optional[str] = None) -> Dict[str, Any]:
+    """Guarded snapshot of a sim VM; auto-names ``auto-<YYYYmmddHHMM>`` if no name given.
+    ``kind`` skips the detect_guest_type probe when known (see start_vm)."""
     vid = assert_sim_vm(vmid, protected)
-    kind = await detect_guest_type(vid)
-    bin_ = "pct" if kind == "lxc" else "qm"
+    k = (kind or "").lower()
+    if k not in ("qemu", "lxc"):
+        k = await detect_guest_type(vid)
+    bin_ = "pct" if k == "lxc" else "qm"
     snap = name or f"auto-{time.strftime('%Y%m%d%H%M')}"
     await _run([bin_, "snapshot", str(vid), snap, "--description", "client-sim"])
-    return {"vmid": vid, "action": "snapshot", "snapshot": snap, "kind": kind}
+    return {"vmid": vid, "action": "snapshot", "snapshot": snap, "kind": k}
 
 
 # ── Unguarded single-VM actions (Hypervisors view — ANY vmid) ────────────────
@@ -353,22 +385,35 @@ async def list_qemu_vmids() -> List[int]:
 async def _batch(action: str, protected: Set[int]) -> Dict[str, Any]:
     """Run a single-VM action (start/stop/snapshot) over every sim VM in ``list_qemu_vmids``.
 
-    Non-sim VMIDs are skipped; per-VM failures are logged and don't abort the batch.
-    Returns ``{action, done, skipped}``.
+    Non-sim VMIDs are skipped; per-VM failures are logged and don't abort the
+    batch. VMs run in PARALLEL under a Semaphore(4) (was serial — a fleet of
+    slow ops stacked linearly), and ``kind="qemu"`` is passed explicitly since
+    ``list_qemu_vmids`` only returns qemu guests — skipping the wasted
+    pct-status detect probe per VM. Returns ``{action, done, skipped}``.
     """
     done: List[int] = []
     skipped: List[int] = []
     fn = {"start_vms": start_vm, "stop_vms": stop_vm,
           "snapshot_vms": snapshot_vm}[action]
+    targets: List[int] = []
     for vid in await list_qemu_vmids():
         if not is_sim_vm(vid, protected):
             skipped.append(vid)
-            continue
-        try:
-            await fn(vid, protected)
-            done.append(vid)
-        except (PveError, GuardError) as e:
-            logger.warning(f"{action}: vmid {vid} failed: {e}")
+        else:
+            targets.append(vid)
+
+    sem = asyncio.Semaphore(4)
+
+    async def _one(vid: int) -> None:
+        async with sem:
+            try:
+                await fn(vid, protected, kind="qemu")
+                done.append(vid)
+            except (PveError, GuardError) as e:
+                logger.warning(f"{action}: vmid {vid} failed: {e}")
+
+    await asyncio.gather(*[_one(vid) for vid in targets])
+    done.sort()
     return {"action": action, "done": done, "skipped": skipped}
 
 
