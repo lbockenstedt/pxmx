@@ -437,14 +437,71 @@ class ProxmoxSpoke(BaseSpoke):
 
     # ── Node stats ────────────────────────────────────────────────────────────
 
+    async def _node_stats_from_agent(self, agent_id: str) -> Dict[str, Any]:
+        """GET_NODE_STATS via multi-round-trip RUN_COMMAND (#4).
+
+        Reproduces the Agent's ``get_node_stats`` orchestration on the spoke so
+        the Agent is a dumb executor: primary ``pvesh get /cluster/resources``
+        (type==node) → one first-node ``/status`` for the cluster-wide
+        pveversion; fallback ``pvesh get /nodes`` → per-node ``/status``. The
+        ``cluster`` field is stamped from ``connected_agents`` (the Agent used
+        ``self.cluster_name``). On a total agent failure returns ``{nodes:[],
+        error}`` (the Agent's outer-try shape); a pvesh error alone yields empty
+        nodes (read-only, non-fatal), matching the Agent.
+        """
+        info = (self.control_plane.connected_agents or {}).get(agent_id, {}) \
+            if self.control_plane else {}
+        cluster = info.get("cluster_name", agent_id)
+
+        async def _send(cmd: str, timeout: float = 12.0):
+            return await self.control_plane.send_to_agent(
+                "RUN_COMMAND",
+                {"command": cmd, "allow_shell": True, "timeout": timeout},
+                agent_id=agent_id, timeout=15.0)
+
+        try:
+            # Primary: /cluster/resources filtered to type==node.
+            res = await _send(pve_cmd_builder.cluster_resources_cmd())
+            nodes = pve_cmd_builder.parse_cluster_resource_nodes(res, cluster)
+            if nodes:
+                # Best-effort cluster-wide pveversion from the first node.
+                try:
+                    stat = await _send(pve_cmd_builder.node_status_cmd(nodes[0]["node"]))
+                    pve_ver = pve_cmd_builder.parse_pveversion(stat)
+                    if pve_ver:
+                        for n in nodes:
+                            n["proxmox_version"] = pve_ver
+                except Exception as e:  # node-status trip failure is non-fatal
+                    logger.debug("pxmx GET_NODE_STATS pveversion for %s: %s", agent_id, e)
+                return {"nodes": nodes, "cluster": cluster}
+
+            # Fallback: /nodes listing → per-node /status.
+            res = await _send(pve_cmd_builder.nodes_list_cmd())
+            entries = pve_cmd_builder.parse_nodes_list_entries(res)
+            nodes = []
+            for nrec in entries:
+                try:
+                    stat = await _send(pve_cmd_builder.node_status_cmd(nrec["node"]))
+                    nodes.append(pve_cmd_builder.node_from_status(stat, nrec, cluster))
+                except Exception as e:  # one node's /status failing is non-fatal
+                    logger.debug("pxmx GET_NODE_STATS node %s: %s", nrec.get("node"), e)
+            return {"nodes": nodes, "cluster": cluster}
+        except Exception as e:
+            # send_to_agent raised (agent unreachable) — Agent's total-failure shape.
+            logger.warning("pxmx GET_NODE_STATS agent %s failed: %s", agent_id, e)
+            return {"nodes": [], "error": str(e)}
+
     async def _get_node_stats(self, data: Dict[str, Any]) -> Dict[str, Any]:
         if not self.control_plane:
             return {"status": "ERROR", "error": "Control plane not initialised"}
 
         agent_id = data.get("agent_id")
         if agent_id:
-            result = await self.control_plane.send_to_agent("GET_NODE_STATS", {}, agent_id=agent_id)
-            return result
+            # Multi-round-trip from the spoke (#4): build pvesh commands + send
+            # RUN_COMMAND to the dumb Agent, orchestrating the parse/merge the
+            # Agent's get_node_stats used to do. Returns the Agent's shape
+            # ({nodes, cluster}) verbatim so the hub sees the same contract.
+            return await self._node_stats_from_agent(agent_id)
 
         # Aggregate from all agents via telemetry cache (avoid hammering PVE API)
         all_nodes: List[Dict] = []
@@ -454,10 +511,12 @@ class ProxmoxSpoke(BaseSpoke):
                 all_nodes.append({**node, "agent_id": aid, "cluster": cluster})
 
         if not all_nodes:
-            # Telemetry not yet received — ask agents directly
-            results = await self.control_plane.broadcast_to_agents("GET_NODE_STATS", {})
-            for res in results:
-                aid = res.get("agent_id", "")
+            # Telemetry not yet received — orchestrate per-agent RUN_COMMAND
+            # round-trips (same helper as the pinned path) instead of the typed
+            # GET_NODE_STATS the Agent used to answer. Best-effort per agent; an
+            # agent that fails (unreachable/pvesh error) contributes no nodes.
+            for aid in list(self.control_plane.connected_agents or {}):
+                res = await self._node_stats_from_agent(aid)
                 for node in res.get("nodes", []):
                     all_nodes.append({**node, "agent_id": aid})
 

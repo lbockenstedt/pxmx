@@ -189,3 +189,116 @@ def parse_iso_items(run_response: Any, storage: str) -> List[Dict[str, Any]]:
             "size":    it.get("size", 0) or 0,
         })
     return out
+
+
+# ── GET_NODE_STATS (multi-round-trip) ────────────────────────────────────────
+# The Agent's ``get_node_stats`` had a primary path (``/cluster/resources``
+# filtered to type=node → one first-node ``/status`` for the cluster-wide
+# pveversion) and a fallback (``/nodes`` → per-node ``/status``). The spoke now
+# orchestrates the same sequence as RUN_COMMAND round-trips. The ``cluster``
+# field is stamped by the spoke (it knows the agent's cluster from
+# connected_agents), matching the Agent's ``self.cluster_name``.
+
+def cluster_resources_cmd() -> str:
+    """``pvesh get /cluster/resources`` — primary node-stats source."""
+    return pvesh_get("/cluster/resources")
+
+
+def nodes_list_cmd() -> str:
+    """``pvesh get /nodes`` — the fallback node listing."""
+    return pvesh_get("/nodes")
+
+
+def node_status_cmd(node: str) -> str:
+    """``pvesh get /nodes/<node>/status`` — per-node detail (pveversion + the
+    fallback's cpu/mem/uptime)."""
+    return pvesh_get(f"/nodes/{node}/status")
+
+
+def _parse_json_obj(run_response: Any) -> Dict[str, Any]:
+    """Parse a ``pvesh get`` JSON OBJECT from the run response (``/nodes/{n}/status``).
+    Returns ``{}`` on any failure (the Agent's per-node lookups are best-effort)."""
+    if not runner_ok(run_response):
+        return {}
+    out = runner_stdout(run_response)
+    if not out:
+        return {}
+    try:
+        data = json.loads(out)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def parse_cluster_resource_nodes(run_response: Any, cluster: str) -> List[Dict[str, Any]]:
+    """Primary path: ``/cluster/resources`` filtered to ``type == node`` → the
+    node-stats shape the Agent produced (``proxmox_version`` left blank; the
+    spoke fills it from a first-node ``/status`` round-trip)."""
+    out: List[Dict[str, Any]] = []
+    for r in _parse_json_list(run_response):
+        if not isinstance(r, dict) or r.get("type") != "node":
+            continue
+        node_name = r.get("node", "")
+        mem_used = r.get("mem", 0)
+        mem_total = r.get("maxmem", 1)
+        out.append({
+            "cluster":         cluster,
+            "node":             node_name,
+            "status":           r.get("status", "unknown"),
+            "cpu_usage":        round(r.get("cpu", 0) * 100, 1),
+            "cpu_cores":        r.get("maxcpu", 0),
+            "mem_used":         mem_used,
+            "mem_total":        mem_total,
+            "mem_pct":          round(mem_used / max(mem_total, 1) * 100, 1),
+            "uptime":           r.get("uptime", 0),
+            "proxmox_version":  "",
+        })
+    return out
+
+
+def parse_pveversion(run_response: Any) -> str:
+    """The cluster-wide PVE version from a ``/nodes/{n}/status`` object (best-
+    effort; ``""`` if unavailable — the Agent leaves proxmox_version blank then)."""
+    return _parse_json_obj(run_response).get("pveversion", "") or ""
+
+
+def parse_nodes_list_entries(run_response: Any) -> List[Dict[str, Any]]:
+    """Fallback ``/nodes`` listing: minimal ``{node, status, maxcpu, mem, maxmem,
+    uptime}`` per node — the rec the per-node ``/status`` merge falls back to."""
+    out: List[Dict[str, Any]] = []
+    for n in _parse_json_list(run_response):
+        if not isinstance(n, dict) or not n.get("node"):
+            continue
+        out.append({
+            "node":   n.get("node"),
+            "status": n.get("status", "unknown"),
+            "maxcpu": n.get("maxcpu", 0),
+            "mem":    n.get("mem", 0),
+            "maxmem": n.get("maxmem", 0),
+            "uptime": n.get("uptime", 0),
+        })
+    return out
+
+
+def node_from_status(run_response: Any, nrec: Dict[str, Any], cluster: str) -> Dict[str, Any]:
+    """Build a node-stats dict from a ``/nodes/{n}/status`` object merged with
+    the fallback ``/nodes`` rec (``nrec``). Mirrors the Agent's fallback branch
+    (memory/cpuinfo from /status; status/maxcpu/mem/maxmem/uptime fall back to
+    the /nodes rec when /status lacks them)."""
+    stat = _parse_json_obj(run_response)
+    mem = stat.get("memory", {}) if isinstance(stat.get("memory"), dict) else {}
+    cpu_info = stat.get("cpuinfo", {}) if isinstance(stat.get("cpuinfo"), dict) else {}
+    mem_used = mem.get("used", nrec.get("mem", 0))
+    mem_total = mem.get("total", nrec.get("maxmem", 0))
+    return {
+        "cluster":         cluster,
+        "node":             nrec.get("node", ""),
+        "status":           nrec.get("status", "unknown"),
+        "cpu_usage":        round(stat.get("cpu", 0) * 100, 1),
+        "cpu_cores":        cpu_info.get("cpus", nrec.get("maxcpu", 0)),
+        "mem_used":         mem_used,
+        "mem_total":        mem_total,
+        "mem_pct":          round(mem_used / max(mem_total, 1) * 100, 1),
+        "uptime":           stat.get("uptime", nrec.get("uptime", 0)),
+        "proxmox_version":  stat.get("pveversion", ""),
+    }

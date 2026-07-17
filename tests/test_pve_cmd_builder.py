@@ -330,3 +330,173 @@ def test_list_isos_no_agent_resolved_errors():
     sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCP({}, {}))
     res = _run(sp.handle_command("PXMX_LIST_ISOS", {"node": "ghost"}))
     assert res["status"] == "ERROR" and "No agent resolved" in res["message"]
+
+
+# ── GET_NODE_STATS (multi-round-trip) ─────────────────────────────────────────
+
+def test_cluster_resources_cmd_is_pvesh_get_cluster_resources():
+    assert pve_cmd_builder.cluster_resources_cmd() == "pvesh get /cluster/resources"
+
+
+def test_nodes_list_cmd_is_pvesh_get_nodes():
+    assert pve_cmd_builder.nodes_list_cmd() == "pvesh get /nodes"
+
+
+def test_node_status_cmd_is_pvesh_get_node_status():
+    assert pve_cmd_builder.node_status_cmd("edge01") == "pvesh get /nodes/edge01/status"
+
+
+def test_parse_cluster_resource_nodes_filters_type_node_and_shapes():
+    r = _runner(stdout=(
+        '[{"type":"node","node":"edge01","status":"online","cpu":0.42,"maxcpu":8,'
+        '"mem":4000,"maxmem":8000,"uptime":1234},'
+        '{"type":"storage","storage":"local"},'
+        '{"type":"vm","vmid":100,"node":"edge01"}]'))
+    nodes = pve_cmd_builder.parse_cluster_resource_nodes(r, "edge-cluster")
+    assert len(nodes) == 1
+    n = nodes[0]
+    assert n == {
+        "cluster": "edge-cluster", "node": "edge01", "status": "online",
+        "cpu_usage": 42.0, "cpu_cores": 8,
+        "mem_used": 4000, "mem_total": 8000, "mem_pct": 50.0,
+        "uptime": 1234, "proxmox_version": ""}
+
+
+def test_parse_cluster_resource_nodes_empty_on_failure():
+    assert pve_cmd_builder.parse_cluster_resource_nodes(_runner(rc=1, stderr="x"), "c") == []
+    assert pve_cmd_builder.parse_cluster_resource_nodes(_runner(stdout="not json"), "c") == []
+    assert pve_cmd_builder.parse_cluster_resource_nodes(_runner(stdout='{"x":1}'), "c") == []
+
+
+def test_parse_pveversion_from_node_status():
+    r = _runner(stdout='{"pveversion":"pve-manager/8.2/abc","memory":{"used":1}}')
+    assert pve_cmd_builder.parse_pveversion(r) == "pve-manager/8.2/abc"
+    assert pve_cmd_builder.parse_pveversion(_runner(rc=1)) == ""
+    assert pve_cmd_builder.parse_pveversion(_runner(stdout="not json")) == ""
+
+
+def test_parse_nodes_list_entries_minimal():
+    r = _runner(stdout=(
+        '[{"node":"edge01","status":"online","maxcpu":8,"mem":1,"maxmem":2,'
+        '"uptime":7}, {"nope":1}]'))
+    out = pve_cmd_builder.parse_nodes_list_entries(r)
+    assert out == [{"node": "edge01", "status": "online", "maxcpu": 8,
+                    "mem": 1, "maxmem": 2, "uptime": 7}]
+
+
+def test_node_from_status_merges_status_with_nrec():
+    stat = _runner(stdout=(
+        '{"pveversion":"pve-8.2","cpu":0.5,"cpuinfo":{"cpus":4},'
+        '"memory":{"used":30,"total":100},"uptime":99}'))
+    nrec = {"node": "edge01", "status": "online", "maxcpu": 8,
+            "mem": 1, "maxmem": 2, "uptime": 7}
+    n = pve_cmd_builder.node_from_status(stat, nrec, "c")
+    assert n == {
+        "cluster": "c", "node": "edge01", "status": "online",
+        "cpu_usage": 50.0, "cpu_cores": 4,
+        "mem_used": 30, "mem_total": 100, "mem_pct": 30.0,
+        "uptime": 99, "proxmox_version": "pve-8.2"}
+
+
+def test_node_from_status_falls_back_to_nrec_on_failure():
+    nrec = {"node": "edge01", "status": "online", "maxcpu": 8,
+            "mem": 5, "maxmem": 10, "uptime": 7}
+    n = pve_cmd_builder.node_from_status(_runner(rc=1, stderr="x"), nrec, "c")
+    assert n == {
+        "cluster": "c", "node": "edge01", "status": "online",
+        "cpu_usage": 0.0, "cpu_cores": 8, "mem_used": 5, "mem_total": 10,
+        "mem_pct": 50.0, "uptime": 7, "proxmox_version": ""}
+
+
+def test_get_node_stats_primary_path_two_round_trips():
+    # /cluster/resources yields 2 node rows → one first-node /status for pveversion.
+    cluster_res = _runner(stdout=(
+        '[{"type":"node","node":"edge01","status":"online","cpu":0.1,"maxcpu":4,'
+        '"mem":100,"maxmem":200,"uptime":1},'
+        '{"type":"node","node":"edge02","status":"online","cpu":0.0,"maxcpu":4,'
+        '"mem":50,"maxmem":200,"uptime":2}]'))
+    status = _runner(stdout='{"pveversion":"pve-8.2","memory":{}}')
+    cp = _FakeCPRoundRobin(
+        {"a": {"cluster_name": "edge-cluster", "nodes": ["edge01"]}},
+        {"a": [cluster_res, status]})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_NODE_STATS", {"agent_id": "a"}))
+    # Pinned path returns the Agent's shape verbatim ({nodes, cluster}, no status).
+    assert res == {"nodes": [
+        {"cluster": "edge-cluster", "node": "edge01", "status": "online",
+         "cpu_usage": 10.0, "cpu_cores": 4, "mem_used": 100, "mem_total": 200,
+         "mem_pct": 50.0, "uptime": 1, "proxmox_version": "pve-8.2"},
+        {"cluster": "edge-cluster", "node": "edge02", "status": "online",
+         "cpu_usage": 0.0, "cpu_cores": 4, "mem_used": 50, "mem_total": 200,
+         "mem_pct": 25.0, "uptime": 2, "proxmox_version": "pve-8.2"}],
+        "cluster": "edge-cluster"}
+    assert len(cp.calls) == 2
+    assert all(c["cmd"] == "RUN_COMMAND" for c in cp.calls)
+    assert cp.calls[0]["data"]["command"] == "pvesh get /cluster/resources"
+    assert cp.calls[1]["data"]["command"] == "pvesh get /nodes/edge01/status"
+    assert all(c["data"]["allow_shell"] is True for c in cp.calls)
+
+
+def test_get_node_stats_primary_without_pveversion_leaves_blank():
+    # /status returns no pveversion → proxmox_version stays "" (best-effort).
+    cluster_res = _runner(stdout=(
+        '[{"type":"node","node":"n1","status":"online","cpu":0,"maxcpu":2,'
+        '"mem":0,"maxmem":1,"uptime":0}]'))
+    status = _runner(stdout='{"memory":{}}')  # no pveversion key
+    cp = _FakeCPRoundRobin(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}}, {"a": [cluster_res, status]})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_NODE_STATS", {"agent_id": "a"}))
+    assert res["nodes"][0]["proxmox_version"] == ""
+
+
+def test_get_node_stats_fallback_path_nodes_then_per_node_status():
+    # /cluster/resources yields 0 node rows → fallback /nodes → per-node /status.
+    empty_cluster = _runner(stdout='[{"type":"storage","storage":"local"}]')
+    nodes_list = _runner(stdout=(
+        '[{"node":"n1","status":"online","maxcpu":4,"mem":0,"maxmem":0,"uptime":0},'
+        '{"node":"n2","status":"online","maxcpu":2,"mem":0,"maxmem":0,"uptime":0}]'))
+    s1 = _runner(stdout='{"pveversion":"pve-8","cpu":0.25,"cpuinfo":{"cpus":4},'
+                         '"memory":{"used":10,"total":100},"uptime":5}')
+    s2 = _runner(stdout='{"cpu":0.0,"cpuinfo":{"cpus":2},'
+                         '"memory":{"used":0,"total":50},"uptime":6}')
+    cp = _FakeCPRoundRobin(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": [empty_cluster, nodes_list, s1, s2]})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_NODE_STATS", {"agent_id": "a"}))
+    by = {n["node"]: n for n in res["nodes"]}
+    assert set(by) == {"n1", "n2"}
+    assert by["n1"]["proxmox_version"] == "pve-8" and by["n1"]["cpu_cores"] == 4
+    assert by["n2"]["proxmox_version"] == "" and by["n2"]["cpu_cores"] == 2
+    # 4 round-trips: /cluster/resources → /nodes → n1/status → n2/status.
+    assert len(cp.calls) == 4
+    assert cp.calls[0]["data"]["command"] == "pvesh get /cluster/resources"
+    assert cp.calls[1]["data"]["command"] == "pvesh get /nodes"
+    assert cp.calls[2]["data"]["command"] == "pvesh get /nodes/n1/status"
+    assert cp.calls[3]["data"]["command"] == "pvesh get /nodes/n2/status"
+
+
+def test_get_node_stats_agent_unreachable_returns_error_shape():
+    cp = _FakeCP({"a": {"cluster_name": "c", "nodes": ["n1"]}}, {"a": None})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_NODE_STATS", {"agent_id": "a"}))
+    assert res == {"nodes": [], "error": "agent unreachable"}
+
+
+def test_get_node_stats_aggregate_fallback_uses_run_command():
+    # No agent_id, telemetry cache empty → broadcast becomes per-agent RUN_COMMAND.
+    cluster_res = _runner(stdout=(
+        '[{"type":"node","node":"n1","status":"online","cpu":0,"maxcpu":1,'
+        '"mem":0,"maxmem":1,"uptime":0}]'))
+    status = _runner(stdout='{"pveversion":"pve-8","memory":{}}')
+    cp = _FakeCPRoundRobin(
+        {"a": {"cluster_name": "c", "nodes": []}},  # empty telemetry nodes → fallback
+        {"a": [cluster_res, status]})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_NODE_STATS", {}))
+    assert res["status"] == "SUCCESS"
+    assert len(res["nodes"]) == 1
+    assert res["nodes"][0]["agent_id"] == "a"
+    assert res["nodes"][0]["proxmox_version"] == "pve-8"
+    assert cp.calls[0]["cmd"] == "RUN_COMMAND"
