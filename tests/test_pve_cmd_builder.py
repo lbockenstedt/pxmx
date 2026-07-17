@@ -761,3 +761,101 @@ def test_list_vms_aggregate_live_query_concurrent():
     # Only a1 contributed (a2 unreachable → skipped, not fatal).
     assert {v["agent_id"] for v in res["vms"]} == {"a1"}
     assert {v["vmid"] for v in res["vms"]} == {100, 200}
+
+
+# ── GET_VM_INFO (broken-path fix: agent had no handler) ───────────────────────
+
+def test_get_vm_info_single_from_unique_id_targeted():
+    pools = _runner(stdout='[{"poolid":"dev","members":[{"vmid":100}]}]')
+    qga = _runner(stdout=(
+        '{"result":[{"name":"eth0","hardware-address":"AA:BB:CC:DD:EE:01",'
+        '"ip-addresses":[{"ip-address":"10.0.0.5","ip-address-type":"ipv4"}]}]}'))
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": pools,
+               "pvesh get /cluster/resources": _vms_response(),
+               "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces": qga}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "c/n1/100"}))
+    assert res["status"] == "SUCCESS"
+    # Flat VM record shape (ips/tags/pool + detail) — what the hub reads.
+    assert res["vmid"] == 100 and res["node"] == "n1" and res["cluster"] == "c"
+    assert res["pool"] == "dev"           # stamped from the short-circuit pool lookup
+    assert res["ips"] == ["10.0.0.5"]     # running → QGA guest IPs
+    assert res["tags"] == ["t1", "tenant-a"]
+    cmds = [c["data"]["command"] for c in cp.calls]
+    # Targeted: /pools (probe) + /cluster/resources + the one VM's guest-ifaces.
+    assert "pvesh get /cluster/resources" in cmds
+    assert "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces" in cmds
+    # NOT a full LIST_VMS — VM 200's config/annotation is not fetched.
+    assert not any("200" in c for c in cmds)
+
+
+def test_get_vm_info_pool_from_detail_when_not_inline():
+    pools = _runner(stdout='[{"poolid":"prod"}]')  # no inline members
+    detail = _runner(stdout='{"poolid":"prod","members":[{"vmid":100}]}')
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": pools,
+               "pvesh get /pools/prod": detail,
+               "pvesh get /cluster/resources": _vms_response()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "c/n1/100"}))
+    assert res["status"] == "SUCCESS" and res["pool"] == "prod"
+
+
+def test_get_vm_info_uses_vmid_and_node_when_no_unique_id():
+    # pxmx_vm.py calls {vm_id: str(vmid), vmid, node} — resolve via node→agent.
+    pools = _runner(stdout="[]")
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": pools,
+               "pvesh get /cluster/resources": _vms_response()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "200", "vmid": 200, "node": "n1"}))
+    assert res["status"] == "SUCCESS"
+    assert res["vmid"] == 200 and res["pool"] == ""  # 200 not in any pool
+
+
+def test_get_vm_info_not_found_returns_error():
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": _runner(stdout="[]"),
+               "pvesh get /cluster/resources": _vms_response(),
+               "pvesh get /nodes/n1/qemu": _runner(stdout="[]"),
+               "pvesh get /nodes/n1/lxc": _runner(stdout="[]")}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "c/n1/999", "node": "n1"}))
+    # Fail-closed ERROR — the hub 403s on an unattributable VM, not "success".
+    assert res["status"] == "ERROR" and "not found" in res["message"]
+
+
+def test_get_vm_info_unreachable_agent_returns_error():
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": {"status": "ERROR", "message": "not connected"}}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "c/n1/100"}))
+    assert res["status"] == "ERROR" and "not connected" in res["message"]
+
+
+def test_get_vm_info_all_returns_fleet_list():
+    pools = _runner(stdout="[]")
+    cp = _FakeCPByCmd(
+        {"a1": {"cluster_name": "c1", "nodes": []},
+         "a2": {"cluster_name": "c2", "nodes": []}},
+        {"a1": {"pvesh get /pools": pools,
+                "pvesh get /cluster/resources": _vms_response()},
+         "a2": {"pvesh get /pools": {"status": "ERROR", "message": "down"}}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "all"}))
+    assert res["status"] == "SUCCESS"
+    # Only a1 contributed (a2 down → skipped). Each VM tagged with agent_id.
+    assert {v["vmid"] for v in res["vms"]} == {100, 200}
+    assert {v["agent_id"] for v in res["vms"]} == {"a1"}
+
+
+def test_get_vm_info_no_agent_resolved_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCPByCmd({}, {}))
+    res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "ghost/n1/100"}))
+    assert res["status"] == "ERROR" and "Cannot resolve agent" in res["message"]

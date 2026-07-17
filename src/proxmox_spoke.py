@@ -812,24 +812,151 @@ class ProxmoxSpoke(BaseSpoke):
     # ── VM detail / actions ───────────────────────────────────────────────────
 
     async def _get_vm_info(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Resolve a VM by unique_id ("<cluster>/<node>/<vmid>") or by agent_id+vmid.
-        """
+        """Resolve a single VM (ips/tags/pool + detail) or the fleet list.
+
+        The Agent never had a GET_VM_INFO handler (it returned "Unknown command"),
+        so this is a spoke-side implementation via RUN_COMMAND (#4), reusing the
+        LIST_VMS builders. Two variants:
+
+        - ``vm_id == "all"`` (or absent) → fleet list across connected agents
+          (``{status:SUCCESS, vms:[...], cluster}``); used by the admin aggregate.
+        - ``vm_id == "<cluster>/<node>/<vmid>"`` (or ``{vmid, node}``) → the single
+          VM record (``{status:SUCCESS, <vm fields>}`` with ips/tags/pool); used by
+          the VM detail page + VNC/VM-action ownership (fail-closed: an
+          unattributable VM returns ERROR so the hub 403s).
+
+        Single-VM is a TARGETED fetch (``/cluster/resources`` for the one VM +
+        short-circuit pool lookup + that VM's interface annotation), not a full
+        LIST_VMS — the detail/VNC-ownership path is frequent and must not annotate
+        the whole fleet."""
         unique_id = data.get("unique_id") or data.get("vm_id", "")
-        agent_id  = data.get("agent_id")
+        agent_id = data.get("agent_id")
+        node = data.get("node") or ""
+        vmid = data.get("vmid")
 
-        if not agent_id and "/" in unique_id:
-            # Derive agent from cluster name
-            cluster = unique_id.split("/")[0]
-            for aid, info in (self.control_plane.connected_agents or {}).items():
-                if info.get("cluster_name") == cluster:
-                    agent_id = aid
-                    break
+        if unique_id == "all":
+            return await self._all_vms_info()
 
+        # Parse node/vmid from "<cluster>/<node>/<vmid>" when not supplied directly.
+        if (not node or vmid in (None, "")) and "/" in unique_id:
+            parts = unique_id.split("/")
+            if len(parts) >= 3:
+                cluster_part = parts[0]
+                node = node or parts[1]
+                vmid = parts[2]
+                if not agent_id:
+                    for aid, info in (self.control_plane.connected_agents or {}).items():
+                        if info.get("cluster_name") == cluster_part:
+                            agent_id = aid
+                            break
+
+        if not agent_id and node:
+            agent_id = self._agent_for_node(node)
+        if not agent_id and self.control_plane and self.control_plane.connected_agents:
+            agent_id = next(iter(self.control_plane.connected_agents))
         if not agent_id:
             return {"status": "ERROR", "message": f"Cannot resolve agent for '{unique_id}'"}
 
-        return await self.control_plane.send_to_agent("GET_VM_INFO", data, agent_id=agent_id)
+        return await self._single_vm_info(agent_id, node, vmid, unique_id)
+
+    async def _all_vms_info(self) -> Dict[str, Any]:
+        """Fleet VM list across all connected agents (``vm_id:'all'``). Concurrent
+        per agent; an unreachable agent is skipped (not fatal)."""
+        if not self.control_plane or not self.control_plane.connected_agents:
+            return {"status": "SUCCESS", "vms": [], "cluster": ""}
+        aids = list(self.control_plane.connected_agents)
+        results = await asyncio.gather(
+            *[self._vms_from_agent(a) for a in aids], return_exceptions=True)
+        all_vms: List[Dict[str, Any]] = []
+        cluster = ""
+        for aid, res in zip(aids, results):
+            if isinstance(res, Exception) or not isinstance(res, dict):
+                continue
+            if res.get("status") == "ERROR":
+                continue
+            cluster = cluster or res.get("cluster", "")
+            for vm in res.get("vms", []):
+                all_vms.append({**vm, "agent_id": aid})
+        return {"status": "SUCCESS", "vms": all_vms, "cluster": cluster}
+
+    async def _single_vm_info(self, agent_id: str, node: str, vmid: Any,
+                              unique_id: str) -> Dict[str, Any]:
+        """Targeted single-VM fetch: /cluster/resources for the one VM (type,
+        status, tags, cpu, mem) + a short-circuit pool lookup + that VM's
+        interface annotation. Falls back to per-node /qemu+/lxc if the VM isn't
+        in /cluster/resources."""
+        info = (self.control_plane.connected_agents or {}).get(agent_id, {}) \
+            if self.control_plane else {}
+        cluster = info.get("cluster_name", agent_id)
+
+        async def _send(cmd: str, timeout: float = 12.0):
+            return await self.control_plane.send_to_agent(
+                "RUN_COMMAND",
+                {"command": cmd, "allow_shell": True, "timeout": timeout},
+                agent_id=agent_id, timeout=15.0)
+
+        probe = await _send(pve_cmd_builder.list_pools_cmd())
+        if isinstance(probe, dict) and probe.get("status") == "ERROR":
+            return {"status": "ERROR",
+                    "message": probe.get("message", f"agent {agent_id} unreachable")}
+
+        try:
+            pool = await self._pool_for_vmid(agent_id, _send, probe, vmid)
+
+            def _match(v):
+                return str(v.get("vmid")) == str(vmid) and (not node or v.get("node") == node)
+
+            # Primary: /cluster/resources.
+            r = await _send(pve_cmd_builder.cluster_resources_cmd())
+            vms = pve_cmd_builder.parse_cluster_resource_vms(r, cluster, {})
+            vm = next((v for v in vms if _match(v)), None)
+
+            # Fallback: per-node /qemu + /lxc (a VM missing from /cluster/resources).
+            if vm is None and node:
+                for kind, cmd in (("qemu", pve_cmd_builder.node_qemu_cmd(node)),
+                                  ("lxc", pve_cmd_builder.node_lxc_cmd(node))):
+                    rr = await _send(cmd)
+                    vms2 = pve_cmd_builder.parse_node_vm_list(rr, node, kind, cluster, {})
+                    vm = next((v for v in vms2 if _match(v)), None)
+                    if vm is not None:
+                        break
+
+            if vm is None:
+                return {"status": "ERROR",
+                        "message": f"VM {unique_id} not found on agent {agent_id}"}
+
+            if pool:
+                vm["pool"] = pool
+            await self._annotate_vm_interfaces(agent_id, [vm], _send)
+            # The VM record carries its own ``status`` (running/stopped); rename it
+            # to ``vm_status`` so it doesn't clobber the envelope ``status:SUCCESS``
+            # the hub checks (pxmx.py:208) — ips/tags/pool stay top-level for the
+            # fail-closed ownership probe (pxmx_vm.py:43).
+            vm["vm_status"] = vm.pop("status")
+            return {"status": "SUCCESS", **vm}
+        except Exception as e:
+            logger.warning("pxmx GET_VM_INFO %s failed: %s", unique_id, e)
+            return {"status": "ERROR", "message": str(e)}
+
+    async def _pool_for_vmid(self, agent_id: str, _send, probe, vmid: Any) -> str:
+        """Short-circuit: the first poolid whose members contain ``vmid``. Reuses
+        the ``/pools`` probe (no extra round-trip); fetches ``/pools/{pid}`` detail
+        only for pools whose listing didn't include members inline, stopping at the
+        first hit. ``""`` on any failure (best-effort — pool isn't a hard gate)."""
+        try:
+            listing = pve_cmd_builder.parse_pools_listing_for_members(probe)
+            for p in listing:
+                members = p.get("members")
+                if members is None:
+                    detail = await _send(pve_cmd_builder.pool_detail_cmd(p["poolid"]))
+                    members = pve_cmd_builder.pool_detail_members(detail)
+                for m in (members if isinstance(members, list) else []):
+                    if isinstance(m, dict) and str(m.get("vmid")) == str(vmid):
+                        return p["poolid"]
+            return ""
+        except Exception as e:  # best-effort
+            logger.debug("pxmx pool-for-vmid %s unavailable: %s", agent_id, e)
+            return ""
 
     def _agent_for_node(self, node: str) -> Optional[str]:
         """Resolve the agent_id whose ``nodes`` list contains ``node``. Falls
