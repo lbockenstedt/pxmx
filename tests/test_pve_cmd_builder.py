@@ -147,3 +147,79 @@ def test_list_pools_no_agents_returns_empty_success():
     sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCP({}, {}))
     res = _run(sp.handle_command("PXMX_LIST_POOLS", {}))
     assert res == {"status": "SUCCESS", "pools": []}
+
+
+# ── PXMX_LIST_STORAGES (single-shot, node-scoped) ─────────────────────────────
+
+def test_list_storages_cmd_is_pvesh_get_node_storage():
+    assert pve_cmd_builder.list_storages_cmd("edge01") == "pvesh get /nodes/edge01/storage"
+
+
+def test_parse_storages_filters_by_content_and_shapes():
+    r = _runner(stdout=(
+        '[{"storage":"local","content":"iso,images","type":"dir","avail":100,'
+        '"total":500,"shared":0},'
+        '{"storage":"iso-only","content":"iso","type":"dir","avail":50,'
+        '"total":200,"shared":1},'
+        '{"storage":"local-lvm","content":"images","type":"lvm","avail":300,'
+        '"total":800,"shared":0}]'))
+    storages = pve_cmd_builder.parse_storages(r, "images")
+    assert len(storages) == 2  # iso-only excluded (no images content)
+    by = {s["storage"]: s for s in storages}
+    assert by["local"]["type"] == "dir" and by["local"]["shared"] is False
+    assert by["local-lvm"]["avail"] == 300 and by["local-lvm"]["total"] == 800
+
+
+def test_parse_storages_empty_on_run_failure():
+    assert pve_cmd_builder.parse_storages(_runner(rc=1, stderr="x")) == []
+    assert pve_cmd_builder.parse_storages(_runner(ok=False, error="nofile")) == []
+    assert pve_cmd_builder.parse_storages(_runner(stdout="not json")) == []
+
+
+def test_list_storages_uses_run_command_and_returns_cluster():
+    cp = _FakeCP(
+        {"a-edge": {"cluster_name": "edge-cluster", "nodes": ["edge01"]}},
+        {"a-edge": _runner(stdout=(
+            '[{"storage":"local","content":"images","type":"dir","avail":1,'
+            '"total":2,"shared":0}]'))})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_STORAGES", {"node": "edge01"}))
+    assert res["status"] == "SUCCESS"
+    assert res["node"] == "edge01"
+    assert res["cluster"] == "edge-cluster"
+    assert res["storages"] == [{"storage": "local", "type": "dir", "avail": 1,
+                                "total": 2, "shared": False}]
+    assert cp.calls[0]["cmd"] == "RUN_COMMAND"
+    assert cp.calls[0]["data"]["command"] == "pvesh get /nodes/edge01/storage"
+    assert cp.calls[0]["data"]["allow_shell"] is True
+
+
+def test_list_storages_resolves_agent_from_node_and_uses_content_filter():
+    # No explicit agent_id → resolved via _agent_for_node (nodes list match).
+    cp = _FakeCP(
+        {"a-edge": {"cluster_name": "c", "nodes": ["edge01"]},
+         "a-other": {"cluster_name": "c", "nodes": ["other02"]}},
+        {"a-edge": _runner(stdout=(
+            '[{"storage":"s","content":"images,iso","type":"dir","avail":1,'
+            '"total":2,"shared":0}]'))})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_STORAGES",
+                                 {"node": "edge01", "content": "iso"}))
+    assert res["status"] == "SUCCESS"
+    assert cp.calls[0]["agent_id"] == "a-edge"
+    assert res["storages"] == [{"storage": "s", "type": "dir", "avail": 1,
+                                "total": 2, "shared": False}]
+
+
+def test_list_storages_no_agent_resolved_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCP({}, {}))
+    res = _run(sp.handle_command("PXMX_LIST_STORAGES", {"node": "ghost"}))
+    assert res["status"] == "ERROR" and "No agent resolved" in res["message"]
+
+
+def test_list_storages_agent_failure_returns_empty_success():
+    cp = _FakeCP({"a": {"cluster_name": "c", "nodes": ["n1"]}},
+                 {"a": None})  # raises
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_STORAGES", {"node": "n1"}))
+    assert res == {"status": "SUCCESS", "storages": [], "node": "n1", "cluster": "c"}

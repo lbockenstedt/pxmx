@@ -107,3 +107,34 @@ def parse_pools(run_response: Any) -> List[Dict[str, Any]]:
             continue
         out.append({"poolid": pid, "comment": p.get("comment", "") or ""})
     return out
+
+
+# ── PXMX_LIST_STORAGES ────────────────────────────────────────────────────────
+
+def list_storages_cmd(node: str) -> str:
+    """``pvesh get /nodes/<node>/storage`` — single-shot read of the node's
+    storages. The spoke filters by content type (the Agent's
+    ``list_node_storages`` did the same)."""
+    return pvesh_get(f"/nodes/{node}/storage")
+
+
+def parse_storages(run_response: Any, content_filter: str = "images") -> List[Dict[str, Any]]:
+    """``[{storage, type, avail, total, shared}, ...]`` filtered to storages
+    accepting ``content_filter`` (default ``images`` — boot-disk targets).
+    Mirrors the Agent's ``list_node_storages`` shape + filter."""
+    out: List[Dict[str, Any]] = []
+    for s in _parse_json_list(run_response):
+        if not isinstance(s, dict):
+            continue
+        content = s.get("content") or ""
+        parts = content.split(",") if isinstance(content, str) else content
+        if content_filter not in parts:
+            continue
+        out.append({
+            "storage": s.get("storage"),
+            "type":    s.get("type", ""),
+            "avail":   s.get("avail", 0) or 0,
+            "total":   s.get("total", 0) or 0,
+            "shared":  bool(s.get("shared", 0)),
+        })
+    return out

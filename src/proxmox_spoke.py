@@ -219,10 +219,28 @@ class ProxmoxSpoke(BaseSpoke):
                 agent_id = self._agent_for_node(data.get("node", ""))
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for node"}
-            r = await self.control_plane.send_to_agent(
-                "PXMX_LIST_STORAGES", data, agent_id=agent_id, timeout=20.0)
-            r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
-            return r if isinstance(r, dict) else {"status": "ERROR", "message": "agent returned no storages"}
+            node = data.get("node", "") or ""
+            content_filter = data.get("content") or "images"
+            # #4 migration: spoke builds `pvesh get /nodes/<node>/storage` and
+            # sends it as RUN_COMMAND; the dumb Agent just runs it + returns
+            # stdout. The spoke parses + filters by content (parse_storages) and
+            # adds node/cluster. The Agent's old typed PXMX_LIST_STORAGES handler
+            # stays as a rollback fallback. The agent's list_node_storages
+            # always returns [] on failure (never raises) → SUCCESS w/ empty here.
+            cluster = ((self.control_plane.connected_agents or {})
+                        .get(agent_id, {}).get("cluster_name", agent_id))
+            try:
+                r = await self.control_plane.send_to_agent(
+                    "RUN_COMMAND",
+                    {"command": pve_cmd_builder.list_storages_cmd(node),
+                     "allow_shell": True, "timeout": 18},
+                    agent_id=agent_id, timeout=20.0)
+                storages = pve_cmd_builder.parse_storages(r, content_filter)
+            except Exception as e:
+                logger.debug("list_storages agent %s failed: %s", agent_id, e)
+                storages = []
+            return {"status": "SUCCESS", "storages": storages,
+                    "node": node, "cluster": cluster}
 
         # Create a new qemu VM from an ISO. Routed to the target node's agent
         # (agent_id from the hub, or resolved from the node). pvesh create is
