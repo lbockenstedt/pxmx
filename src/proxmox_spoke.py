@@ -152,24 +152,39 @@ class ProxmoxSpoke(BaseSpoke):
         if cmd in ("DELETE_VM", "AGENT_DELETE_VM"):
             return await self._route_vm_cmd("DELETE_VM", data)
 
-        # Hypervisors view VM lifecycle (unguarded — any vmid). stop/snapshot
-        # can take a few seconds, so allow a 30s agent window.
+        # Hypervisors view VM lifecycle (unguarded — any vmid; cs_guard does NOT
+        # apply — these are real tenant VMs, not the sim 90000 floor).
+        # #4 migration: the spoke builds the qm/pct/pvesm/vzdump command string
+        # and sends it as RUN_COMMAND; the dumb Agent just runs it. start/stop/
+        # snapshot are foreground (await + check rc); reboot/backup are fire-and-
+        # forget (backgrounded). The Agent's old typed PXMX_VM_ACTION handler
+        # stays as a rollback fallback.
         if cmd == "PXMX_VM_ACTION":
-            return await self._route_vm_cmd("PXMX_VM_ACTION", data, timeout=30.0)
+            agent_id = self._resolve_agent_for_vm(data)
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agents connected"}
+            return await self._vm_action_via_agent(agent_id, data)
 
-        # Bulk VM lifecycle: ONE action over MANY VMs in a single hub message.
-        # The spoke groups items by owning agent (unique_id → cluster) and sends
-        # ONE PXMX_VM_ACTION_BULK per agent, then merges the per-item results —
-        # so the agent inbox gets one message per node, not one per VM.
+        # Bulk VM lifecycle: ONE action over MANY VMs. The spoke groups items by
+        # owning agent (unique_id → cluster → agent) and runs them CONCURRENTLY
+        # per agent (6-semaphore, mirroring the Agent's _bulk_one) via RUN_COMMAND
+        # — send_to_agent multiplexes in-flight requests per agent — then merges
+        # the per-item results. One VM's failure never sinks the rest.
         if cmd == "PXMX_VM_ACTION_BULK":
-            return await self._route_vm_bulk(data, timeout=120.0)
+            return await self._route_vm_bulk(data)
 
         # Clone-from-template: a tenant clones a template-pool VM. Routed to the
         # agent on the template's node via the template unique_id (cluster prefix)
-        # — qm/pct clone operates on the local template. Full-disk clones can
-        # take minutes, so allow a 600s agent window (matches clone_vm_any).
+        # — qm/pct clone operates on the local template.
+        # #4 migration: the spoke orchestrates 3 RUN_COMMAND round-trips —
+        # /cluster/nextid (atomic free VMID, no TOCTOU) → qm/pct clone → qm/pct
+        # set --tags (best-effort) — + a template-config tag read. The Agent's
+        # old typed PXMX_CLONE_VM handler stays as a rollback fallback.
         if cmd == "PXMX_CLONE_VM":
-            return await self._route_vm_cmd("PXMX_CLONE_VM", data, timeout=600.0)
+            agent_id = self._resolve_agent_for_vm(data)
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agents connected"}
+            return await self._clone_vm_via_agent(agent_id, data)
 
         # Proxmox resource pool list for the clone/create-VM UI's pool dropdown.
         # Aggregated across every connected agent (each reports its cluster's
@@ -276,16 +291,18 @@ class ProxmoxSpoke(BaseSpoke):
 
         # Create a new qemu VM from an ISO. Routed to the target node's agent
         # (agent_id from the hub, or resolved from the node). pvesh create is
-        # cluster-wide so any agent in the cluster can create on any node. The
-        # create itself is fast (no install — just defines the VM); 120s window.
+        # cluster-wide so any agent in the cluster can create on any node.
+        # #4 migration: the spoke orchestrates 2 RUN_COMMAND round-trips —
+        # /cluster/nextid (atomic free VMID) → pvesh create /nodes/<node>/qemu
+        # with the ISO/disk/memory/cores args + tenant tags. The Agent's old
+        # typed PXMX_CREATE_VM handler stays as a rollback fallback.
         if cmd == "PXMX_CREATE_VM":
             agent_id = data.get("agent_id")
             if not agent_id:
                 agent_id = self._agent_for_node(data.get("node", ""))
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for node"}
-            return await self.control_plane.send_to_agent(
-                "PXMX_CREATE_VM", data, agent_id=agent_id, timeout=125.0)
+            return await self._create_vm_via_agent(agent_id, data)
 
         # Hub-brokered cert install: the le spoke issued/renewed a Let's Encrypt
         # cert and the hub pushes INSTALL_CERT here to apply it to a Proxmox
@@ -976,38 +993,129 @@ class ProxmoxSpoke(BaseSpoke):
                     return aid
         return next(iter(agents))
 
-    async def _route_vm_cmd(self, cmd: str, data: Dict[str, Any],
-                            timeout: float = 15.0) -> Dict[str, Any]:
-        """Route a VM mutation command to the correct agent via unique_id."""
+    def _resolve_agent_for_vm(self, data: Dict[str, Any]) -> Optional[str]:
+        """Resolve the agent_id for a VM command: explicit ``agent_id`` → the
+        ``unique_id`` cluster prefix → fall back to the first connected agent.
+        Returns ``None`` when no agent is connected."""
+        agent_id = data.get("agent_id")
         unique_id = data.get("unique_id", "")
-        agent_id  = data.get("agent_id")
-
-        if not agent_id and "/" in unique_id:
+        if not agent_id and "/" in unique_id and self.control_plane:
             cluster = unique_id.split("/")[0]
             for aid, info in (self.control_plane.connected_agents or {}).items():
                 if info.get("cluster_name") == cluster:
                     agent_id = aid
                     break
-
         if not agent_id:
             if not self.control_plane or not self.control_plane.connected_agents:
-                return {"status": "ERROR", "message": "No agents connected"}
+                return None
             agent_id = next(iter(self.control_plane.connected_agents))
+        return agent_id
 
+    async def _route_vm_cmd(self, cmd: str, data: Dict[str, Any],
+                            timeout: float = 15.0) -> Dict[str, Any]:
+        """Route a still-typed VM command (VNC_PROXY) to the correct agent via
+        unique_id. The mutating families now use the RUN_COMMAND paths below."""
+        agent_id = self._resolve_agent_for_vm(data)
+        if not agent_id:
+            return {"status": "ERROR", "message": "No agents connected"}
         return await self.control_plane.send_to_agent(cmd, data, agent_id=agent_id,
                                                       timeout=timeout)
 
-    async def _route_vm_bulk(self, data: Dict[str, Any],
-                             timeout: float = 120.0) -> Dict[str, Any]:
+    # ── Mutating VM lifecycle via RUN_COMMAND (#4 family #5) ───────────────────
+    # The spoke builds qm/pct/pvesm/vzdump/pvesh command strings; the dumb Agent
+    # runs them and returns {ok, rc, stdout, stderr}. cs_guard does NOT apply
+    # (unguarded tenant VMs). The Agent's typed handlers stay as a rollback
+    # fallback (a rolled-back spoke uses the typed path; RUN_COMMAND is generic).
+
+    async def _vm_action_one(self, agent_id: str, item: Dict[str, Any],
+                             action: str) -> Dict[str, Any]:
+        """One VM action via RUN_COMMAND. Returns a bulk-row-shaped dict:
+        ``{vmid, ok: True, ...action-result}`` or ``{vmid, ok: False, error}``.
+        Used by both the single PXMX_VM_ACTION (one item) and the bulk path."""
+        vmid = item.get("vmid")
+        kind = (item.get("type") or "").lower()
+        snapshot_name = item.get("snapshot_name")
+        backup_opts = item.get("backup") or {}
+        try:
+            if vmid is None:
+                raise pve_cmd_builder.PveCmdError("vmid is required")
+            vid = int(vmid)
+
+            async def _send(cmd: str, timeout: float = 30.0):
+                return await self.control_plane.send_to_agent(
+                    "RUN_COMMAND",
+                    {"command": cmd, "allow_shell": True, "timeout": timeout},
+                    agent_id=agent_id, timeout=timeout + 3.0)
+
+            # Resolve kind if the hub didn't pass it (one probe round-trip).
+            if kind not in ("qemu", "lxc"):
+                kind = pve_cmd_builder.kind_from_probe(
+                    await _send(pve_cmd_builder.detect_kind_cmd(vid), timeout=10.0))
+
+            act = (action or "").lower()
+            if act in ("start", "stop", "snapshot"):
+                cmd = pve_cmd_builder.vm_action_cmd(vid, act, kind, snapshot_name)
+                r = await _send(cmd, timeout=30.0)
+                if not pve_cmd_builder.runner_ok(r):
+                    raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
+                row: Dict[str, Any] = {"vmid": vid, "action": act, "kind": kind}
+                if act == "snapshot":
+                    row["snapshot"] = snapshot_name or pve_cmd_builder.default_snapshot_name()
+                return {"ok": True, **row}
+            if act in ("reboot", "restart"):
+                # Fire-and-forget (backgrounded) — RUN_COMMAND returns immediately.
+                await _send(pve_cmd_builder.vm_reboot_cmd(vid, kind), timeout=10.0)
+                return {"ok": True, "vmid": vid, "action": "reboot", "kind": kind,
+                        "method": "reset" if kind == "qemu" else "reboot",
+                        "started": True}
+            if act == "backup":
+                storage = str((backup_opts or {}).get("storage") or "").strip()
+                if not storage:
+                    raise pve_cmd_builder.PveCmdError(
+                        "backup: no storage configured — set one in Setup → Hypervisors")
+                r = await _send(pve_cmd_builder.pvesm_status_cmd(storage), timeout=15.0)
+                if not pve_cmd_builder.storage_present(r, storage):
+                    raise pve_cmd_builder.PveCmdError(
+                        f"backup: storage '{storage}' not found on this host")
+                mode = pve_cmd_builder.normalize_backup_mode(
+                    (backup_opts or {}).get("mode") or "snapshot")
+                try:
+                    keep = int((backup_opts or {}).get("keep") or 0)
+                except (TypeError, ValueError):
+                    keep = 0
+                await _send(pve_cmd_builder.vzdump_cmd(vid, storage, mode, keep),
+                            timeout=15.0)
+                return {"ok": True, "vmid": vid, "action": "backup",
+                        "storage": storage, "mode": mode, "keep": keep,
+                        "kind": kind, "started": True}
+            raise pve_cmd_builder.PveCmdError(f"unknown vm action: {action}")
+        except pve_cmd_builder.PveCmdError as e:
+            return {"vmid": vmid, "ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001 - one VM must not sink the bulk
+            logger.warning("pxmx VM_ACTION agent %s vmid=%s: %s", agent_id, vmid, e)
+            return {"vmid": vmid, "ok": False, "error": str(e)}
+
+    async def _vm_action_via_agent(self, agent_id: str,
+                                   data: Dict[str, Any]) -> Dict[str, Any]:
+        """Single PXMX_VM_ACTION via RUN_COMMAND. Wraps :meth:`_vm_action_one`
+        and maps the row to the SUCCESS/ERROR envelope the typed handler sent."""
+        row = await self._vm_action_one(agent_id, data, data.get("action"))
+        if row.get("ok"):
+            return {"status": "SUCCESS", **{k: v for k, v in row.items() if k != "ok"}}
+        return {"status": "ERROR", "message": row.get("error", "vm action failed")}
+
+    async def _route_vm_bulk(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Group a bulk VM action by owning agent (unique_id → cluster → agent)
-        and send ONE PXMX_VM_ACTION_BULK per agent, then merge the per-item
-        results. One message per node instead of one per VM."""
+        and run each item via RUN_COMMAND CONCURRENTLY per agent (6-semaphore,
+        mirroring the Agent's ``_bulk_one``; send_to_agent multiplexes in-flight
+        requests per agent). Merges the per-item rows; one VM's failure never
+        sinks the rest."""
         items = [it for it in (data.get("items") or []) if isinstance(it, dict)]
         action = data.get("action")
         agents = (self.control_plane.connected_agents if self.control_plane else None) or {}
         if not agents:
             return {"status": "ERROR", "message": "No agents connected"}
-        cluster_to_agent = {}
+        cluster_to_agent: Dict[str, str] = {}
         for aid, info in agents.items():
             cn = info.get("cluster_name")
             if cn and cn not in cluster_to_agent:
@@ -1023,20 +1131,181 @@ class ProxmoxSpoke(BaseSpoke):
 
         merged: list = []
         for aid, grp in groups.items():
-            try:
-                resp = await self.control_plane.send_to_agent(
-                    "PXMX_VM_ACTION_BULK", {"action": action, "items": grp},
-                    agent_id=aid, timeout=timeout)
-            except Exception as e:  # noqa: BLE001
-                resp = {"status": "ERROR", "message": str(e)}
-            inner = resp.get("payload", {}).get("data", resp) if isinstance(resp, dict) else resp
-            rows = (inner or {}).get("results") if isinstance(inner, dict) else None
-            if rows:
-                merged.extend(rows)
-            else:
-                err = (inner or {}).get("message", "bulk relay failed") if isinstance(inner, dict) else "bulk relay failed"
-                merged.extend({"vmid": it.get("vmid"), "ok": False, "error": err} for it in grp)
+            sem = asyncio.Semaphore(6)
+
+            async def _run_one(it, _aid=aid, _sem=sem):
+                async with _sem:
+                    return await self._vm_action_one(_aid, it, action)
+
+            rows = await asyncio.gather(*[_run_one(it) for it in grp])
+            merged.extend(rows)
         return {"status": "SUCCESS", "results": merged}
+
+    async def _next_free_vmid_via_agent(self, _send) -> int:
+        """Next free VMID via RUN_COMMAND: atomic ``/cluster/nextid`` first; on
+        any failure fall back to ``max(qm list ∪ pct list)+1`` (two round-trips).
+        Mirrors the Agent's ``next_free_vmid``."""
+        vid = pve_cmd_builder.parse_next_free_vmid(
+            await _send(pve_cmd_builder.next_free_vmid_cmd(), timeout=15.0))
+        if vid is not None:
+            return vid
+        used: list = []
+        for c in (pve_cmd_builder.qm_list_cmd(), pve_cmd_builder.pct_list_cmd()):
+            try:
+                used.extend(pve_cmd_builder.parse_vmids_from_list(
+                    await _send(c, timeout=20.0)))
+            except Exception as e:  # noqa: BLE001 - best-effort fallback source
+                logger.debug("pxmx nextid fallback %s: %s", c, e)
+        return pve_cmd_builder.next_free_vmid_fallback(used)
+
+    async def _clone_vm_via_agent(self, agent_id: str,
+                                  data: Dict[str, Any]) -> Dict[str, Any]:
+        """PXMX_CLONE_VM via RUN_COMMAND. Resolves template vmid/node/kind (from
+        ``template_unique_id`` ``<cluster>/<node>/<vmid>`` or explicit fields),
+        auto-assigns a free VMID (atomic /cluster/nextid), clones, inherits the
+        template's tags + appends the tenant labels (best-effort), and stamps the
+        new VM's tags. Mirrors the Agent's PXMX_CLONE_VM handler."""
+        cluster = ((self.control_plane.connected_agents or {}).get(agent_id, {})
+                   .get("cluster_name", agent_id)) if self.control_plane else agent_id
+
+        async def _send(cmd: str, timeout: float = 600.0):
+            return await self.control_plane.send_to_agent(
+                "RUN_COMMAND",
+                {"command": cmd, "allow_shell": True, "timeout": timeout},
+                agent_id=agent_id, timeout=timeout + 5.0)
+
+        try:
+            tuid = data.get("template_unique_id") or data.get("unique_id") or ""
+            if tuid and "/" in tuid:
+                parts = tuid.split("/")
+                node = parts[-2] if len(parts) >= 3 else ""
+                template_vmid = parts[-1]
+            else:
+                node = data.get("node") or ""
+                template_vmid = data.get("template_vmid")
+            if template_vmid is None:
+                raise pve_cmd_builder.PveCmdError(
+                    "template_vmid or template_unique_id required")
+            name = (data.get("name") or "").strip()
+            if not name:
+                raise pve_cmd_builder.PveCmdError("name is required")
+            kind = (data.get("type") or "").lower()
+            if kind not in ("qemu", "lxc"):
+                kind = pve_cmd_builder.kind_from_probe(
+                    await _send(pve_cmd_builder.detect_kind_cmd(template_vmid),
+                                timeout=10.0))
+            new_vmid = data.get("new_vmid")
+            if new_vmid is None:
+                new_vmid = await self._next_free_vmid_via_agent(_send)
+            pool = (data.get("pool") or "").strip() or None
+            ttags_in = data.get("tenant_tags") or (
+                [data.get("tenant_tag")] if data.get("tenant_tag") else [])
+            tenant_tags = [str(t).strip() for t in ttags_in if str(t).strip()]
+
+            # Clone the template → new VMID (full clone so the new VM has its own
+            # disk). Can take minutes for a large template → 600s window.
+            r = await _send(pve_cmd_builder.clone_cmd(
+                template_vmid, new_vmid, name, kind, pool=pool), timeout=600.0)
+            if not pve_cmd_builder.runner_ok(r):
+                raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
+
+            # Inherit the template's tags + append the tenant labels (dedup,
+            # case-insensitive). Best-effort: a tag failure doesn't undo the clone.
+            tags: list = []
+            try:
+                cfg = await _send(pve_cmd_builder.vm_config_cmd(
+                    node, template_vmid, kind), timeout=15.0)
+                tags = pve_cmd_builder.parse_config_tags(cfg)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("clone: template tags %s/%s: %s", node, template_vmid, e)
+            lower_tags = {t.lower() for t in tags}
+            for tt in tenant_tags:
+                if tt.lower() not in lower_tags:
+                    tags.append(tt)
+                    lower_tags.add(tt.lower())
+            if tags:
+                try:
+                    r2 = await _send(pve_cmd_builder.set_tags_cmd(
+                        new_vmid, kind, tags), timeout=30.0)
+                    if not pve_cmd_builder.runner_ok(r2):
+                        logger.warning("clone: tag set failed for new VM %s: %s",
+                                       new_vmid, pve_cmd_builder.runner_err(r2))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("clone: tag set failed for new VM %s: %s", new_vmid, e)
+
+            return {"status": "SUCCESS",
+                    "unique_id": f"{cluster}/{node}/{new_vmid}",
+                    "cluster": cluster, "node": node, "vmid": int(new_vmid),
+                    "name": name, "type": kind, "pool": pool or "",
+                    "template_vmid": int(template_vmid), "tags": tags}
+        except pve_cmd_builder.PveCmdError as e:
+            return {"status": "ERROR", "message": str(e)}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("pxmx PXMX_CLONE_VM agent %s failed", agent_id)
+            return {"status": "ERROR", "message": str(e)}
+
+    async def _create_vm_via_agent(self, agent_id: str,
+                                   data: Dict[str, Any]) -> Dict[str, Any]:
+        """PXMX_CREATE_VM via RUN_COMMAND. Creates a stopped qemu VM from an ISO
+        via ``pvesh create /nodes/<node>/qemu`` (cluster-wide), auto-assigns a
+        free VMID (atomic /cluster/nextid), and tags it with the acting tenant's
+        labels. Mirrors the Agent's PXMX_CREATE_VM handler."""
+        cluster = ((self.control_plane.connected_agents or {}).get(agent_id, {})
+                   .get("cluster_name", agent_id)) if self.control_plane else agent_id
+
+        async def _send(cmd: str, timeout: float = 120.0):
+            return await self.control_plane.send_to_agent(
+                "RUN_COMMAND",
+                {"command": cmd, "allow_shell": True, "timeout": timeout},
+                agent_id=agent_id, timeout=timeout + 5.0)
+
+        try:
+            node = (data.get("node") or "").strip()
+            if not node:
+                raise pve_cmd_builder.PveCmdError("node is required")
+            name = (data.get("name") or "").strip()
+            if not name:
+                raise pve_cmd_builder.PveCmdError("name is required")
+            volid = (data.get("volid") or "").strip()
+            if not volid:
+                raise pve_cmd_builder.PveCmdError("volid (ISO) is required")
+            new_vmid = data.get("new_vmid")
+            if new_vmid is None:
+                new_vmid = await self._next_free_vmid_via_agent(_send)
+            ttags_in = data.get("tenant_tags") or (
+                [data.get("tenant_tag")] if data.get("tenant_tag") else [])
+            tenant_tags = [str(t).strip() for t in ttags_in if str(t).strip()]
+            tags_joined = ";".join(tenant_tags)
+            pool = (data.get("pool") or "").strip() or None
+            memory_mb = int(data.get("memory_mb") or 2048)
+            cores = int(data.get("cores") or 2)
+            disk_storage = (data.get("disk_storage") or "").strip() or "local-lvm"
+            disk_gb = int(data.get("disk_gb") or 32)
+            bridge = (data.get("bridge") or "vmbr0").strip() or "vmbr0"
+
+            args = ["--vmid", str(new_vmid), "--name", name, "--cdrom", volid,
+                    "--memory", str(memory_mb), "--cores", str(cores),
+                    "--scsi0", f"{disk_storage}:{disk_gb}",
+                    "--net0", f"virtio,bridge={bridge}", "--ostype", "l26"]
+            if pool:
+                args += ["--pool", pool]
+            if tags_joined:
+                args += ["--tags", tags_joined]
+            r = await _send(pve_cmd_builder.pvesh_create_cmd(
+                f"/nodes/{node}/qemu", args), timeout=120.0)
+            if not pve_cmd_builder.runner_ok(r):
+                raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
+
+            return {"status": "SUCCESS",
+                    "unique_id": f"{cluster}/{node}/{new_vmid}",
+                    "cluster": cluster, "node": node, "vmid": int(new_vmid),
+                    "name": name, "type": "qemu", "pool": pool or "",
+                    "tags": tenant_tags}
+        except pve_cmd_builder.PveCmdError as e:
+            return {"status": "ERROR", "message": str(e)}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("pxmx PXMX_CREATE_VM agent %s failed", agent_id)
+            return {"status": "ERROR", "message": str(e)}
 
     # ── Status / version ──────────────────────────────────────────────────────
 

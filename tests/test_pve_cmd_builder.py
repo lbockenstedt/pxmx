@@ -859,3 +859,469 @@ def test_get_vm_info_no_agent_resolved_errors():
     sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCPByCmd({}, {}))
     res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "ghost/n1/100"}))
     assert res["status"] == "ERROR" and "Cannot resolve agent" in res["message"]
+
+# ── Family #5: mutating VM lifecycle (builder command strings) ────────────────
+
+def test_detect_kind_cmd_is_pct_status():
+    assert pve_cmd_builder.detect_kind_cmd(100) == "pct status 100"
+
+
+def test_kind_from_probe_lxc_when_ok_qemu_otherwise():
+    assert pve_cmd_builder.kind_from_probe(_runner(rc=0)) == "lxc"
+    # pct status exits non-zero for a qemu guest → not runner_ok → qemu.
+    assert pve_cmd_builder.kind_from_probe(_runner(rc=2, stderr="no such ct")) == "qemu"
+    assert pve_cmd_builder.kind_from_probe(_runner(ok=False, error="missing")) == "qemu"
+
+
+def test_default_snapshot_name_is_auto_timestamp():
+    assert pve_cmd_builder.default_snapshot_name().startswith("auto-")
+    assert len(pve_cmd_builder.default_snapshot_name()) == len("auto-YYYYmmddHHMM")
+
+
+def test_vm_action_cmd_start_stop_snapshot():
+    assert pve_cmd_builder.vm_action_cmd(100, "start", "qemu") == "qm start 100"
+    assert pve_cmd_builder.vm_action_cmd(200, "stop", "lxc") == "pct stop 200"
+    # snapshot uses the given name (shell-quoted) + the lm-hub description.
+    assert pve_cmd_builder.vm_action_cmd(100, "snapshot", "qemu", "pre patch") == \
+        'qm snapshot 100 \'pre patch\' --description lm-hub'
+    # reboot/backup are NOT foreground → raises (bespoke fire-and-forget cmds).
+    import pytest
+    for bad in ("reboot", "backup", "restart", "nonsense"):
+        with pytest.raises(pve_cmd_builder.PveCmdError):
+            pve_cmd_builder.vm_action_cmd(100, bad, "qemu")
+
+
+def test_vm_reboot_cmd_is_backgrounded_reset_or_reboot():
+    assert pve_cmd_builder.vm_reboot_cmd(100, "qemu") == "qm reset 100 >/dev/null 2>&1 &"
+    assert pve_cmd_builder.vm_reboot_cmd(200, "lxc") == "pct reboot 200 >/dev/null 2>&1 &"
+
+
+def test_pvesm_status_cmd_quotes_storage():
+    assert pve_cmd_builder.pvesm_status_cmd("local-bak") == "pvesm status --storage local-bak"
+    assert pve_cmd_builder.pvesm_status_cmd("my pool") == "pvesm status --storage 'my pool'"
+
+
+def test_storage_present_checks_rc_and_name():
+    ok = _runner(stdout="local-bak active\nother active")
+    assert pve_cmd_builder.storage_present(ok, "local-bak") is True
+    # rc!=0 → not present.
+    assert pve_cmd_builder.storage_present(_runner(rc=1, stderr="x"), "local-bak") is False
+    # rc 0 but the storage name absent from stdout → not present.
+    assert pve_cmd_builder.storage_present(_runner(stdout="other active"), "local-bak") is False
+
+
+def test_vzdump_cmd_backgrounded_with_keep_and_mode_norm():
+    base = pve_cmd_builder.vzdump_cmd(100, "local-bak", "snapshot", 0)
+    assert base == ("vzdump 100 --mode snapshot --storage local-bak "
+                    "--compress zstd >/dev/null 2>&1 &")
+    with_keep = pve_cmd_builder.vzdump_cmd(100, "local-bak", "suspend", 3)
+    assert "--mode suspend" in with_keep and "--prune-backups keep-last=3" in with_keep
+    # bad mode normalizes to snapshot.
+    assert "--mode snapshot" in pve_cmd_builder.vzdump_cmd(100, "s", "bogus", 0)
+
+
+def test_normalize_backup_mode():
+    assert pve_cmd_builder.normalize_backup_mode("SUSPEND") == "suspend"
+    assert pve_cmd_builder.normalize_backup_mode("stop") == "stop"
+    assert pve_cmd_builder.normalize_backup_mode("") == "snapshot"
+    assert pve_cmd_builder.normalize_backup_mode("weird") == "snapshot"
+
+
+def test_runner_err_prefers_stderr_then_rc():
+    assert pve_cmd_builder.runner_err(_runner(rc=2, stderr="boom")) == "boom"
+    assert pve_cmd_builder.runner_err(_runner(rc=2, stderr="")) == "exited 2"
+
+
+def test_next_free_vmid_cmd_and_parse():
+    assert pve_cmd_builder.next_free_vmid_cmd() == \
+        "pvesh get /cluster/nextid --output-format json"
+    # {"data": N} wrap (pvesh json form).
+    assert pve_cmd_builder.parse_next_free_vmid(_runner(stdout='{"data": 150}')) == 150
+    # bare int (scalar form).
+    assert pve_cmd_builder.parse_next_free_vmid(_runner(stdout="150")) == 150
+    # quoted string form.
+    assert pve_cmd_builder.parse_next_free_vmid(_runner(stdout='"151"')) == 151
+    # failures → None (the spoke falls back to qm/pct list).
+    assert pve_cmd_builder.parse_next_free_vmid(_runner(rc=1, stderr="x")) is None
+    assert pve_cmd_builder.parse_next_free_vmid(_runner(stdout="not json")) is None
+    assert pve_cmd_builder.parse_next_free_vmid(_runner(stdout='{"data": "abc"}')) is None
+
+
+def test_qm_pct_list_cmd_and_parse_vmids():
+    assert pve_cmd_builder.qm_list_cmd() == "qm list"
+    assert pve_cmd_builder.pct_list_cmd() == "pct list"
+    table = _runner(stdout=("      VMID NAME                 STATUS\n"
+                            "      100 web                  running\n"
+                            "      200 db                   stopped\n"
+                            " nope\n"))
+    assert pve_cmd_builder.parse_vmids_from_list(table) == [100, 200]
+    assert pve_cmd_builder.parse_vmids_from_list(_runner(rc=1)) == []
+    assert pve_cmd_builder.parse_vmids_from_list(_runner(stdout="")) == []
+
+
+def test_next_free_vmid_fallback():
+    assert pve_cmd_builder.next_free_vmid_fallback([100, 200, 150]) == 201
+    assert pve_cmd_builder.next_free_vmid_fallback([]) == 100
+
+
+def test_clone_cmd_qemu_full_and_lxc_and_pool():
+    assert pve_cmd_builder.clone_cmd(90000, 100, "web", "qemu") == \
+        "qm clone 90000 100 --name web --full"
+    # qemu non-full (linked clone) omits --full.
+    assert pve_cmd_builder.clone_cmd(90000, 100, "web", "qemu", full=False) == \
+        "qm clone 90000 100 --name web"
+    # lxc uses --hostname.
+    assert pve_cmd_builder.clone_cmd(90000, 101, "ct", "lxc") == \
+        "pct clone 90000 101 --hostname ct"
+    # pool appended; name with spaces quoted.
+    assert pve_cmd_builder.clone_cmd(90000, 100, "foo bar", "qemu", pool="dev") == \
+        "qm clone 90000 100 --name 'foo bar' --full --pool dev"
+
+
+def test_set_tags_cmd_joins_semicolon_and_quotes():
+    assert pve_cmd_builder.set_tags_cmd(100, "qemu", ["a", "b"]) == "qm set 100 --tags 'a;b'"
+    assert pve_cmd_builder.set_tags_cmd(200, "lxc", ["only"]) == "pct set 200 --tags only"
+    # empty list → empty tags value.
+    assert pve_cmd_builder.set_tags_cmd(100, "qemu", []) == "qm set 100 --tags ''"
+
+
+def test_parse_config_tags_splits_and_tolerates_data_wrap():
+    bare = _runner(stdout='{"tags":"base;tenant-x","net0":"x"}')
+    assert pve_cmd_builder.parse_config_tags(bare) == ["base", "tenant-x"]
+    wrapped = _runner(stdout='{"data":{"tags":"a;b"}}')
+    assert pve_cmd_builder.parse_config_tags(wrapped) == ["a", "b"]
+    assert pve_cmd_builder.parse_config_tags(_runner(stdout='{"tags":""}')) == []
+    assert pve_cmd_builder.parse_config_tags(_runner(rc=1)) == []
+    assert pve_cmd_builder.parse_config_tags(_runner(stdout="not json")) == []
+
+
+def test_pvesh_create_cmd_quotes_values_adds_json_flag():
+    args = ["--vmid", "100", "--name", "foo bar", "--cdrom", "local:iso/x.iso",
+            "--scsi0", "local-lvm:32", "--full"]
+    cmd = pve_cmd_builder.pvesh_create_cmd("/nodes/n1/qemu", args)
+    assert cmd == ("pvesh create /nodes/n1/qemu --vmid 100 --name 'foo bar' "
+                   "--cdrom local:iso/x.iso --scsi0 local-lvm:32 --full "
+                   "--output-format json")
+    # flags (start with --) stay bare; values get quoted only when needed.
+    assert "--ostype l26" in pve_cmd_builder.pvesh_create_cmd(
+        "/nodes/n1/qemu", ["--ostype", "l26"])
+
+
+# ── Family #5: spoke orchestration via RUN_COMMAND ────────────────────────────
+
+def _vm_action_cp(cmd_responses):
+    """One-agent _FakeCPByCmd for VM_ACTION tests."""
+    return _FakeCPByCmd({"a": {"cluster_name": "c", "nodes": ["n1"]}},
+                        {"a": cmd_responses})
+
+
+def test_vm_action_start_qemu_foreground():
+    cp = _vm_action_cp({"qm start 100": _runner()})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "start",
+                                  "type": "qemu"}))
+    assert res == {"status": "SUCCESS", "vmid": 100, "action": "start", "kind": "qemu"}
+    assert [c["data"]["command"] for c in cp.calls] == ["qm start 100"]
+    assert cp.calls[0]["cmd"] == "RUN_COMMAND"
+
+
+def test_vm_action_stop_lxc():
+    cp = _vm_action_cp({"pct stop 200": _runner()})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 200, "action": "stop",
+                                  "type": "lxc"}))
+    assert res["status"] == "SUCCESS" and res["kind"] == "lxc"
+    assert cp.calls[0]["data"]["command"] == "pct stop 200"
+
+
+def test_vm_action_snapshot_returns_snapshot_name():
+    cp = _vm_action_cp({"qm snapshot 100 presnap --description lm-hub": _runner()})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "snapshot",
+                                  "type": "qemu", "snapshot_name": "presnap"}))
+    assert res["status"] == "SUCCESS" and res["snapshot"] == "presnap"
+    assert cp.calls[0]["data"]["command"] == \
+        "qm snapshot 100 presnap --description lm-hub"
+
+
+def test_vm_action_kind_detection_probes_pct_status():
+    # No type → probe pct status 100 (rc!=0 → qemu) → then qm start.
+    cp = _vm_action_cp({"pct status 100": _runner(rc=2, stderr="no ct"),
+                        "qm start 100": _runner()})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "start"}))
+    assert res["status"] == "SUCCESS" and res["kind"] == "qemu"
+    cmds = [c["data"]["command"] for c in cp.calls]
+    assert cmds == ["pct status 100", "qm start 100"]
+
+
+def test_vm_action_reboot_is_fire_and_forget_reset():
+    cp = _vm_action_cp({"qm reset 100 >/dev/null 2>&1 &": _runner()})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "reboot",
+                                  "type": "qemu"}))
+    assert res == {"status": "SUCCESS", "vmid": 100, "action": "reboot",
+                   "kind": "qemu", "method": "reset", "started": True}
+    assert cp.calls[0]["data"]["command"] == "qm reset 100 >/dev/null 2>&1 &"
+
+
+def test_vm_action_backup_missing_storage_errors_fast():
+    # pvesm status returns rc 0 but stdout lacks the storage → not present.
+    cp = _vm_action_cp({"pvesm status --storage missing": _runner(stdout="other active")})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "backup",
+                                  "type": "qemu", "backup": {"storage": "missing"}}))
+    assert res["status"] == "ERROR"
+    assert "missing" in res["message"]
+    # Only the validation round-trip fired — no vzdump.
+    assert [c["data"]["command"] for c in cp.calls] == ["pvesm status --storage missing"]
+
+
+def test_vm_action_backup_no_storage_configured_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_vm_action_cp({}))
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "backup",
+                                  "type": "qemu", "backup": {}}))
+    assert res["status"] == "ERROR"
+    assert "no storage configured" in res["message"]
+
+
+def test_vm_action_backup_present_starts_vzdump_backgrounded():
+    vzdump = ("vzdump 100 --mode snapshot --storage local-bak --compress zstd "
+              "--prune-backups keep-last=3 >/dev/null 2>&1 &")
+    cp = _vm_action_cp({"pvesm status --storage local-bak": _runner(stdout="local-bak active"),
+                        vzdump: _runner()})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "backup",
+                                  "type": "qemu",
+                                  "backup": {"storage": "local-bak", "keep": 3}}))
+    assert res["status"] == "SUCCESS" and res["started"] is True
+    assert res["storage"] == "local-bak" and res["mode"] == "snapshot" and res["keep"] == 3
+    cmds = [c["data"]["command"] for c in cp.calls]
+    assert cmds[0] == "pvesm status --storage local-bak"
+    assert cmds[1] == vzdump
+
+
+def test_vm_action_nonzero_rc_surfaces_stderr():
+    cp = _vm_action_cp({"qm start 100": _runner(rc=1, stderr="vm locked")})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "start",
+                                  "type": "qemu"}))
+    assert res["status"] == "ERROR" and res["message"] == "vm locked"
+
+
+def test_vm_action_unknown_action_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_vm_action_cp({}))
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "frob",
+                                  "type": "qemu"}))
+    assert res["status"] == "ERROR" and "unknown vm action" in res["message"]
+
+
+def test_vm_action_no_agents_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCPByCmd({}, {}))
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"unique_id": "c/n1/100", "action": "stop"}))
+    assert res["status"] == "ERROR" and "No agents" in res["message"]
+
+
+def test_vm_action_resolves_agent_from_unique_id_cluster():
+    cp = _FakeCPByCmd({"a-edge": {"cluster_name": "edge", "nodes": ["n1"]}},
+                      {"a-edge": {"qm stop 100": _runner()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"unique_id": "edge/n1/100", "vmid": 100,
+                                  "action": "stop", "type": "qemu"}))
+    assert res["status"] == "SUCCESS"
+    assert cp.calls[0]["agent_id"] == "a-edge"
+
+
+def test_vm_action_bulk_groups_by_agent_and_merges():
+    # Two items on agent a (one ok, one failing), one on agent b.
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "ca", "nodes": ["n1"]},
+         "b": {"cluster_name": "cb", "nodes": ["n2"]}},
+        {"a": {"qm start 100": _runner(),
+               "qm start 101": _runner(rc=1, stderr="locked")},
+         "b": {"pct start 200": _runner()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION_BULK",
+                                 {"action": "start", "items": [
+                                     {"unique_id": "ca/n1/100", "vmid": 100, "type": "qemu"},
+                                     {"unique_id": "ca/n1/101", "vmid": 101, "type": "qemu"},
+                                     {"unique_id": "cb/n2/200", "vmid": 200, "type": "lxc"}]}))
+    assert res["status"] == "SUCCESS"
+    by = {r["vmid"]: r for r in res["results"]}
+    assert by[100]["ok"] is True
+    assert by[101]["ok"] is False and by[101]["error"] == "locked"
+    assert by[200]["ok"] is True and by[200]["kind"] == "lxc"
+
+
+def test_vm_action_bulk_no_agents_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCPByCmd({}, {}))
+    res = _run(sp.handle_command("PXMX_VM_ACTION_BULK",
+                                 {"action": "start", "items": [{"vmid": 100}]}))
+    assert res["status"] == "ERROR" and "No agents" in res["message"]
+
+
+def test_clone_vm_full_flow_nextid_clone_tags():
+    nextid = "pvesh get /cluster/nextid --output-format json"
+    clone = "qm clone 90000 150 --name newvm --full"
+    cfg = "pvesh get /nodes/n1/qemu/90000/config --output-format json"
+    settags = "qm set 150 --tags 'base;tenant-x;tenant-a'"
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {nextid: _runner(stdout='{"data": 150}'),
+               clone: _runner(),
+               cfg: _runner(stdout='{"tags":"base;tenant-x"}'),
+               settags: _runner()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_CLONE_VM",
+                                 {"agent_id": "a",
+                                  "template_unique_id": "c/n1/90000",
+                                  "name": "newvm", "type": "qemu",
+                                  "tenant_tags": ["tenant-a"]}))
+    assert res["status"] == "SUCCESS"
+    assert res["vmid"] == 150
+    assert res["unique_id"] == "c/n1/150"
+    assert res["template_vmid"] == 90000 and res["type"] == "qemu"
+    # Template tags inherited + tenant label appended (dedup).
+    assert res["tags"] == ["base", "tenant-x", "tenant-a"]
+    cmds = [c["data"]["command"] for c in cp.calls]
+    assert cmds == [nextid, clone, cfg, settags]
+
+
+def test_clone_vm_uses_explicit_new_vmid_and_lxc():
+    # explicit new_vmid skips nextid; lxc uses --hostname + pct set.
+    clone = "pct clone 90000 300 --hostname ct"
+    cfg = "pvesh get /nodes/n1/lxc/90000/config --output-format json"
+    settags = "pct set 300 --tags 'tenant-a'"
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {clone: _runner(), cfg: _runner(stdout='{"tags":""}'), settags: _runner()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_CLONE_VM",
+                                 {"agent_id": "a",
+                                  "template_unique_id": "c/n1/90000",
+                                  "name": "ct", "type": "lxc",
+                                  "new_vmid": 300, "tenant_tags": ["tenant-a"]}))
+    assert res["status"] == "SUCCESS" and res["vmid"] == 300
+    assert res["tags"] == ["tenant-a"]
+    # No nextid round-trip (explicit vmid).
+    cmds = [c["data"]["command"] for c in cp.calls]
+    assert "pvesh get /cluster/nextid --output-format json" not in cmds
+
+
+def test_clone_vm_nextid_failure_falls_back_to_qm_pct_list():
+    nextid = "pvesh get /cluster/nextid --output-format json"
+    clone = "qm clone 90000 201 --name newvm --full"
+    cfg = "pvesh get /nodes/n1/qemu/90000/config --output-format json"
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {nextid: _runner(rc=1, stderr="nope"),
+               "qm list": _runner(stdout="VMID NAME\n100 web\n200 db\n"),
+               "pct list": _runner(stdout="VMID NAME\n"),
+               clone: _runner(),
+               cfg: _runner(stdout='{"tags":""}')}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_CLONE_VM",
+                                 {"agent_id": "a",
+                                  "template_unique_id": "c/n1/90000",
+                                  "name": "newvm", "type": "qemu"}))
+    assert res["status"] == "SUCCESS"
+    # max(100,200)+1 = 201.
+    assert res["vmid"] == 201
+
+
+def test_clone_vm_missing_template_vmid_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCPByCmd(
+        {"a": {"cluster_name": "c"}}, {"a": {}}))
+    res = _run(sp.handle_command("PXMX_CLONE_VM",
+                                 {"agent_id": "a", "name": "x"}))
+    assert res["status"] == "ERROR"
+    assert "template_vmid" in res["message"]
+
+
+def test_clone_vm_missing_name_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCPByCmd(
+        {"a": {"cluster_name": "c"}}, {"a": {}}))
+    res = _run(sp.handle_command("PXMX_CLONE_VM",
+                                 {"agent_id": "a", "template_vmid": 90000}))
+    assert res["status"] == "ERROR" and "name" in res["message"]
+
+
+def test_clone_vm_clone_failure_surfaces_stderr():
+    nextid = "pvesh get /cluster/nextid --output-format json"
+    clone = "qm clone 90000 150 --name newvm --full"
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {nextid: _runner(stdout='{"data": 150}'),
+               clone: _runner(rc=1, stderr="disk full")}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_CLONE_VM",
+                                 {"agent_id": "a",
+                                  "template_unique_id": "c/n1/90000",
+                                  "name": "newvm", "type": "qemu"}))
+    assert res["status"] == "ERROR" and res["message"] == "disk full"
+
+
+def test_create_vm_full_flow():
+    nextid = "pvesh get /cluster/nextid --output-format json"
+    create = ("pvesh create /nodes/n1/qemu --vmid 150 --name newvm "
+              "--cdrom local:iso/x.iso --memory 2048 --cores 2 "
+              "--scsi0 local-lvm:32 --net0 virtio,bridge=vmbr0 --ostype l26 "
+              "--tags tenant-a --output-format json")
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {nextid: _runner(stdout='{"data": 150}'), create: _runner()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_CREATE_VM",
+                                 {"agent_id": "a", "node": "n1", "name": "newvm",
+                                  "volid": "local:iso/x.iso",
+                                  "tenant_tags": ["tenant-a"]}))
+    assert res["status"] == "SUCCESS"
+    assert res["vmid"] == 150 and res["unique_id"] == "c/n1/150"
+    assert res["type"] == "qemu" and res["tags"] == ["tenant-a"]
+    assert [c["data"]["command"] for c in cp.calls] == [nextid, create]
+
+
+def test_create_vm_missing_volid_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}}, {"a": {}}))
+    res = _run(sp.handle_command("PXMX_CREATE_VM",
+                                 {"agent_id": "a", "node": "n1", "name": "x"}))
+    assert res["status"] == "ERROR" and "volid" in res["message"]
+
+
+def test_create_vm_missing_node_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCPByCmd(
+        {"a": {"cluster_name": "c"}}, {"a": {}}))
+    res = _run(sp.handle_command("PXMX_CREATE_VM",
+                                 {"agent_id": "a", "name": "x", "volid": "local:iso/x.iso"}))
+    assert res["status"] == "ERROR" and "node" in res["message"]
+
+
+def test_create_vm_resolves_agent_from_node():
+    nextid = "pvesh get /cluster/nextid --output-format json"
+    create = ("pvesh create /nodes/n1/qemu --vmid 150 --name newvm "
+              "--cdrom local:iso/x.iso --memory 2048 --cores 2 "
+              "--scsi0 local-lvm:32 --net0 virtio,bridge=vmbr0 --ostype l26 "
+              "--output-format json")
+    cp = _FakeCPByCmd(
+        {"a-edge": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a-edge": {nextid: _runner(stdout='{"data": 150}'), create: _runner()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    # No agent_id → resolved via _agent_for_node (nodes list match).
+    res = _run(sp.handle_command("PXMX_CREATE_VM",
+                                 {"node": "n1", "name": "newvm",
+                                  "volid": "local:iso/x.iso"}))
+    assert res["status"] == "SUCCESS"
+    assert cp.calls[0]["agent_id"] == "a-edge"

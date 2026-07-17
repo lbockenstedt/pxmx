@@ -26,7 +26,8 @@ the Agent used to do — keeping the Agent fully dumb.
 import json
 import re
 import shlex
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 logger = __import__("logging").getLogger("PveCmdBuilder")
 
@@ -60,6 +61,17 @@ def runner_ok(run_response: Any) -> bool:
 def runner_stdout(run_response: Any) -> str:
     """The command's stdout (``""`` if the run failed)."""
     return (_runner_dict(run_response).get("stdout") or "").strip()
+
+
+def runner_err(run_response: Any) -> str:
+    """The failure message for a non-zero run: ``stderr`` (stripped) when
+    present, else ``"exited <rc>"``. Mirrors the Agent's ``_run`` error so the
+    spoke surfaces the same message the typed handler did."""
+    r = _runner_dict(run_response)
+    err = (r.get("stderr") or "").strip()
+    if err:
+        return err
+    return f"exited {r.get('rc')}"
 
 
 # ── single-shot pvesh reads ──────────────────────────────────────────────────
@@ -571,3 +583,224 @@ def parse_config_nets(run_response: Any) -> List[Dict[str, Any]]:
         if mac or name:
             out.append({"name": name or key, "mac": mac, "ips": []})
     return out
+
+
+# ── Mutating VM lifecycle (PXMX_VM_ACTION / BULK / CLONE / CREATE) ─────────────
+# Family #5 — the highest-risk migration. These are UNGUARDED tenant VM ops (the
+# Hypervisors view manages real VMs at arbitrary vmids, NOT the cs 90000 floor),
+# so cs_guard does NOT apply here — it stays at the Agent execution point for
+# CS_* sim commands only. The spoke builds qm/pct/pvesh/pvesm/vzdump command
+# strings; the Agent runs them via RUN_COMMAND and returns {ok, rc, stdout,
+# stderr}. start/stop/snapshot are foreground (await + check rc); reboot/backup
+# are FIRE-AND-FORGET (backgrounded with `>/dev/null 2>&1 &` so a slow op is
+# never killed mid-flight by the RPC timeout — mirrors the Agent's detached
+# create_subprocess_exec). /cluster/nextid is Proxmox's ATOMIC free-VMID
+# allocator, so clone has no TOCTOU race. The Agent's old typed handlers
+# (PXMX_VM_ACTION/BULK/CLONE/CREATE) stay in agent.py as a rollback fallback.
+
+def detect_kind_cmd(vmid: Any) -> str:
+    """``pct status <vmid>`` — exits 0 ONLY for containers. The kind probe when
+    the hub didn't pass ``type`` (mirrors the Agent's ``detect_guest_type``)."""
+    return f"pct status {int(vmid)}"
+
+
+def kind_from_probe(run_response: Any) -> str:
+    """``'lxc'`` if the pct-status probe exited 0, else ``'qemu'`` (mirrors the
+    Agent — a non-zero pct status means it isn't a container, so qemu)."""
+    return "lxc" if runner_ok(run_response) else "qemu"
+
+
+def default_snapshot_name() -> str:
+    """``auto-<YYYYmmddHHMM>`` — the Agent's auto snapshot name when none given."""
+    return f"auto-{time.strftime('%Y%m%d%H%M')}"
+
+
+def vm_action_cmd(vmid: Any, action: str, kind: str,
+                  snapshot_name: Optional[str] = None) -> str:
+    """Foreground ``qm``/``pct`` command for start/stop/snapshot (await + check
+    rc). ``reboot``/``backup`` are fire-and-forget → use :func:`vm_reboot_cmd` /
+    :func:`vzdump_cmd`. Raises :class:`PveCmdError` for any other action."""
+    vid = int(vmid)
+    bin_ = "pct" if kind == "lxc" else "qm"
+    act = (action or "").lower()
+    if act == "start":
+        return f"{bin_} start {vid}"
+    if act == "stop":
+        return f"{bin_} stop {vid}"
+    if act == "snapshot":
+        snap = snapshot_name or default_snapshot_name()
+        return f"{bin_} snapshot {vid} {shlex.quote(snap)} --description lm-hub"
+    raise PveCmdError(f"not a foreground vm action: {action!r}")
+
+
+def vm_reboot_cmd(vmid: Any, kind: str) -> str:
+    """Fire-and-forget reboot: ``qm reset <vmid>`` (qemu — an immediate hardware
+    reset that always reboots a running VM, no guest cooperation) / ``pct reboot
+    <vmid>`` (containers reboot cleanly). Backgrounded so RUN_COMMAND returns
+    immediately — mirrors the Agent's detached ``create_subprocess_exec``."""
+    vid = int(vmid)
+    if kind == "lxc":
+        return f"pct reboot {vid} >/dev/null 2>&1 &"
+    return f"qm reset {vid} >/dev/null 2>&1 &"
+
+
+def pvesm_status_cmd(storage: str) -> str:
+    """``pvesm status --storage <storage>`` — backup-storage validation. The
+    backup action fails fast with a clear message if the storage isn't
+    configured on this host (instead of a silent task-log error)."""
+    return f"pvesm status --storage {shlex.quote(storage)}"
+
+
+def storage_present(run_response: Any, storage: str) -> bool:
+    """True if the pvesm-status probe exited 0 AND the storage name appears in
+    its stdout (mirrors the Agent's ``rc == 0 or storage not in out`` guard)."""
+    if not runner_ok(run_response):
+        return False
+    return storage in runner_stdout(run_response)
+
+
+def normalize_backup_mode(mode: str) -> str:
+    """Backup mode normalized to one of ``snapshot``/``suspend``/``stop``
+    (default ``snapshot`` — no downtime). Mirrors the Agent's normalization."""
+    m = (mode or "snapshot").lower()
+    return m if m in ("snapshot", "suspend", "stop") else "snapshot"
+
+
+def vzdump_cmd(vmid: Any, storage: str, mode: str = "snapshot",
+               keep: int = 0) -> str:
+    """Fire-and-forget vzdump backup: ``vzdump <vmid> --mode <m> --storage <s>
+    --compress zstd [--prune-backups keep-last=N] >/dev/null 2>&1 &``. vzdump can
+    run minutes, so it's backgrounded (completion/failure surfaces in the
+    Proxmox node task log). ``mode`` is normalized to snapshot/suspend/stop."""
+    vid = int(vmid)
+    m = normalize_backup_mode(mode)
+    cmd = (f"vzdump {vid} --mode {m} --storage {shlex.quote(storage)} "
+           f"--compress zstd")
+    try:
+        k = int(keep or 0)
+    except (TypeError, ValueError):
+        k = 0
+    if k > 0:
+        cmd += f" --prune-backups keep-last={k}"
+    return cmd + " >/dev/null 2>&1 &"
+
+
+def next_free_vmid_cmd() -> str:
+    """``pvesh get /cluster/nextid --output-format json`` — Proxmox's ATOMIC free-
+    VMID allocator (no TOCTOU race for clone). Returns ``{"data": <id>}``."""
+    return pvesh_get("/cluster/nextid")
+
+
+def parse_next_free_vmid(run_response: Any) -> Optional[int]:
+    """The free VMID from a ``/cluster/nextid`` response, or ``None`` on failure
+    (the spoke then falls back to ``max(qm list ∪ pct list)+1``). Handles the
+    ``{"data": N}`` wrap, a bare int, and a quoted string. Mirrors the Agent's
+    ``next_free_vmid``."""
+    if not runner_ok(run_response):
+        return None
+    out = runner_stdout(run_response)
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict):
+        data = data.get("data", data)
+    if isinstance(data, str):
+        data = data.strip().strip('"')
+    try:
+        return int(data)
+    except (TypeError, ValueError):
+        return None
+
+
+def qm_list_cmd() -> str:
+    """``qm list`` — the next-free-VMID fallback's qemu source."""
+    return "qm list"
+
+
+def pct_list_cmd() -> str:
+    """``pct list`` — the next-free-VMID fallback's lxc source."""
+    return "pct list"
+
+
+def parse_vmids_from_list(run_response: Any) -> List[int]:
+    """VMIDs from a ``qm list``/``pct list`` table (first column, header skipped).
+    The next-free-VMID fallback merges these and takes ``max+1``."""
+    if not runner_ok(run_response):
+        return []
+    out = runner_stdout(run_response)
+    if not out:
+        return []
+    used: List[int] = []
+    for line in out.splitlines()[1:]:  # skip header
+        parts = line.split()
+        if parts and parts[0].isdigit():
+            used.append(int(parts[0]))
+    return used
+
+
+def next_free_vmid_fallback(used_vmids: List[int]) -> int:
+    """``max(used)+1``, or ``100`` when nothing is used (mirrors the Agent)."""
+    return (max(used_vmids) + 1) if used_vmids else 100
+
+
+def clone_cmd(template_vmid: Any, new_vmid: Any, name: str, kind: str,
+              full: bool = True, pool: Optional[str] = None) -> str:
+    """``qm``/``pct clone <template> <new> --name/--hostname <name> [--full]
+    [--pool]``. qemu defaults to a full clone (own disk); lxc uses ``--hostname``.
+    Both take ``--pool`` to place the new VM in a resource pool."""
+    tvid = int(template_vmid)
+    nvid = int(new_vmid)
+    if kind == "lxc":
+        cmd = f"pct clone {tvid} {nvid} --hostname {shlex.quote(name)}"
+    else:
+        cmd = f"qm clone {tvid} {nvid} --name {shlex.quote(name)}"
+        if full:
+            cmd += " --full"
+    if pool:
+        cmd += f" --pool {shlex.quote(str(pool))}"
+    return cmd
+
+
+def set_tags_cmd(vmid: Any, kind: str, tags: List[str]) -> str:
+    """``qm``/``pct set <vmid> --tags <;joined>`` (overwrites current tags).
+    Used by clone-from-template to tag the new VM for the cloning tenant."""
+    vid = int(vmid)
+    bin_ = "pct" if kind == "lxc" else "qm"
+    joined = ";".join(str(t).strip() for t in (tags or []) if str(t).strip())
+    return f"{bin_} set {vid} --tags {shlex.quote(joined)}"
+
+
+def parse_config_tags(run_response: Any) -> List[str]:
+    """The ``tags`` field from a ``qm``/``pct config`` object → the split ``;``
+    list (used by clone to inherit the template's tags). Tolerates a
+    ``{"data": {...}}`` wrap (pvesh json may wrap single objects) — mirrors
+    :func:`parse_config_nets`. ``[]`` on any failure."""
+    if not runner_ok(run_response):
+        return []
+    out = runner_stdout(run_response)
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except (ValueError, TypeError):
+        return []
+    cfg = data.get("data", data) if isinstance(data, dict) else data
+    if not isinstance(cfg, dict):
+        return []
+    return _parse_tags(cfg.get("tags", ""))
+
+
+def pvesh_create_cmd(path: str, args: List[str]) -> str:
+    """``pvesh create <path> <args...> --output-format json`` — mirrors the
+    Agent's ``_pvesh_action('create', path, *args, json_out=True)``. ``args`` is
+    a flat ``["--flag", "value", ...]`` list; values are shell-quoted (flags
+    starting ``--`` are left bare). Used by create-VM-from-ISO."""
+    parts = ["pvesh", "create", shlex.quote(path)]
+    for a in (args or []):
+        a = str(a)
+        parts.append(a if a.startswith("--") else shlex.quote(a))
+    parts.append("--output-format json")
+    return " ".join(parts)
