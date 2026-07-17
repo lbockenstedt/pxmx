@@ -138,3 +138,54 @@ def parse_storages(run_response: Any, content_filter: str = "images") -> List[Di
             "shared":  bool(s.get("shared", 0)),
         })
     return out
+
+
+def storage_names_for_content(run_response: Any, content_filter: str = "iso") -> List[str]:
+    """Storage NAMES whose ``content`` includes ``content_filter`` (e.g. ``iso``
+    for the create-VM-from-ISO flow). The first round-trip of PXMX_LIST_ISOS;
+    the spoke then fetches each storage's content. Mirrors the Agent's
+    ``list_node_isos`` storage-filter step."""
+    out: List[str] = []
+    for s in _parse_json_list(run_response):
+        if not isinstance(s, dict):
+            continue
+        content = s.get("content") or ""
+        parts = content.split(",") if isinstance(content, str) else content
+        if content_filter not in parts:
+            continue
+        storage = s.get("storage")
+        if storage:
+            out.append(storage)
+    return out
+
+
+# ── PXMX_LIST_ISOS (multi-round-trip) ─────────────────────────────────────────
+# The Agent's ``list_node_isos`` was a multi-step pvesh sequence: list storages
+# → for each iso-content storage, list its content → flatten the .iso items. The
+# spoke now orchestrates the same sequence as RUN_COMMAND round-trips (keeping
+# the Agent fully dumb) and does the parse/flatten the Agent used to do.
+
+def list_iso_content_cmd(node: str, storage: str) -> str:
+    """``pvesh get /nodes/<node>/storage/<storage>/content`` — the per-storage
+    content listing (second round-trip of PXMX_LIST_ISOS)."""
+    return pvesh_get(f"/nodes/{node}/storage/{storage}/content")
+
+
+def parse_iso_items(run_response: Any, storage: str) -> List[Dict[str, Any]]:
+    """``[{volid, name, storage, size}, ...]`` for items whose volid ends in
+    ``.iso``. Mirrors the Agent's ``list_node_isos`` item flatten. The storage
+    arg is stamped back so the caller knows where each ISO lives."""
+    out: List[Dict[str, Any]] = []
+    for it in _parse_json_list(run_response):
+        if not isinstance(it, dict):
+            continue
+        volid = it.get("volid") or ""
+        if not volid.endswith(".iso"):
+            continue
+        out.append({
+            "volid":   volid,
+            "name":    volid.split("/")[-1],
+            "storage": storage,
+            "size":    it.get("size", 0) or 0,
+        })
+    return out

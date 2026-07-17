@@ -199,19 +199,50 @@ class ProxmoxSpoke(BaseSpoke):
                         logger.debug("list_pools agent %s failed: %s", aid, e)
             return {"status": "SUCCESS", "pools": pools}
 
-        # ISO + storage listing for the create-VM-from-ISO flow. Scoped to a
-        # node: route to the agent that owns the node (agent_id passed by the
-        # hub, resolved from /api/pxmx/nodes). Falls back to the first agent.
+        # ISO listing for the create-VM-from-ISO flow. Scoped to a node: route
+        # to the agent that owns the node (agent_id passed by the hub, resolved
+        # from /api/pxmx/nodes). Falls back to the first agent.
+        #
+        # #4 migration: multi-round-trip (the Agent's list_node_isos was a
+        # multi-step pvesh sequence). The spoke: (1) RUN_COMMANDs the node's
+        # storage list, picks iso-content storages; (2) RUN_COMMANDs each iso
+        # storage's content; (3) flattens the .iso items. The Agent stays a dumb
+        # executor; the spoke does the parse/flatten the Agent used to do. The
+        # Agent's old typed PXMX_LIST_ISOS handler stays as a rollback fallback.
         if cmd == "PXMX_LIST_ISOS":
             agent_id = data.get("agent_id")
             if not agent_id:
                 agent_id = self._agent_for_node(data.get("node", ""))
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for node"}
-            r = await self.control_plane.send_to_agent(
-                "PXMX_LIST_ISOS", data, agent_id=agent_id, timeout=20.0)
-            r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
-            return r if isinstance(r, dict) else {"status": "ERROR", "message": "agent returned no isos"}
+            node = data.get("node", "") or ""
+            cluster = ((self.control_plane.connected_agents or {})
+                        .get(agent_id, {}).get("cluster_name", agent_id))
+            isos: list = []
+            try:
+                r = await self.control_plane.send_to_agent(
+                    "RUN_COMMAND",
+                    {"command": pve_cmd_builder.list_storages_cmd(node),
+                     "allow_shell": True, "timeout": 12},
+                    agent_id=agent_id, timeout=15.0)
+                iso_storages = pve_cmd_builder.storage_names_for_content(r, "iso")
+                # One content round-trip per iso storage (typically 1-2/node).
+                for storage in iso_storages:
+                    try:
+                        r2 = await self.control_plane.send_to_agent(
+                            "RUN_COMMAND",
+                            {"command": pve_cmd_builder.list_iso_content_cmd(node, storage),
+                             "allow_shell": True, "timeout": 12},
+                            agent_id=agent_id, timeout=15.0)
+                        isos.extend(pve_cmd_builder.parse_iso_items(r2, storage))
+                    except Exception as e:  # noqa: BLE001 - one storage failing ≠ all
+                        logger.debug("iso content %s/%s failed: %s",
+                                      node, storage, e)
+            except Exception as e:
+                logger.debug("list_isos storage-list agent %s failed: %s",
+                             agent_id, e)
+            return {"status": "SUCCESS", "isos": isos,
+                    "node": node, "cluster": cluster}
 
         if cmd == "PXMX_LIST_STORAGES":
             agent_id = data.get("agent_id")

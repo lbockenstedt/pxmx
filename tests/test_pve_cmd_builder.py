@@ -223,3 +223,110 @@ def test_list_storages_agent_failure_returns_empty_success():
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("PXMX_LIST_STORAGES", {"node": "n1"}))
     assert res == {"status": "SUCCESS", "storages": [], "node": "n1", "cluster": "c"}
+
+
+# ── PXMX_LIST_ISOS (multi-round-trip) ─────────────────────────────────────────
+
+def test_list_iso_content_cmd():
+    assert pve_cmd_builder.list_iso_content_cmd("edge01", "local") == \
+        "pvesh get /nodes/edge01/storage/local/content"
+
+
+def test_storage_names_for_content_picks_iso_storages():
+    r = _runner(stdout=(
+        '[{"storage":"local","content":"iso,images"},'
+        '{"storage":"iso-pool","content":"iso"},'
+        '{"storage":"vztmpl","content":"vztmpl"}]'))
+    assert pve_cmd_builder.storage_names_for_content(r, "iso") == ["local", "iso-pool"]
+
+
+def test_parse_iso_items_keeps_iso_only_and_stamps_storage():
+    r = _runner(stdout=(
+        '[{"volid":"local:iso/ubuntu-22.04.iso","size":12345},'
+        '{"volid":"local:backup/foo.tar.zst","size":999},'
+        '{"volid":"local:iso/debian-12.iso","size":222}]'))
+    items = pve_cmd_builder.parse_iso_items(r, "local")
+    assert len(items) == 2  # the .tar.zst backup is dropped
+    assert items[0] == {"volid": "local:iso/ubuntu-22.04.iso",
+                       "name": "ubuntu-22.04.iso", "storage": "local", "size": 12345}
+    assert items[1]["name"] == "debian-12.iso"
+
+
+class _FakeCPRoundRobin:
+    """Returns a sequence of responses per agent_id, in order (for multi-trip)."""
+    def __init__(self, agents, responses):
+        self.connected_agents = agents
+        self._responses = responses  # agent_id → list of runner dicts (consumed)
+        self.calls = []
+
+    async def send_to_agent(self, cmd, data, agent_id=None, timeout=15.0):
+        self.calls.append({"cmd": cmd, "data": dict(data), "agent_id": agent_id})
+        seq = self._responses.get(agent_id, [])
+        resp = seq[len([c for c in self.calls if c["agent_id"] == agent_id]) - 1] \
+            if seq else _runner()
+        return resp
+
+
+def test_list_isos_two_round_trips_storage_then_content():
+    storage_list = _runner(stdout=(
+        '[{"storage":"local","content":"iso,images"},'
+        '{"storage":"iso-pool","content":"iso"},'
+        '{"storage":"vztmpl","content":"vztmpl"}]'))
+    local_content = _runner(stdout=(
+        '[{"volid":"local:iso/ubuntu.iso","size":100}]'))
+    pool_content = _runner(stdout=(
+        '[{"volid":"iso-pool:iso/debian.iso","size":200},'
+        '{"volid":"iso-pool:backup/x.tar.zst","size":9}]'))
+    cp = _FakeCPRoundRobin(
+        {"a-edge": {"cluster_name": "c", "nodes": ["edge01"]}},
+        {"a-edge": [storage_list, local_content, pool_content]})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_ISOS", {"node": "edge01"}))
+    assert res["status"] == "SUCCESS"
+    assert res["cluster"] == "c" and res["node"] == "edge01"
+    # 3 RUN_COMMANDs: storage list + one content fetch per iso storage (vztmpl skipped).
+    assert len(cp.calls) == 3
+    assert all(c["cmd"] == "RUN_COMMAND" for c in cp.calls)
+    assert cp.calls[0]["data"]["command"] == "pvesh get /nodes/edge01/storage"
+    assert cp.calls[1]["data"]["command"] == "pvesh get /nodes/edge01/storage/local/content"
+    assert cp.calls[2]["data"]["command"] == "pvesh get /nodes/edge01/storage/iso-pool/content"
+    volids = sorted(i["volid"] for i in res["isos"])
+    assert volids == ["iso-pool:iso/debian.iso", "local:iso/ubuntu.iso"]
+
+
+def test_list_isos_no_iso_storages_single_trip_empty():
+    cp = _FakeCPRoundRobin(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": [_runner(stdout='[{"storage":"vztmpl","content":"vztmpl"}]')]})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_ISOS", {"node": "n1"}))
+    assert res == {"status": "SUCCESS", "isos": [], "node": "n1", "cluster": "c"}
+    assert len(cp.calls) == 1  # only the storage-list trip
+
+
+def test_list_isos_one_storage_failure_doesnt_sink_others():
+    # storage-list OK; local content raises; iso-pool content OK → only pool's ISO.
+    storage_list = _runner(stdout=(
+        '[{"storage":"local","content":"iso"},'
+        '{"storage":"iso-pool","content":"iso"}]'))
+    cp = _FakeCPRoundRobin(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": [storage_list, None, _runner(
+            stdout='[{"volid":"iso-pool:iso/d.iso","size":1}]')]})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_ISOS", {"node": "n1"}))
+    assert res["status"] == "SUCCESS"
+    assert [i["volid"] for i in res["isos"]] == ["iso-pool:iso/d.iso"]
+
+
+def test_list_isos_storage_list_failure_empty_success():
+    cp = _FakeCP({"a": {"cluster_name": "c", "nodes": ["n1"]}}, {"a": None})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_ISOS", {"node": "n1"}))
+    assert res == {"status": "SUCCESS", "isos": [], "node": "n1", "cluster": "c"}
+
+
+def test_list_isos_no_agent_resolved_errors():
+    sp = ProxmoxSpoke("px-1", {}, control_plane=_FakeCP({}, {}))
+    res = _run(sp.handle_command("PXMX_LIST_ISOS", {"node": "ghost"}))
+    assert res["status"] == "ERROR" and "No agent resolved" in res["message"]
