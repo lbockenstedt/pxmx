@@ -24,6 +24,7 @@ Single-shot pvesh reads are one ``RUN_COMMAND``. Multi-step families
 the Agent used to do — keeping the Agent fully dumb.
 """
 import json
+import re
 import shlex
 from typing import Any, Dict, List
 
@@ -302,3 +303,266 @@ def node_from_status(run_response: Any, nrec: Dict[str, Any], cluster: str) -> D
         "uptime":           stat.get("uptime", nrec.get("uptime", 0)),
         "proxmox_version":  stat.get("pveversion", ""),
     }
+
+
+# ── PXMX_LIST_VMS (multi-round-trip + pool map + interface annotation) ───────
+# The Agent's ``get_vm_list`` was the richest family: a best-effort vmid→poolid
+# map (``/pools`` + per-pool ``/pools/{pid}`` detail when members aren't inline),
+# a base VM list (primary ``/cluster/resources`` type in {qemu,lxc}; fallback
+# ``/nodes`` → per-node ``/qemu`` + ``/lxc``), and per-VM interface annotation
+# (running: QGA ``network-get-interfaces`` / lxc ``/interfaces``; fallback
+# ``qm/pct config`` netN lines for the configured MACs). The spoke now
+# orchestrates all of it as RUN_COMMAND round-trips. Annotation round-trips are
+# issued CONCURRENTLY from the spoke (send_to_agent multiplexes in-flight
+# requests per agent via correlation-id futures), with a 16-concurrent
+# semaphore + 12s deadline — mirroring the Agent's ``_annotate_vm_interfaces``.
+
+_MAC_RE = re.compile(r"^[0-9a-f]{2}([:-]?[0-9a-f]{2}){5}$", re.IGNORECASE)
+
+
+def _looks_like_mac(s: str) -> bool:
+    """True if ``s`` is a 6-octet MAC (colon or dash separators)."""
+    return bool(_MAC_RE.match((s or "").strip()))
+
+
+def _parse_tags(raw: Any) -> List[str]:
+    """Proxmox tags are a ``;``-joined string → split + trimmed list."""
+    return [t.strip() for t in (raw or "").split(";") if t.strip()]
+
+
+# ── pool map ──────────────────────────────────────────────────────────────────
+
+def parse_pools_listing_for_members(run_response: Any) -> List[Dict[str, Any]]:
+    """``[{poolid, members}]`` from ``/pools``. ``members`` is the inline member
+    list when PVE returns it on the listing, else ``None`` (the spoke then fetches
+    ``/pools/{poolid}`` for the detail)."""
+    out: List[Dict[str, Any]] = []
+    for p in _parse_json_list(run_response):
+        if not isinstance(p, dict) or not p.get("poolid"):
+            continue
+        members = p.get("members")
+        out.append({"poolid": p.get("poolid"),
+                    "members": members if isinstance(members, list) else None})
+    return out
+
+
+def pool_detail_cmd(poolid: str) -> str:
+    """``pvesh get /pools/<poolid>`` — the per-pool detail fetch (members)."""
+    return pvesh_get(f"/pools/{poolid}")
+
+
+def pool_detail_members(run_response: Any) -> List[Dict[str, Any]]:
+    """Member dicts from a ``/pools/{pid}`` detail object (``{members:[...]}``).
+    ``[]`` on any failure (best-effort — a pool with no detail just maps nothing)."""
+    d = _parse_json_obj(run_response)
+    members = d.get("members")
+    return members if isinstance(members, list) else []
+
+
+def build_pool_map(pools_listing: List[Dict[str, Any]],
+                   details: Dict[str, List[Dict[str, Any]]]) -> Dict[Any, str]:
+    """``{vmid: poolid}`` reverse-map. ``pools_listing`` is
+    ``parse_pools_listing_for_members`` output; ``details`` maps poolid → the
+    member list fetched for pools whose listing ``members`` was ``None``. First
+    pool seen wins (a VM shouldn't be in two pools)."""
+    out: Dict[Any, str] = {}
+    for p in pools_listing:
+        pid = p.get("poolid")
+        if not pid:
+            continue
+        members = p.get("members")
+        if members is None:
+            members = details.get(pid, [])
+        for m in (members if isinstance(members, list) else []):
+            if isinstance(m, dict) and m.get("vmid") is not None:
+                out.setdefault(m.get("vmid"), pid)
+    return out
+
+
+# ── base VM list ──────────────────────────────────────────────────────────────
+
+def _vm_entry(r: Dict[str, Any], node: str, rtype: str, vmid: Any,
+              cluster: str, pool_map: Dict[Any, str]) -> Dict[str, Any]:
+    """The VM record shape the Agent's ``get_vm_list`` produced. ``interfaces``
+    + ``ips`` are left empty here; the spoke fills them via
+    ``parse_guest_ifaces``/``parse_config_nets`` after the base list is built."""
+    return {
+        "unique_id": f"{cluster}/{node}/{vmid}",
+        "cluster":   cluster,
+        "node":      node,
+        "vmid":      vmid,
+        "type":      rtype,
+        "name":      r.get("name", f"{'vm' if rtype == 'qemu' else 'ct'}-{vmid}"),
+        "status":    r.get("status", "unknown"),
+        "template":  int(r.get("template", 0) or 0),
+        "cpu":       round(r.get("cpu", 0) * 100, 1),
+        "mem_bytes": r.get("mem") or r.get("maxmem", 0),
+        "uptime":    r.get("uptime", 0),
+        "vcpus":     int(r.get("maxcpu", 0) or 0),
+        "disk_gb":   round((r.get("maxdisk", 0) or 0) / 1e9, 1),
+        "pool":      pool_map.get(vmid, "") if pool_map else "",
+        "tags":      _parse_tags(r.get("tags")),
+        "interfaces": [],
+        "ips":       [],
+    }
+
+
+def parse_cluster_resource_vms(run_response: Any, cluster: str,
+                               pool_map: Dict[Any, str]) -> List[Dict[str, Any]]:
+    """Primary path: ``/cluster/resources`` filtered to ``type in {qemu, lxc}``."""
+    out: List[Dict[str, Any]] = []
+    for r in _parse_json_list(run_response):
+        if not isinstance(r, dict):
+            continue
+        rtype = r.get("type")
+        if rtype not in ("qemu", "lxc"):
+            continue
+        vmid = r.get("vmid")
+        if vmid is None:
+            continue
+        out.append(_vm_entry(r, r.get("node", ""), rtype, vmid, cluster, pool_map))
+    return out
+
+
+def node_qemu_cmd(node: str) -> str:
+    """``pvesh get /nodes/<node>/qemu`` — fallback per-node QEMU list."""
+    return pvesh_get(f"/nodes/{node}/qemu")
+
+
+def node_lxc_cmd(node: str) -> str:
+    """``pvesh get /nodes/<node>/lxc`` — fallback per-node LXC list."""
+    return pvesh_get(f"/nodes/{node}/lxc")
+
+
+def parse_node_vm_list(run_response: Any, node: str, rtype: str, cluster: str,
+                       pool_map: Dict[Any, str]) -> List[Dict[str, Any]]:
+    """Fallback per-node ``/qemu`` or ``/lxc`` list → the same VM record shape."""
+    out: List[Dict[str, Any]] = []
+    for r in _parse_json_list(run_response):
+        if not isinstance(r, dict):
+            continue
+        vmid = r.get("vmid")
+        if vmid is None:
+            continue
+        out.append(_vm_entry(r, node, rtype, vmid, cluster, pool_map))
+    return out
+
+
+def node_names(run_response: Any) -> List[str]:
+    """Node names from a ``/nodes`` listing — used by the LIST_VMS fallback
+    (per-node /qemu + /lxc). Distinct from ``parse_nodes_list_entries`` (which
+    carries the node-stats fields); this is just the names the VM loop needs."""
+    return [n.get("node") for n in _parse_json_list(run_response)
+            if isinstance(n, dict) and n.get("node")]
+
+
+# ── interface annotation ──────────────────────────────────────────────────────
+
+def vm_guest_ifaces_cmd(node: str, vmid: Any, kind: str) -> str:
+    """Running-VM guest interfaces: QGA ``network-get-interfaces`` (qemu) or the
+    container netns ``/interfaces`` (lxc). The first annotation round-trip."""
+    if kind == "qemu":
+        return pvesh_get(f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces")
+    return pvesh_get(f"/nodes/{node}/lxc/{vmid}/interfaces")
+
+
+def vm_config_cmd(node: str, vmid: Any, kind: str) -> str:
+    """``qm/pct config`` — the configured-MAC fallback when the guest source is
+    absent/unresponsive or the VM is stopped. MACs are config so always available."""
+    return pvesh_get(f"/nodes/{node}/{kind}/{vmid}/config")
+
+
+def parse_guest_ifaces(run_response: Any) -> List[Dict[str, Any]]:
+    """Normalize QGA ``network-get-interfaces`` / lxc ``/interfaces`` into
+    ``[{name, mac, ips}]``. PVE wraps agent responses inconsistently (result/data
+    nesting) — unwrapped here. Loopback/zero-MAC pseudo-interfaces are excluded;
+    per-interface IPv4s are deduped. ``[]`` on any failure."""
+    if not runner_ok(run_response):
+        return []
+    out_str = runner_stdout(run_response)
+    if not out_str:
+        return []
+    try:
+        data = json.loads(out_str)
+    except (ValueError, TypeError):
+        return []
+    result = data
+    if isinstance(data, dict):
+        result = data.get("result", data.get("data", data))
+    if isinstance(result, dict) and "result" in result:
+        result = result["result"]
+    if not isinstance(result, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    seen_names: set = set()
+    for iface in result:
+        if not isinstance(iface, dict):
+            continue
+        name = str(iface.get("name") or iface.get("netdev") or "").strip()
+        mac = str(iface.get("hardware-address") or iface.get("hwaddr") or "").strip().lower()
+        if name.lower() == "lo" or mac == "00:00:00:00:00:00":
+            continue
+        ips: List[str] = []
+        for entry in (iface.get("ip-addresses") or []):
+            if str(entry.get("ip-address-type", "")).lower() == "ipv4":
+                ip = entry.get("ip-address")
+                if isinstance(ip, str) and ip and not ip.startswith(("127.", "169.254.")):
+                    ips.append(ip)
+        inet = iface.get("inet")
+        addrs = inet if isinstance(inet, list) else (
+            [inet] if isinstance(inet, str) and inet else [])
+        for addr in addrs:
+            ip = str(addr).split("/")[0]
+            if ip and not ip.startswith(("127.", "169.254.")):
+                ips.append(ip)
+        seen, uips = set(), []
+        for ip in ips:
+            if ip not in seen:
+                seen.add(ip)
+                uips.append(ip)
+        key = name or mac or f"iface{len(out)}"
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        out.append({"name": name, "mac": mac, "ips": uips})
+    return out
+
+
+def parse_config_nets(run_response: Any) -> List[Dict[str, Any]]:
+    """Parse a ``qm``/``pct config`` object for ``netN`` entries →
+    ``[{name, mac, ips: []}]`` (configured MACs only; no guest IPs). qemu:
+    ``net0: "virtio=AA:..,bridge=vmbr0"``; lxc:
+    ``net0: "name=eth0,bridge=vmbr0,hwaddr=AA:.."``. ``[]`` on any failure."""
+    if not runner_ok(run_response):
+        return []
+    out_str = runner_stdout(run_response)
+    if not out_str:
+        return []
+    try:
+        data = json.loads(out_str)
+    except (ValueError, TypeError):
+        return []
+    cfg = data.get("data", data) if isinstance(data, dict) else data
+    if not isinstance(cfg, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for key, val in cfg.items():
+        if not key.startswith("net") or not isinstance(val, str):
+            continue
+        mac, name = "", ""
+        for token in val.split(","):
+            token = token.strip()
+            if not token or "=" not in token:
+                continue
+            k, v = token.split("=", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if k == "hwaddr" and _looks_like_mac(v):
+                mac = v.lower()
+            elif k == "name":
+                name = v
+            elif _looks_like_mac(v):
+                mac = v.lower()   # qemu: <model>=<MAC>
+        if mac or name:
+            out.append({"name": name or key, "mac": mac, "ips": []})
+    return out

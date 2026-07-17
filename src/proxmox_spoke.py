@@ -9,6 +9,7 @@ connect/auth/dispatch loop. Audience: pxmx developers; see the repo
 the canonical VM identity key.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -534,6 +535,128 @@ class ProxmoxSpoke(BaseSpoke):
 
     # ── VM list (aggregated) ──────────────────────────────────────────────────
 
+    async def _vms_from_agent(self, agent_id: str) -> Dict[str, Any]:
+        """PXMX_LIST_VMS via multi-round-trip RUN_COMMAND (#4).
+
+        Reproduces the Agent's ``get_vm_list`` on the spoke so the Agent is a dumb
+        executor: (1) best-effort vmid→poolid map from ``/pools`` (+ per-pool
+        ``/pools/{pid}`` detail when members aren't inline); (2) base VM list —
+        primary ``/cluster/resources`` filtered to qemu/lxc, fallback ``/nodes``
+        → per-node ``/qemu`` + ``/lxc``; (3) per-VM interface annotation issued
+        CONCURRENTLY (send_to_agent multiplexes in-flight requests per agent) with
+        a 16-concurrent semaphore + 12s deadline, mirroring the Agent's
+        ``_annotate_vm_interfaces``. ``cluster`` is stamped from
+        ``connected_agents`` (the Agent used ``self.cluster_name``). On an
+        unreachable agent returns ``{status:ERROR, message}`` (so the pinned path
+        surfaces it honestly, not as "0 VMs synced, success"); on a reachable-but-
+        failed query returns the Agent's ``{vms:[], cluster, error}`` shape."""
+        info = (self.control_plane.connected_agents or {}).get(agent_id, {}) \
+            if self.control_plane else {}
+        cluster = info.get("cluster_name", agent_id)
+
+        async def _send(cmd: str, timeout: float = 12.0):
+            return await self.control_plane.send_to_agent(
+                "RUN_COMMAND",
+                {"command": cmd, "allow_shell": True, "timeout": timeout},
+                agent_id=agent_id, timeout=15.0)
+
+        # Reachability check: a RUN_COMMAND to an unreachable agent returns the
+        # agent-level ERROR dict (not a runner dict). Surface it honestly so the
+        # pinned sync records an 'error' status instead of an empty 'success'.
+        probe = await _send(pve_cmd_builder.list_pools_cmd())
+        if isinstance(probe, dict) and probe.get("status") == "ERROR":
+            return {"status": "ERROR",
+                    "message": probe.get("message", f"agent {agent_id} unreachable")}
+
+        try:
+            pool_map = await self._pool_map_from_agent(agent_id, _send, probe)
+
+            # Primary: /cluster/resources filtered to qemu/lxc.
+            r = await _send(pve_cmd_builder.cluster_resources_cmd())
+            vms = pve_cmd_builder.parse_cluster_resource_vms(r, cluster, pool_map)
+            if not vms:
+                # Fallback: /nodes → per-node /qemu + /lxc.
+                rn = await _send(pve_cmd_builder.nodes_list_cmd())
+                for node in pve_cmd_builder.node_names(rn):
+                    rq = await _send(pve_cmd_builder.node_qemu_cmd(node))
+                    vms += pve_cmd_builder.parse_node_vm_list(rq, node, "qemu", cluster, pool_map)
+                    rl = await _send(pve_cmd_builder.node_lxc_cmd(node))
+                    vms += pve_cmd_builder.parse_node_vm_list(rl, node, "lxc", cluster, pool_map)
+
+            await self._annotate_vm_interfaces(agent_id, vms, _send)
+            return {"vms": vms, "cluster": cluster}
+        except Exception as e:
+            logger.warning("pxmx PXMX_LIST_VMS agent %s failed: %s", agent_id, e)
+            return {"vms": [], "cluster": cluster, "error": str(e)}
+
+    async def _pool_map_from_agent(self, agent_id: str, _send, probe) -> Dict[Any, str]:
+        """Best-effort ``{vmid: poolid}`` from ``/pools`` (+ per-pool detail).
+        ``probe`` is the already-fetched ``/pools`` response (the reachability
+        check round-trip is reused rather than re-sent). ``{}`` on any failure."""
+        try:
+            listing = pve_cmd_builder.parse_pools_listing_for_members(probe)
+            details: Dict[str, List[Dict[str, Any]]] = {}
+            for p in listing:
+                if p.get("members") is None:
+                    details[p["poolid"]] = pve_cmd_builder.pool_detail_members(
+                        await _send(pve_cmd_builder.pool_detail_cmd(p["poolid"])))
+            return pve_cmd_builder.build_pool_map(listing, details)
+        except Exception as e:  # pool map is best-effort — never sink the VM list
+            logger.debug("pxmx pool map for %s unavailable: %s", agent_id, e)
+            return {}
+
+    async def _annotate_vm_interfaces(self, agent_id: str, vms: List[Dict[str, Any]],
+                                      _send) -> None:
+        """Per-VM interface annotation in parallel — bounded by a 16-concurrent
+        semaphore and a 12s deadline so a hung guest agent can't stall the list.
+        Mirrors the Agent's ``_annotate_vm_interfaces`` (which the telemetry loop
+        still uses internally). Best-effort: VMs not annotated before the deadline
+        keep ``interfaces=[]``/``ips=[]`` (filled next telemetry tick)."""
+        targets = [v for v in vms if v.get("node") and v.get("vmid") not in (None, "")]
+        if not targets:
+            return
+        sem = asyncio.Semaphore(16)
+
+        async def _one(v):
+            async with sem:
+                try:
+                    ifaces = await self._vm_interfaces(_send, v)
+                except Exception:  # one VM's annotation failure is non-fatal
+                    ifaces = []
+                v["interfaces"] = ifaces
+                v["ips"] = [ip for i in ifaces for ip in (i.get("ips") or [])]
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*[_one(v) for v in targets], return_exceptions=True),
+                timeout=12)
+        except asyncio.TimeoutError:
+            pass  # partial — un-annotated VMs keep interfaces=[]/ips=[]
+
+    async def _vm_interfaces(self, _send, v: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Best-effort ``[{name, mac, ips}]`` for one VM/CT. Running → guest
+        interfaces (QGA / lxc netns); stopped or empty → ``qm/pct config`` netN
+        MACs. Mirrors the Agent's ``_vm_interfaces`` (4s per-call timeout)."""
+        node, vmid = v.get("node", ""), v.get("vmid")
+        kind = "qemu" if v.get("type") == "qemu" else "lxc"
+        status = v.get("status")
+        ifaces: List[Dict[str, Any]] = []
+        if status == "running":
+            try:
+                r = await _send(pve_cmd_builder.vm_guest_ifaces_cmd(node, vmid, kind),
+                                timeout=4.0)
+                ifaces = pve_cmd_builder.parse_guest_ifaces(r)
+            except Exception:
+                ifaces = []
+        if not ifaces:  # QGA absent / stopped / empty → configured MACs
+            try:
+                r = await _send(pve_cmd_builder.vm_config_cmd(node, vmid, kind),
+                                timeout=4.0)
+                ifaces = pve_cmd_builder.parse_config_nets(r)
+            except Exception:
+                ifaces = []
+        return ifaces
+
     async def _list_vms(self, data: Dict[str, Any]) -> Dict[str, Any]:
         if not self.control_plane:
             return {"status": "ERROR", "error": "Control plane not initialised"}
@@ -548,7 +671,12 @@ class ProxmoxSpoke(BaseSpoke):
         # surface it honestly so the hub records an 'error' sync status instead
         # of silently reading an empty vms list as "0 records synced, success".
         if agent_id:
-            result = await self.control_plane.send_to_agent("GET_VM_LIST", {}, agent_id=agent_id)
+            # Multi-round-trip from the spoke (#4): orchestrate pool map + base
+            # list + per-VM interface annotation as RUN_COMMAND round-trips. The
+            # pinned path MUST surface an unreachable agent honestly (an ERROR
+            # dict) so the hub records an 'error' sync status instead of reading
+            # an empty vms list as "0 records synced, success".
+            result = await self._vms_from_agent(agent_id)
             if not isinstance(result, dict) or result.get("status") == "ERROR":
                 logger.warning("PXMX_LIST_VMS pinned agent %r unreachable: %s",
                                agent_id, result if isinstance(result, dict) else "non-dict")
@@ -596,11 +724,19 @@ class ProxmoxSpoke(BaseSpoke):
                     "source": "telemetry_cache",
                     "agent_count": len(self.control_plane.connected_agents)}
 
-        # No telemetry yet — live query all agents
-        results = await self.control_plane.broadcast_to_agents("GET_VM_LIST", {})
+        # No telemetry yet — live query all agents via the same RUN_COMMAND
+        # orchestration as the pinned path (concurrent across agents; each
+        # agent's annotation round-trips are concurrent within). An unreachable
+        # agent returns {status:ERROR} and contributes nothing (honest skip).
+        aids = list(self.control_plane.connected_agents or {})
+        results = await asyncio.gather(
+            *[self._vms_from_agent(a) for a in aids], return_exceptions=True)
         all_vms: List[Dict] = []
-        for res in results:
-            aid = res.get("agent_id", "")
+        for aid, res in zip(aids, results):
+            if isinstance(res, Exception) or not isinstance(res, dict):
+                continue
+            if res.get("status") == "ERROR":
+                continue  # unreachable agent — skip, don't sink the aggregate
             cluster = res.get("cluster", aid)
             for vm in res.get("vms", []):
                 vmid = vm.get("vmid", "?")

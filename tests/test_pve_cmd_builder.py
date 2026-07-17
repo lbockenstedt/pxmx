@@ -500,3 +500,264 @@ def test_get_node_stats_aggregate_fallback_uses_run_command():
     assert res["nodes"][0]["agent_id"] == "a"
     assert res["nodes"][0]["proxmox_version"] == "pve-8"
     assert cp.calls[0]["cmd"] == "RUN_COMMAND"
+
+
+# ── PXMX_LIST_VMS (multi-round-trip + pool map + annotation) ──────────────────
+
+def test_looks_like_mac():
+    assert pve_cmd_builder._looks_like_mac("AA:BB:CC:DD:EE:01")
+    assert pve_cmd_builder._looks_like_mac("aa-bb-cc-dd-ee-01")
+    assert not pve_cmd_builder._looks_like_mac("not-a-mac")
+    assert not pve_cmd_builder._looks_like_mac("")
+
+
+def test_parse_pools_listing_for_members():
+    r = _runner(stdout=(
+        '[{"poolid":"dev","members":[{"vmid":100}]},'
+        '{"poolid":"prod"}, {"nope":1}]'))
+    out = pve_cmd_builder.parse_pools_listing_for_members(r)
+    assert out == [{"poolid": "dev", "members": [{"vmid": 100}]},
+                   {"poolid": "prod", "members": None}]
+
+
+def test_pool_detail_cmd_and_members():
+    assert pve_cmd_builder.pool_detail_cmd("dev") == "pvesh get /pools/dev"
+    r = _runner(stdout='{"poolid":"dev","members":[{"vmid":100},{"vmid":101}]}')
+    assert [m["vmid"] for m in pve_cmd_builder.pool_detail_members(r)] == [100, 101]
+    assert pve_cmd_builder.pool_detail_members(_runner(rc=1)) == []
+
+
+def test_build_pool_map_inline_and_detail():
+    listing = [{"poolid": "dev", "members": [{"vmid": 100}, {"vmid": 101}]},
+               {"poolid": "prod", "members": None}]
+    details = {"prod": [{"vmid": 200}]}
+    pm = pve_cmd_builder.build_pool_map(listing, details)
+    assert pm == {100: "dev", 101: "dev", 200: "prod"}
+
+
+def test_parse_cluster_resource_vms_filters_and_shapes():
+    r = _runner(stdout=(
+        '[{"type":"qemu","node":"n1","vmid":100,"name":"web","status":"running",'
+        '"cpu":0.5,"maxcpu":2,"mem":100,"maxmem":200,"uptime":1,"maxdisk":1000000000,'
+        '"tags":"t1;tenant-a","template":0},'
+        '{"type":"lxc","node":"n1","vmid":200,"name":"ct","status":"stopped",'
+        '"cpu":0,"maxcpu":1,"mem":0,"maxmem":50,"uptime":0,"maxdisk":5000000000,'
+        '"tags":"","template":1},'
+        '{"type":"storage","storage":"local"},'
+        '{"type":"qemu","node":"n1"}]'))  # no vmid → skipped
+    vms = pve_cmd_builder.parse_cluster_resource_vms(r, "c", {100: "dev"})
+    assert len(vms) == 2
+    by = {v["vmid"]: v for v in vms}
+    assert by[100] == {
+        "unique_id": "c/n1/100", "cluster": "c", "node": "n1", "vmid": 100,
+        "type": "qemu", "name": "web", "status": "running", "template": 0,
+        "cpu": 50.0, "mem_bytes": 100, "uptime": 1, "vcpus": 2, "disk_gb": 1.0,
+        "pool": "dev", "tags": ["t1", "tenant-a"], "interfaces": [], "ips": []}
+    assert by[200]["pool"] == ""  # not in pool map
+    assert by[200]["template"] == 1 and by[200]["disk_gb"] == 5.0
+    assert by[200]["tags"] == []
+
+
+def test_node_qemu_lxc_cmds_and_node_names():
+    assert pve_cmd_builder.node_qemu_cmd("n1") == "pvesh get /nodes/n1/qemu"
+    assert pve_cmd_builder.node_lxc_cmd("n1") == "pvesh get /nodes/n1/lxc"
+    r = _runner(stdout='[{"node":"n1"},{"node":"n2"},{"nope":1}]')
+    assert pve_cmd_builder.node_names(r) == ["n1", "n2"]
+
+
+def test_vm_guest_ifaces_and_config_cmds():
+    assert pve_cmd_builder.vm_guest_ifaces_cmd("n1", 100, "qemu") == \
+        "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces"
+    assert pve_cmd_builder.vm_guest_ifaces_cmd("n1", 200, "lxc") == \
+        "pvesh get /nodes/n1/lxc/200/interfaces"
+    assert pve_cmd_builder.vm_config_cmd("n1", 100, "qemu") == \
+        "pvesh get /nodes/n1/qemu/100/config"
+    assert pve_cmd_builder.vm_config_cmd("n1", 200, "lxc") == \
+        "pvesh get /nodes/n1/lxc/200/config"
+
+
+def test_parse_guest_ifaces_qga_unwrap_and_filter():
+    # QGA wrapped in {"result":[...]}: eth0 kept, lo + zero-MAC skipped, ipv6 skipped.
+    r = _runner(stdout=(
+        '{"result":[{"name":"eth0","hardware-address":"AA:BB:CC:DD:EE:01",'
+        '"ip-addresses":[{"ip-address":"10.0.0.5","ip-address-type":"ipv4"},'
+        '{"ip-address":"::1","ip-address-type":"ipv6"}]},'
+        '{"name":"lo","hardware-address":"00:00:00:00:00:00"}]}'))
+    out = pve_cmd_builder.parse_guest_ifaces(r)
+    assert out == [{"name": "eth0", "mac": "aa:bb:cc:dd:ee:01", "ips": ["10.0.0.5"]}]
+
+
+def test_parse_guest_ifaces_lxc_inet():
+    r = _runner(stdout=(
+        '{"result":[{"name":"eth0","hwaddr":"BB:CC:DD:EE:FF:00","inet":"10.0.0.9/24"}]}'))
+    out = pve_cmd_builder.parse_guest_ifaces(r)
+    assert out == [{"name": "eth0", "mac": "bb:cc:dd:ee:ff:00", "ips": ["10.0.0.9"]}]
+
+
+def test_parse_guest_ifaces_empty_on_failure():
+    assert pve_cmd_builder.parse_guest_ifaces(_runner(rc=1)) == []
+    assert pve_cmd_builder.parse_guest_ifaces(_runner(stdout="not json")) == []
+    assert pve_cmd_builder.parse_guest_ifaces(_runner(stdout='{"result":"x"}')) == []
+
+
+def test_parse_config_nets_qemu_model_mac():
+    r = _runner(stdout=(
+        '{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0",'
+        '"net1":"e1000=11:22:33:44:55:66,bridge=vmbr1","boot":"order=net0"}}'))
+    out = pve_cmd_builder.parse_config_nets(r)
+    assert out == [{"name": "net0", "mac": "aa:bb:cc:dd:ee:01", "ips": []},
+                   {"name": "net1", "mac": "11:22:33:44:55:66", "ips": []}]
+
+
+def test_parse_config_nets_lxc_hwaddr():
+    r = _runner(stdout=(
+        '{"data":{"net0":"name=eth0,bridge=vmbr0,hwaddr=BB:CC:DD:EE:FF:00"}}'))
+    out = pve_cmd_builder.parse_config_nets(r)
+    assert out == [{"name": "eth0", "mac": "bb:cc:dd:ee:ff:00", "ips": []}]
+
+
+def test_parse_config_nets_empty_on_failure():
+    assert pve_cmd_builder.parse_config_nets(_runner(rc=1)) == []
+    assert pve_cmd_builder.parse_config_nets(_runner(stdout="not json")) == []
+
+
+class _FakeCPByCmd:
+    """Returns a fixed response per (agent_id, command-string) — concurrency-safe
+    for gather's interleaved annotation calls (each gets the right response
+    regardless of call order). Unmapped commands → empty success (parse → [])."""
+    def __init__(self, agents, responses):
+        self.connected_agents = agents
+        self._responses = responses  # agent_id -> {cmd: resp}
+        self.calls = []
+
+    async def send_to_agent(self, cmd, data, agent_id=None, timeout=15.0):
+        self.calls.append({"cmd": cmd, "data": dict(data), "agent_id": agent_id})
+        cmdstr = data.get("command")
+        return self._responses.get(agent_id, {}).get(cmdstr, _runner())
+
+
+def _vms_response():
+    return _runner(stdout=(
+        '[{"type":"qemu","node":"n1","vmid":100,"name":"web","status":"running",'
+        '"cpu":0.5,"maxcpu":2,"mem":100,"maxmem":200,"uptime":1,"maxdisk":1000000000,'
+        '"tags":"t1;tenant-a","template":0},'
+        '{"type":"lxc","node":"n1","vmid":200,"name":"ct","status":"stopped",'
+        '"cpu":0,"maxcpu":1,"mem":0,"maxmem":50,"uptime":0,"maxdisk":5000000000,'
+        '"tags":"","template":0}]'))
+
+
+def test_list_vms_primary_path_pool_map_and_annotation():
+    pools = _runner(stdout='[{"poolid":"dev","members":[{"vmid":100}]}]')
+    qga = _runner(stdout=(
+        '{"result":[{"name":"eth0","hardware-address":"AA:BB:CC:DD:EE:01",'
+        '"ip-addresses":[{"ip-address":"10.0.0.5","ip-address-type":"ipv4"}]}]}'))
+    ct_cfg = _runner(stdout=(
+        '{"data":{"net0":"name=eth0,bridge=vmbr0,hwaddr=BB:CC:DD:EE:FF:00"}}'))
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": pools,
+               "pvesh get /cluster/resources": _vms_response(),
+               "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces": qga,
+               "pvesh get /nodes/n1/lxc/200/config": ct_cfg}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_VMS", {"agent_id": "a"}))
+    assert res["status"] == "SUCCESS"
+    assert res["source"] == "pinned_agent" and res["agent_count"] == 1
+    by = {v["vmid"]: v for v in res["vms"]}
+    # VM 100: pool stamped from inline members; running → QGA guest ifaces.
+    assert by[100]["pool"] == "dev"
+    assert by[100]["interfaces"] == [{"name": "eth0", "mac": "aa:bb:cc:dd:ee:01",
+                                      "ips": ["10.0.0.5"]}]
+    assert by[100]["ips"] == ["10.0.0.5"]
+    # VM 200: not in pool map → pool=""; stopped → config MACs (no guest IPs).
+    assert by[200]["pool"] == ""
+    assert by[200]["interfaces"] == [{"name": "eth0", "mac": "bb:cc:dd:ee:ff:00",
+                                      "ips": []}]
+    assert by[200]["ips"] == []
+    # Every spoke→agent call was RUN_COMMAND with allow_shell.
+    assert all(c["cmd"] == "RUN_COMMAND" and c["data"]["allow_shell"] is True
+               for c in cp.calls)
+
+
+def test_list_vms_pool_detail_fetch_when_members_not_inline():
+    pools = _runner(stdout='[{"poolid":"prod"}]')  # no inline members
+    detail = _runner(stdout='{"poolid":"prod","members":[{"vmid":100}]}')
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": pools,
+               "pvesh get /pools/prod": detail,
+               "pvesh get /cluster/resources": _vms_response()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_VMS", {"agent_id": "a"}))
+    by = {v["vmid"]: v for v in res["vms"]}
+    assert by[100]["pool"] == "prod"  # stamped from the per-pool detail fetch
+    cmds = [c["data"]["command"] for c in cp.calls]
+    assert "pvesh get /pools/prod" in cmds
+
+
+def test_list_vms_fallback_per_node_qemu_lxc():
+    # /cluster/resources empty → /nodes → per-node /qemu + /lxc.
+    qemu = _runner(stdout=(
+        '[{"vmid":100,"node":"n1","name":"web","status":"running","cpu":0,'
+        '"maxcpu":1,"mem":0,"maxmem":1,"uptime":0,"maxdisk":0,"tags":""}]'))
+    lxc = _runner(stdout=(
+        '[{"vmid":200,"node":"n1","name":"ct","status":"stopped","cpu":0,'
+        '"maxcpu":1,"mem":0,"maxmem":1,"uptime":0,"maxdisk":0,"tags":""}]'))
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": _runner(stdout="[]"),
+               "pvesh get /cluster/resources": _runner(stdout="[]"),
+               "pvesh get /nodes": _runner(stdout='[{"node":"n1"}]'),
+               "pvesh get /nodes/n1/qemu": qemu,
+               "pvesh get /nodes/n1/lxc": lxc}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_VMS", {"agent_id": "a"}))
+    assert res["status"] == "SUCCESS"
+    assert {v["vmid"] for v in res["vms"]} == {100, 200}
+    cmds = [c["data"]["command"] for c in cp.calls]
+    assert "pvesh get /nodes" in cmds
+    assert "pvesh get /nodes/n1/qemu" in cmds
+    assert "pvesh get /nodes/n1/lxc" in cmds
+
+
+def test_list_vms_pinned_unreachable_surfaces_error():
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": {"status": "ERROR",
+                                    "message": "Agent 'a' not connected"}}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_VMS", {"agent_id": "a"}))
+    # Honest ERROR — not an empty "success" that masks the down agent.
+    assert res["status"] == "ERROR"
+    assert "not connected" in res["message"]
+
+
+def test_list_vms_tag_filter_applies_on_pinned_path():
+    pools = _runner(stdout="[]")
+    cp = _FakeCPByCmd(
+        {"a": {"cluster_name": "c", "nodes": ["n1"]}},
+        {"a": {"pvesh get /pools": pools,
+               "pvesh get /cluster/resources": _vms_response()}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_VMS",
+                                 {"agent_id": "a", "tag_filter": "tenant-a"}))
+    assert res["status"] == "SUCCESS"
+    assert [v["vmid"] for v in res["vms"]] == [100]  # VM 200 has no tags
+
+
+def test_list_vms_aggregate_live_query_concurrent():
+    # No agent_id, empty telemetry → live query both agents concurrently.
+    pools = _runner(stdout="[]")
+    cp = _FakeCPByCmd(
+        {"a1": {"cluster_name": "c1", "nodes": []},
+         "a2": {"cluster_name": "c2", "nodes": []}},
+        {"a1": {"pvesh get /pools": pools,
+                "pvesh get /cluster/resources": _vms_response()},
+         "a2": {"pvesh get /pools": {"status": "ERROR", "message": "down"}}})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_LIST_VMS", {}))
+    assert res["status"] == "SUCCESS"
+    assert res["source"] == "live_query"
+    # Only a1 contributed (a2 unreachable → skipped, not fatal).
+    assert {v["agent_id"] for v in res["vms"]} == {"a1"}
+    assert {v["vmid"] for v in res["vms"]} == {100, 200}
