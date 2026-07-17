@@ -65,12 +65,17 @@ def runner_stdout(run_response: Any) -> str:
 # ── single-shot pvesh reads ──────────────────────────────────────────────────
 
 def pvesh_get(path: str) -> str:
-    """Build a ``pvesh get <path>`` command string for ``RUN_COMMAND``.
+    """Build a ``pvesh get <path> --output-format json`` command string for
+    ``RUN_COMMAND``.
 
-    ``pvesh`` prints JSON to stdout; the Agent runs it via the login shell so
-    ``pvesh`` resolves on PATH (root on Proxmox has ``/usr/sbin``). The path is
-    shell-quoted (node/storage names are safe but quoting is correct)."""
-    return f"pvesh get {shlex.quote(path)}"
+    ``pvesh`` defaults to ``text`` output (an ASCII table — NOT JSON; see
+    pvesh(1) FORMAT_OPTIONS), so the ``--output-format json`` flag is MANDATORY:
+    without it ``json.loads`` on the captured stdout fails and every read-only
+    family silently returns empty. The Agent's own ``_pvesh`` always passed this
+    flag; the builder must too. The Agent runs it via the login shell so ``pvesh``
+    resolves on PATH (root on Proxmox has ``/usr/sbin``). The path is shell-quoted
+    (node/storage names are safe but quoting is correct)."""
+    return f"pvesh get {shlex.quote(path)} --output-format json"
 
 
 def _parse_json_list(run_response: Any) -> List[Any]:

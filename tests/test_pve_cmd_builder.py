@@ -39,15 +39,15 @@ def _runner(stdout="", rc=0, stderr="", ok=True, error=""):
 
 def test_list_pools_cmd_is_pvesh_get_pools():
     # The Agent's list_pools did `_pvesh("/pools")` → `pvesh get /pools`.
-    assert pve_cmd_builder.list_pools_cmd() == "pvesh get /pools"
+    assert pve_cmd_builder.list_pools_cmd() == "pvesh get /pools --output-format json"
 
 
 def test_pvesh_get_quotes_path():
     # Node/storage names are safe but the path is shell-quoted (runs via bash -lc).
     assert pve_cmd_builder.pvesh_get("/nodes/edge01/storage") == \
-        "pvesh get /nodes/edge01/storage"
+        "pvesh get /nodes/edge01/storage --output-format json"
     # A path with a shell metachar is quoted so it can't break the command.
-    assert pve_cmd_builder.pvesh_get("/pools/a b") == "pvesh get '/pools/a b'"
+    assert pve_cmd_builder.pvesh_get("/pools/a b") == "pvesh get '/pools/a b' --output-format json"
 
 
 # ── result parsing ────────────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ def test_list_pools_uses_run_command_and_aggregates_with_cluster():
     # golden command + allow_shell.
     assert [c["cmd"] for c in cp.calls] == ["RUN_COMMAND", "RUN_COMMAND"]
     for c in cp.calls:
-        assert c["data"]["command"] == "pvesh get /pools"
+        assert c["data"]["command"] == "pvesh get /pools --output-format json"
         assert c["data"]["allow_shell"] is True
     # Aggregated, each pool tagged with its cluster.
     pools = sorted(res["pools"], key=lambda p: p["poolid"])
@@ -152,7 +152,7 @@ def test_list_pools_no_agents_returns_empty_success():
 # ── PXMX_LIST_STORAGES (single-shot, node-scoped) ─────────────────────────────
 
 def test_list_storages_cmd_is_pvesh_get_node_storage():
-    assert pve_cmd_builder.list_storages_cmd("edge01") == "pvesh get /nodes/edge01/storage"
+    assert pve_cmd_builder.list_storages_cmd("edge01") == "pvesh get /nodes/edge01/storage --output-format json"
 
 
 def test_parse_storages_filters_by_content_and_shapes():
@@ -190,7 +190,7 @@ def test_list_storages_uses_run_command_and_returns_cluster():
     assert res["storages"] == [{"storage": "local", "type": "dir", "avail": 1,
                                 "total": 2, "shared": False}]
     assert cp.calls[0]["cmd"] == "RUN_COMMAND"
-    assert cp.calls[0]["data"]["command"] == "pvesh get /nodes/edge01/storage"
+    assert cp.calls[0]["data"]["command"] == "pvesh get /nodes/edge01/storage --output-format json"
     assert cp.calls[0]["data"]["allow_shell"] is True
 
 
@@ -229,7 +229,7 @@ def test_list_storages_agent_failure_returns_empty_success():
 
 def test_list_iso_content_cmd():
     assert pve_cmd_builder.list_iso_content_cmd("edge01", "local") == \
-        "pvesh get /nodes/edge01/storage/local/content"
+        "pvesh get /nodes/edge01/storage/local/content --output-format json"
 
 
 def test_storage_names_for_content_picks_iso_storages():
@@ -287,9 +287,9 @@ def test_list_isos_two_round_trips_storage_then_content():
     # 3 RUN_COMMANDs: storage list + one content fetch per iso storage (vztmpl skipped).
     assert len(cp.calls) == 3
     assert all(c["cmd"] == "RUN_COMMAND" for c in cp.calls)
-    assert cp.calls[0]["data"]["command"] == "pvesh get /nodes/edge01/storage"
-    assert cp.calls[1]["data"]["command"] == "pvesh get /nodes/edge01/storage/local/content"
-    assert cp.calls[2]["data"]["command"] == "pvesh get /nodes/edge01/storage/iso-pool/content"
+    assert cp.calls[0]["data"]["command"] == "pvesh get /nodes/edge01/storage --output-format json"
+    assert cp.calls[1]["data"]["command"] == "pvesh get /nodes/edge01/storage/local/content --output-format json"
+    assert cp.calls[2]["data"]["command"] == "pvesh get /nodes/edge01/storage/iso-pool/content --output-format json"
     volids = sorted(i["volid"] for i in res["isos"])
     assert volids == ["iso-pool:iso/debian.iso", "local:iso/ubuntu.iso"]
 
@@ -335,15 +335,15 @@ def test_list_isos_no_agent_resolved_errors():
 # ── GET_NODE_STATS (multi-round-trip) ─────────────────────────────────────────
 
 def test_cluster_resources_cmd_is_pvesh_get_cluster_resources():
-    assert pve_cmd_builder.cluster_resources_cmd() == "pvesh get /cluster/resources"
+    assert pve_cmd_builder.cluster_resources_cmd() == "pvesh get /cluster/resources --output-format json"
 
 
 def test_nodes_list_cmd_is_pvesh_get_nodes():
-    assert pve_cmd_builder.nodes_list_cmd() == "pvesh get /nodes"
+    assert pve_cmd_builder.nodes_list_cmd() == "pvesh get /nodes --output-format json"
 
 
 def test_node_status_cmd_is_pvesh_get_node_status():
-    assert pve_cmd_builder.node_status_cmd("edge01") == "pvesh get /nodes/edge01/status"
+    assert pve_cmd_builder.node_status_cmd("edge01") == "pvesh get /nodes/edge01/status --output-format json"
 
 
 def test_parse_cluster_resource_nodes_filters_type_node_and_shapes():
@@ -432,8 +432,8 @@ def test_get_node_stats_primary_path_two_round_trips():
         "cluster": "edge-cluster"}
     assert len(cp.calls) == 2
     assert all(c["cmd"] == "RUN_COMMAND" for c in cp.calls)
-    assert cp.calls[0]["data"]["command"] == "pvesh get /cluster/resources"
-    assert cp.calls[1]["data"]["command"] == "pvesh get /nodes/edge01/status"
+    assert cp.calls[0]["data"]["command"] == "pvesh get /cluster/resources --output-format json"
+    assert cp.calls[1]["data"]["command"] == "pvesh get /nodes/edge01/status --output-format json"
     assert all(c["data"]["allow_shell"] is True for c in cp.calls)
 
 
@@ -471,10 +471,10 @@ def test_get_node_stats_fallback_path_nodes_then_per_node_status():
     assert by["n2"]["proxmox_version"] == "" and by["n2"]["cpu_cores"] == 2
     # 4 round-trips: /cluster/resources → /nodes → n1/status → n2/status.
     assert len(cp.calls) == 4
-    assert cp.calls[0]["data"]["command"] == "pvesh get /cluster/resources"
-    assert cp.calls[1]["data"]["command"] == "pvesh get /nodes"
-    assert cp.calls[2]["data"]["command"] == "pvesh get /nodes/n1/status"
-    assert cp.calls[3]["data"]["command"] == "pvesh get /nodes/n2/status"
+    assert cp.calls[0]["data"]["command"] == "pvesh get /cluster/resources --output-format json"
+    assert cp.calls[1]["data"]["command"] == "pvesh get /nodes --output-format json"
+    assert cp.calls[2]["data"]["command"] == "pvesh get /nodes/n1/status --output-format json"
+    assert cp.calls[3]["data"]["command"] == "pvesh get /nodes/n2/status --output-format json"
 
 
 def test_get_node_stats_agent_unreachable_returns_error_shape():
@@ -521,7 +521,7 @@ def test_parse_pools_listing_for_members():
 
 
 def test_pool_detail_cmd_and_members():
-    assert pve_cmd_builder.pool_detail_cmd("dev") == "pvesh get /pools/dev"
+    assert pve_cmd_builder.pool_detail_cmd("dev") == "pvesh get /pools/dev --output-format json"
     r = _runner(stdout='{"poolid":"dev","members":[{"vmid":100},{"vmid":101}]}')
     assert [m["vmid"] for m in pve_cmd_builder.pool_detail_members(r)] == [100, 101]
     assert pve_cmd_builder.pool_detail_members(_runner(rc=1)) == []
@@ -559,21 +559,21 @@ def test_parse_cluster_resource_vms_filters_and_shapes():
 
 
 def test_node_qemu_lxc_cmds_and_node_names():
-    assert pve_cmd_builder.node_qemu_cmd("n1") == "pvesh get /nodes/n1/qemu"
-    assert pve_cmd_builder.node_lxc_cmd("n1") == "pvesh get /nodes/n1/lxc"
+    assert pve_cmd_builder.node_qemu_cmd("n1") == "pvesh get /nodes/n1/qemu --output-format json"
+    assert pve_cmd_builder.node_lxc_cmd("n1") == "pvesh get /nodes/n1/lxc --output-format json"
     r = _runner(stdout='[{"node":"n1"},{"node":"n2"},{"nope":1}]')
     assert pve_cmd_builder.node_names(r) == ["n1", "n2"]
 
 
 def test_vm_guest_ifaces_and_config_cmds():
     assert pve_cmd_builder.vm_guest_ifaces_cmd("n1", 100, "qemu") == \
-        "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces"
+        "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces --output-format json"
     assert pve_cmd_builder.vm_guest_ifaces_cmd("n1", 200, "lxc") == \
-        "pvesh get /nodes/n1/lxc/200/interfaces"
+        "pvesh get /nodes/n1/lxc/200/interfaces --output-format json"
     assert pve_cmd_builder.vm_config_cmd("n1", 100, "qemu") == \
-        "pvesh get /nodes/n1/qemu/100/config"
+        "pvesh get /nodes/n1/qemu/100/config --output-format json"
     assert pve_cmd_builder.vm_config_cmd("n1", 200, "lxc") == \
-        "pvesh get /nodes/n1/lxc/200/config"
+        "pvesh get /nodes/n1/lxc/200/config --output-format json"
 
 
 def test_parse_guest_ifaces_qga_unwrap_and_filter():
@@ -655,10 +655,10 @@ def test_list_vms_primary_path_pool_map_and_annotation():
         '{"data":{"net0":"name=eth0,bridge=vmbr0,hwaddr=BB:CC:DD:EE:FF:00"}}'))
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": pools,
-               "pvesh get /cluster/resources": _vms_response(),
-               "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces": qga,
-               "pvesh get /nodes/n1/lxc/200/config": ct_cfg}})
+        {"a": {"pvesh get /pools --output-format json": pools,
+               "pvesh get /cluster/resources --output-format json": _vms_response(),
+               "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces --output-format json": qga,
+               "pvesh get /nodes/n1/lxc/200/config --output-format json": ct_cfg}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("PXMX_LIST_VMS", {"agent_id": "a"}))
     assert res["status"] == "SUCCESS"
@@ -684,15 +684,15 @@ def test_list_vms_pool_detail_fetch_when_members_not_inline():
     detail = _runner(stdout='{"poolid":"prod","members":[{"vmid":100}]}')
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": pools,
-               "pvesh get /pools/prod": detail,
-               "pvesh get /cluster/resources": _vms_response()}})
+        {"a": {"pvesh get /pools --output-format json": pools,
+               "pvesh get /pools/prod --output-format json": detail,
+               "pvesh get /cluster/resources --output-format json": _vms_response()}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("PXMX_LIST_VMS", {"agent_id": "a"}))
     by = {v["vmid"]: v for v in res["vms"]}
     assert by[100]["pool"] == "prod"  # stamped from the per-pool detail fetch
     cmds = [c["data"]["command"] for c in cp.calls]
-    assert "pvesh get /pools/prod" in cmds
+    assert "pvesh get /pools/prod --output-format json" in cmds
 
 
 def test_list_vms_fallback_per_node_qemu_lxc():
@@ -705,25 +705,25 @@ def test_list_vms_fallback_per_node_qemu_lxc():
         '"maxcpu":1,"mem":0,"maxmem":1,"uptime":0,"maxdisk":0,"tags":""}]'))
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": _runner(stdout="[]"),
-               "pvesh get /cluster/resources": _runner(stdout="[]"),
-               "pvesh get /nodes": _runner(stdout='[{"node":"n1"}]'),
-               "pvesh get /nodes/n1/qemu": qemu,
-               "pvesh get /nodes/n1/lxc": lxc}})
+        {"a": {"pvesh get /pools --output-format json": _runner(stdout="[]"),
+               "pvesh get /cluster/resources --output-format json": _runner(stdout="[]"),
+               "pvesh get /nodes --output-format json": _runner(stdout='[{"node":"n1"}]'),
+               "pvesh get /nodes/n1/qemu --output-format json": qemu,
+               "pvesh get /nodes/n1/lxc --output-format json": lxc}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("PXMX_LIST_VMS", {"agent_id": "a"}))
     assert res["status"] == "SUCCESS"
     assert {v["vmid"] for v in res["vms"]} == {100, 200}
     cmds = [c["data"]["command"] for c in cp.calls]
-    assert "pvesh get /nodes" in cmds
-    assert "pvesh get /nodes/n1/qemu" in cmds
-    assert "pvesh get /nodes/n1/lxc" in cmds
+    assert "pvesh get /nodes --output-format json" in cmds
+    assert "pvesh get /nodes/n1/qemu --output-format json" in cmds
+    assert "pvesh get /nodes/n1/lxc --output-format json" in cmds
 
 
 def test_list_vms_pinned_unreachable_surfaces_error():
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": {"status": "ERROR",
+        {"a": {"pvesh get /pools --output-format json": {"status": "ERROR",
                                     "message": "Agent 'a' not connected"}}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("PXMX_LIST_VMS", {"agent_id": "a"}))
@@ -736,8 +736,8 @@ def test_list_vms_tag_filter_applies_on_pinned_path():
     pools = _runner(stdout="[]")
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": pools,
-               "pvesh get /cluster/resources": _vms_response()}})
+        {"a": {"pvesh get /pools --output-format json": pools,
+               "pvesh get /cluster/resources --output-format json": _vms_response()}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("PXMX_LIST_VMS",
                                  {"agent_id": "a", "tag_filter": "tenant-a"}))
@@ -751,9 +751,9 @@ def test_list_vms_aggregate_live_query_concurrent():
     cp = _FakeCPByCmd(
         {"a1": {"cluster_name": "c1", "nodes": []},
          "a2": {"cluster_name": "c2", "nodes": []}},
-        {"a1": {"pvesh get /pools": pools,
-                "pvesh get /cluster/resources": _vms_response()},
-         "a2": {"pvesh get /pools": {"status": "ERROR", "message": "down"}}})
+        {"a1": {"pvesh get /pools --output-format json": pools,
+                "pvesh get /cluster/resources --output-format json": _vms_response()},
+         "a2": {"pvesh get /pools --output-format json": {"status": "ERROR", "message": "down"}}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("PXMX_LIST_VMS", {}))
     assert res["status"] == "SUCCESS"
@@ -772,9 +772,9 @@ def test_get_vm_info_single_from_unique_id_targeted():
         '"ip-addresses":[{"ip-address":"10.0.0.5","ip-address-type":"ipv4"}]}]}'))
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": pools,
-               "pvesh get /cluster/resources": _vms_response(),
-               "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces": qga}})
+        {"a": {"pvesh get /pools --output-format json": pools,
+               "pvesh get /cluster/resources --output-format json": _vms_response(),
+               "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces --output-format json": qga}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "c/n1/100"}))
     assert res["status"] == "SUCCESS"
@@ -785,8 +785,8 @@ def test_get_vm_info_single_from_unique_id_targeted():
     assert res["tags"] == ["t1", "tenant-a"]
     cmds = [c["data"]["command"] for c in cp.calls]
     # Targeted: /pools (probe) + /cluster/resources + the one VM's guest-ifaces.
-    assert "pvesh get /cluster/resources" in cmds
-    assert "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces" in cmds
+    assert "pvesh get /cluster/resources --output-format json" in cmds
+    assert "pvesh get /nodes/n1/qemu/100/agent/network-get-interfaces --output-format json" in cmds
     # NOT a full LIST_VMS — VM 200's config/annotation is not fetched.
     assert not any("200" in c for c in cmds)
 
@@ -796,9 +796,9 @@ def test_get_vm_info_pool_from_detail_when_not_inline():
     detail = _runner(stdout='{"poolid":"prod","members":[{"vmid":100}]}')
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": pools,
-               "pvesh get /pools/prod": detail,
-               "pvesh get /cluster/resources": _vms_response()}})
+        {"a": {"pvesh get /pools --output-format json": pools,
+               "pvesh get /pools/prod --output-format json": detail,
+               "pvesh get /cluster/resources --output-format json": _vms_response()}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "c/n1/100"}))
     assert res["status"] == "SUCCESS" and res["pool"] == "prod"
@@ -809,8 +809,8 @@ def test_get_vm_info_uses_vmid_and_node_when_no_unique_id():
     pools = _runner(stdout="[]")
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": pools,
-               "pvesh get /cluster/resources": _vms_response()}})
+        {"a": {"pvesh get /pools --output-format json": pools,
+               "pvesh get /cluster/resources --output-format json": _vms_response()}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "200", "vmid": 200, "node": "n1"}))
     assert res["status"] == "SUCCESS"
@@ -820,10 +820,10 @@ def test_get_vm_info_uses_vmid_and_node_when_no_unique_id():
 def test_get_vm_info_not_found_returns_error():
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": _runner(stdout="[]"),
-               "pvesh get /cluster/resources": _vms_response(),
-               "pvesh get /nodes/n1/qemu": _runner(stdout="[]"),
-               "pvesh get /nodes/n1/lxc": _runner(stdout="[]")}})
+        {"a": {"pvesh get /pools --output-format json": _runner(stdout="[]"),
+               "pvesh get /cluster/resources --output-format json": _vms_response(),
+               "pvesh get /nodes/n1/qemu --output-format json": _runner(stdout="[]"),
+               "pvesh get /nodes/n1/lxc --output-format json": _runner(stdout="[]")}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "c/n1/999", "node": "n1"}))
     # Fail-closed ERROR — the hub 403s on an unattributable VM, not "success".
@@ -833,7 +833,7 @@ def test_get_vm_info_not_found_returns_error():
 def test_get_vm_info_unreachable_agent_returns_error():
     cp = _FakeCPByCmd(
         {"a": {"cluster_name": "c", "nodes": ["n1"]}},
-        {"a": {"pvesh get /pools": {"status": "ERROR", "message": "not connected"}}})
+        {"a": {"pvesh get /pools --output-format json": {"status": "ERROR", "message": "not connected"}}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "c/n1/100"}))
     assert res["status"] == "ERROR" and "not connected" in res["message"]
@@ -844,9 +844,9 @@ def test_get_vm_info_all_returns_fleet_list():
     cp = _FakeCPByCmd(
         {"a1": {"cluster_name": "c1", "nodes": []},
          "a2": {"cluster_name": "c2", "nodes": []}},
-        {"a1": {"pvesh get /pools": pools,
-                "pvesh get /cluster/resources": _vms_response()},
-         "a2": {"pvesh get /pools": {"status": "ERROR", "message": "down"}}})
+        {"a1": {"pvesh get /pools --output-format json": pools,
+                "pvesh get /cluster/resources --output-format json": _vms_response()},
+         "a2": {"pvesh get /pools --output-format json": {"status": "ERROR", "message": "down"}}})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("GET_VM_INFO", {"vm_id": "all"}))
     assert res["status"] == "SUCCESS"
