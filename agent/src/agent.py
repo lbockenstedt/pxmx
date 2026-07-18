@@ -2692,6 +2692,15 @@ class ProxmoxAgent:
                         except Exception as e:
                             result = {"status": "ERROR", "message": str(e)}
 
+                    elif cmd_type == "PXMX_RETAG_TENANT":
+                        # Cross-tenant migration: swap a tenant's proxmox_tag on
+                        # every VM/CT that carries it (old_tag -> new_tag).
+                        try:
+                            result = await pve_cmds.retag_tenant(
+                                data.get("old_tag", ""), data.get("new_tag", ""))
+                        except Exception as e:
+                            result = {"status": "ERROR", "message": str(e)}
+
                     elif cmd_type == "PXMX_CLONE_VM":
                         # Clone-from-template: any tenant may clone a VM that
                         # lives in a configured template pool (the hub resolves
