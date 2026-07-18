@@ -32,18 +32,28 @@ logger = logging.getLogger("PxmxAgent")
 
 PXMLIB = "/var/lib/pxmx"
 DONGLE_BLACKLIST_CONF = "/etc/modprobe.d/cs-dongle-blacklist.conf"
-DESTROY_MAX_FAILS = 3  # bash line 43, hardcoded
 
-# Bus-map + orphan-registry persistence lives in usb_state_store; re-exported
-# here so existing usb_provision.X callers (and this module's own unqualified
-# calls in the provisioning brain) are unchanged. usb_state_store owns
-# USB_STATE_FILE / ORPHAN_VMS_FILE.
+# Bus-map + orphan-registry persistence lives in usb_state_store; the dongle
+# quarantine + destroy-fail + bus-exclusion state lives in usb_quarantine. Both
+# are re-exported here so existing usb_provision.X callers (and this module's own
+# unqualified calls in the provisioning brain) are unchanged. usb_state_store
+# owns USB_STATE_FILE / ORPHAN_VMS_FILE; usb_quarantine owns USB_QUARANTINE_FILE
+# / DESTROY_FAILS_FILE.
 from .usb_state_store import (  # noqa: E402
     ORPHAN_VMS_FILE, USB_STATE_FILE,
     _read_orphans, _write_orphans, add_orphan_vm, remove_orphan_vm,
     get_orphan_vms, _new_usb_state, load_usb_state, save_usb_state,
     clear_assignment, prune_ghost_vms, set_assignment, reconcile_bus_map,
     bus_for_vmid,
+)
+from .usb_quarantine import (  # noqa: E402
+    USB_QUARANTINE_FILE, DESTROY_FAILS_FILE, QUARANTINE_MAX_FAILS,
+    QUARANTINE_RECOVERY_S, DESTROY_MAX_FAILS,
+    _USB_DMESG_ERROR_RE, _DMESG_USB_WINDOW_S, _DMESG_USB_QUARANTINE_MIN,
+    exclude_bus, clear_excluded_buses, clear_quarantine,
+    _read_quarantine, _save_quarantine, scan_dmesg_usb_errors, quarantine_bus,
+    _read_destroy_fails, _save_destroy_fails, record_destroy_fail,
+    clear_destroy_fails,
 )
 
 _VIDPID_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{4}$")
@@ -1092,33 +1102,12 @@ async def blacklist_dongle_drivers(agent) -> Dict[str, Any]:
     return {"action": "blacklist_dongle_drivers", "drivers": sorted(drivers), "unloaded": unloaded}
 
 
-# ── USB provision state + quarantine files (Phase E) ──────────────────────
+# ── USB provision state + quarantine (Phase E) ────────────────────────────
 # The vmid↔bus state doc (usb_state.json) + orphan registry live in
-# usb_state_store; the provision loop + delete/reclone long-op tasks run on the
-# single asyncio event loop so no lock is needed.
-
-USB_QUARANTINE_FILE = f"{PXMLIB}/usb_quarantine.json"
-DESTROY_FAILS_FILE = f"{PXMLIB}/destroy_fails.json"
-QUARANTINE_MAX_FAILS = 3  # bash line 1217: a bus is quarantined after 3 fails
-# A quarantined dongle (dmesg kernel USB errors — the ONLY quarantine path now)
-# auto-recovers after this long, present OR absent: a still-plugged dongle gets a
-# fresh provisioning attempt, and if the kernel errors persist it re-quarantines.
-# 1h keeps a genuinely faulty dongle sidelined long enough to be noticed while
-# never stranding a good dongle that hit a transient kernel hiccup.
-QUARANTINE_RECOVERY_S = 3600
-
-# Kernel USB errors for a SPECIFIC device/port → quarantine that dongle so a
-# faulty port/dongle isn't re-provisioned. The kernel logs the bus id (e.g.
-# "usb 3-1.2: device descriptor read/64, error -71") — that id IS the sysfs
-# bus_path dongles are tracked by. Distinct from the watchdog's subsystem-level
-# scrape (xhci_hcd died); this is per-dongle. -71 = EPROTO, -110 = ETIMEDOUT.
-_USB_DMESG_ERROR_RE = re.compile(
-    r"usb (\d+-[\d.]+):.*?("
-    r"device descriptor read|unable to enumerate|not accepting address|"
-    r"error -71\b|error -110\b|can't set config|cannot enable port|reset .*fail"
-    r")", re.IGNORECASE)
-_DMESG_USB_WINDOW_S = 180        # look back this far in the kernel log
-_DMESG_USB_QUARANTINE_MIN = 3    # >= this many error lines in-window → quarantine
+# usb_state_store; the dongle quarantine + destroy-fail + bus-exclusion state
+# lives in usb_quarantine (both re-exported below). The provision loop +
+# delete/reclone long-op tasks run on the single asyncio event loop so no lock
+# is needed.
 
 
 async def _vm_usb_bus(vid: int) -> Optional[str]:
@@ -1206,141 +1195,6 @@ async def reconcile_vm_configs(agent, start: int, end: int,
     if changed:
         save_usb_state(st)
     return changed
-
-
-def clear_excluded_buses() -> int:
-    """Wipe all bus exclusions (bash ``provision_unassigned`` dispatch 4078-4084).
-    Returns the count cleared."""
-    st = load_usb_state()
-    n = len(st.get("excluded_buses", {}))
-    st["excluded_buses"] = {}
-    save_usb_state(st)
-    return n
-
-
-def exclude_bus(bus: str) -> None:
-    # Store the exclusion TIMESTAMP (not a bare 1) so the provision loop can
-    # auto-return the bus after EXCLUDE_COOLDOWN_S. Legacy bare-1 values are
-    # treated as already-expired by the reconcile cooldown clear.
-    st = load_usb_state()
-    st["excluded_buses"][bus] = time.time()
-    save_usb_state(st)
-
-
-def clear_quarantine(bus: Optional[str] = None) -> None:
-    path = USB_QUARANTINE_FILE
-    try:
-        os.makedirs(PXMLIB, exist_ok=True)
-        if bus:
-            data: Dict[str, Any] = {}
-            if os.path.exists(path) and os.path.getsize(path) > 0:
-                with open(path) as f:
-                    data = json.load(f) or {}
-            data.pop(bus, None)
-            with open(path, "w") as f:
-                json.dump(data, f)
-        else:
-            with open(path, "w") as f:
-                json.dump({}, f)
-    except (OSError, json.JSONDecodeError):
-        pass
-
-
-def _read_quarantine() -> Dict[str, Any]:
-    try:
-        if os.path.exists(USB_QUARANTINE_FILE) and os.path.getsize(USB_QUARANTINE_FILE) > 0:
-            with open(USB_QUARANTINE_FILE) as f:
-                d = json.load(f)
-            return d if isinstance(d, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
-
-
-def _save_quarantine(d: Dict[str, Any]) -> None:
-    try:
-        os.makedirs(PXMLIB, exist_ok=True)
-        with open(USB_QUARANTINE_FILE, "w") as f:
-            json.dump(d, f)
-    except OSError:
-        pass
-
-
-async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str, int]:
-    """Kernel-log per-device USB errors → ``{bus_path: error_line_count}`` over
-    the last *window_s*. A faulty port/dongle logs ``usb 3-1.2: device
-    descriptor read/64, error -71`` etc.; the bus id (3-1.2) IS the sysfs
-    bus_path dongles are tracked by, so a persistently-erroring bus can be
-    quarantined and not re-provisioned. Best-effort via ``journalctl -k``; empty
-    dict on any failure (never quarantines on missing data)."""
-    from . import pve_cmds  # deferred — avoid a top-level import cycle
-    try:
-        rc, out, _ = await pve_cmds._run(
-            ["journalctl", "-k", "--no-pager", "-o", "cat",
-             "--since", f"-{int(window_s)}s"], check=False, timeout=10)
-    except Exception:  # noqa: BLE001
-        return {}
-    if rc != 0 or not out:
-        return {}
-    errors: Dict[str, int] = {}
-    for line in out.splitlines():
-        m = _USB_DMESG_ERROR_RE.search(line)
-        if m:
-            errors[m.group(1)] = errors.get(m.group(1), 0) + 1
-    return errors
-
-
-def quarantine_bus(bus: str, reason: str) -> None:
-    """Force a bus into quarantine (fails = QUARANTINE_MAX_FAILS) so the provision
-    loop skips it, tagged with a reason. Idempotent — no-ops if already quarantined
-    at/above the threshold. Auto-clears via the loop's absent-dongle sweep."""
-    q = _read_quarantine()
-    entry = q.get(bus) or {}
-    if int(entry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
-        return
-    q[bus] = {"fails": QUARANTINE_MAX_FAILS, "since": int(time.time()), "reason": reason}
-    _save_quarantine(q)
-
-
-
-def _read_destroy_fails() -> Dict[str, int]:
-    try:
-        if os.path.exists(DESTROY_FAILS_FILE) and os.path.getsize(DESTROY_FAILS_FILE) > 0:
-            with open(DESTROY_FAILS_FILE) as f:
-                d = json.load(f)
-            return {str(k): int(v) for k, v in d.items()} if isinstance(d, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
-
-
-def _save_destroy_fails(d: Dict[str, int]) -> None:
-    try:
-        os.makedirs(PXMLIB, exist_ok=True)
-        with open(DESTROY_FAILS_FILE, "w") as f:
-            json.dump(d, f)
-    except OSError:
-        pass
-
-
-def record_destroy_fail(vmid: int, bus: str) -> Dict[str, Any]:
-    """Count a destroy failure; on reaching DESTROY_MAX_FAILS declare the VM an
-    orphan (bash 1321-1351). Returns {count, orphaned}."""
-    fails = _read_destroy_fails()
-    count = int(fails.get(str(int(vmid)), 0)) + 1
-    fails[str(int(vmid))] = count
-    orphaned = count >= DESTROY_MAX_FAILS
-    if orphaned:
-        fails.pop(str(int(vmid)), None)
-        add_orphan_vm(int(vmid), bus)
-    _save_destroy_fails(fails)
-    return {"count": count, "orphaned": orphaned}
-
-
-def clear_destroy_fails(vmid: int) -> None:
-    fails = _read_destroy_fails()
-    fails.pop(str(int(vmid)), None)
-    _save_destroy_fails(fails)
 
 
 # ── present-dongle discovery ──────────────────────────────────────────────
