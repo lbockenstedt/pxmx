@@ -245,6 +245,18 @@ async def _delete_vm(agent, data, cs_cmd_id) -> None:
                         vmid=vid, orphaned=r["orphaned"])
 
 
+def _reclone_vm_name(vid: int, existing: str = "") -> str:
+    """The name a reclone should give VM ``vid``: the deterministic username
+    from ``vm_names.json`` — the SAME map the initial clone
+    (``usb_provision._clone_and_provision``) uses — so a reclone lands on the
+    same human name (e.g. ``khenderson``) as the initial clone, not the stale
+    Proxmox default ``sim-<vmid>`` an existing VM may carry. Falls back to the
+    existing Proxmox name (a custom rename), then ``sim-<vmid>``. Centralized so
+    the fleet + single-VM reclone paths agree and the resolution is unit-tested.
+    """
+    return usb_provision._vm_name(vid) or existing or f"sim-{vid}"
+
+
 async def _reclone_vm(agent, data, cs_cmd_id) -> None:
     vmid = data.get("vmid") or data.get("vm_id")
     source_vmid = data.get("source_vmid") or data.get("template_id")
@@ -305,7 +317,14 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
         return {"ok": False, "error": f"destroy before reclone failed (attempt {dr.get('fails')}/3)",
                 "bus": bus}
 
-    vm_name = name or f"sim-{vid}"
+    # Resolve the deterministic username from vm_names.json (the same map the
+    # initial clone uses) so a reclone lands on the human name (e.g.
+    # khenderson), not the stale Proxmox default sim-<vmid>. A caller-supplied
+    # name (the fleet reclone resolves it upfront) wins; then the map; then
+    # sim-<vmid>. Without this a VM named sim-<vmid> recloned to sim-<vmid> and
+    # the guest hostname came up as sim-9xxxx, losing the username programmed
+    # into the local map.
+    vm_name = name or _reclone_vm_name(vid)
     await _prog("cloning", 40)
     await pve_cmds.qm_clone(template, vid, vm_name, protected=prot, timeout=600)
     await pve_cmds.qm_set(vid, "--onboot", "1", "--startup", "order=2,up=60", protected=prot)
@@ -391,7 +410,13 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
         bus = usb_provision.bus_for_vmid(vid)
         if not bus or not os.path.isdir(f"/sys/bus/usb/devices/{bus}"):
             continue
-        candidates.append({"vmid": vid, "name": v.get("name") or f"sim-{vid}"})
+        # Resolve the deterministic username from vm_names.json (the same map
+        # the initial clone uses) so a fleet reclone produces the SAME human
+        # name as the initial clone — not the stale Proxmox default sim-<vmid>
+        # the existing VM may carry. Fall back to the existing Proxmox name (a
+        # custom rename) then sim-<vmid>.
+        candidates.append({"vmid": vid,
+                           "name": _reclone_vm_name(vid, v.get("name") or "")})
 
     if not candidates:
         await _terminal(agent, cs_cmd_id, "proxmox_reclone_all", "completed",
