@@ -365,6 +365,13 @@ async def get_vm_list(agent) -> Dict[str, Any]:
             # instead of only tags/name (templates without a "template"
             # tag or a "template-" name were misfiled as 'Other').
             "template":  int(r.get("template", 0) or 0),
+            # Proxmox guest OS type (qemu ``ostype`` from the VM config, e.g.
+            # l26 / win11 / other). Best-effort: /cluster/resources and the
+            # per-node /qemu+/lxc lists expose it for qemu guests; absent on
+            # lxc and on older nodes → "" and the WebUI falls back to the
+            # type label (Linux (CT) / —). Captured so the Hypervisor VM list
+            # OS column mirrors the cs VM Server list (csVmOs).
+            "ostype":    r.get("ostype", "") or "",
             "cpu":       round(r.get("cpu", 0) * 100, 1),
             "mem_bytes": r.get("mem") or r.get("maxmem", 0),
             "uptime":    r.get("uptime", 0),
