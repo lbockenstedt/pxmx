@@ -2026,38 +2026,61 @@ async def _is_runnable_template(vmid: int) -> bool:
 
 
 async def _resolve_template_vmid(configured: Any) -> Optional[int]:
-    """Resolve the configured clone-source vmid, only substituting a fallback
-    when the configured id doesn't exist on this host at all (bash
-    resolve_template_vmid, proxmox-agent.sh:933-944). Returns None, unchanged,
-    when nothing is configured — callers' existing "no template configured"
-    gates still apply.
+    """Resolve the configured clone-source — accepts EITHER a vmid (numeric) OR
+    a template NAME (text). Returns the resolved vmid, or None when nothing is
+    configured (callers' existing "no template configured" gates still apply)
+    or when a NAME can't be resolved to exactly one vmid.
 
-    IMPORTANT: the source does NOT have to be a Proxmox *template* (``template:
-    1``). ``qm clone`` clones from a plain stopped VM just as well, and the
-    original port cloned from whatever vmid was configured — so as long as the
-    configured vmid EXISTS we use it as-is. Only a truly missing (deleted/typo)
-    id triggers the template fallback search; requiring template:1 here would
-    (and did) break every setup whose golden image isn't template-flagged."""
+    Numeric entry (``100``, ``101``): the original behavior — use the vmid
+    directly if it exists (template-flagged or NOT; ``qm clone`` clones a plain
+    stopped VM just as well), else fall back to the lowest-numbered
+    ``template: 1`` VM on the cluster (bash resolve_template_vmid,
+    proxmox-agent.sh:933-944). A missing numeric id is recoverable, so the
+    fallback is appropriate.
+
+    Name entry (text with chars+digits, e.g. ``debian-12-template``): look up
+    the vmid whose ``qm list`` NAME matches exactly, on THIS host.
+      * exactly one match  → that vmid.
+      * no match           → log an error + return None (NO silent fallback to
+        a random template — a name typo shouldn't clone from the wrong image).
+      * multiple matches   → log an error + return None (Proxmox names aren't
+        unique; refuse to pick rather than clone from the wrong source). The
+        operator must make the name unique (rename one VM) or use the VMID."""
     from . import pve_cmds  # local: pve_cmds is imported per-function
-    try:
-        cvid = int(configured) if configured else None
-    except (TypeError, ValueError):
-        cvid = None
-    if cvid is None:
+    raw = str(configured).strip() if configured is not None else ""
+    if not raw:
         return None
-    # Exists as any VM (qm_config returns {} only for a nonexistent vmid) → use
-    # it directly, template-flagged or not.
-    if await pve_cmds.qm_config(cvid):
-        return cvid
-    logger.warning(f"provision loop: configured clone-source vmid {cvid} does "
-                   "not exist on this host — searching the cluster for a "
-                   "template to fall back to")
-    for vid in sorted(await pve_cmds.list_qemu_vmids()):
-        if vid != cvid and await _is_runnable_template(vid):
-            logger.warning(f"provision loop: falling back to template vmid {vid}")
-            return vid
-    logger.error(f"provision loop: clone-source vmid {cvid} does not exist and "
-                "no template was found on the cluster — clones will fail")
+    # ── numeric → vmid lookup (original path) ─────────────────────────────
+    if raw.lstrip("-").isdigit():
+        cvid = int(raw)
+        # Exists as any VM (qm_config returns {} only for a nonexistent vmid) →
+        # use it directly, template-flagged or not.
+        if await pve_cmds.qm_config(cvid):
+            return cvid
+        logger.warning(f"provision loop: configured clone-source vmid {cvid} does "
+                       "not exist on this host — searching the cluster for a "
+                       "template to fall back to")
+        for vid in sorted(await pve_cmds.list_qemu_vmids()):
+            if vid != cvid and await _is_runnable_template(vid):
+                logger.warning(f"provision loop: falling back to template vmid {vid}")
+                return vid
+        logger.error(f"provision loop: clone-source vmid {cvid} does not exist and "
+                    "no template was found on the cluster — clones will fail")
+        return None
+    # ── non-numeric → resolve by NAME across qemu VMs on this host ────────
+    matches = [vid for vid, name in await pve_cmds.list_qemu_vms()
+               if name == raw]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        logger.error(f"provision loop: configured clone-source template name "
+                    f"{raw!r} not found on this host — clones will fail "
+                    "(check the VM name / use the VMID instead)")
+        return None
+    logger.error(f"provision loop: configured clone-source template name "
+                f"{raw!r} matches multiple vmids {sorted(matches)} — refusing "
+                "to pick; clones will fail (make the template name unique or "
+                "use the VMID)")
     return None
 
 

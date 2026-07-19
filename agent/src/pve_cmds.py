@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .cs_guard import GuardError, assert_sim_vm, is_sim_vm
 
@@ -436,6 +436,36 @@ async def list_qemu_vmids() -> List[int]:
         if parts and parts[0].isdigit():
             ids.append(int(parts[0]))
     return ids
+
+
+async def list_qemu_vms() -> List[Tuple[int, str]]:
+    """All qemu VMs on this host as ``(vmid, name)`` from ``qm list``.
+
+    Used to resolve a configured clone-source template NAME to its vmid
+    (auto-provisioning accepts either a vmid or a name in the template field;
+    see ``usb_provision._resolve_template_vmid``). Read-only, unguarded.
+
+    ``qm list`` columns are FIXED-WIDTH (``VMID %10s``, ``NAME %20s``,
+    ``STATUS %10s``, …) so NAME is SLICED off the column, not whitespace-split
+    — a name containing spaces survives. A name longer than 20 chars overflows
+    the NAME column and would be truncated by the slice (realistic template
+    names are short; flagged in the field's WebUI help). Returns ``[]`` on any
+    failure (non-zero ``qm list`` or empty output)."""
+    rc, out, _ = await _run(["qm", "list"], check=False, timeout=20)
+    if rc != 0:
+        return []
+    vms: List[Tuple[int, str]] = []
+    for line in out.decode().splitlines()[1:]:  # skip the header row
+        if len(line) < 10:
+            continue
+        vid_s = line[:10].strip()
+        if not vid_s.isdigit():
+            continue
+        # NAME column is [10:30]; fall back to the remainder if the line is
+        # shorter than the full column set (a short name + trailing columns).
+        name = line[10:30].strip() if len(line) >= 30 else line[10:].strip()
+        vms.append((int(vid_s), name))
+    return vms
 
 
 async def _batch(action: str, protected: Set[int]) -> Dict[str, Any]:
