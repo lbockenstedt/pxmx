@@ -289,6 +289,16 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
             *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         return {"vmid": vid, "action": "backup", "storage": storage,
                 "mode": mode, "keep": keep, "kind": k, "started": True}
+    elif act in ("destroy", "delete"):
+        # Irreversible delete. `qm/pct destroy` FAILS on a running guest, so stop
+        # first (best-effort — `check=False` so the "not running" error on an
+        # already-stopped guest is ignored), then destroy + --purge so the VM,
+        # its disks, AND its backup-job membership are all removed (not just the
+        # config). Authorized + delete-protection-checked at the hub; the agent
+        # runs it unguarded like the other actions.
+        await _run([bin_, "stop", str(vid)], check=False)
+        await _run([bin_, "destroy", str(vid), "--purge"])
+        return {"vmid": vid, "action": "destroy", "kind": k, "purged": True}
     else:
         raise PveError(f"unknown vm action: {action}")
     return {"vmid": vid, "action": act, "kind": k}
