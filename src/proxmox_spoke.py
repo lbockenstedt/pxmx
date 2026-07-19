@@ -1079,8 +1079,15 @@ class ProxmoxSpoke(BaseSpoke):
                     row["snapshot"] = snapshot_name or pve_cmd_builder.default_snapshot_name()
                 return {"ok": True, **row}
             if act in ("reboot", "restart"):
-                # Fire-and-forget (backgrounded) — RUN_COMMAND returns immediately.
-                await _send(pve_cmd_builder.vm_reboot_cmd(vid, kind), timeout=10.0)
+                # Foreground (qm reset is a fast hardware reset) + rc check, so a
+                # failed reset (e.g. VM not running) surfaces as an error instead
+                # of a silent false-success toast. Previously this was fire-and-
+                # forget (backgrounded, output discarded) — RUN_COMMAND returned
+                # rc=0 for launching the job and the hub toasted success even
+                # when qm reset never ran.
+                r = await _send(pve_cmd_builder.vm_reboot_cmd(vid, kind), timeout=30.0)
+                if not pve_cmd_builder.runner_ok(r):
+                    raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
                 return {"ok": True, "vmid": vid, "action": "reboot", "kind": kind,
                         "method": "reset" if kind == "qemu" else "reboot",
                         "started": True}

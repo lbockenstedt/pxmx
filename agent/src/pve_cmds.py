@@ -249,10 +249,12 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
         #     always reboots a RUNNING VM, no guest cooperation. Not a clean
         #     shutdown, but it actually reboots.
         #   * LXC  → `pct reboot` — containers reboot cleanly + fast.
-        # Fire-and-forget (detached) so a slow op is never killed mid-flight.
+        # Foreground + rc check (qm reset is fast) so a failed reset (e.g. VM
+        # not running) raises PveError instead of a silent false-success — the
+        # old detached create_subprocess_exec returned "started" without ever
+        # checking the reset actually ran.
         reboot_argv = [bin_, "reset", str(vid)] if k == "qemu" else [bin_, "reboot", str(vid)]
-        await asyncio.create_subprocess_exec(
-            *reboot_argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await _run(reboot_argv)
         return {"vmid": vid, "action": "reboot", "kind": k,
                 "method": "reset" if k == "qemu" else "reboot", "started": True}
     elif act == "snapshot":

@@ -891,9 +891,12 @@ def test_vm_action_cmd_start_stop_snapshot():
             pve_cmd_builder.vm_action_cmd(100, bad, "qemu")
 
 
-def test_vm_reboot_cmd_is_backgrounded_reset_or_reboot():
-    assert pve_cmd_builder.vm_reboot_cmd(100, "qemu") == "qm reset 100 >/dev/null 2>&1 &"
-    assert pve_cmd_builder.vm_reboot_cmd(200, "lxc") == "pct reboot 200 >/dev/null 2>&1 &"
+def test_vm_reboot_cmd_is_foreground_reset_or_reboot():
+    # Foreground (NOT backgrounded) so RUN_COMMAND captures the real rc — a
+    # failed reset (e.g. VM not running) surfaces as an error instead of a
+    # silent false-success toast.
+    assert pve_cmd_builder.vm_reboot_cmd(100, "qemu") == "qm reset 100"
+    assert pve_cmd_builder.vm_reboot_cmd(200, "lxc") == "pct reboot 200"
 
 
 def test_pvesm_status_cmd_quotes_storage():
@@ -1059,15 +1062,30 @@ def test_vm_action_kind_detection_probes_pct_status():
     assert cmds == ["pct status 100", "qm start 100"]
 
 
-def test_vm_action_reboot_is_fire_and_forget_reset():
-    cp = _vm_action_cp({"qm reset 100 >/dev/null 2>&1 &": _runner()})
+def test_vm_action_reboot_foreground_reset_success():
+    # Foreground qm reset (NOT backgrounded) + rc check → SUCCESS when rc 0.
+    cp = _vm_action_cp({"qm reset 100": _runner()})
     sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
     res = _run(sp.handle_command("PXMX_VM_ACTION",
                                  {"agent_id": "a", "vmid": 100, "action": "reboot",
                                   "type": "qemu"}))
     assert res == {"status": "SUCCESS", "vmid": 100, "action": "reboot",
                    "kind": "qemu", "method": "reset", "started": True}
-    assert cp.calls[0]["data"]["command"] == "qm reset 100 >/dev/null 2>&1 &"
+    assert cp.calls[0]["data"]["command"] == "qm reset 100"
+
+
+def test_vm_action_reboot_foreground_reset_failure_surfaces_error():
+    # The fix: a failed reset (e.g. VM not running) surfaces as an ERROR instead
+    # of the old fire-and-forget false-success toast. Pre-fix this returned
+    # SUCCESS (the backgrounded `&` launch returned rc 0 and the spoke never
+    # checked the reset's real rc).
+    cp = _vm_action_cp({"qm reset 100": _runner(rc=255, stderr="VM is not running")})
+    sp = ProxmoxSpoke("px-1", {}, control_plane=cp)
+    res = _run(sp.handle_command("PXMX_VM_ACTION",
+                                 {"agent_id": "a", "vmid": 100, "action": "reboot",
+                                  "type": "qemu"}))
+    assert res["status"] == "ERROR"
+    assert "not running" in res["message"]
 
 
 def test_vm_action_backup_missing_storage_errors_fast():

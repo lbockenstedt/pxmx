@@ -634,14 +634,18 @@ def vm_action_cmd(vmid: Any, action: str, kind: str,
 
 
 def vm_reboot_cmd(vmid: Any, kind: str) -> str:
-    """Fire-and-forget reboot: ``qm reset <vmid>`` (qemu — an immediate hardware
+    """Foreground reboot: ``qm reset <vmid>`` (qemu — an immediate hardware
     reset that always reboots a running VM, no guest cooperation) / ``pct reboot
-    <vmid>`` (containers reboot cleanly). Backgrounded so RUN_COMMAND returns
-    immediately — mirrors the Agent's detached ``create_subprocess_exec``."""
+    <vmid>`` (containers reboot cleanly). Foreground (NOT backgrounded) so
+    RUN_COMMAND captures the real rc — a failed reset (e.g. VM not running)
+    surfaces as an error instead of a silent false-success toast. ``qm reset``
+    is a fast hardware reset, not the slow graceful ACPI ``qm reboot`` that
+    originally motivated fire-and-forget, so a foreground await + rc check is
+    safe and the toast is truthful."""
     vid = int(vmid)
     if kind == "lxc":
-        return f"pct reboot {vid} >/dev/null 2>&1 &"
-    return f"qm reset {vid} >/dev/null 2>&1 &"
+        return f"pct reboot {vid}"
+    return f"qm reset {vid}"
 
 
 def pvesm_status_cmd(storage: str) -> str:
