@@ -2254,11 +2254,34 @@ class ProxmoxAgent:
                     except Exception as e:
                         logger.debug(f"CS_TELEMETRY emit failed: {e}")
 
+                # Near-real-time on ANY VM/node-set change — not only auto-prov
+                # ops. A manually created/removed VM, a node that just joined, or
+                # the settle right AFTER an auto-prov burst does NOT flip the
+                # "active" flags below, so without this they'd wait out the full
+                # 60s idle tick before the VM Server / Overview reflects them (the
+                # "VMs/servers take ages to show up, deletes linger" report). Diff
+                # this tick's vmid set + node count vs the last; on a change, open a
+                # short fast-tick window so it propagates in seconds.
+                try:
+                    _sig = (
+                        frozenset(str(v.get("vmid")) for v in (vms or {}).get("vms", [])
+                                  if v.get("vmid") is not None),
+                        len((nodes or {}).get("nodes", []) or []),
+                    )
+                except Exception:  # noqa: BLE001
+                    _sig = None
+                if _sig is not None and _sig != getattr(self, "_last_vm_sig", None):
+                    # Skip the very first tick (last is None → establishing baseline).
+                    if getattr(self, "_last_vm_sig", None) is not None:
+                        self._vm_change_fast_until = _now + 15   # settle window (s)
+                    self._last_vm_sig = _sig
+
                 # Adaptive cadence: the auto-prov / delete / reclone state rides
                 # the CS_TELEMETRY frame, so a fixed 60s tick made the WebUI lag
                 # (or miss) VMs coming up. While auto-prov is ACTIVELY provisioning,
-                # deleting, or recloning, tick fast (~3s, the old bash cadence) so
-                # the UI shows VMs in near real time; fall back to 60s when idle.
+                # deleting, or recloning — OR just after ANY VM/node change (above)
+                # — tick fast (~3s, the old bash cadence) so the UI shows changes in
+                # near real time; fall back to 60s when idle.
                 interval = 60
                 if self.cs_enabled:
                     try:
@@ -2272,6 +2295,8 @@ class ProxmoxAgent:
                             interval = 3
                     except Exception:  # noqa: BLE001 — cadence hint only
                         pass
+                if _now < getattr(self, "_vm_change_fast_until", 0):
+                    interval = min(interval, 3)
                 await asyncio.sleep(interval)
             except Exception as e:
                 logger.error(f"Telemetry push failed: {e}")
