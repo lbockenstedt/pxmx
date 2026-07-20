@@ -41,6 +41,7 @@ logger = logging.getLogger("PxmxAgent")
 LONG_ACTIONS = frozenset({
     "delete_vm", "reclone_vm", "proxmox_reclone_all", "clone_lxc",
     "provision_unassigned", "backup", "reseed", "update_agent",
+    "quarantine_dongle_and_destroy",
 })
 
 
@@ -243,6 +244,54 @@ async def _delete_vm(agent, data, cs_cmd_id) -> None:
                f"VM {vid} destroy failed (attempt {r.get('fails')}/3)")
         await _terminal(agent, cs_cmd_id, "delete_vm", "failed", msg,
                         vmid=vid, orphaned=r["orphaned"])
+
+
+async def _quarantine_dongle_and_destroy(agent, data, cs_cmd_id) -> None:
+    """Dongle-quarantine shed: a T2 client that never connected to an SSID / never
+    got an IP (and isn't running an exclusion sim). Quarantine the USB bus (strike-
+    aware — 5 strikes → permanent) then destroy the VM so the provision loop
+    re-clones onto a free eligible non-permanent bus (or does nothing if none).
+
+    The spoke dispatches this with {vmid, bus_path?, reason?, cs_cmd_id}; the agent
+    resolves the bus authoritatively from usb_state if the spoke didn't supply it.
+    ``exclude_bus_after=False`` because quarantine already sidelines the bus — we
+    do NOT want destroy's exclusion-cooldown path to also fire (that auto-returns
+    the bus; quarantine's own 1h recovery / permanent semantics own the lifecycle).
+    """
+    vmid = data.get("vmid") or data.get("vm_id")
+    prot = _protected(agent)
+    vid = assert_sim_vm(vmid, prot)  # raises → run_long_op emits terminal failed
+    reason = data.get("reason") or "client never connected (no IP / no SSID)"
+    bus = data.get("bus_path") or usb_provision.bus_for_vmid(vid)
+    async with _vm_lock(agent, vid):
+        if bus:
+            usb_provision.quarantine_bus(bus, reason)
+            logger.warning(
+                "quarantine_dongle_and_destroy: VM %s bus %s quarantined (%s)",
+                vid, bus, reason)
+        else:
+            # No bus mapping → not a T2 USB client (or the dongle already cleared).
+            # Still shed the dead VM; nothing to quarantine.
+            logger.warning(
+                "quarantine_dongle_and_destroy: VM %s has no bus — destroying "
+                "without quarantine (reason: %s)", vid, reason)
+        await _progress(agent, cs_cmd_id, "quarantine_dongle_and_destroy",
+                        "running", "destroying", 20, vmid=vid)
+        r = await destroy_vm(agent, vid, bus=bus, protected=prot,
+                             exclude_bus_after=False)
+    if r["ok"]:
+        await _terminal(agent, cs_cmd_id, "quarantine_dongle_and_destroy",
+                        "completed",
+                        f"VM {vid} shed (bus {bus or '—'} quarantined, "
+                        f"reason: {reason})",
+                        vmid=vid, bus=bus, kind=r["kind"])
+    else:
+        msg = (f"VM {vid} shed failed — declared orphan (bus released)"
+               if r["orphaned"] else
+               f"VM {vid} shed failed (attempt {r.get('fails')}/3)")
+        await _terminal(agent, cs_cmd_id, "quarantine_dongle_and_destroy",
+                        "failed", msg, vmid=vid, bus=bus,
+                        orphaned=r["orphaned"])
 
 
 def _reclone_vm_name(vid: int, existing: str = "") -> str:
@@ -739,6 +788,7 @@ _HANDLERS = {
     "backup": _backup,
     "reseed": _reseed,
     "update_agent": _update_agent,
+    "quarantine_dongle_and_destroy": _quarantine_dongle_and_destroy,
 }
 
 
