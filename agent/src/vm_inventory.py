@@ -13,11 +13,20 @@ list_node_isos, list_node_storages, get_vm_list) so the dispatch chain and
 
 import asyncio
 import re
+import time
 from typing import Any, Dict, List, Optional  # noqa: F401 — kept for signature parity
 
 import logging
 
 logger = logging.getLogger("PxmxAgent")
+
+# Per-VM interface cache TTLs (annotate_vm_interfaces). The QGA
+# ``network-get-interfaces`` guest round-trip dominates get_vm_list on a busy
+# host — an unresponsive/booting guest rides the 4s timeout EVERY telemetry tick
+# (every 3s while provisioning). IPs/MACs barely change, so cache them:
+_IFACE_TTL_OK = 300.0    # fully resolved (has an IP, or a stopped VM's config MAC): 5 min
+_IFACE_TTL_MISS = 60.0   # running VM with no IP yet (guest agent booting / not answering):
+                         # retry every 60s instead of riding the 4s timeout each tick
 
 # Matches a MAC in either colon or dash form (case-insensitive): aa:bb:cc:dd:ee:ff
 _MAC_RE = re.compile(r"^[0-9a-f]{2}([:-]?[0-9a-f]{2}){5}$", re.IGNORECASE)
@@ -175,19 +184,52 @@ async def annotate_vm_interfaces(agent, vms: List[Dict[str, Any]]) -> None:
     in parallel — best-effort, bounded by a semaphore (16 concurrent pvesh
     calls) and a 12s deadline so a hung guest agent can't stall the 60s
     telemetry tick. Running VMs get guest IPs + MACs (QGA/LXC); stopped VMs
-    get their configured MACs via qm/pct config. VMs not annotated before the
-    deadline keep interfaces=[] (and ips=[]); they'll be filled next tick."""
+    get their configured MACs via qm/pct config.
+
+    CACHED per VM (agent._iface_cache): the QGA guest round-trip is the dominant
+    cost of get_vm_list (it showed 3.7s on 8 VMs — an unresponsive/booting guest
+    rides the 4s timeout every tick). IPs/MACs barely change, so a resolved VM is
+    re-queried at most every _IFACE_TTL_OK (5 min) and a running-but-no-IP VM
+    backs off _IFACE_TTL_MISS (60s) instead of costing 4s every 3s tick. A
+    status change (stopped<->running) forces a refresh so a freshly-booted VM's
+    IPs appear promptly. The cache is pruned to the live VMID set each call."""
     targets = [v for v in vms if v.get("node") and v.get("vmid") not in (None, "")]
     if not targets:
         return
+    cache = getattr(agent, "_iface_cache", None)
+    if cache is None:
+        cache = agent._iface_cache = {}
+    now = time.time()
     sem = asyncio.Semaphore(16)
 
     async def _one(v):
+        key = str(v.get("vmid"))
+        status = str(v.get("status") or "")
+        ent = cache.get(key)
+        # Cache hit: same power state AND still within TTL (longer once resolved,
+        # short while a running guest hasn't yielded an IP). Reuse — no round-trip.
+        if ent is not None and ent.get("status") == status:
+            ttl = _IFACE_TTL_OK if ent.get("ok") else _IFACE_TTL_MISS
+            if (now - ent.get("ts", 0.0)) < ttl:
+                v["interfaces"] = ent["interfaces"]
+                v["ips"] = list(ent.get("ips") or [])
+                return
         async with sem:
             ifaces = await vm_interfaces(
-                agent, v.get("node", ""), v.get("vmid"), v.get("type"), v.get("status"))
-            v["interfaces"] = ifaces
-            v["ips"] = [ip for i in ifaces for ip in (i.get("ips") or [])]
+                agent, v.get("node", ""), v.get("vmid"), v.get("type"), status)
+        ips = [ip for i in ifaces for ip in (i.get("ips") or [])]
+        v["interfaces"] = ifaces
+        v["ips"] = ips
+        # "Resolved" = a running VM that yielded at least one IP, or a stopped VM
+        # with config MACs (which never change). A running VM with MACs but no IP
+        # yet (guest agent still booting / not answering) is a MISS → short TTL so
+        # we keep trying until the IP appears, without paying 4s every tick.
+        if status == "running":
+            ok = bool(ips)
+        else:
+            ok = any(i.get("mac") for i in ifaces)
+        cache[key] = {"interfaces": ifaces, "ips": ips, "ts": now,
+                      "status": status, "ok": ok}
 
     try:
         await asyncio.wait_for(
@@ -195,6 +237,12 @@ async def annotate_vm_interfaces(agent, vms: List[Dict[str, Any]]) -> None:
             timeout=12)
     except asyncio.TimeoutError:
         pass  # partial — VMs not yet annotated keep interfaces=[]/ips=[]
+    # Prune cache entries for VMs no longer present so it can't grow unbounded
+    # across clone/destroy churn.
+    live = {str(v.get("vmid")) for v in targets}
+    for k in list(cache.keys()):
+        if k not in live:
+            cache.pop(k, None)
 
 
 async def vm_pool_map(agent) -> dict:
