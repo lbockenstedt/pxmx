@@ -312,6 +312,21 @@ def get_version():
             pass
     return "unknown"
 
+
+def _ws_keepalive_env(name: str, default: float) -> float:
+    """Env-overridable WebSocket keepalive knob (seconds) for the agent's
+    ``websockets.connect`` to the spoke. Mirrors the hub/spoke legs in lm core
+    (control_plane._ws_keepalive_env) so all three WS legs of a VNC console
+    session agree. The websockets library default 20s/20s is too tight — a long
+    synchronous agent command can block the loop past 20s and the spoke's
+    ping_timeout would tear down the WS, killing every in-flight VNC console.
+    Clamped to >=5s. See open_vnc_ws (pve_cmds) for the Proxmox-leg exception."""
+    try:
+        return max(5.0, float(os.environ.get(name, str(default))))
+    except Exception:
+        return default
+
+
 version = get_version()
 
 
@@ -1594,7 +1609,15 @@ class ProxmoxAgent:
         # in run() to form a TLS troubleshooting trail.
         logger.info("TLS mode: %s", _tls_mode)
 
-        async with websockets.connect(self.spoke_url, ssl=ssl_ctx) as websocket:
+        # WS keepalive: 30s ping / 90s pong timeout (env-overridable via
+        # LM_WS_PING_INTERVAL_S / LM_WS_PING_TIMEOUT_S) to match the hub<->spoke
+        # and spoke->agent legs — NOT the websockets library default 20s/20s.
+        # See _ws_keepalive_env above for why the default kills idle VNC sessions.
+        async with websockets.connect(
+            self.spoke_url, ssl=ssl_ctx,
+            ping_interval=_ws_keepalive_env("LM_WS_PING_INTERVAL_S", 30.0),
+            ping_timeout=_ws_keepalive_env("LM_WS_PING_TIMEOUT_S", 90.0),
+        ) as websocket:
             self.websocket = websocket
 
             # 1. Agent → Spoke handshake

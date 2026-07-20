@@ -1127,6 +1127,15 @@ async def open_vnc_ws(vmid: Any, node: str, kind: str, api_token: str):
         "ssl": ssl_ctx,
         "open_timeout": 20,
         "max_size": None,
+        # Disable the websockets library's keepalive PING. Proxmox's
+        # /vncwebsocket is a raw binary bridge to QEMU's VNC socket and does
+        # NOT reply to WS PING control frames, so the library default
+        # ping_interval=20 / ping_timeout=20 sends a PING once the VNC goes
+        # idle (~20s after the RFB handshake), Proxmox never PONGs, and the
+        # library raises ConnectionClosed — tearing down the console at
+        # ~15-20s. RFB has its own liveness via the framebuffer, so no WS
+        # keepalive is needed here.
+        "ping_interval": None,
     }
     hdr_key = "additional_headers" if "additional_headers" in inspect.signature(
         websockets.connect).parameters else "extra_headers"
