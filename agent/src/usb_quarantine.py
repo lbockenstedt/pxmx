@@ -36,6 +36,13 @@ DESTROY_MAX_FAILS = 3     # bash line 43, hardcoded — VM declared orphan after
 # 1h keeps a genuinely faulty dongle sidelined long enough to be noticed while
 # never stranding a good dongle that hit a transient kernel hiccup.
 QUARANTINE_RECOVERY_S = 3600
+# A bus that re-quarantines this many times (across recovery cycles) is PERMANENTLY
+# sidelined: auto-recovery stops, the provision loop never re-picks it. A strike
+# is one quarantine EPISODE (not one provision pass — quarantine_bus no-ops while
+# fails>=MAX, so repeat dmesg hits within one episode count once). The recovery
+# sweep resets fails=0 but preserves strikes. Operator can still clear it
+# manually (clear_usb_quarantine pops the whole entry → strike history reset).
+QUARANTINE_PERMANENT_STRIKES = 5
 
 # Kernel USB errors for a SPECIFIC device/port → quarantine that dongle so a
 # faulty port/dongle isn't re-provisioned. The kernel logs the bus id (e.g.
@@ -137,14 +144,40 @@ async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str
 
 def quarantine_bus(bus: str, reason: str) -> None:
     """Force a bus into quarantine (fails = QUARANTINE_MAX_FAILS) so the provision
-    loop skips it, tagged with a reason. Idempotent — no-ops if already quarantined
-    at/above the threshold. Auto-clears via the loop's absent-dongle sweep."""
+    loop skips it, tagged with a reason.
+
+    Strike tracking: a strike is one quarantine EPISODE. Within an episode
+    (fails already >= MAX) this no-ops so repeat triggers don't double-count;
+    the recovery sweep resets fails=0 (re-eligible) while preserving strikes,
+    so the NEXT quarantine increments strikes again. At QUARANTINE_PERMANENT_STRIKES
+    the bus is marked permanent — auto-recovery stops, the loop never re-picks it.
+    A permanent bus no-ops here (it's already as sidelined as it can be). Manual
+    ``clear_usb_quarantine`` pops the whole entry, resetting strike history.
+    """
     q = _read_quarantine()
     entry = q.get(bus) or {}
-    if int(entry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
+    if entry.get("permanent"):
         return
-    q[bus] = {"fails": QUARANTINE_MAX_FAILS, "since": int(time.time()), "reason": reason}
+    if int(entry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
+        return  # already quarantined this episode — don't double-count a strike
+    now = int(time.time())
+    strikes = int(entry.get("strikes", 0)) + 1
+    permanent = strikes >= QUARANTINE_PERMANENT_STRIKES
+    q[bus] = {
+        "fails": QUARANTINE_MAX_FAILS,
+        "since": now,
+        "reason": reason,
+        "strikes": strikes,
+        "permanent": permanent,
+        "first_strike": entry.get("first_strike") or now,
+        "last_strike": now,
+    }
     _save_quarantine(q)
+    if permanent:
+        logger.warning(
+            "auto-provision: bus %s reached %d quarantine strikes — PERMANENTLY "
+            "sidelined (last reason: %s; clear_usb_quarantine to reset)",
+            bus, strikes, reason)
 
 
 # ── destroy-fail counters (destroy_fails.json) ────────────────────────────

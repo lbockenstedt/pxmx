@@ -48,7 +48,7 @@ from .usb_state_store import (  # noqa: E402
 )
 from .usb_quarantine import (  # noqa: E402
     USB_QUARANTINE_FILE, DESTROY_FAILS_FILE, QUARANTINE_MAX_FAILS,
-    QUARANTINE_RECOVERY_S, DESTROY_MAX_FAILS,
+    QUARANTINE_RECOVERY_S, DESTROY_MAX_FAILS, QUARANTINE_PERMANENT_STRIKES,
     _USB_DMESG_ERROR_RE, _DMESG_USB_WINDOW_S, _DMESG_USB_QUARANTINE_MIN,
     exclude_bus, clear_excluded_buses, clear_quarantine,
     _read_quarantine, _save_quarantine, scan_dmesg_usb_errors, quarantine_bus,
@@ -998,18 +998,25 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
             qt = {}
         _now = time.time()
         for bus, entry in (qt or {}).items():
-            if int((entry or {}).get("fails", 0)) < QUARANTINE_MAX_FAILS:
+            e = entry or {}
+            permanent = bool(e.get("permanent"))
+            if not permanent and int(e.get("fails", 0)) < QUARANTINE_MAX_FAILS:
                 continue
             pe = present_by_bus.get(bus) or {}
-            since = (entry or {}).get("since")
-            # Absolute epoch the 1h auto-recovery clears this bus — the WebUI QT
-            # badge counts down to it live (since + QUARANTINE_RECOVERY_S).
+            since = e.get("since")
+            # Absolute epoch the 1h auto-recovery re-eligibles this bus — the
+            # WebUI QT badge counts down to it live (since + QUARANTINE_RECOVERY_S).
+            # A PERMANENT bus (5 strikes) never auto-recovers → no recovers_at.
             recovers_at = (float(since) + QUARANTINE_RECOVERY_S) \
-                if since is not None else None
+                if (since is not None and not permanent) else None
             quarantined.append({
                 "bus_path": bus,
-                "reason": (entry or {}).get("reason") or "quarantined",
+                "reason": e.get("reason") or "quarantined",
                 "since": since,
+                # 5-strike state — permanent buses never auto-recover; strikes is
+                # the count of quarantine episodes (1..QUARANTINE_PERMANENT_STRIKES).
+                "permanent": permanent,
+                "strikes": int(e.get("strikes", 0)),
                 # Absolute recovery target (epoch seconds) for the live badge.
                 "recovers_at": recovers_at,
                 # Seconds until the 1h auto-recovery clears it (clamped >=0).
@@ -1234,24 +1241,39 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             logger.info("provision loop: bus exclusion cleared for %s (%s)", bus,
                         "unplugged" if bus not in present
                         else f"cooldown {exclude_cooldown}s elapsed")
-    # Auto-clear quarantine after QUARANTINE_RECOVERY_S (1h) — present OR absent.
+    # Auto-recover quarantine after QUARANTINE_RECOVERY_S (1h) — present OR absent.
     # Quarantine is now dmesg-ONLY (a real kernel USB hardware-fault signal), so a
     # still-plugged quarantined dongle MUST be retried eventually: a transient
     # kernel hiccup (cable jiggle, port reset) shouldn't sideline a good dongle
     # forever. After 1h it gets a fresh provisioning attempt; if the kernel errors
     # are still firing, scan_dmesg_usb_errors re-quarantines it next pass. Absent
     # dongles clear on the same 1h clock so a replug starts clean.
+    #
+    # Strike-aware recovery: a bus that re-quarantines QUARANTINE_PERMANENT_STRIKES
+    # times is marked permanent — those NEVER auto-recover (operator clears them).
+    # Non-permanent: reset fails=0 (re-eligible for a retry) but PRESERVE the
+    # strike/first_strike/last_strike history so the next quarantine increments
+    # toward permanent. We no longer pop the entry (that would lose strike history).
     quarantine = _read_quarantine()
+    changed = False
     for bus in list(quarantine):
-        since = (quarantine[bus] or {}).get("since")
+        entry = quarantine[bus] or {}
+        if entry.get("permanent"):
+            continue  # permanent buses never auto-recover
+        if int(entry.get("fails", 0)) < QUARANTINE_MAX_FAILS:
+            continue  # already recovered/eligible this cycle
+        since = entry.get("since")
         if since is not None and now - float(since) >= QUARANTINE_RECOVERY_S:
-            reason = (quarantine[bus] or {}).get("reason", "")
-            quarantine.pop(bus, None)
-            logger.info("provision loop: quarantine auto-cleared for %s "
-                        "(%s — %ds elapsed, %s)",
-                        bus, reason, QUARANTINE_RECOVERY_S,
-                        "still present" if bus in present else "absent")
-    _save_quarantine(quarantine)
+            entry["fails"] = 0
+            quarantine[bus] = entry
+            changed = True
+            logger.info("provision loop: quarantine auto-recovered for %s "
+                        "(%s — %ds elapsed, %s; strikes=%d/%d)",
+                        bus, entry.get("reason", ""), QUARANTINE_RECOVERY_S,
+                        "still present" if bus in present else "absent",
+                        int(entry.get("strikes", 0)), QUARANTINE_PERMANENT_STRIKES)
+    if changed:
+        _save_quarantine(quarantine)
 
     # 1c. Post-provisioning retry queue — runs unconditionally (matches bash
     # calling _run_post_prov_retry_queue independently of the AUTO_PROVISION
@@ -1535,10 +1557,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         # Only skip a bus once it has actually reached QUARANTINE_MAX_FAILS —
         # quarantine is now dmesg-ONLY (quarantine_bus sets fails=MAX in one shot),
         # but gate on the count anyway so a partial/stale entry can't sideline a
-        # good dongle. Gate on the count, not mere file presence.
+        # good dongle. Gate on the count, not mere file presence. A PERMANENT bus
+        # (QUARANTINE_PERMANENT_STRIKES reached) is always skipped — its fails is
+        # kept at MAX and the recovery sweep never resets it.
         qentry = quarantine.get(bus) or {}
-        if int(qentry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
-            culled["quarantined"].append(f"{bus}({qentry.get('fails')})")
+        if qentry.get("permanent") or int(qentry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
+            culled["quarantined"].append(
+                f"{bus}({qentry.get('fails')}{'/P' if qentry.get('permanent') else ''})")
             continue
         dtype = info["type"]
         if _sim_phy_accepts(sim_phy, dtype):
