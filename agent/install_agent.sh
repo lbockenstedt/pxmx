@@ -163,7 +163,7 @@ elif [ "$SPOKE_URL_PINNED" != "1" ]; then
 fi
 
 # Bake AGENT_ID into .env + the unit ONLY when it was explicitly pinned. In the
-# derived case Python computes `<hostname>-agent` at startup, so a clone that was
+# derived case Python uses the bare `<hostname>` at startup, so a clone that was
 # renamed reconnects under a new id (correlated to the old one via the install
 # UUID). INSTALL_UUID is NOT written here — the agent mints it at first start.
 AGENT_ID_LINE=""
@@ -513,7 +513,7 @@ fi
 if [ "$AGENT_ID_PINNED" = "1" ]; then
     echo "🆔 Agent ID: $AGENT_ID  (pinned)"
 else
-    echo "🆔 Agent ID: $(hostname -s)-agent  (derived from hostname at startup)"
+    echo "🆔 Agent ID: $(hostname)  (derived from hostname at startup)"
 fi
 echo "📦 Version: $(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo unknown)"
 echo "🛡️  Rollback: /usr/local/bin/lm-component-update-restart — a failed self-update"

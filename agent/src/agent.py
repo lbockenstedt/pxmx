@@ -2614,7 +2614,9 @@ if __name__ == "__main__":
     parser.add_argument("--secret")
     args = parser.parse_args()
     if not args.id:
-        args.id = f"{socket.gethostname()}-agent"
+        # Derived id = the bare hostname (no "-agent" suffix). A pinned --id
+        # still wins; only the unpinned/derived case is affected.
+        args.id = socket.gethostname()
 
     try:
         agent = ProxmoxAgent(args.spoke_url, args.id, args.secret,
