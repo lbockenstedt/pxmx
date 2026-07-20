@@ -1135,6 +1135,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     img1 = await _resolve_template_vmid(usb_cfg.get("image1_template_id"))
     img2 = await _resolve_template_vmid(usb_cfg.get("image2_template_id"))
     img1_pct = int(usb_cfg.get("image1_pct", 50) or 50)
+    # N-image clone sources. Generic image_count + image{i}_template_id/_pct,
+    # falling back to the legacy image1/image2 + image1_pct pair. Each entry is
+    # {"num": i, "template": <resolved vmid>, "pct": <int 0-100>}; the selection
+    # loop below fills the fleet to these proportions. See _resolve_images.
+    images = await _resolve_images(usb_cfg, img1, img2, img1_pct)
     # Per-host VMID batch: the cs speak emits vmid_start/vmid_end in usb_config
     # (defaults 90000/99999). When those are at the default the agent derives
     # this host's block from its own hostname suffix (svr-02→90025-90048, stride
@@ -1459,12 +1464,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     await _vmid_gap_audit(agent, state, start, end, now, existing, present)
     save_usb_state(state)
 
-    if not img1 and not img2:
+    if not images:
         # Silent gate made loud — the #2 cause of "nothing provisions"; previously
         # returned with no log line. Surface it in the log + telemetry.
         _provision_reason = "no template ids configured"
-        logger.warning("auto-provision: no image1/image2 template_id configured — "
-                        "set clone-source templates in the Simulations UI so VMs can be cloned")
+        logger.warning("auto-provision: no clone-source template_id resolved — set "
+                        "the VM Images (clone-source templates) in the Simulations UI "
+                        "so VMs can be cloned")
         return {"provisioned": 0, "torn_down": len(torn_down),
                 "reason": "no template ids configured"}
 
@@ -1670,7 +1676,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             # addition to existing_after (which already covers present templates
             # but not a just-deleted one mid-reclone).
             templates = set()
-            for _t in (img1, img2):
+            for _t in ([_im["template"] for _im in images] + [img1, img2]):
                 try:
                     _tv = int(_t)
                     if _tv > 0:
@@ -1722,11 +1728,25 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 item_by_bus[bus]["status"] = "failed"
                 return False
             item_by_bus[bus]["vmid"] = vid
-            # Image 1 vs 2 by IMAGE1_PCT ceiling (bash 2729-2735).
+            # N-way weighted fill: pick the configured image whose current share
+            # is furthest BELOW its target (ceil of pct% of the post-clone total).
+            # Generalizes the old 2-image IMAGE1_PCT split to any number of images
+            # (image_count + image{i}_template_id/_pct — see _resolve_images).
             total = len(state["vmid_to_image"]) + 1
-            target_img1 = (img1_pct * total + 99) // 100
-            image_num = 2 if img1_count >= target_img1 and img2 else 1
-            template = img1 if image_num == 1 else (img2 or img1)
+            _counts = {}
+            for _v in state["vmid_to_image"].values():
+                try:
+                    _counts[int(_v)] = _counts.get(int(_v), 0) + 1
+                except (TypeError, ValueError):
+                    pass
+            _pick = None
+            _best = None
+            for _im in images:
+                _deficit = ((_im["pct"] * total + 99) // 100) - _counts.get(_im["num"], 0)
+                if _pick is None or _deficit > _best:
+                    _pick, _best = _im, _deficit
+            image_num = _pick["num"] if _pick else 1
+            template = _pick["template"] if _pick else None
             if not template:
                 # Roll back the pre-clone reservation — no VM was created.
                 state["vmid_to_bus"].pop(str(vid), None)
@@ -2048,6 +2068,64 @@ async def _is_runnable_template(vmid: int) -> bool:
     from . import pve_cmds  # local: pve_cmds is imported per-function
     cfg = await pve_cmds.qm_config(vmid)
     return cfg.get("template") == "1"
+
+
+def _normalize_image_pcts(images: list) -> None:
+    """Coerce each image's ``pct`` to 0-100. Images with a missing/invalid pct
+    split the remaining share evenly; if NOTHING is set, split 100 evenly. Keeps
+    the weighted-fill selection sane regardless of what the UI/config sent."""
+    if not images:
+        return
+    unassigned = []
+    assigned = 0
+    for im in images:
+        try:
+            im["pct"] = max(0, min(100, int(im.get("pct"))))
+            assigned += im["pct"]
+        except (TypeError, ValueError):
+            im["pct"] = None
+            unassigned.append(im)
+    if unassigned:
+        rem = max(0, 100 - assigned)
+        share = rem // len(unassigned)
+        for im in unassigned:
+            im["pct"] = share
+        unassigned[-1]["pct"] += rem - share * len(unassigned)
+    if sum(im["pct"] for im in images) == 0:
+        share = 100 // len(images)
+        for im in images:
+            im["pct"] = share
+        images[-1]["pct"] += 100 - share * len(images)
+
+
+async def _resolve_images(usb_cfg: Dict[str, Any], legacy_img1: Any = None,
+                          legacy_img2: Any = None, legacy_img1_pct: int = 50) -> list:
+    """Resolve the configured clone-source images into an ordered list of
+    ``{"num": i, "template": <vmid>, "pct": <int>}``.
+
+    Generic shape: ``image_count`` + ``image{i}_template_id`` + ``image{i}_pct``
+    (i = 1..count). Legacy fallback (image_count absent/<=0): the already-resolved
+    ``image1``/``image2`` + ``image1_pct`` pair (image2 gets the remaining %).
+    Images whose template can't be resolved are dropped; pcts are normalized to
+    sum ~100 so the fleet fills to the intended proportions."""
+    try:
+        count = int(usb_cfg.get("image_count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    images: list = []
+    if count > 0:
+        for i in range(1, count + 1):
+            t = await _resolve_template_vmid(usb_cfg.get(f"image{i}_template_id"))
+            if not t:
+                continue
+            images.append({"num": i, "template": int(t), "pct": usb_cfg.get(f"image{i}_pct")})
+    else:
+        if legacy_img1:
+            images.append({"num": 1, "template": int(legacy_img1), "pct": legacy_img1_pct})
+        if legacy_img2:
+            images.append({"num": 2, "template": int(legacy_img2), "pct": None})
+    _normalize_image_pcts(images)
+    return images
 
 
 async def _resolve_template_vmid(configured: Any) -> Optional[int]:
