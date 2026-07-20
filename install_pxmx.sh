@@ -471,6 +471,17 @@ if [ -f .env ]; then
     fi
 fi
 
+# CRITICAL: .env is created/rewritten above AS ROOT (the chown -R at clone time
+# ran BEFORE .env existed), but the spoke runs as svc_lm and must WRITE .env at
+# runtime — _ensure_install_uuid persists the minted INSTALL_UUID there, and the
+# hub-secret rotation persists HUB_SECRET there. A root-owned .env →
+#   "[Errno 13] Permission denied: /opt/lm/pxmx/.env"
+# → the spoke can NEVER persist a stable per-clone identity: it reports an
+# empty/stale UUID every boot, so cloned boxes step on each other on the hub.
+# Hand .env to svc_lm (and mode 600) so the runtime persistence writes succeed.
+chown svc_lm:svc_lm .env 2>/dev/null || true
+chmod 600 .env 2>/dev/null || true
+
 # --- Agent Secret + host dirs (shared with local Proxmox agent on this machine) ---
 # Host/OS-level agent-host prep (dirs + /etc/lm-agent/config.json agent_secret),
 # extracted into setup_pxmx_host so the agent's --infra-only path reuses it.
