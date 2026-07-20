@@ -660,7 +660,23 @@ class ProxmoxAgent:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # MUST kill the child on timeout AND on cancellation. Callers wrap
+            # this in an OUTER wait_for (vm_interfaces: 4s per VM;
+            # annotate_vm_interfaces: 12s for the whole gather) — when that outer
+            # deadline fires it cancels us here, and a bare wait_for leaves the
+            # pvesh child running. A QGA query to an unresponsive/booting guest
+            # blocks for a long time, so every telemetry tick would orphan pvesh
+            # processes that pile up, saturate host CPU (100%), and slow ALL
+            # pvesh — the runaway behind the fleet-wide 10-20 min telemetry lag.
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         if proc.returncode != 0:
             raise RuntimeError(stderr.decode().strip() or f"pvesh exited {proc.returncode}")
         return json.loads(stdout.decode())
@@ -679,7 +695,15 @@ class ProxmoxAgent:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            proc.kill()  # don't orphan a hung/slow pvesh on timeout/cancel
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         if proc.returncode != 0:
             raise RuntimeError(stderr.decode().strip() or f"pvesh {verb} exited {proc.returncode}")
         if not json_out:
@@ -963,16 +987,27 @@ class ProxmoxAgent:
             except Exception as e:
                 logger.warning(f"cluster/resources unavailable for nodes ({e}), falling back to per-node status")
 
-            # Fallback: per-node /status (cpu resets to 0 on first call — less accurate)
+            # Fallback: per-node /status (cpu resets to 0 on first call — less
+            # accurate). For a REMOTE node, pvesh proxies /nodes/<n>/status over
+            # SSH — so a node that is down (or the cluster is inquorate) makes
+            # this block on a dead-host TCP connect EVERY tick, stalling the
+            # telemetry loop (the "ssh: connect to <ip> port 22: No route to
+            # host" / empty "Node stats error:" spam). Two guards: (1) SKIP nodes
+            # /nodes already reports as not "online" — never SSH a known-dead
+            # node; (2) run the survivors CONCURRENTLY under a short per-call
+            # deadline so one slow node can't serialize-block the rest.
             raw_nodes = await self._pvesh("/nodes")
-            nodes = []
-            for n in (raw_nodes if isinstance(raw_nodes, list) else []):
+            candidates = [n for n in (raw_nodes if isinstance(raw_nodes, list) else [])
+                          if str(n.get("status", "")).lower() == "online"]
+
+            async def _node_stat(n: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 node_name = n.get("node", "")
                 try:
-                    stat = await self._pvesh(f"/nodes/{node_name}/status")
+                    stat = await asyncio.wait_for(
+                        self._pvesh(f"/nodes/{node_name}/status"), timeout=8)
                     mem      = stat.get("memory", {})
                     cpu_info = stat.get("cpuinfo", {})
-                    nodes.append({
+                    return {
                         "cluster":         self.cluster_name,
                         "node":            node_name,
                         "status":          n.get("status", "unknown"),
@@ -983,9 +1018,14 @@ class ProxmoxAgent:
                         "mem_pct":         round(mem.get("used", 0) / max(mem.get("total", 1), 1) * 100, 1),
                         "uptime":          stat.get("uptime", n.get("uptime", 0)),
                         "proxmox_version": stat.get("pveversion", ""),
-                    })
-                except Exception as e:
+                    }
+                except Exception as e:  # noqa: BLE001 — one node must not sink the rest
                     logger.warning(f"Node status error for {node_name}: {e}")
+                    return None
+
+            results = await asyncio.gather(*[_node_stat(n) for n in candidates],
+                                           return_exceptions=True)
+            nodes = [r for r in results if isinstance(r, dict)]
             return {"nodes": nodes, "cluster": self.cluster_name}
         except Exception as e:
             logger.error(f"Node stats error: {e}")
