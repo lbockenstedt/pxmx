@@ -1500,11 +1500,21 @@ class ProxmoxAgent:
                 if self.spoke_ip:
                     self.spoke_url = ""
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 120)
+                # Cap at 20s (was 120s): the agent↔spoke link is LAN, and the
+                # spoke restarts often (updates / cert-arm / mTLS). A 120s cap
+                # left the agent disconnected up to 2 min after a spoke bounce
+                # — a big slice of the "several-minute lag after an update". 20s
+                # keeps reconnect prompt without hammering a genuinely-down spoke.
+                backoff = min(backoff * 2, 20)
             except Exception as e:
                 logger.error(f"Unexpected error: {e} — retrying in {backoff}s")
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 120)
+                # Cap at 20s (was 120s): the agent↔spoke link is LAN, and the
+                # spoke restarts often (updates / cert-arm / mTLS). A 120s cap
+                # left the agent disconnected up to 2 min after a spoke bounce
+                # — a big slice of the "several-minute lag after an update". 20s
+                # keeps reconnect prompt without hammering a genuinely-down spoke.
+                backoff = min(backoff * 2, 20)
 
     def _wss_ssl_context(self, spoke_url: str):
         """Build the SSL context for a ``wss://`` connect to the spoke.
