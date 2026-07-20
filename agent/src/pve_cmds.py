@@ -525,6 +525,52 @@ async def list_qemu_vms() -> List[Tuple[int, str]]:
     return vms
 
 
+async def local_node_name() -> str:
+    """This host's Proxmox node name — the ``/cluster/status`` entry flagged
+    ``local: 1``. Falls back to the short hostname (Proxmox requires the node
+    name to equal the hostname), so this also works on a standalone (non-
+    clustered) host. Used to scope clone-source template resolution to THIS
+    node — on a cluster every node carries its own same-named template at a
+    different vmid, and a cluster-wide match would wrongly look ambiguous."""
+    try:
+        rc, out, _ = await _run(
+            ["pvesh", "get", "/cluster/status", "--output-format", "json"],
+            check=False, timeout=10)
+        if rc == 0:
+            for e in json.loads(out.decode("utf-8", "replace") or "[]"):
+                if e.get("type") == "node" and e.get("local") in (1, True):
+                    name = e.get("name")
+                    if name:
+                        return str(name)
+    except Exception:  # noqa: BLE001 — fall back to the hostname
+        pass
+    import socket
+    return socket.gethostname().split(".")[0]
+
+
+async def list_qemu_vms_cluster() -> List[Tuple[int, str, str]]:
+    """Every qemu VM across the cluster as ``(vmid, name, node)`` from
+    ``/cluster/resources`` (each row carries the owning ``node``). Unlike
+    ``list_qemu_vms`` (``qm list``, local node only) this sees peer nodes, so a
+    caller can resolve a template NAME to the copy on a SPECIFIC node. Read-only.
+    Returns ``[]`` on any failure."""
+    rc, out, _ = await _run(
+        ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
+        check=False, timeout=20)
+    if rc != 0:
+        return []
+    try:
+        rows = json.loads(out.decode("utf-8", "replace") or "[]")
+    except Exception:  # noqa: BLE001
+        return []
+    out_vms: List[Tuple[int, str, str]] = []
+    for r in (rows if isinstance(rows, list) else []):
+        if r.get("type") != "qemu" or r.get("vmid") is None:
+            continue
+        out_vms.append((int(r["vmid"]), str(r.get("name") or ""), str(r.get("node") or "")))
+    return out_vms
+
+
 async def _batch(action: str, protected: Set[int]) -> Dict[str, Any]:
     """Run a single-VM action (start/stop/snapshot) over every sim VM in ``list_qemu_vmids``.
 

@@ -2142,13 +2142,17 @@ async def _resolve_template_vmid(configured: Any) -> Optional[int]:
     fallback is appropriate.
 
     Name entry (text with chars+digits, e.g. ``debian-12-template``): look up
-    the vmid whose ``qm list`` NAME matches exactly, on THIS host.
-      * exactly one match  → that vmid.
-      * no match           → log an error + return None (NO silent fallback to
-        a random template — a name typo shouldn't clone from the wrong image).
-      * multiple matches   → log an error + return None (Proxmox names aren't
-        unique; refuse to pick rather than clone from the wrong source). The
-        operator must make the name unique (rename one VM) or use the VMID."""
+    the vmid whose NAME matches exactly, scoped to THIS node. On a cluster every
+    node carries its OWN same-named template at a different vmid, so the match is
+    filtered to the local node (``/cluster/resources`` node ownership) — the
+    clone runs locally, so the local copy is the only valid source.
+      * exactly one match on this node  → that vmid.
+      * no match on this node           → log an error + return None (NO silent
+        fallback — a name typo/cross-node-only template shouldn't clone from the
+        wrong image).
+      * multiple matches on this SAME node → log an error + return None (a real
+        local duplicate; refuse to pick rather than clone from the wrong source).
+        The operator must make the name unique (rename one VM) or use the VMID."""
     from . import pve_cmds  # local: pve_cmds is imported per-function
     raw = str(configured).strip() if configured is not None else ""
     if not raw:
@@ -2170,20 +2174,32 @@ async def _resolve_template_vmid(configured: Any) -> Optional[int]:
         logger.error(f"provision loop: clone-source vmid {cvid} does not exist and "
                     "no template was found on the cluster — clones will fail")
         return None
-    # ── non-numeric → resolve by NAME across qemu VMs on this host ────────
-    matches = [vid for vid, name in await pve_cmds.list_qemu_vms()
-               if name == raw]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        logger.error(f"provision loop: configured clone-source template name "
-                    f"{raw!r} not found on this host — clones will fail "
-                    "(check the VM name / use the VMID instead)")
+    # ── non-numeric → resolve by NAME, scoped to the LOCAL node ───────────
+    # On a cluster, /cluster/resources sees every node's copy of the same-named
+    # template; the clone is local, so only THIS node's copy is a valid source.
+    local_node = await pve_cmds.local_node_name()
+    cluster_vms = await pve_cmds.list_qemu_vms_cluster()
+    local_matches = [vid for vid, name, node in cluster_vms
+                     if name == raw and node == local_node]
+    if len(local_matches) == 1:
+        return local_matches[0]
+    if not local_matches:
+        # Distinguish "nowhere" from "only on other nodes" for an actionable log.
+        other_nodes = sorted({node for vid, name, node in cluster_vms if name == raw})
+        if other_nodes:
+            logger.error(f"provision loop: clone-source template {raw!r} is not on "
+                        f"this node ({local_node}) — it exists on {other_nodes}. A "
+                        f"clone runs locally; put a copy named {raw!r} on this node "
+                        "or use the VMID. Clones will fail.")
+        else:
+            logger.error(f"provision loop: configured clone-source template name "
+                        f"{raw!r} not found on this node ({local_node}) — clones "
+                        "will fail (check the VM name / use the VMID instead)")
         return None
     logger.error(f"provision loop: configured clone-source template name "
-                f"{raw!r} matches multiple vmids {sorted(matches)} — refusing "
-                "to pick; clones will fail (make the template name unique or "
-                "use the VMID)")
+                f"{raw!r} matches multiple vmids {sorted(local_matches)} on this "
+                f"node ({local_node}) — refusing to pick; clones will fail (make "
+                "the template name unique or use the VMID)")
     return None
 
 
