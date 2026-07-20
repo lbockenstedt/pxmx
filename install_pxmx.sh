@@ -263,6 +263,50 @@ retire_legacy_agent() {
 }
 retire_legacy_agent
 
+# ── Ensure the shared LM core is present ─────────────────────────────────────
+# The pxmx spoke imports dep_guard / BaseControlPlane from $INSTALL_DIR/core/src
+# (see control_plane.py's import block + the unit's PYTHONPATH). install_all.sh
+# and the hub-orchestrated install normally lay core down FIRST; a STANDALONE
+# spoke install on a bare or freshly-wiped box (e.g. after uninstall_lm.sh) has
+# no core, so control_plane.py crash-loops on
+#   ModuleNotFoundError: No module named 'dep_guard'
+# Provision it here as a real GIT CHECKOUT of the lm repo at $INSTALL_DIR
+# (mirrors install_all.sh) so SPOKE_UPDATE's shared-core git-pull keeps working.
+# `git reset --hard` only touches TRACKED paths, so the untracked module dirs
+# (pxmx/, cs/, venv/, .env, certs/, data/) are preserved.
+ensure_core() {
+    if [ -f "$INSTALL_DIR/core/src/dep_guard.py" ]; then
+        echo "✅ Shared LM core already present at $INSTALL_DIR/core."
+        return 0
+    fi
+    echo "🌐 Shared LM core missing — provisioning $INSTALL_DIR/core from lm.git…"
+    rm -rf "$INSTALL_DIR/lm_tmp"
+    if ! git clone --depth 1 "https://github.com/lbockenstedt/lm.git" "$INSTALL_DIR/lm_tmp"; then
+        echo "❌ Failed to clone the lm core repository."; exit 1
+    fi
+    git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        # $INSTALL_DIR is already an lm checkout (core removed but .git kept) —
+        # just re-materialize the tracked tree from HEAD.
+        rm -rf "$INSTALL_DIR/lm_tmp"
+        ( cd "$INSTALL_DIR" && git reset --hard HEAD ) || true
+    else
+        # Graft the clone's .git into $INSTALL_DIR and let git lay the tracked
+        # tree (core/, WebUI/, dns/, dhcp/, VERSION, scripts) in place. Drop any
+        # stray untracked copies first so `reset --hard` can't collide.
+        rm -rf "$INSTALL_DIR/core" "$INSTALL_DIR/WebUI" "$INSTALL_DIR/dns" "$INSTALL_DIR/dhcp"
+        mv "$INSTALL_DIR/lm_tmp/.git" "$INSTALL_DIR/.git"
+        rm -rf "$INSTALL_DIR/lm_tmp"
+        ( cd "$INSTALL_DIR" && git reset --hard HEAD ) || { echo "❌ core git checkout failed."; exit 1; }
+    fi
+    if [ ! -f "$INSTALL_DIR/core/src/dep_guard.py" ]; then
+        echo "❌ core still missing after provisioning ($INSTALL_DIR/core/src/dep_guard.py)."; exit 1
+    fi
+    chown -R svc_lm:svc_lm "$INSTALL_DIR/core" "$INSTALL_DIR/.git" 2>/dev/null || true
+    echo "✅ Shared LM core laid down at $INSTALL_DIR/core (git checkout)."
+}
+ensure_core
+
 if [ -d "pxmx/.git" ]; then
     echo "📂 PXMX repository already exists. Updating..."
     cd pxmx && git pull --rebase --autostash && cd ..
@@ -295,6 +339,13 @@ echo "Installing requirements..."
 ./venv/bin/python3 -m pip install --upgrade pip -q
 if [ -f "requirements.txt" ]; then
     ./venv/bin/python3 -m pip install -r requirements.txt -q
+fi
+# The spoke imports the shared LM core (dep_guard, BaseControlPlane, …) using
+# THIS venv via PYTHONPATH=$INSTALL_DIR/core/src, so core's deps must be present
+# here too — dep_guard only self-heals the spoke's OWN requirements.txt, not
+# core's. Install them into the pxmx venv so the core imports resolve.
+if [ -f "$INSTALL_DIR/core/requirements.txt" ]; then
+    ./venv/bin/python3 -m pip install -r "$INSTALL_DIR/core/requirements.txt" -q
 fi
 
 # ── Hub auto-discovery ──────────────────────────────────────────────────────
