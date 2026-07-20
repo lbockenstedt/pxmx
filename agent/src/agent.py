@@ -558,43 +558,85 @@ class ProxmoxAgent:
             logger.error("asyncio error: %s", msg)
         loop.default_exception_handler(context)
 
-    def _ensure_install_uuid(self) -> str:
-        """Return this agent's stable install UUID, minting + persisting it on first start.
+    def _machine_fingerprint(self) -> str:
+        """Stable per-MACHINE id, used to detect a cloned .env (identity copied
+        onto a different physical box). /etc/machine-id first (regenerated per
+        clone by most provisioning), then the SMBIOS/DMI product UUID. '' if
+        neither is readable — binding is skipped (fail-open, never blind re-mint)."""
+        for path in ("/etc/machine-id", "/var/lib/dbus/machine-id",
+                     "/sys/class/dmi/id/product_uuid"):
+            try:
+                with open(path) as f:
+                    v = f.read().strip()
+                if v:
+                    return v
+            except Exception:
+                continue
+        return ""
 
-        Mirrors the spoke-side BaseControlPlane._ensure_install_uuid: the UUID is
-        created at FIRST START (not install) so cloning the agent install tree
-        does not copy a UUID — a clone gets its own on first start. prep-for-imaging
-        strips INSTALL_UUID so a cloned node mints a fresh one (clean new identity
-        vs. a rename of the original). We trust only what lands on disk: a failed
-        write returns '' (no UUID) rather than a volatile value that would differ
-        every boot. The hub treats '' as "no correlation".
-        """
+    def _env_get(self, key: str) -> str:
         env_path = self._env_path()
         try:
-            existing = ""
             if os.path.exists(env_path):
                 with open(env_path) as f:
                     for line in f:
-                        if line.startswith("INSTALL_UUID="):
-                            existing = line.split("=", 1)[1].strip()
-                            if existing:
-                                return existing
-            new_uuid = str(uuid.uuid4())
-            lines = []
-            if os.path.exists(env_path):
-                with open(env_path) as f:
-                    lines = [l for l in f if not l.startswith("INSTALL_UUID=")]
-            lines.append(f"INSTALL_UUID={new_uuid}\n")
-            with open(env_path, "w") as f:
-                f.writelines(lines)
-            logger.info(f"Install UUID minted and saved to {env_path}")
-            # Re-read so a silent write failure can't leave us reporting a UUID
-            # that isn't actually on disk (which would mismatch on next start).
+                        if line.startswith(f"{key}="):
+                            return line.split("=", 1)[1].strip()
+        except Exception:
+            pass
+        return ""
+
+    def _env_upsert(self, updates: dict) -> None:
+        """Write/replace each key in ``updates`` in .env (create the file/keys if absent)."""
+        env_path = self._env_path()
+        lines = []
+        if os.path.exists(env_path):
             with open(env_path) as f:
-                for line in f:
-                    if line.startswith("INSTALL_UUID="):
-                        return line.split("=", 1)[1].strip()
-            return ""
+                lines = [l for l in f if not any(l.startswith(f"{k}=") for k in updates)]
+        for k, v in updates.items():
+            lines.append(f"{k}={v}\n")
+        with open(env_path, "w") as f:
+            f.writelines(lines)
+
+    def _ensure_install_uuid(self) -> str:
+        """Return this agent's stable install UUID, minting + persisting it on first start.
+
+        MACHINE-BOUND (mirrors BaseControlPlane._ensure_install_uuid): the UUID is
+        pinned to this box's machine fingerprint via ``INSTALL_UUID_MACHINE``. A VM
+        clone copies the whole .env, so without this a cloned Proxmox host would
+        present the ORIGIN's agent UUID and the hub would collapse both onto one
+        hypervisor (the "N agents, one UUID" trap). If a cloned .env lands on a
+        DIFFERENT machine (stored fingerprint != this box), we mint a FRESH UUID so
+        the clone registers as its own agent. A missing stored fingerprint on an
+        existing UUID = a pre-binding install: backfill the fingerprint, keep UUID.
+        We trust only what lands on disk: a failed write returns '' (no correlation).
+        """
+        try:
+            cur_fp = self._machine_fingerprint()
+            existing = self._env_get("INSTALL_UUID")
+            if existing:
+                stored_fp = self._env_get("INSTALL_UUID_MACHINE")
+                if cur_fp and stored_fp and stored_fp != cur_fp:
+                    logger.warning(
+                        "INSTALL_UUID %s… was minted on a different machine "
+                        "(fingerprint %s… != this box %s…) — cloned .env detected; "
+                        "minting a fresh agent identity so this clone does not step "
+                        "on the origin hypervisor.",
+                        existing[:8], stored_fp[:8], cur_fp[:8])
+                    new_uuid = str(uuid.uuid4())
+                    self._env_upsert({"INSTALL_UUID": new_uuid,
+                                      "INSTALL_UUID_MACHINE": cur_fp})
+                    return self._env_get("INSTALL_UUID")
+                if cur_fp and not stored_fp:
+                    self._env_upsert({"INSTALL_UUID_MACHINE": cur_fp})
+                return existing
+            new_uuid = str(uuid.uuid4())
+            upd = {"INSTALL_UUID": new_uuid}
+            if cur_fp:
+                upd["INSTALL_UUID_MACHINE"] = cur_fp
+            self._env_upsert(upd)
+            logger.info(f"Install UUID minted and saved to {self._env_path()}")
+            return self._env_get("INSTALL_UUID")
         except Exception as e:
             logger.warning(f"Could not ensure INSTALL_UUID in .env: {e}")
             return ""
