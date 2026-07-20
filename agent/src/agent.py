@@ -2318,6 +2318,7 @@ class ProxmoxAgent:
                 # caches it for the Simulations/VM Server view. Piggybacks on the
                 # 60s tick (the bash agent pushed every 3s; HEALTH_STALE_SECS=180
                 # gives ample margin). send_cs_event injects hostname + agent_id.
+                _usb_sig = None   # USB present-set for the fast-tick trigger below
                 if self.cs_enabled:
                     try:
                         # Classify each VM's tier by passthrough (cached ~60s) in
@@ -2332,22 +2333,37 @@ class ProxmoxAgent:
                         (self._last_phase_ms or {})["tiers_ms"] = int((time.time() - _t_e) * 1000)
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         await self.send_cs_event("CS_TELEMETRY", cs_body)
+                        # Signature of the present USB set (dongles). A plug/unplug
+                        # must propagate in seconds, but a USB change flips none of
+                        # the VM/node/prov flags — so fold it into the fast-tick
+                        # diff below (was: dongles waited out the full 60s tick).
+                        try:
+                            _all_usb = ((cs_body.get("present_usb") or [])
+                                        + (cs_body.get("unknown_usb") or [])
+                                        + (cs_body.get("usb_state") or []))
+                            _usb_sig = frozenset(
+                                f"{(u or {}).get('bus_path') or (u or {}).get('bus') or ''}"
+                                f":{(u or {}).get('vidpid') or ''}"
+                                for u in _all_usb)
+                        except Exception:  # noqa: BLE001 — sig is a hint only
+                            _usb_sig = None
                     except Exception as e:
                         logger.debug(f"CS_TELEMETRY emit failed: {e}")
 
-                # Near-real-time on ANY VM/node-set change — not only auto-prov
-                # ops. A manually created/removed VM, a node that just joined, or
-                # the settle right AFTER an auto-prov burst does NOT flip the
-                # "active" flags below, so without this they'd wait out the full
-                # 60s idle tick before the VM Server / Overview reflects them (the
-                # "VMs/servers take ages to show up, deletes linger" report). Diff
-                # this tick's vmid set + node count vs the last; on a change, open a
-                # short fast-tick window so it propagates in seconds.
+                # Near-real-time on ANY VM/node-set OR USB change — not only
+                # auto-prov ops. A manually created/removed VM, a node that just
+                # joined, a dongle plugged/unplugged, or the settle right AFTER an
+                # auto-prov burst does NOT flip the "active" flags below, so
+                # without this they'd wait out the full 60s idle tick before the
+                # VM Server / Overview / USB view reflects them. Diff this tick's
+                # vmid set + node count + USB present-set vs the last; on a change,
+                # open a short fast-tick window so it propagates in seconds.
                 try:
                     _sig = (
                         frozenset(str(v.get("vmid")) for v in (vms or {}).get("vms", [])
                                   if v.get("vmid") is not None),
                         len((nodes or {}).get("nodes", []) or []),
+                        _usb_sig,
                     )
                 except Exception:  # noqa: BLE001
                     _sig = None
