@@ -1477,8 +1477,16 @@ class ProxmoxAgent:
                 await self._connect_once()
                 backoff = 5  # reset on clean disconnect
                 _consecutive_auth_fails = 0
+                # Reconnect diagnostics — surfaced on the Details page (remote
+                # boxes have no console). A clean return = the socket dropped
+                # (spoke/hub restart or net blip); we reconnect on the next pass.
+                self._reconnect_count = getattr(self, "_reconnect_count", 0) + 1
+                self._last_disconnect_reason = "connection closed (spoke/hub restart or network)"
+                self._last_disconnect_ts = time.time()
             except _AuthError:
                 _consecutive_auth_fails += 1
+                self._last_disconnect_reason = "auth rejected by spoke — awaiting admin approval"
+                self._last_disconnect_ts = time.time()
                 logger.warning(
                     "Authentication rejected by spoke — clearing stale secret and "
                     "retrying zero-touch (will await re-approval). "
@@ -1492,6 +1500,8 @@ class ProxmoxAgent:
                     self.secret = None
                 await asyncio.sleep(5)
             except (OSError, websockets.exceptions.WebSocketException) as e:
+                self._last_disconnect_reason = f"connect failed: {type(e).__name__}: {str(e)[:120]}"
+                self._last_disconnect_ts = time.time()
                 logger.warning(f"Connection to {self.spoke_url} failed: {e} — retrying in {backoff}s")
                 # If the operator pinned only an IP, a failure may mean the spoke
                 # restarted on a different scheme/port (e.g. gained/lost its TLS
@@ -2558,6 +2568,13 @@ class ProxmoxAgent:
                 "phase_ms":     dict(getattr(self, "_last_phase_ms", {}) or {}),
                 "vm_count":     len(vms),
                 "node_count":   len(nodes_list),
+                # Reconnect context (Details page): how many times the WS has
+                # dropped, and why/when it last dropped — so a "just bounced,
+                # back now" reads as expected rather than alarming on a remote box.
+                "reconnect_count":       getattr(self, "_reconnect_count", 0),
+                "last_disconnect_reason": getattr(self, "_last_disconnect_reason", None),
+                "last_disconnect_age_s": (int(time.time() - self._last_disconnect_ts)
+                                          if getattr(self, "_last_disconnect_ts", None) else None),
             },
         }
 
