@@ -985,7 +985,10 @@ class ProxmoxAgent:
                 if nodes:
                     return {"nodes": nodes, "cluster": self.cluster_name}
             except Exception as e:
-                logger.warning(f"cluster/resources unavailable for nodes ({e}), falling back to per-node status")
+                # str(e) is often EMPTY on a pvesh/quorum failure — !r keeps the
+                # exception type visible so this never logs a blank reason.
+                logger.warning(f"cluster/resources unavailable for nodes ({e!r}), "
+                               f"falling back to per-node status")
 
             # Fallback: per-node /status (cpu resets to 0 on first call — less
             # accurate). For a REMOTE node, pvesh proxies /nodes/<n>/status over
@@ -997,8 +1000,17 @@ class ProxmoxAgent:
             # node; (2) run the survivors CONCURRENTLY under a short per-call
             # deadline so one slow node can't serialize-block the rest.
             raw_nodes = await self._pvesh("/nodes")
-            candidates = [n for n in (raw_nodes if isinstance(raw_nodes, list) else [])
-                          if str(n.get("status", "")).lower() == "online"]
+            candidates, offline = [], []
+            for n in (raw_nodes if isinstance(raw_nodes, list) else []):
+                (candidates if str(n.get("status", "")).lower() == "online"
+                 else offline).append(n)
+            # LOG the down member(s) by name — a dead node is a real operational
+            # signal the operator needs to see; we skip the SSH poll but not the
+            # visibility. WARNING, throttled by the ~60s telemetry tick.
+            if offline:
+                logger.warning(
+                    "cluster node(s) not online — skipping status poll (no SSH): %s",
+                    ", ".join(f"{n.get('node','?')}={n.get('status','?')}" for n in offline))
 
             async def _node_stat(n: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 node_name = n.get("node", "")
@@ -1028,8 +1040,10 @@ class ProxmoxAgent:
             nodes = [r for r in results if isinstance(r, dict)]
             return {"nodes": nodes, "cluster": self.cluster_name}
         except Exception as e:
-            logger.error(f"Node stats error: {e}")
-            return {"nodes": [], "error": str(e)}
+            # !r so a pvesh/quorum failure with an EMPTY message still logs its
+            # type (was the blank "Node stats error:" line).
+            logger.error(f"Node stats error: {e!r}")
+            return {"nodes": [], "error": str(e) or type(e).__name__}
 
     # ── VM/CT inventory + interface enrichment ────────────────────────────────
     # Extracted to vm_inventory.py (free functions taking ``agent``); these thin
