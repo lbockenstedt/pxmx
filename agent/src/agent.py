@@ -2253,17 +2253,22 @@ class ProxmoxAgent:
                 # on the VM Server detail page). These three pvesh-backed calls are
                 # the usual stall points on a loaded host — recording how long each
                 # took, per tick, is what pinpoints WHERE the lag is.
-                _t_a = time.time()
-                metrics = await self.collect_metrics()
-                _t_b = time.time()
-                vms     = await self.get_vm_list()
-                _t_c = time.time()
-                nodes   = await self.get_node_stats()
-                _t_d = time.time()
+                # Run the three independent collects CONCURRENTLY (they were
+                # serial → wall-time was their SUM). Each is still timed on its
+                # own so the per-phase breakdown stays accurate; wall-time is now
+                # the MAX, so node_stats/metrics overlap the long get_vm_list.
+                async def _timed(coro):
+                    _t0 = time.time()
+                    _r = await coro
+                    return _r, int((time.time() - _t0) * 1000)
+                (metrics, _m_ms), (vms, _v_ms), (nodes, _n_ms) = await asyncio.gather(
+                    _timed(self.collect_metrics()),
+                    _timed(self.get_vm_list()),
+                    _timed(self.get_node_stats()))
                 self._last_phase_ms = {
-                    "metrics_ms":    int((_t_b - _t_a) * 1000),
-                    "vm_list_ms":    int((_t_c - _t_b) * 1000),
-                    "node_stats_ms": int((_t_d - _t_c) * 1000),
+                    "metrics_ms":    _m_ms,
+                    "vm_list_ms":    _v_ms,
+                    "node_stats_ms": _n_ms,
                 }
                 self._telemetry_iter = getattr(self, "_telemetry_iter", 0) + 1
 

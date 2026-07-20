@@ -57,14 +57,18 @@ async def vm_interfaces(agent, node: str, vmid: Any, rtype: str,
     interfaces: List[Dict[str, Any]] = []
     if status == "running":
         try:
+            # 2s (was 4s): a responsive guest agent answers in well under a
+            # second; an unresponsive one just costs the timeout, so a shorter
+            # bound halves the per-VM miss cost on a busy host. The interface
+            # cache means a resolved VM isn't re-queried for 5 min anyway.
             if kind == "qemu":
                 data = await asyncio.wait_for(
                     agent._pvesh(f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"),
-                    timeout=4)
+                    timeout=2)
             else:
                 data = await asyncio.wait_for(
                     agent._pvesh(f"/nodes/{node}/lxc/{vmid}/interfaces"),
-                    timeout=4)
+                    timeout=2)
             interfaces = parse_guest_ifaces(data)
         except Exception:
             interfaces = []
@@ -232,9 +236,13 @@ async def annotate_vm_interfaces(agent, vms: List[Dict[str, Any]]) -> None:
                       "status": status, "ok": ok}
 
     try:
+        # 6s (was 12s) overall deadline: with per-VM timeout at 2s + the cache,
+        # a full sweep finishes fast; capping at 6s bounds the worst-case tick on
+        # a host with many unresponsive guests. VMs not annotated before the
+        # deadline keep their cached value (or []), filled on a later tick.
         await asyncio.wait_for(
             asyncio.gather(*[_one(v) for v in targets], return_exceptions=True),
-            timeout=12)
+            timeout=6)
     except asyncio.TimeoutError:
         pass  # partial — VMs not yet annotated keep interfaces=[]/ips=[]
     # Prune cache entries for VMs no longer present so it can't grow unbounded
