@@ -1766,6 +1766,17 @@ class ProxmoxAgent:
                         except Exception as e:
                             result = {"status": "ERROR", "message": str(e)}
 
+                    elif cmd_type == "PXMX_APPLY_SIM_TAGS":
+                        # sim-tag sync (moved off the cs spoke's Proxmox-API path).
+                        # The cs spoke computes {vmid: [sim- tags]} from the client
+                        # registry and sends it here; we apply via local qm/pct so
+                        # tagging never PUTs to the API (was storming CS telemetry).
+                        try:
+                            result = await pve_cmds.apply_sim_tags(
+                                data.get("tags") or {})
+                        except Exception as e:
+                            result = {"status": "ERROR", "message": str(e)}
+
                     elif cmd_type == "PXMX_CLONE_VM":
                         # Clone-from-template: any tenant may clone a VM that
                         # lives in a configured template pool (the hub resolves

@@ -422,6 +422,63 @@ async def retag_tenant(old_tag: str, new_tag: str) -> Dict[str, Any]:
                         + (f", {len(errors)} error(s)" if errors else ""))}
 
 
+_SIM_TAG_PREFIX = "sim-"
+
+
+async def apply_sim_tags(tag_map: Dict[Any, List[str]]) -> Dict[str, Any]:
+    """Apply ``sim-`` tags to VMs LOCALLY via ``qm``/``pct`` — no Proxmox API.
+
+    ``tag_map`` is ``{vmid: [desired sim- tags]}`` computed by the cs spoke from
+    the client registry (client hostname → active_simulations). The cs spoke is
+    OFF the Proxmox host and cannot run ``qm``; it used to PUT ``tags=`` to the
+    API per VM, which storms the telemetry hot path (CS_INGEST_TELEMETRY Request
+    Timeouts → stale VM Server / quota engine fleet-wide). This runs on the host.
+
+    For each VM: read its current tags from ``/cluster/resources`` (one read for
+    the whole sweep), preserve every non-``sim-`` tag, replace the ``sim-`` tags
+    with the desired set, and write back via :func:`set_tags_any`. Idempotent
+    (unchanged VMs are skipped). One VM's failure never aborts the sweep. VMs not
+    present on this host are silently skipped. Best-effort — returns a summary."""
+    if not tag_map:
+        return {"status": "SUCCESS", "updated": [], "count": 0,
+                "message": "no tags to apply"}
+    rc, out, err = await _run(
+        ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
+        check=False, timeout=30)
+    if rc != 0:
+        return {"status": "ERROR",
+                "message": f"cluster/resources failed: {err.decode('utf-8', 'replace')[:200]}"}
+    try:
+        resources = json.loads(out.decode("utf-8", "replace") or "[]")
+    except Exception as e:  # noqa: BLE001
+        return {"status": "ERROR", "message": f"parse failed: {e}"}
+    by_vmid = {str(r.get("vmid")): r for r in resources if r.get("vmid") is not None}
+    updated: List[Dict[str, Any]] = []
+    errors: Dict[str, str] = {}
+    for vmid, desired in tag_map.items():
+        r = by_vmid.get(str(vmid))
+        if r is None:
+            continue  # VM not on this host (another node owns it) — skip
+        kind = "lxc" if r.get("type") == "lxc" else "qemu"
+        current = [t.strip() for t in str(r.get("tags", "")).split(";") if t.strip()]
+        non_sim = [t for t in current if not t.lower().startswith(_SIM_TAG_PREFIX)]
+        desired_clean = sorted({
+            str(t).strip() for t in (desired or [])
+            if str(t).strip() and str(t).strip().lower().startswith(_SIM_TAG_PREFIX)})
+        new_tags = non_sim + desired_clean
+        if sorted(current) == sorted(new_tags):
+            continue  # idempotent — no change for this VM
+        try:
+            await set_tags_any(vmid, kind, new_tags)
+            updated.append({"vmid": vmid, "tags": new_tags})
+        except Exception as e:  # noqa: BLE001 - one VM must not abort the sweep
+            errors[str(vmid)] = str(e)
+    status = "SUCCESS" if not errors else "PARTIAL"
+    return {"status": status, "updated": updated, "count": len(updated), "errors": errors,
+            "message": (f"tagged {len(updated)} VM(s)"
+                        + (f", {len(errors)} error(s)" if errors else ""))}
+
+
 # ── Batch commands (guarded filter, never unfiltered qm list) ───────────────
 
 async def list_qemu_vmids() -> List[int]:
