@@ -2229,9 +2229,23 @@ class ProxmoxAgent:
                     self._cluster_resolved = True
                     logger.info(f"Cluster name resolved: {self.cluster_name}")
 
+                # Per-phase timing for the telemetry-freshness diagnostic (surfaced
+                # on the VM Server detail page). These three pvesh-backed calls are
+                # the usual stall points on a loaded host — recording how long each
+                # took, per tick, is what pinpoints WHERE the lag is.
+                _t_a = time.time()
                 metrics = await self.collect_metrics()
+                _t_b = time.time()
                 vms     = await self.get_vm_list()
+                _t_c = time.time()
                 nodes   = await self.get_node_stats()
+                _t_d = time.time()
+                self._last_phase_ms = {
+                    "metrics_ms":    int((_t_b - _t_a) * 1000),
+                    "vm_list_ms":    int((_t_c - _t_b) * 1000),
+                    "node_stats_ms": int((_t_d - _t_c) * 1000),
+                }
+                self._telemetry_iter = getattr(self, "_telemetry_iter", 0) + 1
 
                 if vms.get("error"):
                     logger.error(f"get_vm_list error: {vms['error']}")
@@ -2308,12 +2322,14 @@ class ProxmoxAgent:
                     try:
                         # Classify each VM's tier by passthrough (cached ~60s) in
                         # this async context, then stamp it into the sync body.
+                        _t_e = time.time()
                         try:
                             tiers = await usb_provision.compute_vm_tiers(
                                 self, (vms or {}).get("vms", []) or [])
                         except Exception as _te:
                             logger.debug(f"compute_vm_tiers failed: {_te}")
                             tiers = {}
+                        (self._last_phase_ms or {})["tiers_ms"] = int((time.time() - _t_e) * 1000)
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         await self.send_cs_event("CS_TELEMETRY", cs_body)
                     except Exception as e:
@@ -2362,6 +2378,11 @@ class ProxmoxAgent:
                         pass
                 if _now < getattr(self, "_vm_change_fast_until", 0):
                     interval = min(interval, 3)
+                # Record the cadence chosen this tick + when we finished, so the
+                # detail page can show the effective interval and the true gap
+                # between telemetry frames (not just the per-phase durations).
+                self._last_interval_s = interval
+                self._last_tick_done_ts = time.time()
                 await asyncio.sleep(interval)
             except Exception as e:
                 logger.error(f"Telemetry push failed: {e}")
@@ -2491,6 +2512,26 @@ class ProxmoxAgent:
                 "reason":            usb_provision.current_provision_reason(),
                 "halt":              usb_provision.current_provision_halt(),
                 "config":           usb_provision.current_provision_cfg_snapshot(),
+            },
+            # ── Telemetry-freshness diagnostic ──────────────────────────────
+            # Stamps HOW and WHEN this frame was produced on the agent, so the
+            # VM Server detail page can show where the delay is: agent gen age,
+            # per-phase collect durations (the pvesh calls that stall on a
+            # loaded host), the effective cadence, and the loop iteration.
+            # The cs spoke adds ingested_at and the hub adds cached_at, giving a
+            # per-hop age chain: agent → spoke → hub → WebUI.
+            "telemetry": {
+                "gen_ts":       time.time(),                       # frame built at (agent clock)
+                "agent_id":     self.agent_id,
+                "hostname":     self.hostname,
+                "agent_version": get_version(),
+                "cs_enabled":   bool(self.cs_enabled),
+                "iter":         getattr(self, "_telemetry_iter", 0),
+                "interval_s":   getattr(self, "_last_interval_s", None),  # cadence of the PREVIOUS tick
+                "last_tick_done_ts": getattr(self, "_last_tick_done_ts", None),
+                "phase_ms":     dict(getattr(self, "_last_phase_ms", {}) or {}),
+                "vm_count":     len(vms),
+                "node_count":   len(nodes_list),
             },
         }
 
