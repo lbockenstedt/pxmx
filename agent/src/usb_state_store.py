@@ -39,6 +39,11 @@ PXMLIB = "/var/lib/pxmx"
 ORPHAN_VMS_FILE = f"{PXMLIB}/orphan_vms.json"
 USB_STATE_FILE = f"{PXMLIB}/usb_state.json"
 
+# Post-clone settle reboot: seconds after a clone completes (set_assignment)
+# before the provision-loop sweep reboots the VM, so a freshly-cloned box gets
+# a clean restart after its settle/update window. Env-overridable.
+_POST_PROV_REBOOT_DELAY_S = int(os.environ.get("POST_PROV_REBOOT_DELAY_S", "900"))
+
 
 # ── orphan registry ───────────────────────────────────────────────────────
 def _read_orphans() -> List[Dict[str, Any]]:
@@ -88,7 +93,7 @@ def get_orphan_vms() -> List[Dict[str, Any]]:
 def _new_usb_state() -> Dict[str, Any]:
     return {"vmid_to_bus": {}, "bus_to_vmid": {}, "vmid_to_image": {},
             "excluded_buses": {}, "quarantined": {}, "missing_since": {},
-            "vidpid_by_bus": {}, "post_prov_retry": {}}
+            "vidpid_by_bus": {}, "post_prov_retry": {}, "post_prov_reboot": {}}
 
 
 def load_usb_state() -> Dict[str, Any]:
@@ -122,6 +127,7 @@ def clear_assignment(vmid: int, bus: Optional[str] = None) -> None:
         st["bus_to_vmid"].pop(b, None)
         st["missing_since"].pop(b, None)
     st["vmid_to_image"].pop(str(int(vmid)), None)
+    st.get("post_prov_reboot", {}).pop(str(int(vmid)), None)
     save_usb_state(st)
 
 
@@ -160,6 +166,10 @@ def prune_ghost_vms(existing: Set[int]) -> List[int]:
         if _gone(vmid):
             st["vmid_to_image"].pop(vmid, None)
             pruned.add(int(vmid))
+    for vmid in list(st.get("post_prov_reboot", {})):
+        if _gone(vmid):
+            st["post_prov_reboot"].pop(vmid, None)
+            pruned.add(int(vmid))
     if pruned:
         save_usb_state(st)
         # destroy-fail counters + orphan registry live in separate files.
@@ -191,6 +201,17 @@ def set_assignment(vmid: int, bus: str, image_num: int) -> None:
     st["bus_to_vmid"][bus] = v
     st["vmid_to_image"][v] = int(image_num)
     st["missing_since"].pop(bus, None)
+    # Post-clone settle reboot: stamp a deferred reboot 15 min (default) after
+    # this clone completes. The provision-loop sweep (_run_post_prov_reboot_queue
+    # in usb_provision) fires it when due, then pops the entry. Re-stamping on a
+    # reclone overwrites the prior entry — a fresh clone resets the window.
+    cloned_at = time.time()
+    st.setdefault("post_prov_reboot", {})[v] = {
+        "cloned_at": cloned_at,
+        "reboot_at": cloned_at + _POST_PROV_REBOOT_DELAY_S,
+        "bus": bus,
+        "image_num": int(image_num),
+    }
     save_usb_state(st)
 
 

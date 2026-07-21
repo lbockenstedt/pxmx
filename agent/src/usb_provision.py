@@ -1246,6 +1246,9 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
             logger.debug("cs_usb_telemetry: load_usb_state failed: %s", exc)
             st = _new_usb_state()
         missing_since = st.get("missing_since") or {}
+        # Post-clone settle reboot schedule (stamped by set_assignment): surface
+        # reboot_at so the WebUI can show "reboot in Xm" for a freshly-cloned VM.
+        post_prov_reboot = st.get("post_prov_reboot") or {}
         # Missing-dongle shed deadline for the WebUI countdown: the teardown fires
         # when now - missing_since >= missing_timeout, so shed_at = missing_since +
         # missing_timeout (same units the teardown compares — accurate regardless
@@ -1257,6 +1260,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
         for bus, vmid in (st.get("bus_to_vmid") or {}).items():
             pe = present_by_bus.get(bus) or {}
             ms = missing_since.get(bus)
+            rpr = post_prov_reboot.get(str(vmid)) or {}
             usb_state.append({
                 "vmid": vmid,
                 "bus_path": bus,
@@ -1267,6 +1271,8 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "name": pe.get("product") or bus,
                 "vidpid": pe.get("vidpid") or "",
                 "prov_status": "missing" if ms is not None else "active",
+                "reboot_at": rpr.get("reboot_at"),
+                "cloned_at": rpr.get("cloned_at"),
             })
         # Quarantined dongles (dmesg kernel USB errors — the ONLY quarantine path)
         # for the WebUI badge: bus-id + reason + when, so an admin can see WHY a
@@ -1576,6 +1582,15 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # toggle, proxmox-agent.sh:5068): a VM already cloned before the toggle
     # was switched off still deserves its update.sh retry / 1h reclone.
     if await _run_post_prov_retry_queue(agent, state):
+        save_usb_state(state)
+
+    # 1d. Post-clone settle reboot queue — runs unconditionally too: a VM cloned
+    # before auto-provision was toggled off still deserves its +15-min settle
+    # reboot. Fires a graceful QGA reboot once reboot_at (cloned_at + 900s) is
+    # reached, then pops the entry. Persisted in usb_state.json (survives
+    # agent restart). Stamped by usb_state_store.set_assignment, the choke
+    # point both clone paths (first-clone + reclone) hit.
+    if await _run_post_prov_reboot_queue(agent, state):
         save_usb_state(state)
 
     torn_down: List[int] = []
@@ -2430,6 +2445,65 @@ async def _run_post_prov_retry_queue(agent, state: Dict[str, Any]) -> bool:
         else:
             entry["last_ts"] = now
             mutated = True
+    return mutated
+
+
+async def _run_post_prov_reboot_queue(agent, state: Dict[str, Any]) -> bool:
+    """Post-clone settle reboot sweep. Every clone (first-clone AND reclone)
+    stamps a ``post_prov_reboot[vmid] = {cloned_at, reboot_at, bus, image_num}``
+    entry in ``usb_state.json`` (via ``usb_state_store.set_assignment``, the
+    shared choke point both clone paths hit). This sweep, run at the top of
+    every provision-loop tick alongside ``_run_post_prov_retry_queue``, fires
+    a graceful QGA reboot once ``now >= reboot_at`` (default 15 min after the
+    clone completed), then pops the entry — so a freshly-cloned box gets a
+    clean restart after its settle/update window. Survives an agent restart
+    because it lives in ``usb_state.json``. Returns True if ``state`` was
+    mutated (caller should persist it)."""
+    q = state.get("post_prov_reboot") or {}
+    if not q:
+        return False
+    from . import pve_cmds  # local: pve_cmds is imported per-function
+    protected = _protected_vmids(agent)
+    now = time.time()
+    mutated = False
+    for vmid_s, entry in list(q.items()):
+        vmid = int(vmid_s)
+        if now < float(entry.get("reboot_at", 0)):
+            continue
+        bus = entry.get("bus")
+        # Stale entry — the VM was reassigned to a different bus (reclone onto
+        # a new dongle would overwrite its entry via set_assignment, but a
+        # partial clear could strand one). Drop without rebooting.
+        if state["vmid_to_bus"].get(vmid_s) != bus:
+            logger.info(f"post-prov reboot: VM {vmid} bus mismatch (stale entry) — dropping")
+            q.pop(vmid_s, None)
+            mutated = True
+            continue
+        cfg = await pve_cmds.qm_config(vmid)
+        if not cfg:
+            logger.info(f"post-prov reboot: VM {vmid} no longer exists — dropping reboot entry")
+            q.pop(vmid_s, None)
+            mutated = True
+            continue
+        # Due — fire a graceful QGA reboot (matches the immediate post-clone
+        # reboot idiom at _clone_and_provision: lets in-flight updates flush).
+        # qm_guest_exec is fire-and-forget on reboot — the guest agent dies —
+        # so swallow the channel-died error; the reboot was already issued.
+        # Fall back to a hardware qm reset (vm_action_any) if QGA won't take it.
+        try:
+            await pve_cmds.qm_guest_exec(vmid, "reboot", protected=protected)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"post-prov reboot: QGA reboot failed for VM {vmid}: {e}; "
+                            "falling back to qm reset")
+            try:
+                await pve_cmds.vm_action_any(vmid, "reboot")
+            except Exception as e2:  # noqa: BLE001
+                logger.warning(f"post-prov reboot: qm reset fallback also failed "
+                               f"for VM {vmid}: {e2}")
+        logger.info(f"post-prov reboot: VM {vmid} rebooted "
+                    f"{int(now - float(entry.get('cloned_at', now)))}s after clone")
+        q.pop(vmid_s, None)
+        mutated = True
     return mutated
 
 
