@@ -254,6 +254,11 @@ VMID_AUDIT_INTERVAL_S = 300    # cs line 3619
 # after this cooldown, so an exclusion is never permanent. Configurable per
 # tenant via usb_config usb_exclude_cooldown / exclude_cooldown.
 EXCLUDE_COOLDOWN_S = 900
+# Grace before reclone-on-detach fires: a present dongle whose passthrough dropped
+# (interface driver != usbfs) on a running VM is only recloned after it's stayed
+# detached this long, so a VM that's mid-start (dongle briefly [none] before QEMU
+# grabs it) isn't needlessly recloned.
+_DETACHED_GRACE_S = float(os.environ.get("LM_PXMX_DETACHED_GRACE_S", "120") or 120)
 
 VMID_AUDIT_FILE = f"{PXMLIB}/vmid_audit.json"
 
@@ -825,6 +830,26 @@ def force_unbind_dongle_drivers(dongle_vidpids: Set[str],
                 logger.warning(f"force-unbind: could not unbind {child} from {drv}: {e}")
     out["drivers"] = sorted(drivers)
     return out
+
+
+def _bus_attached(bus: str) -> bool:
+    """True if the dongle at USB ``bus`` is currently handed to QEMU — any of its
+    interfaces is bound to the ``usbfs`` driver. A PRESENT dongle whose interfaces
+    are ``[none]`` (or a host wifi driver) is NOT actually in its VM, even if the
+    VM config still names it (the dropped-passthrough case reclone-on-detach
+    recovers). Best-effort — a probe error reads as 'attached' so a transient
+    sysfs hiccup never triggers a spurious reclone."""
+    base = "/sys/bus/usb/devices"
+    try:
+        for child in os.listdir(base):
+            if not child.startswith(f"{bus}:"):
+                continue
+            drv = os.path.basename(os.path.realpath(os.path.join(base, child, "driver")))
+            if drv == "usbfs":
+                return True
+        return False
+    except OSError:
+        return True
 
 
 # ── USB provision state + quarantine (Phase E) ────────────────────────────
@@ -1556,6 +1581,49 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 state["bus_to_vmid"].pop(bus, None)
                 state["vmid_to_bus"].pop(vmid, None)
                 state["missing_since"].pop(bus, None)
+
+    # 5b. Reclone-on-detach: a bus that is PRESENT but NOT handed to QEMU
+    # (``_bus_attached`` false) on a RUNNING VM whose config names it = a dropped
+    # passthrough (USB reset / re-enum; QEMU never re-grabbed the dongle → the sim
+    # has no wifi). The missing-dongle teardown above can't see it (the dongle is
+    # present, not missing). Destroy the VM so the freed dongle is re-provisioned
+    # fresh (re-grabs it on the new VM's boot). A short grace avoids recloning a VM
+    # that's mid-start (dongle briefly [none] before QEMU attaches). Same enable
+    # gate as the missing-dongle shed.
+    if ap_on and missing_timeout > 0:
+        from . import cs_sim  # deferred — cs_sim imports usb_provision
+        detached_since = state.setdefault("detached_since", {})
+        for bus, vmid in list(state["bus_to_vmid"].items()):
+            if bus not in present or _bus_attached(bus):
+                detached_since.pop(bus, None)
+                continue
+            # Present but detached — only reclone a RUNNING VM (a stopped VM has no
+            # passthrough by design; leave it alone).
+            try:
+                _running = bool((await pve_cmds.vm_status(int(vmid))).get("running"))
+            except Exception:  # noqa: BLE001 — conservative: skip on probe error
+                _running = False
+            if not _running:
+                detached_since.pop(bus, None)
+                continue
+            since = detached_since.get(bus)
+            if since is None:
+                detached_since[bus] = now
+                continue
+            if now - float(since) >= _DETACHED_GRACE_S:
+                logger.warning("provision loop: bus %s detached from RUNNING VM %s "
+                               "(present but not usbfs) — recloning to re-grab the dongle",
+                               bus, vmid)
+                try:
+                    await cs_sim.destroy_vm(agent, int(vmid), bus=bus)
+                    torn_down.append(int(vmid))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"provision loop: detach-reclone destroy of {vmid} failed: {e}")
+                state["bus_to_vmid"].pop(bus, None)
+                state["vmid_to_bus"].pop(str(vmid), None)
+                detached_since.pop(bus, None)
+                (state.get("missing_since") or {}).pop(bus, None)
+        save_usb_state(state)
 
     # 6. VMID-gap audit (every VMID_AUDIT_INTERVAL_S; bypasses delete cooldown).
     #    Compaction: shed the highest VMID above the lowest gap so the next pass
