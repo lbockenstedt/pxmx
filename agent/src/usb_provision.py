@@ -276,6 +276,13 @@ _HEALTH_CHECK_INTERVAL_S = float(os.environ.get("LM_PXMX_HEALTH_INTERVAL_S", "30
 _HEALTH_ATTEMPT_COOLDOWN_S = float(os.environ.get("LM_PXMX_HEALTH_COOLDOWN_S", "180") or 180)
 _HEALTH_LADDER = ["usb_reset", "reattach", "reboot", "reclone", "quarantine"]
 
+# First (immediate) post-clone reboot settle window: once the freshly-cloned
+# guest's QGA agent first answers, let the box run at least this long before
+# yanking it into the hostname/sim_phy reboot. Rebooting too soon after first
+# boot corrupted some clients (filesystem/services not yet settled). Timer
+# starts when the agent ping comes up, not at clone completion. Env-tunable.
+_FIRST_REBOOT_SETTLE_S = float(os.environ.get("FIRST_REBOOT_SETTLE_S", "60") or 60)
+
 VMID_AUDIT_FILE = f"{PXMLIB}/vmid_audit.json"
 
 # Resource sampling ring + cache + delete-gate cooldown live in
@@ -2395,8 +2402,10 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
     await pve_cmds.qm_start(vmid, protected=protected)
     # Wait for the guest agent (bounded — bash waits ~10 min via 40 pings at
     # `timeout 10` ping + `sleep 5` ≈ 15s/iter, proxmox-agent.sh 1999-2009).
+    agent_up_at = None
     for _ in range(40):
         if await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10):
+            agent_up_at = time.time()
             break
         await asyncio.sleep(5)
     # Set the hostname inside the guest — write /etc/hostname + /etc/hosts +
@@ -2426,6 +2435,23 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
         exec_timeout=60, outer_timeout=90, protected=protected)
     set_assignment(vmid, bus, image_num)
     remove_orphan_vm(vmid)
+
+    # Settle window before the FIRST post-clone reboot: a freshly-cloned guest
+    # can corrupt if it's yanked into a reboot too soon after first boot
+    # (filesystem / services not yet settled). Let it run at least
+    # _FIRST_REBOOT_SETTLE_S (default 60s) measured from when the guest agent
+    # first answered (agent_up_at) — the hostname/sim_phy writes above eat into
+    # that window, so we wait only the remainder. The timer starts when the
+    # agent ping came up, not at clone completion. Skipped if the agent never
+    # answered (agent_up_at is None): the reboot still fires and the 300s
+    # comeback loop + post-prov retry handle a no-show.
+    if agent_up_at is not None:
+        remaining = _FIRST_REBOOT_SETTLE_S - (time.time() - agent_up_at)
+        if remaining > 0:
+            logger.info(f"provision loop: VM {vmid} first-reboot settle — "
+                        f"waiting {int(remaining)}s before reboot "
+                        f"(settle window {_FIRST_REBOOT_SETTLE_S:.0f}s from agent-up)")
+            await asyncio.sleep(remaining)
 
     # Reboot so the guest picks up the hostname/sim_phy changes, then run
     # update.sh once it comes back — it needs the latest scripts before
