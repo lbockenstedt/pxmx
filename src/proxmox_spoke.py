@@ -27,6 +27,19 @@ import pve_cmd_builder  # noqa: E402
 logger = logging.getLogger("ProxmoxSpoke")
 
 
+def _norm_mac(raw: str) -> str:
+    """Normalize a MAC to lower-colon form (aa:bb:cc:dd:ee:ff) to match the
+    hub-normalized query. Tolerates dash/colon/space separators and trailing
+    whitespace; returns the input lowercased if parsing is ambiguous."""
+    if not raw:
+        return ""
+    s = str(raw).strip().lower().replace("-", ":").replace(" ", "").replace(".", "")
+    parts = [p for p in s.split(":") if p]
+    if len(parts) == 6:
+        return ":".join(p.zfill(2) for p in parts)
+    return s
+
+
 class ProxmoxSpoke(BaseSpoke):
     """
     Proxmox integration spoke.
@@ -141,7 +154,13 @@ class ProxmoxSpoke(BaseSpoke):
             return await self._list_vms(data)
 
         if cmd == "SEARCH_VMS":
-            return await self._search_vms(data)
+            # Hub sends the new global-search payload; pass through scope fields
+            # so _search_vms can enforce the spoke-side scoping rule.
+            return await self._search_vms({
+                **data,
+                "tag_filter": data.get("proxmox_tag") or "",
+                "is_admin": bool(data.get("is_admin")),
+            })
 
         if cmd == "GET_VM_INFO":
             return await self._get_vm_info(data)
@@ -819,28 +838,86 @@ class ProxmoxSpoke(BaseSpoke):
     # ── VM search ─────────────────────────────────────────────────────────────
 
     async def _search_vms(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Search VMs/CTs by name, VMID, or unique_id fragment."""
-        q = data.get("q", "").strip().lower()
-        all_r = await self._list_vms({})
-        results = []
-        for vm in all_r.get("vms", []):
-            if (q in (vm.get("name") or "").lower() or
-                    q == str(vm.get("vmid", "")) or
-                    q in (vm.get("unique_id") or "").lower() or
-                    q in (vm.get("cluster") or "").lower()):
+        """Search VMs/CTs by name/hostname, VMID, IP, or MAC (hub-normalized).
+
+        Enforces the spoke-side scoping rule from the global-search payload:
+        - proxmox_tag set → filter to that tenant's tagged VMs
+        - no tag + admin → unscoped (all VMs)
+        - no tag + non-admin → EMPTY results (never leak another tenant's VMs)
+        The hub normalizes MACs to lower-colon form; VM MACs are normalized the
+        same way before comparison."""
+        q = (data.get("q") or "").strip().lower()
+        tag_filter = data.get("tag_filter") or ""
+        is_admin = bool(data.get("is_admin"))
+        # No scope key + non-admin → fail-closed empty.
+        if not tag_filter and not is_admin:
+            return {"status": "SUCCESS", "results": [], "count": 0}
+        try:
+            all_r = await self._list_vms({"tag_filter": tag_filter})
+            if all_r.get("status") != "SUCCESS":
+                return {"status": "ERROR",
+                        "message": all_r.get("message") or all_r.get("error") or "list_vms failed",
+                        "results": []}
+            results = []
+            for vm in all_r.get("vms", []):
+                name = (vm.get("name") or "")
+                hostname = (vm.get("hostname") or "")
+                vmid_str = str(vm.get("vmid", ""))
+                uid = (vm.get("unique_id") or "")
+                cluster = (vm.get("cluster") or "")
+                # Gather IPs + MACs across interfaces.
+                ips = []
+                macs = []
+                ifaces = vm.get("interfaces") or vm.get("nics") or []
+                if isinstance(ifaces, list):
+                    for iface in ifaces:
+                        if not isinstance(iface, dict):
+                            continue
+                        mac = iface.get("mac") or iface.get("mac_address")
+                        if mac:
+                            macs.append(_norm_mac(mac))
+                        iface_ips = iface.get("ips") or iface.get("ip_addresses") or []
+                        if isinstance(iface_ips, list):
+                            ips.extend([str(ip) for ip in iface_ips if ip])
+                # Fallback: top-level ips/mac fields some shapes carry.
+                if not ips and vm.get("ips"):
+                    ips = [str(ip) for ip in (vm.get("ips") or []) if ip]
+                if not macs and vm.get("mac"):
+                    macs.append(_norm_mac(vm.get("mac")))
+
+                matched = (
+                    q in name.lower() or
+                    q in hostname.lower() or
+                    q == vmid_str or
+                    q in uid.lower() or
+                    q in cluster.lower() or
+                    any(q in ip.lower() for ip in ips) or
+                    any(q in m for m in macs)
+                )
+                if not matched:
+                    continue
+                # Pick primary/matching IP + MAC for the result contract.
+                first_ip = next((ip for ip in ips if q in ip.lower()), ips[0] if ips else "")
+                first_mac = next((m for m in macs if q in m), macs[0] if macs else "")
                 results.append({
                     "source":    "pxmx",
                     "type":      vm.get("type", "vm"),
-                    "name":      vm.get("name", ""),
-                    "id":        vm.get("unique_id", ""),
-                    "unique_id": vm.get("unique_id", ""),
+                    "id":        uid,
+                    "unique_id": uid,
                     "vmid":      vm.get("vmid"),
+                    "name":      name or hostname,
+                    "hostname":  hostname,
+                    "ip":        first_ip,
+                    "mac":       first_mac,
                     "node":      vm.get("node", ""),
-                    "cluster":   vm.get("cluster", ""),
+                    "cluster":   cluster,
                     "status":    vm.get("status", ""),
+                    "tags":      vm.get("tags") or [],
                     "agent_id":  vm.get("agent_id", ""),
                 })
-        return {"status": "SUCCESS", "results": results, "count": len(results)}
+            return {"status": "SUCCESS", "results": results, "count": len(results)}
+        except Exception as exc:  # never crash the spoke on a search
+            return {"status": "ERROR", "message": str(exc), "results": []}
 
     # ── VM detail / actions ───────────────────────────────────────────────────
 
