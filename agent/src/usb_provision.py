@@ -259,6 +259,14 @@ EXCLUDE_COOLDOWN_S = 900
 # detached this long, so a VM that's mid-start (dongle briefly [none] before QEMU
 # grabs it) isn't needlessly recloned.
 _DETACHED_GRACE_S = float(os.environ.get("LM_PXMX_DETACHED_GRACE_S", "120") or 120)
+# Per-client dongle-health watchdog: verify the GUEST actually sees its dongle
+# (in-guest lsusb) and, if not, escalate a recovery ladder across ticks. Runs at
+# most every _HEALTH_CHECK_INTERVAL_S; a given bus advances one ladder stage no
+# more often than _HEALTH_ATTEMPT_COOLDOWN_S (so the guest has time to recover
+# between attempts). Ladder, in order — last resort quarantines the dongle.
+_HEALTH_CHECK_INTERVAL_S = float(os.environ.get("LM_PXMX_HEALTH_INTERVAL_S", "300") or 300)
+_HEALTH_ATTEMPT_COOLDOWN_S = float(os.environ.get("LM_PXMX_HEALTH_COOLDOWN_S", "180") or 180)
+_HEALTH_LADDER = ["usb_reset", "reattach", "reboot", "reclone", "quarantine"]
 
 VMID_AUDIT_FILE = f"{PXMLIB}/vmid_audit.json"
 
@@ -774,7 +782,24 @@ async def blacklist_dongle_drivers(agent) -> Dict[str, Any]:
         else:
             logger.warning(f"Could not unload driver {drv} (in use?) — blacklist takes effect on next boot")
 
-    return {"action": "blacklist_dongle_drivers", "drivers": sorted(drivers), "unloaded": unloaded}
+    # Detach the host driver per-INTERFACE from any present, UNASSIGNED certified
+    # dongle so a newly-certified adapter is passthrough-ready NOW — even when the
+    # module-wide rmmod above failed "in use" (another dongle still using the
+    # driver). Skips buses assigned to a VM (never disturb a live passthrough). This
+    # is the "detach the driver when a dongle is certified" behaviour: certifying a
+    # vidpid puts it in ``dongles``, so the next blacklist tick frees it.
+    unbound: List[str] = []
+    try:
+        _st = load_usb_state()
+        _assigned = set((_st.get("bus_to_vmid") or {}).keys())
+        unbound = force_unbind_dongle_drivers(dongles, skip_buses=_assigned).get("unbound", [])
+        if unbound:
+            logger.info("blacklist_dongle_drivers: force-unbound %d certified dongle "
+                        "interface(s) from the host driver", len(unbound))
+    except Exception as e:  # noqa: BLE001 — detach is best-effort
+        logger.warning(f"blacklist_dongle_drivers: force-unbind failed: {e}")
+    return {"action": "blacklist_dongle_drivers", "drivers": sorted(drivers),
+            "unloaded": unloaded, "unbound": unbound}
 
 
 def force_unbind_dongle_drivers(dongle_vidpids: Set[str],
@@ -850,6 +875,136 @@ def _bus_attached(bus: str) -> bool:
         return False
     except OSError:
         return True
+
+
+async def _guest_sees_dongle(vid: int, vidpid) -> "Optional[bool]":
+    """True/False whether the GUEST's ``lsusb`` lists ``vidpid``; None when the
+    guest agent isn't responding (booting / no QGA) so the watchdog can't tell and
+    must NOT escalate on a blind guess."""
+    from . import pve_cmds
+    if not vidpid:
+        return None
+    try:
+        if not await pve_cmds.qm_agent_ping(vid):
+            return None
+        return await pve_cmds.qm_guest_exec_shell(
+            vid, f"lsusb 2>/dev/null | grep -qiF '{vidpid}'",
+            exec_timeout=15, outer_timeout=25)
+    except Exception:  # noqa: BLE001 — QGA hiccup → 'unknown', skip
+        return None
+
+
+def _usb_port_reset(bus: str) -> bool:
+    """Host-side USB reset — de-authorize then re-authorize the device so it
+    re-enumerates (the guest's usb-host sees a re-plug). Best-effort."""
+    path = f"/sys/bus/usb/devices/{bus}/authorized"
+    try:
+        with open(path, "w") as f:
+            f.write("0")
+        with open(path, "w") as f:
+            f.write("1")
+        return True
+    except OSError as e:  # noqa: BLE001
+        logger.warning(f"usb reset {bus}: {e}")
+        return False
+
+
+async def _reattach_usb(vid: int, bus: str) -> bool:
+    """Hot detach + re-add the bus passthrough (``qm set -delete usbN`` then
+    ``-usbN host=<bus>``) so QEMU re-grabs the dongle without a full reboot."""
+    from . import pve_cmds
+    try:
+        cfg = await pve_cmds.qm_config(vid)
+    except Exception:  # noqa: BLE001
+        return False
+    key = next((k for k, v in (cfg or {}).items()
+                if str(k).startswith("usb") and f"host={bus}" in str(v)), None)
+    if not key:
+        return False
+    await pve_cmds._run(["qm", "set", str(vid), "-delete", key], check=False, timeout=30)
+    await asyncio.sleep(1)
+    await pve_cmds._run(["qm", "set", str(vid), f"-{key}", f"host={bus}"], check=False, timeout=30)
+    return True
+
+
+async def dongle_health_check_and_recover(agent, present) -> int:
+    """Per-client dongle-health watchdog + recovery ladder. For each RUNNING dongle
+    VM whose dongle is attached host-side (usbfs), verify the GUEST actually sees it
+    (in-guest ``lsusb``). If not, escalate ACROSS ticks — usb_reset -> reattach ->
+    reboot -> reclone -> quarantine (last resort) — one stage per bus per
+    _HEALTH_ATTEMPT_COOLDOWN_S so the guest has time to recover between attempts. A
+    healthy guest clears the bus's fail counter. Returns the number of VMs acted
+    on. Never raises (each recovery is guarded)."""
+    import time as _t
+    from . import pve_cmds, cs_sim
+    st = load_usb_state()
+    b2v = st.get("bus_to_vmid") or {}
+    health = st.setdefault("dongle_health", {})
+    now = _t.time()
+    acted = 0
+    dirty = False
+    for bus, vmid in list(b2v.items()):
+        try:
+            vid = int(vmid)
+        except (TypeError, ValueError):
+            continue
+        # Only watch a present + host-attached (usbfs) dongle; the host-detached
+        # case is reclone-on-detach's job, not this one.
+        if bus not in present or not _bus_attached(bus):
+            dirty = health.pop(bus, None) is not None or dirty
+            continue
+        try:
+            running = bool((await pve_cmds.vm_status(vid)).get("running"))
+        except Exception:  # noqa: BLE001
+            running = False
+        if not running:
+            dirty = health.pop(bus, None) is not None or dirty
+            continue
+        seen = await _guest_sees_dongle(vid, present[bus].get("vidpid"))
+        if seen is None:
+            continue                                   # QGA down — can't tell
+        if seen:
+            dirty = health.pop(bus, None) is not None or dirty
+            continue                                   # healthy
+        h = health.setdefault(bus, {"fails": 0, "last_attempt": 0.0, "stage": ""})
+        if now - float(h.get("last_attempt", 0)) < _HEALTH_ATTEMPT_COOLDOWN_S:
+            continue                                   # cooling down
+        stage = _HEALTH_LADDER[min(h["fails"], len(_HEALTH_LADDER) - 1)]
+        h["fails"] += 1
+        h["last_attempt"] = now
+        h["stage"] = stage
+        dirty = True
+        acted += 1
+        logger.warning("dongle health: VM %s bus %s not visible in guest — recovery "
+                       "stage '%s' (attempt %d)", vid, bus, stage, h["fails"])
+        try:
+            if stage == "usb_reset":
+                _usb_port_reset(bus)
+            elif stage == "reattach":
+                await _reattach_usb(vid, bus)
+            elif stage == "reboot":
+                await pve_cmds.qm_stop_force(vid)
+                await asyncio.sleep(2)
+                await pve_cmds.qm_start(vid)
+            elif stage == "reclone":
+                await cs_sim.destroy_vm(agent, vid, bus=bus)
+                b2v.pop(bus, None)
+                (st.get("vmid_to_bus") or {}).pop(str(vid), None)
+                health.pop(bus, None)                  # loop re-provisions a fresh VM
+            elif stage == "quarantine":
+                quarantine_bus(bus, "dongle unrecoverable — guest never saw it after "
+                                    "reset/reattach/reboot/reclone")
+                await cs_sim.destroy_vm(agent, vid, bus=bus)
+                b2v.pop(bus, None)
+                (st.get("vmid_to_bus") or {}).pop(str(vid), None)
+                health.pop(bus, None)
+                logger.error("dongle health: bus %s QUARANTINED (unrecoverable) — "
+                             "replace/inspect the dongle", bus)
+        except Exception as e:  # noqa: BLE001 — one bad recovery never kills the loop
+            logger.warning("dongle health: stage '%s' for VM %s failed: %s", stage, vid, e)
+    if dirty:
+        save_usb_state(st)
+    return acted
 
 
 # ── USB provision state + quarantine (Phase E) ────────────────────────────
@@ -1624,6 +1779,20 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 detached_since.pop(bus, None)
                 (state.get("missing_since") or {}).pop(bus, None)
         save_usb_state(state)
+
+    # 5c. Per-client dongle-health watchdog (in-guest lsusb + recovery ladder).
+    # Throttled — probing every guest is a QGA round-trip each. Recovers a dongle
+    # that's attached host-side but the GUEST can't see (firmware wedge): usb_reset
+    # -> reattach -> reboot -> reclone -> quarantine (last resort).
+    if ap_on and (now - float(getattr(agent, "_last_dongle_health_check", 0.0))) >= _HEALTH_CHECK_INTERVAL_S:
+        agent._last_dongle_health_check = now
+        try:
+            _hacted = await dongle_health_check_and_recover(agent, present)
+            if _hacted:
+                logger.info("dongle health: acted on %d unhealthy client(s)", _hacted)
+                state = load_usb_state()   # recovery may have released assignments
+        except Exception as e:  # noqa: BLE001 — watchdog must never sink the pass
+            logger.warning("dongle health watchdog failed: %s", e)
 
     # 6. VMID-gap audit (every VMID_AUDIT_INTERVAL_S; bypasses delete cooldown).
     #    Compaction: shed the highest VMID above the lowest gap so the next pass
