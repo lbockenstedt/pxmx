@@ -176,8 +176,21 @@ async def handle_cs_command(agent, action: str,
                                f"unlocked {len(r['unlocked_vmids'])} VMs", **r}
 
         if action == "clear_usb_quarantine":
-            r = await pve_cmds.clear_usb_quarantine(data.get("bus_path"))
-            return {"status": "SUCCESS", **r}
+            # Operator "release dongles" action. Clears BOTH fault stores that
+            # sideline a bus: the dmesg quarantine (usb_quarantine.json, incl. the
+            # 5-strike permanent flag) AND the destroy-fail bus EXCLUSIONS on
+            # usb_state.json — the latter is what repeated spin-up/down teardowns
+            # trip, and the old handler never cleared it. No bus_path = clear all.
+            from . import usb_provision
+            bus = data.get("bus_path")
+            usb_provision.clear_quarantine(bus)
+            excluded = 0 if bus else usb_provision.clear_excluded_buses()
+            msg = (f"cleared quarantine for {bus}" if bus
+                   else f"cleared all quarantine + {excluded} bus exclusion(s) — "
+                        f"dongles available on the next provision pass")
+            return {"status": "SUCCESS", "action": "clear_usb_quarantine",
+                    "bus": bus, "cleared": True, "excluded_cleared": excluded,
+                    "message": msg}
 
         return {"status": "ERROR", "message": f"unknown CS action: {action}"}
 
