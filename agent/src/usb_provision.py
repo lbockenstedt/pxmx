@@ -1616,6 +1616,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     _admission_lock = asyncio.Lock()
     _admitted = [0]
     _pacing_halted = [False]
+    # Live auto-provision-toggle abort: the toggle is read once at the top of the
+    # pass, but the operator can turn it OFF mid-batch. This shared flag lets any
+    # not-yet-started clone halt (mirrors _pacing_halted) so flipping off stops the
+    # batch within a clone or two instead of marching to the slot cap.
+    _toggle_halted = [False]
 
     # prov_run live state (cs _default_provision_run_state 3576-3586): one item
     # per dongle, status provisioning → done/failed as each clone settles.
@@ -1634,6 +1639,19 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         async with sem:
             if _pacing_halted[0]:
                 item_by_bus[bus]["status"] = "failed"
+                return False
+            # Live toggle re-check: re-read usb_auto_provision from agent.config
+            # (the hub/spoke pushes the change live) so turning auto-provision OFF
+            # mid-batch halts every clone not yet started, instead of the batch
+            # running to the slot cap. A clone already past this point finishes —
+            # a running ``qm clone`` can't be safely aborted. Log once on the flip.
+            if not _toggle_halted[0] and not _toggle_on(
+                    (agent.config.get("client_simulation") or {}).get("usb_config") or {}):
+                _toggle_halted[0] = True
+                logger.info("auto-provision: usb_auto_provision turned OFF mid-batch "
+                            "— halting remaining clone(s)")
+            if _toggle_halted[0]:
+                item_by_bus[bus]["status"] = "cancelled"
                 return False
             async with _admission_lock:
                 my_slot = _admitted[0]
@@ -1785,17 +1803,25 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     results = await asyncio.gather(*[_do(b) for b in ordered], return_exceptions=True)
     save_usb_state(state)
     provisioned = sum(1 for r in results if r is True)
+    # A mid-batch toggle-off marks the un-started clones 'cancelled' (not 'failed')
+    # so the telemetry/UI shows the batch was stopped on purpose, not that it broke.
+    cancelled = sum(1 for it in items if it.get("status") == "cancelled")
     # Write to THIS run's dict (captured at publish), not the global _prov_run.
     # If the stuck-run watchdog reassigns the global to a fresh run while this
     # gather was hung, writing to the global here would clobber the fresh run;
     # this_run keeps the orphan's late writes isolated.
     this_run["running"] = False
     this_run["completed"] = provisioned
-    this_run["failed"] = len(ordered) - provisioned
+    this_run["cancelled"] = cancelled
+    this_run["failed"] = len(ordered) - provisioned - cancelled
     this_run["completed_at"] = int(time.time())
-    _provision_reason = f"provisioning: attempted {len(ordered)}, provisioned {provisioned}"
+    if cancelled:
+        _provision_reason = (f"auto-provision turned off mid-batch — provisioned "
+                             f"{provisioned}, cancelled {cancelled} of {len(ordered)}")
+    else:
+        _provision_reason = f"provisioning: attempted {len(ordered)}, provisioned {provisioned}"
     return {"provisioned": provisioned, "torn_down": len(torn_down),
-            "attempted": len(ordered)}
+            "attempted": len(ordered), "cancelled": cancelled}
 
 
 async def _vmid_gap_audit(agent, state: Dict[str, Any],
