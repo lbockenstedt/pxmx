@@ -235,6 +235,13 @@ async def _delete_vm(agent, data, cs_cmd_id) -> None:
         # 900s / 15 min); see usb_provision.exclude_bus + the reconcile cooldown
         # clear. Previously the exclusion was PERMANENT (stranded the dongle forever).
         r = await destroy_vm(agent, vid, protected=prot, exclude_bus_after=True)
+        # Clean slate: an operator delete must NOT count against the dongle. Wipe
+        # this bus's reclone-strike + guest-blind ladder counters so a delete (or
+        # delete→re-provision) never nudges a healthy dongle toward quarantine.
+        # The exclusion set above is separate — time-limited (15 min), non-strike,
+        # and never escalates to QT; it only stops an instant auto-reprovision so
+        # the delete sticks.
+        usb_provision.clear_recovery_state(r.get("bus"))
     if r["ok"]:
         await _terminal(agent, cs_cmd_id, "delete_vm", "completed",
                         f"VM {vid} destroyed", vmid=vid, kind=r["kind"])

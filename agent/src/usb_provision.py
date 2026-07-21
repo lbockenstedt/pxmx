@@ -43,8 +43,8 @@ from .usb_state_store import (  # noqa: E402
     ORPHAN_VMS_FILE, USB_STATE_FILE,
     _read_orphans, _write_orphans, add_orphan_vm, remove_orphan_vm,
     get_orphan_vms, _new_usb_state, load_usb_state, save_usb_state,
-    clear_assignment, prune_ghost_vms, set_assignment, reconcile_bus_map,
-    bus_for_vmid,
+    clear_assignment, clear_recovery_state, prune_ghost_vms, set_assignment,
+    reconcile_bus_map, bus_for_vmid,
 )
 from .usb_quarantine import (  # noqa: E402
     USB_QUARANTINE_FILE, DESTROY_FAILS_FILE, QUARANTINE_MAX_FAILS,

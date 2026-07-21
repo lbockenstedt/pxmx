@@ -131,6 +131,24 @@ def clear_assignment(vmid: int, bus: Optional[str] = None) -> None:
     save_usb_state(st)
 
 
+def clear_recovery_state(bus: Optional[str]) -> None:
+    """Wipe a bus's RECOVERY/strike bookkeeping (``detach_reclones`` reclone
+    strikes + ``dongle_health`` guest-blind ladder counters). Called only by an
+    explicit admin WebUI delete so a manual delete gives the dongle a CLEAN slate
+    — it must never nudge the bus toward quarantine. Deliberately NOT part of
+    ``clear_assignment`` (reclone-on-detach relies on the strike count surviving
+    the VM being destroyed each reclone; only an operator delete resets it)."""
+    if not bus:
+        return
+    st = load_usb_state()
+    changed = False
+    for m in ("detach_reclones", "dongle_health"):
+        if isinstance(st.get(m), dict) and st[m].pop(bus, None) is not None:
+            changed = True
+    if changed:
+        save_usb_state(st)
+
+
 def prune_ghost_vms(existing: Set[int]) -> List[int]:
     """Drop every tracked VM no longer present on the host from ALL state maps,
     iterating ``bus_to_vmid`` BY VALUE (the vmid) so an entry stranded there
