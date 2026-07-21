@@ -55,6 +55,22 @@ def _template_ids(agent, data: Dict[str, Any]):
     return ids or []
 
 
+def _force_unbind_present(agent) -> list:
+    """Force-release driver-bound dongles from the host kernel driver so they can
+    be passed through without a reboot. Skips buses currently assigned to a VM.
+    Best-effort — never raises. Shared by both the Clear Quarantine and Clear
+    Exclusion actions (the physical release is the same for both)."""
+    from . import usb_provision
+    try:
+        _st = usb_provision.load_usb_state()
+        _assigned = set((_st.get("bus_to_vmid") or {}).keys())
+        return usb_provision.force_unbind_dongle_drivers(
+            usb_provision._dongle_vidpids(agent), skip_buses=_assigned).get("unbound", [])
+    except Exception as _e:  # noqa: BLE001 — unbind is best-effort
+        logger.warning(f"force-unbind failed: {_e}")
+        return []
+
+
 async def handle_cs_command(agent, action: str,
                             data: Dict[str, Any]) -> Dict[str, Any]:
     """Dispatch a CS_COMMAND. Returns an AGENT_RESPONSE-shaped result dict.
@@ -176,21 +192,32 @@ async def handle_cs_command(agent, action: str,
                                f"unlocked {len(r['unlocked_vmids'])} VMs", **r}
 
         if action == "clear_usb_quarantine":
-            # Operator "release dongles" action. Clears BOTH fault stores that
-            # sideline a bus: the dmesg quarantine (usb_quarantine.json, incl. the
-            # 5-strike permanent flag) AND the destroy-fail bus EXCLUSIONS on
-            # usb_state.json — the latter is what repeated spin-up/down teardowns
-            # trip, and the old handler never cleared it. No bus_path = clear all.
+            # Clear the dmesg quarantine store (usb_quarantine.json, incl. the
+            # 5-strike permanent flag) + force-release driver-bound dongles. Leaves
+            # the destroy-fail exclusion list intact. No bus_path = clear all.
             from . import usb_provision
             bus = data.get("bus_path")
             usb_provision.clear_quarantine(bus)
-            excluded = 0 if bus else usb_provision.clear_excluded_buses()
-            msg = (f"cleared quarantine for {bus}" if bus
-                   else f"cleared all quarantine + {excluded} bus exclusion(s) — "
-                        f"dongles available on the next provision pass")
+            unbound = _force_unbind_present(agent)
+            msg = (f"cleared quarantine{(' for ' + bus) if bus else ''}"
+                   + (f" + force-unbound {len(unbound)} driver-bound dongle(s)"
+                      if unbound else ""))
             return {"status": "SUCCESS", "action": "clear_usb_quarantine",
-                    "bus": bus, "cleared": True, "excluded_cleared": excluded,
-                    "message": msg}
+                    "bus": bus, "cleared": True, "unbound": unbound, "message": msg}
+
+        if action == "clear_usb_exclusions":
+            # Clear the destroy-fail bus EXCLUSIONS (usb_state.json) — what repeated
+            # spin-up/down teardowns trip — + force-release driver-bound dongles.
+            # Leaves the quarantine (QT) list intact.
+            from . import usb_provision
+            excluded = usb_provision.clear_excluded_buses()
+            unbound = _force_unbind_present(agent)
+            msg = (f"cleared {excluded} bus exclusion(s)"
+                   + (f" + force-unbound {len(unbound)} driver-bound dongle(s)"
+                      if unbound else "")
+                   + " — dongles available on the next provision pass")
+            return {"status": "SUCCESS", "action": "clear_usb_exclusions",
+                    "excluded_cleared": excluded, "unbound": unbound, "message": msg}
 
         return {"status": "ERROR", "message": f"unknown CS action: {action}"}
 

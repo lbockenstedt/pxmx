@@ -772,6 +772,61 @@ async def blacklist_dongle_drivers(agent) -> Dict[str, Any]:
     return {"action": "blacklist_dongle_drivers", "drivers": sorted(drivers), "unloaded": unloaded}
 
 
+def force_unbind_dongle_drivers(dongle_vidpids: Set[str],
+                                skip_buses: Optional[Set[str]] = None) -> Dict[str, Any]:
+    """Force-release each present dongle from its HOST kernel driver by unbinding
+    the driver at the INTERFACE level (``/sys/bus/usb/drivers/<drv>/unbind``). This
+    frees a driver-bound dongle for USB passthrough WITHOUT a reboot — surgical
+    (doesn't rmmod the module), so it works even when the driver is "in use" by
+    other devices (the case where blacklist_dongle_drivers' rmmod fails). Buses in
+    ``skip_buses`` (dongles currently assigned to a VM) are left alone so a working
+    passthrough isn't disturbed. Best-effort; never raises."""
+    skip_buses = skip_buses or set()
+    out: Dict[str, Any] = {"action": "force_unbind_dongle_drivers",
+                           "unbound": [], "failed": [], "drivers": []}
+    base = "/sys/bus/usb/devices"
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return out
+    drivers: Set[str] = set()
+    for name in entries:
+        if ":" in name:            # skip interface entries; we want the device
+            continue
+        if name in skip_buses:     # assigned to a VM — don't disturb it
+            continue
+        dev = os.path.join(base, name)
+        if not os.path.isdir(dev):
+            continue
+        vid = _read_sysfs(os.path.join(dev, "idVendor"))
+        pid = _read_sysfs(os.path.join(dev, "idProduct"))
+        if not vid or not pid or f"{vid}:{pid}" not in dongle_vidpids:
+            continue
+        for child in entries:      # its interface children: <name>:1.0, ...
+            if not child.startswith(f"{name}:"):
+                continue
+            drv_link = os.path.join(base, child, "driver")
+            try:
+                if not os.path.islink(drv_link):
+                    continue
+                drv = os.path.basename(os.path.realpath(drv_link))
+            except OSError:
+                continue
+            if not drv or drv == ".":
+                continue
+            drivers.add(drv)
+            try:
+                with open(f"/sys/bus/usb/drivers/{drv}/unbind", "w") as f:
+                    f.write(child)
+                out["unbound"].append(child)
+                logger.info(f"force-unbind: released {child} from host driver {drv}")
+            except OSError as e:
+                out["failed"].append(child)
+                logger.warning(f"force-unbind: could not unbind {child} from {drv}: {e}")
+    out["drivers"] = sorted(drivers)
+    return out
+
+
 # ── USB provision state + quarantine (Phase E) ────────────────────────────
 # The vmid↔bus state doc (usb_state.json) + orphan registry live in
 # usb_state_store; the dongle quarantine + destroy-fail + bus-exclusion state
