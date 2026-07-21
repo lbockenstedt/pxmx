@@ -1194,6 +1194,33 @@ def scan_present_dongles(dongle_vidpids: Set[str],
     return out
 
 
+def _dongle_recovery_view(hh: Optional[dict], dr: Optional[dict]) -> Optional[Dict[str, Any]]:
+    """Live recovery-in-progress state for one assigned bus, for the WebUI USB
+    page so an operator can see WHY a VM is recloning and WHICH dongle is the
+    problem BEFORE it lands in quarantine. Two sources (guest-blind wins if both):
+      * ``dongle_health`` — the guest-blind ladder: the dongle is attached
+        host-side (usbfs) but the GUEST can't see it, climbing usb_reset →
+        reattach → reboot → reclone → quarantine.
+      * ``detach_reclones`` — detach strikes: the passthrough keeps dropping
+        (present but NOT usbfs), reclone attempts before the bus is quarantined.
+    Returns None for a healthy dongle (no entry in either map)."""
+    if hh:
+        stage = str(hh.get("stage") or "")
+        n = int(hh.get("fails", 0))
+        return {"state": "guest_blind", "stage": stage, "attempts": n,
+                "max": len(_HEALTH_LADDER), "last_attempt": hh.get("last_attempt"),
+                "reason": f"guest can't see the dongle — recovery stage "
+                          f"'{stage}' (attempt {n} of {len(_HEALTH_LADDER)})"}
+    if dr:
+        n = int(dr.get("n", 0))
+        return {"state": "detached", "stage": "reclone", "attempts": n,
+                "max": _DETACH_RECLONE_MAX, "last_attempt": dr.get("last"),
+                "reason": f"passthrough dropped (present but not usbfs) — reclone "
+                          f"{n} of {_DETACH_RECLONE_MAX}; quarantines the dongle "
+                          f"after {_DETACH_RECLONE_MAX}"}
+    return None
+
+
 def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
     """Build the USB portion of this host's CS telemetry body by scanning
     ``/sys/bus/usb/devices`` and classifying each present device against the
@@ -1257,6 +1284,12 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
         # Post-clone settle reboot schedule (stamped by set_assignment): surface
         # reboot_at so the WebUI can show "reboot in Xm" for a freshly-cloned VM.
         post_prov_reboot = st.get("post_prov_reboot") or {}
+        # Live recovery-in-progress state per bus so the WebUI USB page can show
+        # WHY a VM is recloning + WHICH dongle is failing BEFORE it quarantines:
+        # dongle_health = guest-blind ladder ({fails,stage}); detach_reclones =
+        # passthrough-drop strikes ({n}). See _dongle_recovery_view.
+        dongle_health = st.get("dongle_health") or {}
+        detach_reclones = st.get("detach_reclones") or {}
         # Missing-dongle shed deadline for the WebUI countdown: the teardown fires
         # when now - missing_since >= missing_timeout, so shed_at = missing_since +
         # missing_timeout (same units the teardown compares — accurate regardless
@@ -1281,6 +1314,10 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "prov_status": "missing" if ms is not None else "active",
                 "reboot_at": rpr.get("reboot_at"),
                 "cloned_at": rpr.get("cloned_at"),
+                # Live recovery state (None when healthy) — the "why is this
+                # recloning" the WebUI USB page shows per dongle.
+                "recovery": _dongle_recovery_view(dongle_health.get(bus),
+                                                  detach_reclones.get(bus)),
             })
         # Quarantined dongles (dmesg kernel USB errors — the ONLY quarantine path)
         # for the WebUI badge: bus-id + reason + when, so an admin can see WHY a
