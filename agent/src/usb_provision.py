@@ -1201,6 +1201,39 @@ def scan_present_dongles(dongle_vidpids: Set[str],
     return out
 
 
+_LSUSB_CACHE: Dict[str, Any] = {"ts": 0.0, "map": {}}
+
+
+def _lsusb_descriptions() -> Dict[str, str]:
+    """``{vidpid: 'Vendor Product' string}`` resolved by ``lsusb`` (usb.ids), so
+    the WebUI USB page can show the full device name (e.g. ``Realtek
+    Semiconductor Corp. RTL8192EU 802.11b/g/n WLAN Adapter``) per dongle instead
+    of the terse sysfs ``product`` (``802.11n NIC``). Cached ~60s — the vid:pid →
+    name mapping is static — so the per-tick telemetry build doesn't fork lsusb
+    every time. Best-effort: empty on any failure (lsusb / usb.ids absent)."""
+    now = time.time()
+    if now - float(_LSUSB_CACHE.get("ts", 0)) < 60 and _LSUSB_CACHE.get("map"):
+        return _LSUSB_CACHE["map"]
+    out: Dict[str, str] = {}
+    try:
+        import subprocess
+        r = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5)
+        for line in (r.stdout or "").splitlines():
+            # "Bus 011 Device 003: ID 0bda:818b Realtek Semiconductor Corp. RTL8192EU …"
+            m = re.search(r"\bID\s+([0-9a-fA-F]{4}:[0-9a-fA-F]{4})\s+(.+?)\s*$", line)
+            if m:
+                vp = m.group(1).lower()
+                desc = m.group(2).strip()
+                if desc and vp not in out:
+                    out[vp] = desc
+    except Exception:  # noqa: BLE001 — lsusb missing / no usb.ids → no descriptions
+        pass
+    if out:
+        _LSUSB_CACHE["ts"] = now
+        _LSUSB_CACHE["map"] = out
+    return out
+
+
 def _dongle_recovery_view(hh: Optional[dict], dr: Optional[dict]) -> Optional[Dict[str, Any]]:
     """Live recovery-in-progress state for one assigned bus, for the WebUI USB
     page so an operator can see WHY a VM is recloning and WHICH dongle is the
@@ -1251,6 +1284,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
         certified = _dongle_vidpids(agent)
         ignored = _ignored_vidpids(agent)
         ctypes = _certified_types(agent)
+        descmap = _lsusb_descriptions()   # {vidpid: full lsusb/usb.ids name}
         present: List[Dict[str, Any]] = []
         unknown: List[Dict[str, Any]] = []
         present_by_bus: Dict[str, Dict[str, Any]] = {}
@@ -1271,15 +1305,18 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 continue
             vidpid = f"{vid}:{pid}"
             product = _read_sysfs(os.path.join(dev, "product")) or name
+            desc = descmap.get(vidpid, "")
             if vidpid in certified:
                 entry = {"bus_path": name, "vidpid": vidpid,
-                         "product": product, "type": str(ctypes.get(vidpid, "wireless"))}
+                         "product": product, "description": desc,
+                         "type": str(ctypes.get(vidpid, "wireless"))}
                 present.append(entry)
                 present_by_bus[name] = entry
             elif vidpid in ignored:
                 continue
             else:
-                unknown.append({"bus_path": name, "vidpid": vidpid, "name": product})
+                unknown.append({"bus_path": name, "vidpid": vidpid,
+                                "name": product, "description": desc})
 
         usb_state: List[Dict[str, Any]] = []
         try:
