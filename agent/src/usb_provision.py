@@ -259,6 +259,14 @@ EXCLUDE_COOLDOWN_S = 900
 # detached this long, so a VM that's mid-start (dongle briefly [none] before QEMU
 # grabs it) isn't needlessly recloned.
 _DETACHED_GRACE_S = float(os.environ.get("LM_PXMX_DETACHED_GRACE_S", "120") or 120)
+# Cap on reclone-on-detach before giving up. A dongle that keeps dropping its
+# passthrough (physical flap / bad port / dying dongle) can't be fixed by
+# rebuilding the VM — recloning it forever just thrashes (destroy+clone every few
+# minutes). After this many reclones inside the window we QUARANTINE the bus
+# instead (the user's "if all attempts to recover fail, QT the dongle"); the
+# strike count is keyed by BUS so it survives the VM being destroyed each reclone.
+_DETACH_RECLONE_MAX = int(os.environ.get("LM_PXMX_DETACH_RECLONE_MAX", "3") or 3)
+_DETACH_STRIKE_WINDOW_S = float(os.environ.get("LM_PXMX_DETACH_STRIKE_WINDOW_S", "3600") or 3600)
 # Per-client dongle-health watchdog: verify the GUEST actually sees its dongle
 # (in-guest lsusb) and, if not, escalate a recovery ladder across ticks. Runs at
 # most every _HEALTH_CHECK_INTERVAL_S; a given bus advances one ladder stage no
@@ -1763,9 +1771,17 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     if ap_on and missing_timeout > 0:
         from . import cs_sim  # deferred — cs_sim imports usb_provision
         detached_since = state.setdefault("detached_since", {})
+        detach_reclones = state.setdefault("detach_reclones", {})
         for bus, vmid in list(state["bus_to_vmid"].items()):
             if bus not in present or _bus_attached(bus):
                 detached_since.pop(bus, None)
+                # Prune the strike counter only after a full window of quiet — NOT
+                # the instant it re-attaches (a reclone briefly re-grabs the dongle
+                # before it flaps again; clearing here would reset the count every
+                # cycle and never converge to quarantine).
+                _rc = detach_reclones.get(bus)
+                if _rc and (now - float(_rc.get("last", 0))) > _DETACH_STRIKE_WINDOW_S:
+                    detach_reclones.pop(bus, None)
                 continue
             # Present but detached — only reclone a RUNNING VM (a stopped VM has no
             # passthrough by design; leave it alone).
@@ -1781,9 +1797,37 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 detached_since[bus] = now
                 continue
             if now - float(since) >= _DETACHED_GRACE_S:
+                rec = detach_reclones.get(bus)
+                if rec and (now - float(rec.get("first", now))) > _DETACH_STRIKE_WINDOW_S:
+                    rec = None  # window expired → fresh episode
+                n = int((rec or {}).get("n", 0))
+                if n >= _DETACH_RECLONE_MAX:
+                    # Reclone hasn't converged — the dongle keeps dropping its
+                    # passthrough. Rebuilding the VM can't fix flapping hardware, so
+                    # stop thrashing this bus: quarantine it (loop skips it; escalates
+                    # to permanent after QUARANTINE_PERMANENT_STRIKES) and destroy the
+                    # current VM to free the slot. Do NOT re-provision onto it.
+                    logger.error("provision loop: bus %s detached %d× on VM %s despite "
+                                 "reclones — quarantining the dongle (chronic flap; "
+                                 "reclone can't fix hardware)", bus, n, vmid)
+                    try:
+                        quarantine_bus(bus, "chronic detach — passthrough keeps dropping")
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("provision loop: quarantine of %s failed: %s", bus, e)
+                    try:
+                        await cs_sim.destroy_vm(agent, int(vmid), bus=bus)
+                        torn_down.append(int(vmid))
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("provision loop: quarantine-destroy of %s failed: %s", vmid, e)
+                    state["bus_to_vmid"].pop(bus, None)
+                    state["vmid_to_bus"].pop(str(vmid), None)
+                    detached_since.pop(bus, None)
+                    (state.get("missing_since") or {}).pop(bus, None)
+                    detach_reclones.pop(bus, None)  # episode closed — quarantine owns it now
+                    continue
                 logger.warning("provision loop: bus %s detached from RUNNING VM %s "
-                               "(present but not usbfs) — recloning to re-grab the dongle",
-                               bus, vmid)
+                               "(present but not usbfs) — recloning to re-grab the "
+                               "dongle (attempt %d/%d)", bus, vmid, n + 1, _DETACH_RECLONE_MAX)
                 try:
                     await cs_sim.destroy_vm(agent, int(vmid), bus=bus)
                     torn_down.append(int(vmid))
@@ -1793,6 +1837,9 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 state["vmid_to_bus"].pop(str(vmid), None)
                 detached_since.pop(bus, None)
                 (state.get("missing_since") or {}).pop(bus, None)
+                detach_reclones[bus] = {"n": n + 1,
+                                        "first": float((rec or {}).get("first", now)),
+                                        "last": now}
         save_usb_state(state)
 
     # 5c. Per-client dongle-health watchdog (in-guest lsusb + recovery ladder).
@@ -2348,6 +2395,19 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
     # startup.sh runs for the first time (bash clone_vm_for_usb 2050-2097).
     # `qm guest exec ... reboot` never replies (the guest agent dies with the
     # reboot), so this is fire-and-forget like bash's `|| true`.
+    #
+    # This is the FIRST of two post-clone reboots, and both are intentional:
+    #   1) THIS reboot — applies hostname + sim_phy + first-boot bits, then
+    #      runs update.sh. The guest comes up too briefly to have pulled a
+    #      placement/config push from the engine yet, so this reboot is NOT
+    #      the "final" restart.
+    #   2) The +15-min SETTLE reboot — stamped by set_assignment above into
+    #      usb_state.json["post_prov_reboot"] and fired later by
+    #      _run_post_prov_reboot_queue. By then the box has settled, pulled
+    #      its engine config, and run update.sh, so this second restart brings
+    #      it back fully configured. (The reclone path does NOT do reboot #1,
+    #      so for reclone the +15-min reboot is the first/only post-clone
+    #      restart — still correct: the settle+config window is what matters.)
     try:
         await pve_cmds.qm_guest_exec(vmid, "reboot", protected=protected)
     except Exception:
