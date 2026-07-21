@@ -922,6 +922,52 @@ async def reconcile_vm_configs(agent, start: int, end: int,
     return changed
 
 
+async def release_stale_assignments(existing) -> int:
+    """Release bus_to_vmid entries whose VM no longer ACTUALLY passes the dongle
+    through — the VM is gone, was reconfigured onto a DIFFERENT bus (dongle
+    re-enumerated to a new port after replug), or lost its usb passthrough
+    entirely. ``reconcile_vm_configs`` only ADDS (re-tracks); without this a bus
+    stays "assigned" FOREVER after heavy delete/recreate/replug thrashing, so the
+    freed dongle never becomes eligible again — the "no eligible dongles
+    (assigned=[...])" stall. A vidpid-form passthrough (has usb but no bus-path we
+    can read via ``_vm_usb_bus``) is left ALONE — can't verify it by bus, so
+    conservatively keep it (never strand a real client). A STOPPED VM whose config
+    still names this bus is also kept (it legitimately owns the dongle). Returns
+    the number released."""
+    st = load_usb_state()
+    b2v = st.get("bus_to_vmid") or {}
+    existset = {int(x) for x in existing if str(x).lstrip("-").isdigit()}
+    released = 0
+    for bus, vmid in list(b2v.items()):
+        try:
+            vid = int(vmid)
+        except (TypeError, ValueError):
+            continue
+        stale = False
+        if vid not in existset:
+            stale = True                                    # VM gone
+        else:
+            actual = await _vm_usb_bus(vid)
+            if actual == bus:
+                continue                                    # VM passes through THIS bus — valid
+            if actual is not None:
+                stale = True                                # VM moved to a different bus
+            elif not await _vm_has_usb_passthrough(vid):
+                stale = True                                # VM has NO passthrough → lost its dongle
+            # else: vidpid-form passthrough (host=vid:pid) — can't verify, keep
+        if stale:
+            b2v.pop(bus, None)
+            if (st.get("vmid_to_bus") or {}).get(str(vid)) == bus:
+                st["vmid_to_bus"].pop(str(vid), None)
+            (st.get("missing_since") or {}).pop(bus, None)
+            released += 1
+            logger.info("provision loop: released stale assignment bus %s -> VM %s "
+                        "(gone / reconfigured / no passthrough) — dongle re-eligible", bus, vid)
+    if released:
+        save_usb_state(st)
+    return released
+
+
 # ── present-dongle discovery ──────────────────────────────────────────────
 
 
@@ -1279,6 +1325,16 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # countdown) instead of stranded/invisible to the teardown. Self-heals the
     # "N VMs but only M tracked, nothing sheds" case.
     if await reconcile_vm_configs(agent, start, end, present, now, existing):
+        state = load_usb_state()
+    # 1c. Release STALE assignments: a bus mapped to a VM that no longer actually
+    # passes that dongle through (VM deleted+recreated, dongle re-enumerated to a
+    # new bus, or the VM lost its passthrough). reconcile_vm_configs above only
+    # re-tracks; without this the bus stays "assigned" forever and the dongle never
+    # becomes eligible again — the "no eligible dongles (assigned=[...])" stall
+    # after heavy thrashing.
+    _released = await release_stale_assignments(existing)
+    if _released:
+        logger.info("provision reconcile: released %d stale dongle assignment(s)", _released)
         state = load_usb_state()
     # Remember each tracked bus's vidpid while it's actually present, so a
     # dongle that later moves to a different bus path (unplugged/replugged

@@ -207,17 +207,27 @@ async def handle_cs_command(agent, action: str,
 
         if action == "clear_usb_exclusions":
             # Clear the destroy-fail bus EXCLUSIONS (usb_state.json) — what repeated
-            # spin-up/down teardowns trip — + force-release driver-bound dongles.
+            # spin-up/down teardowns trip — + release STALE assignments (a bus stuck
+            # 'assigned' to a VM that no longer holds the dongle: the "no eligible
+            # dongles (assigned=[...])" stall) + force-release driver-bound dongles.
             # Leaves the quarantine (QT) list intact.
-            from . import usb_provision
+            from . import usb_provision, pve_cmds
             excluded = usb_provision.clear_excluded_buses()
+            stale = 0
+            try:
+                _existing = await pve_cmds.list_all_vmids()
+                stale = await usb_provision.release_stale_assignments(_existing)
+            except Exception as _e:  # noqa: BLE001 — best-effort
+                logger.warning(f"clear_usb_exclusions: release_stale_assignments failed: {_e}")
             unbound = _force_unbind_present(agent)
             msg = (f"cleared {excluded} bus exclusion(s)"
+                   + (f" + released {stale} stale assignment(s)" if stale else "")
                    + (f" + force-unbound {len(unbound)} driver-bound dongle(s)"
                       if unbound else "")
                    + " — dongles available on the next provision pass")
             return {"status": "SUCCESS", "action": "clear_usb_exclusions",
-                    "excluded_cleared": excluded, "unbound": unbound, "message": msg}
+                    "excluded_cleared": excluded, "stale_released": stale,
+                    "unbound": unbound, "message": msg}
 
         return {"status": "ERROR", "message": f"unknown CS action: {action}"}
 
