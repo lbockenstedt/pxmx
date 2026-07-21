@@ -1499,6 +1499,14 @@ class ProxmoxAgent:
             # that comes up after this agent (or moves) is found without a restart.
             if self.spoke_url in ("", "auto", None):
                 await self._resolve_spoke_url()
+            # If resolution STILL didn't produce a usable URL (spoke booting, probe
+            # missed), do NOT dial — connecting to an empty URL raises
+            # "InvalidURI: scheme isn't ws or wss", logging a spurious drop and
+            # burning a backoff cycle (the reconnect blip seen on the Details page).
+            # Wait briefly and re-probe on the next pass instead.
+            if self.spoke_url in ("", "auto", None):
+                await asyncio.sleep(5)
+                continue
             try:
                 await self._connect_once()
                 backoff = 5  # reset on clean disconnect
