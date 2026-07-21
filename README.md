@@ -71,6 +71,14 @@ key names — `usb_auto_provision` (webui-spoke 6-key blob) or `auto_provision`
 `usb_missing_timeout`/`missing_timeout` and `usb_max_slots`/`max_slots`. See
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
+Every clone (first-clone + reclone) also schedules a **+15-min post-clone
+settle reboot** (`post_prov_reboot[vmid]` in `usb_state.json`, swept by
+`_run_post_prov_reboot_queue`; env `POST_PROV_REBOOT_DELAY_S`, default 900)
+so the box restarts after settling + pulling engine config + running
+`update.sh`. Two reboots are intentional — the immediate post-clone reboot
+only sets hostname/first-boot bits. See `lm/docs/pxmx.md` → *Post-clone
+settle reboot*.
+
 ### Conventions
 The agent code follows a **"Phase X port of legacy `cs/proxmox/proxmox-agent.sh`…"**
 docstring convention with line-range cross-references to the solutions-hpe cs

@@ -101,6 +101,14 @@ vm-set/template-lock/provision-halt flags, and USB state from
 `provision_halt` (the dict) and `prov_run` (the live run state) so the Hub can
 surface them.
 
+Each per-VM `usb_state[]` entry carries `vmid, bus_path, missing_since,
+missing_timeout_s, shed_at, name, vidpid, prov_status`, plus `reboot_at` /
+`cloned_at` when a post-clone settle reboot is pending (stamped by
+`usb_state_store.set_assignment` into `post_prov_reboot[vmid]`, swept by
+`_run_post_prov_reboot_queue`). The Hub's WebUI renders `reboot_at` as a
+blue "Reboots in Xm" countdown badge next to the VM's status. See
+`lm/docs/pxmx.md` → *Post-clone settle reboot*.
+
 ## Ported-from-cs provenance
 
 The agent code uses a **"Phase X port of legacy `cs/proxmox/proxmox-agent.sh`…"**
