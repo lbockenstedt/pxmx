@@ -201,6 +201,13 @@ _AGENT_DEFAULT_PORT = "443"
 # frame anyway (with last-known tiers). Normal is ~4s; this only trips when a
 # mass delete/clone makes the per-VM passthrough probes block on locked VMs.
 _TIERS_DEADLINE_S = float(os.environ.get("LM_PXMX_TIERS_DEADLINE_S", "8") or 8)
+# Overall watchdog on the metrics+vms+nodes collect. Even with per-call deadlines
+# inside get_vm_list/get_node_stats, a mass op — or a lock held by a stuck
+# delete/clone that the collect blocks on — can wedge the whole telemetry tick for
+# minutes (the frozen "tick #N" the operator saw: no fresh frame leaves the agent,
+# so every downstream cache keeps serving the last one). Hard-bound it so the loop
+# ALWAYS advances; on timeout reuse the last-known snapshot for one tick and retry.
+_COLLECT_DEADLINE_S = float(os.environ.get("LM_PXMX_COLLECT_DEADLINE_S", "25") or 25)
 
 
 def _normalize_spoke_url(url: Optional[str]) -> Optional[str]:
@@ -2288,10 +2295,26 @@ class ProxmoxAgent:
                     _t0 = time.time()
                     _r = await coro
                     return _r, int((time.time() - _t0) * 1000)
-                (metrics, _m_ms), (vms, _v_ms), (nodes, _n_ms) = await asyncio.gather(
-                    _timed(self.collect_metrics()),
-                    _timed(self.get_vm_list()),
-                    _timed(self.get_node_stats()))
+                try:
+                    (metrics, _m_ms), (vms, _v_ms), (nodes, _n_ms) = await asyncio.wait_for(
+                        asyncio.gather(
+                            _timed(self.collect_metrics()),
+                            _timed(self.get_vm_list()),
+                            _timed(self.get_node_stats())),
+                        timeout=_COLLECT_DEADLINE_S)
+                    self._last_metrics, self._last_vms, self._last_nodes = metrics, vms, nodes
+                except asyncio.TimeoutError:
+                    # Collect wedged (busy host / lock held by a stuck op). Reuse the
+                    # last-known snapshot this tick so the LOOP keeps advancing and
+                    # relaying (a downstream 'STALE' badge is honest; a frozen loop
+                    # is not) — next tick re-collects live.
+                    metrics = getattr(self, "_last_metrics", None) or {}
+                    vms = getattr(self, "_last_vms", None) or {"vms": []}
+                    nodes = getattr(self, "_last_nodes", None) or {"nodes": []}
+                    _m_ms = _v_ms = _n_ms = -1
+                    logger.warning("telemetry collect exceeded %.0fs (busy host / stuck op) "
+                                   "— using last-known snapshot this tick, retrying next tick",
+                                   _COLLECT_DEADLINE_S)
                 self._last_phase_ms = {
                     "metrics_ms":    _m_ms,
                     "vm_list_ms":    _v_ms,
