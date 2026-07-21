@@ -197,6 +197,10 @@ AGENT_CONFIG_FILE = os.environ.get(
 _AGENT_WS_PATH = "/ws/agent"
 _AGENT_DEFAULT_SCHEME = "wss"
 _AGENT_DEFAULT_PORT = "443"
+# Max time the per-VM tier probe may take before the telemetry loop ships the
+# frame anyway (with last-known tiers). Normal is ~4s; this only trips when a
+# mass delete/clone makes the per-VM passthrough probes block on locked VMs.
+_TIERS_DEADLINE_S = float(os.environ.get("LM_PXMX_TIERS_DEADLINE_S", "8") or 8)
 
 
 def _normalize_spoke_url(url: Optional[str]) -> Optional[str]:
@@ -2372,12 +2376,31 @@ class ProxmoxAgent:
                         # Classify each VM's tier by passthrough (cached ~60s) in
                         # this async context, then stamp it into the sync body.
                         _t_e = time.time()
+                        # Tier probing (per-VM passthrough) is the ONE collect phase
+                        # with no deadline. During a mass delete/clone its probes
+                        # block on VMs mid ``qm destroy`` (lock contention) and can
+                        # hang for MINUTES — unbounded, it stalled the WHOLE frame,
+                        # so the already-fresh (reduced) VM list waited behind it:
+                        # the "deletes take 5-10 min to show in the UI" lag. Bound it
+                        # and, on timeout, ship the frame NOW with the current
+                        # vms/nodes and the LAST-KNOWN tiers (tiers change slowly, so
+                        # reusing them one tick is harmless; the VM list is what the
+                        # operator is waiting on).
                         try:
-                            tiers = await usb_provision.compute_vm_tiers(
-                                self, (vms or {}).get("vms", []) or [])
+                            tiers = await asyncio.wait_for(
+                                usb_provision.compute_vm_tiers(
+                                    self, (vms or {}).get("vms", []) or []),
+                                timeout=_TIERS_DEADLINE_S)
+                            self._last_tiers = tiers
+                        except asyncio.TimeoutError:
+                            tiers = getattr(self, "_last_tiers", {}) or {}
+                            logger.warning(
+                                "compute_vm_tiers exceeded %.0fs (busy host / mass op) "
+                                "— shipping telemetry with last-known tiers so VM "
+                                "changes aren't held up", _TIERS_DEADLINE_S)
                         except Exception as _te:
                             logger.debug(f"compute_vm_tiers failed: {_te}")
-                            tiers = {}
+                            tiers = getattr(self, "_last_tiers", {}) or {}
                         (self._last_phase_ms or {})["tiers_ms"] = int((time.time() - _t_e) * 1000)
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         await self.send_cs_event("CS_TELEMETRY", cs_body)
