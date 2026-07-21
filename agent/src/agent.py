@@ -1128,7 +1128,11 @@ class ProxmoxAgent:
                              "agent_id": self.agent_id},
                 },
             }
-            await self.websocket.send(encode_frame(self.signer, msg))
+            # Bound the send: a backpressured hub must not hang this best-effort
+            # emit (and, via callers, the telemetry loop). TimeoutError is caught
+            # below like any other send failure.
+            await asyncio.wait_for(
+                self.websocket.send(encode_frame(self.signer, msg)), timeout=10.0)
         except Exception:
             pass
 
@@ -2392,7 +2396,16 @@ class ProxmoxAgent:
                         },
                     },
                 }
-                await self.websocket.send(encode_frame(self.signer, msg))
+                # Bound the send so a backpressured hub can't hang here and
+                # freeze the telemetry loop (defeating the collect watchdogs). On
+                # timeout, log and skip THIS frame — the loop advances.
+                try:
+                    await asyncio.wait_for(
+                        self.websocket.send(encode_frame(self.signer, msg)),
+                        timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("AGENT_TELEMETRY send exceeded 10s (backpressured "
+                                   "hub) — skipping this frame")
 
                 # ── Client-Simulation telemetry (Phase D1) ───────────────────
                 # When CS is enabled, also push a CS_TELEMETRY frame carrying the
@@ -2463,6 +2476,13 @@ class ProxmoxAgent:
                 try:
                     _sig = (
                         frozenset(str(v.get("vmid")) for v in (vms or {}).get("vms", [])
+                                  if v.get("vmid") is not None),
+                        # Coarse per-VM status hash: a manual start/stop/reboot
+                        # leaves the vmid-set unchanged, so without this a power
+                        # change waited the full 60s idle tick. Folding it in
+                        # opens the same 15s fast-tick window a vmid add/remove does.
+                        frozenset((str(v.get("vmid")), str(v.get("status")))
+                                  for v in (vms or {}).get("vms", [])
                                   if v.get("vmid") is not None),
                         len((nodes or {}).get("nodes", []) or []),
                         _usb_sig,

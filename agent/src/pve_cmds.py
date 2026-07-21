@@ -102,9 +102,10 @@ async def is_template(vmid: Any, kind: Optional[str] = None) -> bool:
 
 # Host PCI address → "vvvv:pppp" resolved via `lspci -n`. PCI topology is
 # static while the agent runs, so entries never expire — the cache lives for
-# the process (an agent restart naturally rebuilds it). None = address didn't
-# resolve (also cached, so a bad address isn't re-probed every call).
-_lspci_vidpid_cache: Dict[str, Optional[str]] = {}
+# the process (an agent restart naturally rebuilds it). Only SUCCESSFUL
+# resolutions are cached: a None (miss / transient lspci failure) is NOT stored,
+# so it self-heals on the next call instead of permanently mis-tiering the VM.
+_lspci_vidpid_cache: Dict[str, str] = {}
 
 
 async def _lspci_vidpid(addr: str) -> Optional[str]:
@@ -120,7 +121,10 @@ async def _lspci_vidpid(addr: str) -> Optional[str]:
         m = re.search(r"\b([0-9a-f]{4}:[0-9a-f]{4})\b", o2.decode(errors="replace").lower())
         if m:
             vidpid = m.group(1)
-    _lspci_vidpid_cache[addr] = vidpid
+    # Cache ONLY a successful resolution; a None (miss / transient failure) is
+    # left uncached so it self-heals next call.
+    if vidpid is not None:
+        _lspci_vidpid_cache[addr] = vidpid
     return vidpid
 
 

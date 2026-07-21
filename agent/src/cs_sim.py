@@ -801,6 +801,12 @@ _HANDLERS = {
 # the semaphore (they were already ACCEPTED, so the UI shows them running).
 _LONG_OP_SEM = asyncio.Semaphore(2)
 
+# Batch long-ops that fan out internally and run for MINUTES. They pace themselves
+# with their OWN internal Semaphore (e.g. _reclone_all's `sem`), so letting one
+# occupy a global _LONG_OP_SEM slot for its whole lifetime head-of-line-blocks a
+# single delete_vm/reclone_vm behind it. These run OUTSIDE the global sem.
+_BATCH_LONG_OPS = {"proxmox_reclone_all"}
+
 
 async def run_long_op(agent, action: str, data: Dict[str, Any],
                       cs_cmd_id: str) -> None:
@@ -814,8 +820,13 @@ async def run_long_op(agent, action: str, data: Dict[str, Any],
                         f"unknown long op: {action}")
         return
     try:
-        async with _LONG_OP_SEM:
+        if action in _BATCH_LONG_OPS:
+            # Self-pacing batch op — do NOT hold a global _LONG_OP_SEM slot for
+            # its (minutes-long) lifetime, or single ops queue behind it.
             await handler(agent, data, cs_cmd_id)
+        else:
+            async with _LONG_OP_SEM:
+                await handler(agent, data, cs_cmd_id)
     except asyncio.CancelledError:
         # Best-effort: tell the cs spoke the op was abandoned so the queue
         # command doesn't sit delivered forever.

@@ -24,7 +24,8 @@ logger = logging.getLogger("PxmxAgent")
 # ``network-get-interfaces`` guest round-trip dominates get_vm_list on a busy
 # host — an unresponsive/booting guest rides the 4s timeout EVERY telemetry tick
 # (every 3s while provisioning). IPs/MACs barely change, so cache them:
-_IFACE_TTL_OK = 300.0    # fully resolved (has an IP, or a stopped VM's config MAC): 5 min
+_IFACE_TTL_OK = 120.0    # fully resolved (has an IP, or a stopped VM's config MAC): 2 min
+                         # (was 300 — a running VM's IP change went unseen for 5 min)
 _IFACE_TTL_MISS = 60.0   # running VM with no IP yet (guest agent booting / not answering):
                          # retry every 60s instead of riding the 4s timeout each tick
 

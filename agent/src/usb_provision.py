@@ -1636,6 +1636,43 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         # The pacing branch below publishes a 'pacing' halt into the resource
         # gate's state (usb_resource_gate._provision_halt) so telemetry sees it.
         info = present[bus]
+        # ── Stagger + CPU-ramp admission pacing runs OUTSIDE the semaphore: a
+        # staggered clone's 14s admission sleep must NOT hold a sem slot idle
+        # (that head-of-line-blocked the next clone for the whole stagger). Only
+        # the real clone work below is bounded by ``sem``.
+        async with _admission_lock:
+            my_slot = _admitted[0]
+            _admitted[0] += 1
+        if my_slot > 0 and concurrency > 1:
+            await asyncio.sleep(14)
+            cpu_now = await _current_cpu_pct(agent)
+            if cpu_now is not None and cpu_now >= cpu_prov_ceil:
+                _pacing_halted[0] = True
+                # Surface pacing in telemetry so the WebUI AUTO-PROV cell's
+                # 'pacing' branch fires (csProvThrottleBadge r==='pacing').
+                # Pacing is a transient in-batch ramp abort, not a sustained
+                # halt; the next provision-loop cycle re-evaluates cpu/mem and
+                # reassigns _provision_halt, so this shows for ~1 cycle.
+                # cpu_threshold is the ramp ceiling (cpu_prov_ceil), matching
+                # the bash agent (proxmox-agent.sh:2803). Pacing can fire on an
+                # instantaneous spike above the ceiling even when the 1h avg is
+                # below the provision threshold — in that case this is the ONLY
+                # halt signal, which is exactly when the pacing badge should show.
+                usb_resource_gate._provision_halt = {
+                    "halted": True,
+                    "reason": "pacing",
+                    "cpu_pct": round(cpu_now, 1),
+                    "cpu_threshold": cpu_prov_ceil,
+                    "mem_pct": round(mem_avg, 1) if mem_avg is not None else None,
+                    "mem_threshold": mem_prov_thr,
+                    "ts": int(time.time()),
+                }
+                logger.warning(
+                    "provision loop: pacing — CPU %.0f%% >= ramp ceiling %s%% "
+                    "— stopping batch after %d clone(s)",
+                    cpu_now, cpu_prov_ceil, my_slot)
+                item_by_bus[bus]["status"] = "failed"
+                return False
         async with sem:
             if _pacing_halted[0]:
                 item_by_bus[bus]["status"] = "failed"
@@ -1653,39 +1690,6 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             if _toggle_halted[0]:
                 item_by_bus[bus]["status"] = "cancelled"
                 return False
-            async with _admission_lock:
-                my_slot = _admitted[0]
-                _admitted[0] += 1
-            if my_slot > 0 and concurrency > 1:
-                await asyncio.sleep(14)
-                cpu_now = await _current_cpu_pct(agent)
-                if cpu_now is not None and cpu_now >= cpu_prov_ceil:
-                    _pacing_halted[0] = True
-                    # Surface pacing in telemetry so the WebUI AUTO-PROV cell's
-                    # 'pacing' branch fires (csProvThrottleBadge r==='pacing').
-                    # Pacing is a transient in-batch ramp abort, not a sustained
-                    # halt; the next provision-loop cycle re-evaluates cpu/mem and
-                    # reassigns _provision_halt, so this shows for ~1 cycle.
-                    # cpu_threshold is the ramp ceiling (cpu_prov_ceil), matching
-                    # the bash agent (proxmox-agent.sh:2803). Pacing can fire on an
-                    # instantaneous spike above the ceiling even when the 1h avg is
-                    # below the provision threshold — in that case this is the ONLY
-                    # halt signal, which is exactly when the pacing badge should show.
-                    usb_resource_gate._provision_halt = {
-                        "halted": True,
-                        "reason": "pacing",
-                        "cpu_pct": round(cpu_now, 1),
-                        "cpu_threshold": cpu_prov_ceil,
-                        "mem_pct": round(mem_avg, 1) if mem_avg is not None else None,
-                        "mem_threshold": mem_prov_thr,
-                        "ts": int(time.time()),
-                    }
-                    logger.warning(
-                        "provision loop: pacing — CPU %.0f%% >= ramp ceiling %s%% "
-                        "— stopping batch after %d clone(s)",
-                        cpu_now, cpu_prov_ceil, my_slot)
-                    item_by_bus[bus]["status"] = "failed"
-                    return False
             # The clone-source templates (image1/2_template_id) must stay OUTSIDE
             # the allocation pool: a sim VM must never grab a template's VMID
             # (cloning "from" a sim VM, or colliding when a deleted template's
