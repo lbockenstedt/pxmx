@@ -23,6 +23,12 @@ If the agent is on the same machine as the Proxmox Spoke:
 ```bash
 bash install_agent.sh
 ```
+When run on a Proxmox host with **no `--spoke-ip`/`--spoke-url`**, the installer
+first auto-detects a **co-located LM spoke running as an LXC** on this host: it
+enumerates running containers (`pct list`), resolves each one's IP, and probes it
+for an LM agent listener — the first match is pinned as `--spoke-ip` automatically.
+If no local container answers (or `pct` isn't present) it falls back to hub
+discovery (DNS `lm-hub.*` / mDNS). Pass `--spoke-ip <IP>` to skip detection.
 
 ### Remote Installation
 If the agent is on a separate host from the Spoke — just the IP:

@@ -130,9 +130,32 @@ fi
 
 # ── Resolve where the agent reports in ──────────────────────────────────────
 # Precedence: --spoke-ip (probe the given host) > --spoke-url (verbatim pin) >
-# hub auto-discovery (DNS lm-hub.* / mDNS). All probing uses the just-installed
-# venv + the vendored src/discovery.py. cwd is $INSTALL_DIR so `src.discovery`
-# imports (src/ is a package dir).
+# co-located LXC spoke auto-detect (this Proxmox host) > hub auto-discovery (DNS
+# lm-hub.* / mDNS). All probing uses the just-installed venv + the vendored
+# src/discovery.py. cwd is $INSTALL_DIR so `src.discovery` imports (src/ is a
+# package dir).
+
+# Co-located spoke auto-detect: in the common single-node topology the LM spoke
+# runs as an LXC ON THIS Proxmox host, so the operator shouldn't have to type its
+# IP. When nothing was pinned and `pct` is present, enumerate RUNNING containers,
+# resolve each one's IP, and probe it for an LM agent listener (same probe the
+# --spoke-ip path uses). The first that answers becomes --spoke-ip. Falls through
+# to hub DNS/mDNS discovery below if pct is absent or no local container answers.
+if [ -z "$SPOKE_IP" ] && [ "$SPOKE_URL_PINNED" != "1" ] && command -v pct >/dev/null 2>&1; then
+    echo "🔎 No target given — scanning this Proxmox host's LXC containers for a co-located LM spoke…"
+    for _vmid in $(pct list 2>/dev/null | awk 'NR>1 && /running/ {print $1}'); do
+        _cip=$(pct exec "$_vmid" -- hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -v '^127\.' | head -1)
+        [ -z "$_cip" ] && continue
+        _r=$(cd "$INSTALL_DIR" && "./venv/bin/python3" -m src.discovery --resolve-agent "$_cip" --timeout 3 2>/dev/null || echo NONE)
+        if [ -n "$_r" ] && [ "$_r" != "NONE" ]; then
+            SPOKE_IP="$_cip"
+            echo "✅ Found a co-located LM spoke in LXC $_vmid at $_cip ($_r) — using --spoke-ip $_cip"
+            break
+        fi
+    done
+    [ -z "$SPOKE_IP" ] && echo "   No local LXC answered an LM agent listener; falling back to hub discovery."
+fi
+
 if [ -n "$SPOKE_IP" ]; then
     # Operator supplied only an IP. Probe its known /ws/agent endpoints so we can
     # confirm reachability now and show the resolved URL — but the agent is baked
