@@ -697,11 +697,10 @@ class ProxmoxAgent:
             # blocks for a long time, so every telemetry tick would orphan pvesh
             # processes that pile up, saturate host CPU (100%), and slow ALL
             # pvesh — the runaway behind the fleet-wide 10-20 min telemetry lag.
-            proc.kill()
-            try:
-                await proc.wait()
-            except Exception:  # noqa: BLE001
-                pass
+            # _kill_and_reap bounds the reap so a D-state pvesh (stuck on storage
+            # I/O / wedged USB passthrough) can't wedge this coroutine — and the
+            # telemetry loop — forever after the kill.
+            await pve_cmds._kill_and_reap(proc)
             raise
         if proc.returncode != 0:
             raise RuntimeError(stderr.decode().strip() or f"pvesh exited {proc.returncode}")
@@ -724,11 +723,9 @@ class ProxmoxAgent:
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
-            proc.kill()  # don't orphan a hung/slow pvesh on timeout/cancel
-            try:
-                await proc.wait()
-            except Exception:  # noqa: BLE001
-                pass
+            # Kill+reap on timeout/cancel; _kill_and_reap bounds the reap so a
+            # D-state pvesh can't wedge this coroutine after the kill.
+            await pve_cmds._kill_and_reap(proc)
             raise
         if proc.returncode != 0:
             raise RuntimeError(stderr.decode().strip() or f"pvesh {verb} exited {proc.returncode}")

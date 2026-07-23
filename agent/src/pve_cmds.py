@@ -31,13 +31,40 @@ class PveError(Exception):
     """A qm/pct invocation failed."""
 
 
+async def _kill_and_reap(proc: "asyncio.subprocess.Process", *,
+                         reap_timeout: float = 5.0) -> None:
+    """SIGKILL ``proc`` and reap it, bounding the wait so a D-state child can't
+    wedge the calling coroutine forever. SIGKILL is not delivered to a process
+    in uninterruptible sleep (stuck on storage I/O / a wedged USB passthrough
+    device — the failure surface of a dongle-provisioning host running ``qm
+    clone`` / ``qm set -usb0``), so a bare ``await proc.wait()`` may block
+    indefinitely waiting for a reap that never comes. If the reap doesn't
+    settle within ``reap_timeout``, abandon the child to init — the kernel
+    reaps it when it eventually leaves D-state — and let the caller raise.
+
+    The single cleanup primitive used by every subprocess kill path (_run,
+    agent._pvesh, agent._pvesh_action) so a hung clone/qm/pvesh never
+    permanently stalls the provision or telemetry loop. The
+    pvesh-subprocess-leak invariant: kill the child on timeout AND cancel."""
+    proc.kill()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=reap_timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # D-state child (reap timeout) or a re-entrant cancel during cleanup —
+        # either way don't block cleanup; the child is abandoned to init.
+        pass
+
+
 async def _run(argv: List[str], *, timeout: int = FAST_CMD_TIMEOUT,
                check: bool = True, env: Optional[Dict[str, str]] = None) -> "tuple[int, bytes, bytes]":
     """Run ``argv`` as a subprocess and return ``(rc, stdout, stderr)``.
 
     Raises ``PveError`` on timeout (kills the proc) or, when ``check``, on a
     nonzero exit. The single async primitive every ``qm``/``pct`` wrapper builds on.
-    """
+
+    On cancellation the child is killed+reaped before CancelledError re-raises
+    (a bare wait_for orphans the qm/pct child — the leak behind fleet-wide
+    pvesh slowdowns). Mirrors agent._pvesh."""
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
@@ -47,9 +74,14 @@ async def _run(argv: List[str], *, timeout: int = FAST_CMD_TIMEOUT,
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await _kill_and_reap(proc)
         raise PveError(f"timeout ({timeout}s): {' '.join(argv)}")
+    except asyncio.CancelledError:
+        # A cancel (e.g. _stop_cs_tasks on a CS-disable/config flip, or the
+        # provision gather's PROV_RUN_STUCK_S deadline) must not orphan the
+        # child — kill+reap before re-raising.
+        await _kill_and_reap(proc)
+        raise
     if check and proc.returncode != 0:
         raise PveError(stderr.decode().strip() or f"{' '.join(argv)} exited {proc.returncode}")
     return proc.returncode, stdout, stderr

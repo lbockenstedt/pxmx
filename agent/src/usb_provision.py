@@ -2295,7 +2295,31 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 item_by_bus[bus]["status"] = "failed"
                 return False
 
-    results = await asyncio.gather(*[_do(b) for b in ordered], return_exceptions=True)
+    # Bound the gather wall-clock to PROV_RUN_STUCK_S. _kill_and_reap already
+    # prevents a single D-state clone/qm child from wedging a _do forever, but a
+    # _do is a chain of awaits (clone → start → guest-exec → agent-ping) and any
+    # FUTURE unbounded await would otherwise trap the gather forever — blocking
+    # run_provision_loop, stalling _provision_loop_last_run (loop_running=false),
+    # and denying the stuck-run watchdog its next tick to force-clear. On timeout
+    # wait_for cancels the pending _do tasks (each _run/_pvesh kill+reaps its
+    # child via _kill_and_reap on CancelledError); items still 'provisioning' are
+    # marked 'failed' so this_run completes and the loop advances. 600s matches
+    # the watchdog's existing "stuck" definition, so a legitimately slow _do
+    # would already have been flagged stuck by it.
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*[_do(b) for b in ordered], return_exceptions=True),
+            timeout=PROV_RUN_STUCK_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "provision pass gather timed out after %ss — a clone/reclaim wedged "
+            "in an unreapable subprocess; cancelling pending _do tasks",
+            int(PROV_RUN_STUCK_S))
+        for it in items:
+            if it.get("status") == "provisioning":
+                it["status"] = "failed"
+        results = []
     save_usb_state(state)
     provisioned = sum(1 for r in results if r is True)
     # A mid-batch toggle-off marks the un-started clones 'cancelled' (not 'failed')
