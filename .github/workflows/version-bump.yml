@@ -1,10 +1,15 @@
 name: version-bump
 
-# On every push to main (except pushes that only touch workflow files), bump the
-# last numeric segment of every tracked VERSION file and push the result back as
-# "chore: bump version [skip ci]". The [skip ci] commit message (plus the
-# head-commit guard below) prevents this workflow from re-triggering itself.
-# workflow_dispatch lets an admin trigger a manual bump without a code push.
+# On every push to main (except pushes that only touch workflow files), bump every
+# tracked VERSION file and push the result back as "chore: bump version [skip ci]".
+# Format-aware:
+#   * new "MAJOR.MINOR" scheme (e.g. 1.00) -> minor += 2 (1.00 -> 1.02 -> 1.04);
+#     the MAJOR is NEVER auto-advanced and the bump HOLDS at .98 (a major, X.00,
+#     is set by hand via scripts/set-version.sh across all repos).
+#   * legacy ".NN" counter -> last numeric segment + 1 (until the repo is reset
+#     to MAJOR.MINOR at cutover, when it auto-switches to the branch above).
+# The [skip ci] commit message (plus the head-commit guard below) prevents this
+# workflow from re-triggering itself. workflow_dispatch allows a manual bump.
 on:
   push:
     branches: [main]
@@ -44,13 +49,22 @@ jobs:
           import re, sys
           p = sys.argv[1]
           s = open(p).read().strip()
-          nums = list(re.finditer(r'\d+', s))
-          if not nums:
-              sys.exit(0)          # no numeric segment -> leave unchanged
-          last = nums[-1]
-          width = len(last.group())
-          val = int(last.group()) + 1
-          news = s[:last.start()] + str(val).zfill(width) + s[last.end():]
+          m = re.match(r'^(\d+)\.(\d+)$', s)   # new MAJOR.MINOR scheme
+          if m:
+              major, minor = int(m.group(1)), int(m.group(2))
+              width = max(2, len(m.group(2)))
+              new_minor = minor + 2
+              if new_minor > 98:               # never auto-cross a major; X.00 is set by hand
+                  sys.exit(0)
+              news = f"{major}.{str(new_minor).zfill(width)}"
+          else:                                 # legacy ".NN" (or other) -> last-segment + 1
+              nums = list(re.finditer(r'\d+', s))
+              if not nums:
+                  sys.exit(0)                   # no numeric segment -> leave unchanged
+              last = nums[-1]
+              width = len(last.group())
+              val = int(last.group()) + 1
+              news = s[:last.start()] + str(val).zfill(width) + s[last.end():]
           open(p, 'w').write(news + '\n')
           print(news)
           PY
