@@ -447,6 +447,16 @@ class ProxmoxSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": "No agent resolved for SHELL_START"}
             if session_id:
                 self.shell_sessions[session_id] = agent_id
+                # Phase 2: register the relay token so a co-located edge proxy can
+                # attach a /ws/console-relay leg for this shell session (same path
+                # as VNC — agent_hosting forwards SHELL_* down + routes SHELL_ up).
+                relay_token = data.get("relay_token")
+                if relay_token and hasattr(self.control_plane, "register_console_relay"):
+                    try:
+                        self.control_plane.register_console_relay(
+                            session_id, relay_token, agent_id, "shell")
+                    except Exception:  # noqa: BLE001
+                        pass
             return await self.control_plane.send_to_agent(
                 "SHELL_START", data, agent_id=agent_id, timeout=20.0)
 
@@ -460,6 +470,8 @@ class ProxmoxSpoke(BaseSpoke):
         if cmd == "SHELL_DISCONNECT":
             session_id = data.get("session_id") or ""
             agent_id = self.shell_sessions.pop(session_id, None)
+            if hasattr(self.control_plane, "unregister_console_relay"):
+                self.control_plane.unregister_console_relay(session_id)
             if agent_id:
                 await self.control_plane.send_raw_to_agent(agent_id, "SHELL_DISCONNECT", data)
             return {"status": "OK"}
