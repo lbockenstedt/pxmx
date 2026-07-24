@@ -386,6 +386,18 @@ class ProxmoxSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": "No agent resolved for VNC_START"}
             if session_id:
                 self.vnc_sessions[session_id] = agent_id
+                # Phase 2: register the per-session relay token so a co-located edge
+                # proxy can attach a /ws/console-relay leg (validated by the token)
+                # and carry console bytes straight to this spoke (hub out of the
+                # byte path). Additive — no-op when there's no relay_token/proxy.
+                relay_token = data.get("relay_token")
+                if relay_token and self.control_plane and hasattr(
+                        self.control_plane, "register_console_relay"):
+                    try:
+                        self.control_plane.register_console_relay(
+                            session_id, relay_token, agent_id, "vnc")
+                    except Exception:  # noqa: BLE001
+                        pass
             # Request/response (NOT send_raw_to_agent): the agent opens the
             # Proxmox vncwebsocket synchronously and returns the ticket, which
             # doubles as the RFB VNC password the browser's noVNC must present.
@@ -406,6 +418,8 @@ class ProxmoxSpoke(BaseSpoke):
         if cmd == "VNC_DISCONNECT":
             session_id = data.get("session_id") or ""
             agent_id = self.vnc_sessions.pop(session_id, None)
+            if hasattr(self.control_plane, "unregister_console_relay"):
+                self.control_plane.unregister_console_relay(session_id)
             if agent_id:
                 await self.control_plane.send_raw_to_agent(agent_id, "VNC_DISCONNECT", data)
             return {"status": "OK"}
