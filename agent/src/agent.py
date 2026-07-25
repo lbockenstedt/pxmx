@@ -1888,11 +1888,27 @@ class ProxmoxAgent:
                         # The cs spoke computes {vmid: [sim- tags]} from the client
                         # registry and sends it here; we apply via local qm/pct so
                         # tagging never PUTs to the API (was storming CS telemetry).
-                        try:
-                            result = await pve_cmds.apply_sim_tags(
-                                data.get("tags") or {})
-                        except Exception as e:
-                            result = {"status": "ERROR", "message": str(e)}
+                        #
+                        # NON-BLOCKING + single-flight. Applying tags is several
+                        # `qm/pct set` (each up to 30s) + a `pvesh` read; awaiting
+                        # that inline would stall this SERIAL receive loop
+                        # (`async for message`), delaying clone/delete/telemetry —
+                        # that block was the original "agent stuck setting labels"
+                        # stall. Run it as a background task and ACK immediately;
+                        # skip if a prior apply is still running (the spoke re-
+                        # dispatches the latest desired map on the next change, so
+                        # tags never fall behind). apply_sim_tags is idempotent and
+                        # best-effort per VM, so a dropped/failed run self-heals.
+                        _prev = getattr(self, "_sim_tag_apply_task", None)
+                        if _prev is not None and not _prev.done():
+                            result = {"status": "ACCEPTED", "skipped": "in_progress"}
+                        else:
+                            _task = asyncio.create_task(
+                                pve_cmds.apply_sim_tags(data.get("tags") or {}))
+                            self._sim_tag_apply_task = _task
+                            self._cs_long_ops.add(_task)
+                            _task.add_done_callback(self._cs_long_ops.discard)
+                            result = {"status": "ACCEPTED"}
 
                     elif cmd_type == "PXMX_CLONE_VM":
                         # Clone-from-template: any tenant may clone a VM that
