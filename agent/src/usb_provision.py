@@ -909,6 +909,58 @@ async def _guest_sees_dongle(vid: int, vidpid) -> "Optional[bool]":
         return None
 
 
+async def _guest_health_probe(vid: int) -> "Optional[Dict[str, bool]]":
+    """READ-ONLY in-guest health probe over QGA — the connectivity/driver signals
+    the host and the hub API can't see. Returns a dict of booleans, or None when
+    the guest agent isn't responding (caller must NOT escalate on a blind guess).
+    Each check is a shell one-liner whose EXIT CODE is the signal
+    (qm_guest_exec_shell returns rc==0):
+      netdev_present : a wl* (wifi dongle) netdev exists → the driver is loaded &
+                       bound. FALSE = USB enumerated but NO netdev = driver not
+                       loaded (the reboot-fixes-it case; the "flag it" state).
+      associated     : the default route rides a wl* iface → the dongle associated.
+      gateway_ok     : the default gateway answers a ping → real L3 connectivity.
+      driver_crash   : recent dmesg shows a wifi firmware crash / mass deauth →
+                       a reboot/reclone won't help; swap/quarantine the dongle.
+    This is exactly the signal set that closes the "lsusb-visible but not working"
+    hole (driver unbound / never associated / associated-but-no-gateway)."""
+    from . import pve_cmds
+    checks = {
+        "netdev_present": "ls /sys/class/net 2>/dev/null | grep -qE '^wl'",
+        "associated":     "ip route show default 2>/dev/null | grep -qE 'dev wl'",
+        "gateway_ok":     "ping -c1 -W2 \"$(ip route 2>/dev/null | awk '/default/{print $3; exit}')\" >/dev/null 2>&1",
+        "driver_crash":   "dmesg 2>/dev/null | tail -300 | grep -qiE 'firmware crash|deauthenticat|rtw.*fail|rtl8.*firmware'",
+    }
+    try:
+        if not await pve_cmds.qm_agent_ping(vid):
+            return None
+        out: "Dict[str, bool]" = {}
+        for name, script in checks.items():
+            out[name] = bool(await pve_cmds.qm_guest_exec_shell(
+                vid, script, exec_timeout=15, outer_timeout=25))
+        return out
+    except Exception:  # noqa: BLE001 — QGA hiccup → 'unknown', skip
+        return None
+
+
+def _classify_guest_health(probe) -> str:
+    """Map a _guest_health_probe result to a state + the remediation it implies:
+      unknown    (QGA down)                → never escalate blind
+      no_driver  (USB present, no netdev)  → reboot (cheap) / flag in UI
+      no_assoc   (netdev up, not associated) → dongle/RF suspect → reclone/swap
+      no_gateway (associated, no L3)       → INFRA problem → ALARM, do NOT reclone
+      healthy."""
+    if probe is None:
+        return "unknown"
+    if not probe.get("netdev_present"):
+        return "no_driver"
+    if not probe.get("associated"):
+        return "no_assoc"
+    if not probe.get("gateway_ok"):
+        return "no_gateway"
+    return "healthy"
+
+
 def _usb_port_reset(bus: str) -> bool:
     """Host-side USB reset — de-authorize then re-authorize the device so it
     re-enumerates (the guest's usb-host sees a re-plug). Best-effort."""
@@ -980,7 +1032,17 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             continue                                   # QGA down — can't tell
         if seen:
             dirty = health.pop(bus, None) is not None or dirty
-            continue                                   # healthy
+            # lsusb-visible does NOT mean WORKING — the dongle can be enumerated but
+            # have no driver bound, never associate, or associate with no gateway,
+            # all of which pass the lsusb check and would otherwise run broken
+            # forever. Deeper READ-ONLY probe surfaces those states. Log only for
+            # now (no escalation off these signals yet — that's the next step).
+            _hp = await _guest_health_probe(vid)
+            _hs = _classify_guest_health(_hp)
+            if _hs not in ("healthy", "unknown"):
+                logger.warning("dongle health: VM %s bus %s lsusb-visible but %s "
+                               "(probe=%s)", vid, bus, _hs, _hp)
+            continue                                   # lsusb-visible
         h = health.setdefault(bus, {"fails": 0, "last_attempt": 0.0, "stage": ""})
         if now - float(h.get("last_attempt", 0)) < _HEALTH_ATTEMPT_COOLDOWN_S:
             continue                                   # cooling down
