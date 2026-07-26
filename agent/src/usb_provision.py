@@ -288,6 +288,10 @@ _HEALTH_LADDER_VISIBLE = ["reboot", "reclone", "quarantine"]
 # can span a probe or two; ~3 probes (~15 min sustained) outlasts any burst +
 # its AIMD recovery, so an expected flood never false-flags a healthy dongle.
 _VISIBLE_CONFIRM = int(os.environ.get("LM_PXMX_HEALTH_VISIBLE_CONFIRM", "3") or 3)
+# Max hostname re-stamp+reboot attempts before the audit gives up on a VM (so a
+# box that can't take the stamp doesn't reboot-loop). Past the cap it's logged at
+# ERROR for an operator (reclone territory).
+_HOSTNAME_FIX_MAX = int(os.environ.get("LM_PXMX_HOSTNAME_FIX_MAX", "3") or 3)
 
 # First (immediate) post-clone reboot settle window: once the freshly-cloned
 # guest's QGA agent first answers, let the box run at least this long before
@@ -661,6 +665,21 @@ def _vm_name(vmid: int) -> Optional[str]:
         except (OSError, json.JSONDecodeError):
             _VM_NAMES = {}
     return _VM_NAMES.get(str(vmid))
+
+
+def _hostname_stamp_script(name: str) -> str:
+    """In-guest hostname stamp: write /etc/hostname + /etc/hosts and PIN cloud-init
+    ``preserve_hostname`` so a later cloud-init pass can't revert it. Deliberately
+    writes files instead of ``hostnamectl`` (D-Bus may be unready post-boot and can
+    hang). Shared by the initial-clone stamp, the reclone stamp, AND the hostname
+    audit re-stamp so all three write IDENTICALLY."""
+    return (
+        f"echo '{name}' > /etc/hostname; "
+        f"sed -i 's/^127\\.0\\.1\\.1.*/127.0.1.1\\t{name}/' /etc/hosts 2>/dev/null || true; "
+        "mkdir -p /etc/cloud/cloud.cfg.d; "
+        "echo 'preserve_hostname: true' > /etc/cloud/cloud.cfg.d/99_preserve_hostname.cfg; "
+        "rm -f /var/lib/cloud/sem/config_set_hostname 2>/dev/null || true"
+    )
 
 
 def current_provision_loop_running() -> bool:
@@ -1180,6 +1199,86 @@ def current_guest_health() -> "Dict[str, str]":
         return out
     except Exception:  # noqa: BLE001
         return {}
+
+
+async def hostname_audit_and_restamp(agent) -> int:
+    """Audit each running managed VM's IN-GUEST hostname against its expected
+    identity (``_vm_name(vmid)`` from vm_names.json) and re-stamp + reboot any
+    whose clone-time stamp silently failed — the guest still carries the TEMPLATE
+    hostname (e.g. ``sim-rpi-0000``). A mis-named clone never matches its
+    registered client, so it gets no sim tags and reports the wrong identity;
+    this converges it. The Proxmox config name (``qm clone --name``) is set
+    separately and stays correct, so it CAN'T be trusted as the actual hostname —
+    we ask the guest over QGA.
+
+    Fire-and-forget: re-stamp (idempotent) then reboot to apply; the NEXT pass
+    verifies (non-blocking — never waits out a reboot). Throttled per VM via
+    ``usb_state['hostname_fix']`` {attempts,last} and capped at _HOSTNAME_FIX_MAX
+    so a box that can't take the stamp doesn't reboot-loop (past the cap: ERROR
+    for an operator, reclone territory). Never raises. Returns VMs re-stamped."""
+    import time as _t
+    from . import pve_cmds
+    st = load_usb_state()
+    b2v = st.get("bus_to_vmid") or {}
+    fixes = st.setdefault("hostname_fix", {})
+    now = _t.time()
+    acted = 0
+    dirty = False
+    for bus, vmid in list(b2v.items()):
+        try:
+            vid = int(vmid)
+        except (TypeError, ValueError):
+            continue
+        expected = _vm_name(vid)
+        if not expected:
+            continue                                   # unmapped vmid — no identity to enforce
+        rec = fixes.get(str(vid)) or {}
+        if int(rec.get("attempts", 0)) >= _HOSTNAME_FIX_MAX:
+            continue                                   # gave up — operator/reclone territory
+        if now - float(rec.get("last", 0)) < _HEALTH_ATTEMPT_COOLDOWN_S:
+            continue                                   # let a just-fired reboot come back
+        try:
+            if not await pve_cmds.qm_agent_ping(vid):
+                continue                               # QGA down — can't audit
+            # Hostname correct? Express the compare AS a shell exit code so the
+            # bool return of qm_guest_exec_shell is the answer (0 = matches).
+            ok = await pve_cmds.qm_guest_exec_shell(
+                vid, f'[ "$(hostname)" = "{expected}" ]',
+                exec_timeout=15, outer_timeout=25)
+            if ok is None or ok:
+                dirty = fixes.pop(str(vid), None) is not None or dirty  # clear any strike
+                continue
+            # MISMATCH → re-stamp the correct hostname, then reboot to apply.
+            attempts = int(rec.get("attempts", 0)) + 1
+            logger.warning("hostname audit: VM %s wrong in-guest hostname (expected "
+                           "'%s') — re-stamp + reboot (attempt %d/%d)",
+                           vid, expected, attempts, _HOSTNAME_FIX_MAX)
+            stamped = False
+            for _ in range(3):
+                if await pve_cmds.qm_guest_exec_shell(
+                        vid, _hostname_stamp_script(expected),
+                        exec_timeout=60, outer_timeout=90):
+                    stamped = True
+                    break
+                await asyncio.sleep(3)
+            if stamped:
+                try:
+                    await pve_cmds.qm_guest_exec(vid, "reboot")  # fire-and-forget (agent dies)
+                except Exception:  # noqa: BLE001
+                    pass
+                acted += 1
+            fixes[str(vid)] = {"attempts": attempts, "last": now,
+                               "expected": expected, "stamped": stamped}
+            dirty = True
+            if attempts >= _HOSTNAME_FIX_MAX:
+                logger.error("hostname audit: VM %s still misnamed after %d re-stamp "
+                             "attempts — needs operator/reclone (expected '%s')",
+                             vid, attempts, expected)
+        except Exception as e:  # noqa: BLE001 — one bad VM never sinks the audit
+            logger.warning("hostname audit: VM %s check/restamp failed: %s", vid, e)
+    if dirty:
+        save_usb_state(st)
+    return acted
 
 
 # ── USB provision state + quarantine (Phase E) ────────────────────────────
@@ -2113,6 +2212,20 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         except Exception as e:  # noqa: BLE001 — watchdog must never sink the pass
             logger.warning("dongle health watchdog failed: %s", e)
 
+    # 5d. Hostname audit — a clone whose in-guest hostname stamp silently failed
+    # keeps the TEMPLATE hostname (e.g. sim-rpi-0000), so it never matches its
+    # registered client (no sim tags, wrong identity). Re-stamp the correct name
+    # (_vm_name(vmid)) + reboot to apply. Same 300s throttle as the health check.
+    if ap_on and (now - float(getattr(agent, "_last_hostname_audit", 0.0))) >= _HEALTH_CHECK_INTERVAL_S:
+        agent._last_hostname_audit = now
+        try:
+            _nfixed = await hostname_audit_and_restamp(agent)
+            if _nfixed:
+                logger.info("hostname audit: re-stamped %d misnamed clone(s)", _nfixed)
+                state = load_usb_state()
+        except Exception as e:  # noqa: BLE001 — audit must never sink the pass
+            logger.warning("hostname audit failed: %s", e)
+
     # 6. VMID-gap audit (every VMID_AUDIT_INTERVAL_S; bypasses delete cooldown).
     #    Compaction: shed the highest VMID above the lowest gap so the next pass
     #    refills the hole — but ONLY when every present dongle is already assigned
@@ -2650,13 +2763,7 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
     # (bash 2025-2036). hostnamectl is deliberately avoided (D-Bus may be
     # unready post-boot and can hang the task). Retry up to 3× like bash.
     dtype = info.get("type", "wireless")
-    host_script = (
-        f"echo '{name}' > /etc/hostname; "
-        f"sed -i 's/^127\\.0\\.1\\.1.*/127.0.1.1\\t{name}/' /etc/hosts 2>/dev/null || true; "
-        "mkdir -p /etc/cloud/cloud.cfg.d; "
-        "echo 'preserve_hostname: true' > /etc/cloud/cloud.cfg.d/99_preserve_hostname.cfg; "
-        "rm -f /var/lib/cloud/sem/config_set_hostname 2>/dev/null || true"
-    )
+    host_script = _hostname_stamp_script(name)
     for _ in range(3):
         if await pve_cmds.qm_guest_exec_shell(vmid, host_script, exec_timeout=60,
                                               outer_timeout=90, protected=protected):

@@ -403,16 +403,16 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
     # Set the hostname inside the guest. Write /etc/hostname + /etc/hosts +
     # cloud-init preserve_hostname via `qm guest exec --timeout 60 -- bash -c`
     # (bash 2025-2036) — hostnamectl is deliberately avoided: it talks D-Bus
-    # which may be unready right after boot and can hang the whole task.
-    host_script = (
-        f"echo '{vm_name}' > /etc/hostname; "
-        f"sed -i 's/^127\\.0\\.1\\.1.*/127.0.1.1\\t{vm_name}/' /etc/hosts 2>/dev/null || true; "
-        "mkdir -p /etc/cloud/cloud.cfg.d; "
-        "echo 'preserve_hostname: true' > /etc/cloud/cloud.cfg.d/99_preserve_hostname.cfg; "
-        "rm -f /var/lib/cloud/sem/config_set_hostname 2>/dev/null || true"
-    )
-    await pve_cmds.qm_guest_exec_shell(vid, host_script, exec_timeout=60,
-                                        outer_timeout=90, protected=prot)
+    # which may be unready right after boot and can hang the whole task. Retry 3×
+    # (was fire-once, return ignored): a single missed exec left the clone with
+    # the TEMPLATE hostname (sim-rpi-0000) → no client match, no sim tags. The
+    # hostname audit (hostname_audit_and_restamp) is the backstop if all 3 miss.
+    host_script = usb_provision._hostname_stamp_script(vm_name)
+    for _ in range(3):
+        if await pve_cmds.qm_guest_exec_shell(vid, host_script, exec_timeout=60,
+                                              outer_timeout=90, protected=prot):
+            break
+        await asyncio.sleep(3)
 
     usb_provision.set_assignment(vid, bus, image_num)
     usb_provision.remove_orphan_vm(vid)

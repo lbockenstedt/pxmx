@@ -97,7 +97,11 @@ def _new_usb_state() -> Dict[str, Any]:
             # Per-bus in-guest health classification from _guest_health_probe
             # (healthy/no_driver/no_assoc/no_gateway/not_visible) — surfaced in
             # CS telemetry so the Hub UI can flag "USB present but no driver", etc.
-            "guest_health": {}}
+            "guest_health": {},
+            # Per-VMID hostname-audit strikes {attempts,last,expected,stamped} —
+            # throttles the re-stamp+reboot of a clone that kept its template
+            # hostname (hostname_audit_and_restamp).
+            "hostname_fix": {}}
 
 
 def load_usb_state() -> Dict[str, Any]:
@@ -133,6 +137,7 @@ def clear_assignment(vmid: int, bus: Optional[str] = None) -> None:
         st.get("guest_health", {}).pop(b, None)
     st["vmid_to_image"].pop(str(int(vmid)), None)
     st.get("post_prov_reboot", {}).pop(str(int(vmid)), None)
+    st.get("hostname_fix", {}).pop(str(int(vmid)), None)
     save_usb_state(st)
 
 
