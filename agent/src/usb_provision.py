@@ -1007,9 +1007,21 @@ async def dongle_health_check_and_recover(agent, present) -> int:
     st = load_usb_state()
     b2v = st.get("bus_to_vmid") or {}
     health = st.setdefault("dongle_health", {})
+    gh = st.setdefault("guest_health", {})   # per-bus in-guest state → CS telemetry
     now = _t.time()
     acted = 0
     dirty = False
+
+    def _set_gh(bus, vid, state, probe=None):
+        """Record the per-bus in-guest health state; dirty only on CHANGE."""
+        nonlocal dirty
+        prev = (gh.get(bus) or {}).get("state")
+        gh[bus] = {"state": state, "probe": probe, "vmid": vid, "at": now}
+        if prev != state:
+            dirty = True
+            if state not in ("healthy",):
+                logger.warning("dongle health: VM %s bus %s → %s (probe=%s)",
+                               vid, bus, state, probe)
     for bus, vmid in list(b2v.items()):
         try:
             vid = int(vmid)
@@ -1019,6 +1031,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
         # case is reclone-on-detach's job, not this one.
         if bus not in present or not _bus_attached(bus):
             dirty = health.pop(bus, None) is not None or dirty
+            dirty = gh.pop(bus, None) is not None or dirty
             continue
         try:
             running = bool((await pve_cmds.vm_status(vid)).get("running"))
@@ -1026,6 +1039,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             running = False
         if not running:
             dirty = health.pop(bus, None) is not None or dirty
+            dirty = gh.pop(bus, None) is not None or dirty
             continue
         seen = await _guest_sees_dongle(vid, present[bus].get("vidpid"))
         if seen is None:
@@ -1035,14 +1049,15 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             # lsusb-visible does NOT mean WORKING — the dongle can be enumerated but
             # have no driver bound, never associate, or associate with no gateway,
             # all of which pass the lsusb check and would otherwise run broken
-            # forever. Deeper READ-ONLY probe surfaces those states. Log only for
-            # now (no escalation off these signals yet — that's the next step).
+            # forever. Deeper READ-ONLY probe surfaces those states + persists them
+            # to CS telemetry (Hub UI flag). Escalation off these signals is a
+            # follow-up; for now the ladder still only reacts to lsusb-invisibility.
             _hp = await _guest_health_probe(vid)
             _hs = _classify_guest_health(_hp)
-            if _hs not in ("healthy", "unknown"):
-                logger.warning("dongle health: VM %s bus %s lsusb-visible but %s "
-                               "(probe=%s)", vid, bus, _hs, _hp)
+            if _hs != "unknown":                       # keep last-known if QGA down
+                _set_gh(bus, vid, _hs, _hp)
             continue                                   # lsusb-visible
+        _set_gh(bus, vid, "not_visible")               # guest can't even lsusb it
         h = health.setdefault(bus, {"fails": 0, "last_attempt": 0.0, "stage": ""})
         if now - float(h.get("last_attempt", 0)) < _HEALTH_ATTEMPT_COOLDOWN_S:
             continue                                   # cooling down
@@ -1067,7 +1082,8 @@ async def dongle_health_check_and_recover(agent, present) -> int:
                 await cs_sim.destroy_vm(agent, vid, bus=bus)
                 b2v.pop(bus, None)
                 (st.get("vmid_to_bus") or {}).pop(str(vid), None)
-                health.pop(bus, None)                  # loop re-provisions a fresh VM
+                health.pop(bus, None)
+                gh.pop(bus, None)                  # loop re-provisions a fresh VM
             elif stage == "quarantine":
                 quarantine_bus(bus, "dongle unrecoverable — guest never saw it after "
                                     "reset/reattach/reboot/reclone")
@@ -1075,6 +1091,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
                 b2v.pop(bus, None)
                 (st.get("vmid_to_bus") or {}).pop(str(vid), None)
                 health.pop(bus, None)
+                gh.pop(bus, None)
                 logger.error("dongle health: bus %s QUARANTINED (unrecoverable) — "
                              "replace/inspect the dongle", bus)
         except Exception as e:  # noqa: BLE001 — one bad recovery never kills the loop
@@ -1082,6 +1099,22 @@ async def dongle_health_check_and_recover(agent, present) -> int:
     if dirty:
         save_usb_state(st)
     return acted
+
+
+def current_guest_health() -> "Dict[str, str]":
+    """``{str(vmid): in-guest health state}`` from ``usb_state.guest_health`` —
+    for stamping the CS telemetry VM rows so the Hub UI can flag a dongle that is
+    lsusb-visible but has no driver / never associated / has no gateway. States:
+    healthy / no_driver / no_assoc / no_gateway / not_visible. Best-effort."""
+    try:
+        out: "Dict[str, str]" = {}
+        for rec in (load_usb_state().get("guest_health") or {}).values():
+            vid, state = rec.get("vmid"), rec.get("state")
+            if vid is not None and state:
+                out[str(vid)] = state
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 # ── USB provision state + quarantine (Phase E) ────────────────────────────

@@ -2583,6 +2583,10 @@ class ProxmoxAgent:
             return name.startswith(("template-", "tmpl-"))
 
         tiers = tiers or {}
+        try:
+            _health = usb_provision.current_guest_health()
+        except Exception:  # noqa: BLE001 — health is advisory; never block a frame
+            _health = {}
         vms = []
         for v in (vms_resp or {}).get("vms", []) or []:
             v = v or {}
@@ -2602,6 +2606,11 @@ class ProxmoxAgent:
                 # csClassifyClient renders the correct badge (T3 especially, which
                 # has no USB dongle and would otherwise fall to the T1 default).
                 "tier":            tiers.get(str(v.get("vmid"))),
+                # In-guest health of this VM's dongle (QGA probe): healthy /
+                # no_driver / no_assoc / no_gateway / not_visible. The cs spoke
+                # maps vmid→client and stamps it on the Clients row so the Hub UI
+                # can flag "USB present but no driver loaded", etc. None = no data.
+                "health":          _health.get(str(v.get("vmid"))),
                 "_agent_hostname": self.hostname,
             })
 

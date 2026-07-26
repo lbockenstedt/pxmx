@@ -93,7 +93,11 @@ def get_orphan_vms() -> List[Dict[str, Any]]:
 def _new_usb_state() -> Dict[str, Any]:
     return {"vmid_to_bus": {}, "bus_to_vmid": {}, "vmid_to_image": {},
             "excluded_buses": {}, "quarantined": {}, "missing_since": {},
-            "vidpid_by_bus": {}, "post_prov_retry": {}, "post_prov_reboot": {}}
+            "vidpid_by_bus": {}, "post_prov_retry": {}, "post_prov_reboot": {},
+            # Per-bus in-guest health classification from _guest_health_probe
+            # (healthy/no_driver/no_assoc/no_gateway/not_visible) — surfaced in
+            # CS telemetry so the Hub UI can flag "USB present but no driver", etc.
+            "guest_health": {}}
 
 
 def load_usb_state() -> Dict[str, Any]:
@@ -126,6 +130,7 @@ def clear_assignment(vmid: int, bus: Optional[str] = None) -> None:
     if b:
         st["bus_to_vmid"].pop(b, None)
         st["missing_since"].pop(b, None)
+        st.get("guest_health", {}).pop(b, None)
     st["vmid_to_image"].pop(str(int(vmid)), None)
     st.get("post_prov_reboot", {}).pop(str(int(vmid)), None)
     save_usb_state(st)
@@ -142,7 +147,7 @@ def clear_recovery_state(bus: Optional[str]) -> None:
         return
     st = load_usb_state()
     changed = False
-    for m in ("detach_reclones", "dongle_health"):
+    for m in ("detach_reclones", "dongle_health", "guest_health"):
         if isinstance(st.get(m), dict) and st[m].pop(bus, None) is not None:
             changed = True
     if changed:
