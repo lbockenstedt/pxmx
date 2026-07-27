@@ -2295,6 +2295,24 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             ceil_hit, usb_resource_gate._provision_halt)
         return {"provisioned": 0, "torn_down": len(torn_down),
                 "reason": _provision_reason}
+
+    # ── T1/T3 FIRST — PCI-passthrough the controller cards before the T2 USB pass ──
+    # A T1/T3 device is a PCI USB controller with the sim dongle plugged into it.
+    # Passing the WHOLE controller through removes that dongle from the HOST usb
+    # bus, so the T2 dongle scan below can't grab it — and the host cannot PCI-pass
+    # a controller whose dongle a T2 VM already holds via usb passthrough, so T1/T3
+    # MUST be provisioned first. The count of present controllers is the natural cap
+    # (each maps to exactly one VM). Same clone-source template as T2 for now
+    # (dedicated t1/t3 images come later). Runs under the same toggle + resource
+    # gate; a no-op when no t1/t3_pci_vidpids are configured.
+    pci_provisioned = 0
+    if ap_on and images:
+        _pci_tpl = images[0]["template"]
+        pci_provisioned += await _provision_pci_tier(agent, "t1", _t1_pci_vidpids(agent), _pci_tpl, start, end)
+        pci_provisioned += await _provision_pci_tier(agent, "t3", _t3_pci_vidpids(agent), _pci_tpl, start, end)
+        if pci_provisioned:
+            logger.info("auto-provision: provisioned %d T1/T3 PCI VM(s) this tick", pci_provisioned)
+
     if _prov_run.get("running"):
         # Stuck-run watchdog: a prior pass that never completed (a clone/reclaim
         # hung) leaves _prov_run.running=True, which would short-circuit this and
@@ -2313,7 +2331,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         else:
             _provision_reason = "prov_run active"
             logger.info("auto-provision gate: prov_run already active — skipping trigger")
-            return {"provisioned": 0, "torn_down": len(torn_down),
+            return {"provisioned": pci_provisioned, "torn_down": len(torn_down),
                     "reason": "prov_run active"}
     active_usb_vms = len(state["vmid_to_bus"])
     _provision_cfg_snapshot["active_usb_vms"] = active_usb_vms
@@ -2321,7 +2339,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         _provision_reason = "slot cap reached"
         logger.info("auto-provision: slot cap reached (%d >= %d) — stop provisioning",
                     active_usb_vms, max_slots)
-        return {"provisioned": 0, "torn_down": len(torn_down),
+        return {"provisioned": pci_provisioned, "torn_down": len(torn_down),
                 "reason": "slot cap reached"}
 
     # Provisioning pass: pick unassigned, non-excluded, non-quarantined dongles
@@ -2371,7 +2389,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             detail = f"none match sim_phy={sim_phy}"
         _provision_reason = f"no eligible dongles ({detail})"
         logger.info("auto-provision: no eligible dongles (%s)", detail)
-        return {"provisioned": 0, "torn_down": len(torn_down)}
+        return {"provisioned": pci_provisioned, "torn_down": len(torn_down)}
 
     existing_after = set(await pve_cmds.list_all_vmids())
     img1_count = sum(1 for v in state["vmid_to_image"].values() if v == 1)
@@ -2628,7 +2646,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                              f"{provisioned}, cancelled {cancelled} of {len(ordered)}")
     else:
         _provision_reason = f"provisioning: attempted {len(ordered)}, provisioned {provisioned}"
-    return {"provisioned": provisioned, "torn_down": len(torn_down),
+    return {"provisioned": provisioned + pci_provisioned, "torn_down": len(torn_down),
             "attempted": len(ordered), "cancelled": cancelled}
 
 
@@ -2723,6 +2741,143 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
     except Exception as e:  # noqa: BLE001
         logger.warning("auto-provision vmid-gap audit: delete %s failed: %s",
                        target, e)
+
+
+def _pci_short(addr: str) -> str:
+    """Normalize a PCI address to its domain-less short form (``01:00.0``) so
+    full-domain (``0000:01:00.0``) and short forms compare equal."""
+    a = str(addr or "").strip().lower()
+    return a[5:] if a.startswith("0000:") else a
+
+
+async def _pci_addrs_in_use(agent) -> Set[str]:
+    """Short-form PCI addresses already attached to ANY VM (its ``hostpciN``
+    lines) — so the T1/T3 provisioner never double-passes a controller."""
+    from . import pve_cmds
+    used: Set[str] = set()
+    try:
+        vmids = await pve_cmds.list_all_vmids()
+    except Exception:  # noqa: BLE001
+        return used
+    for vid in vmids:
+        try:
+            cfg = await pve_cmds.qm_config(vid)
+        except Exception:  # noqa: BLE001
+            continue
+        for k, v in (cfg or {}).items():
+            if str(k).startswith("hostpci"):
+                addr = str(v).split(",")[0].strip()
+                if addr:
+                    used.add(_pci_short(addr))
+    return used
+
+
+async def _free_pci_controllers(agent, pci_vidpids) -> List[tuple]:
+    """Present T1/T3 controllers NOT yet passed through to any VM.
+
+    Returns ``[(full_domain_addr, vidpid)]`` — the addr in the form
+    ``qm set -hostpciN`` expects. Empty when none configured/present."""
+    from . import pve_cmds
+    present = await pve_cmds.list_host_pci_by_vidpid(pci_vidpids)  # {addr: vidpid}
+    if not present:
+        return []
+    used = await _pci_addrs_in_use(agent)
+    return [(addr, vp) for addr, vp in present.items() if _pci_short(addr) not in used]
+
+
+async def _clone_and_provision_pci(agent, vmid: int, pci_addr: str, vidpid: str,
+                                   template: int, tier: str) -> bool:
+    """Clone ``template`` → ``vmid`` and PCI-passthrough the whole T1/T3 controller
+    at ``pci_addr`` (the sim dongle plugged into it comes with the card). Mirrors
+    ``_clone_and_provision`` but attaches ``-hostpci0`` instead of ``-usb0`` and
+    keeps NO usb_state — a T1/T3 VM is identified by its hostpci vidpid via
+    ``compute_vm_tiers`` and protected by the delete gate, so no bus tracking is
+    needed. NOTE: the clone-source template must be q35 + IOMMU-ready for hostpci
+    to attach; validate on the host. Returns True if cloned + started."""
+    from . import pve_cmds
+    protected = _protected_vmids(agent)
+    name = _vm_name(vmid) or f"sim-{vmid}-{tier}"
+    await pve_cmds.qm_clone(template, vmid, name, protected=protected, timeout=600)
+    await pve_cmds.qm_set(vmid, "--onboot", "1", "--startup", "order=2,up=60", protected=protected)
+    await pve_cmds.qm_set(vmid, "-hostpci0", f"{pci_addr},pcie=1", protected=protected)
+    vlan = (agent.config.get("client_simulation") or {}).get("usb_config", {}).get("vlan_nic")
+    if vlan:
+        await pve_cmds.qm_set(vmid, "-net0", f"virtio,bridge={vlan}", protected=protected)
+    await pve_cmds.qm_start(vmid, protected=protected)
+    logger.info("provision loop: %s VM %s cloned + PCI passthrough %s (%s)",
+                tier.upper(), vmid, pci_addr, vidpid)
+    # Guest-agent wait + hostname stamp (same bounded pattern as the USB path).
+    agent_up_at = None
+    for _ in range(40):
+        if await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10):
+            agent_up_at = time.time()
+            break
+        await asyncio.sleep(5)
+    for _ in range(3):
+        if await pve_cmds.qm_guest_exec_shell(vmid, _hostname_stamp_script(name),
+                                              exec_timeout=60, outer_timeout=90, protected=protected):
+            break
+        await asyncio.sleep(5)
+    remove_orphan_vm(vmid)
+    # Settle then the first post-clone reboot + update.sh (mirrors the USB path;
+    # no +15-min settle-reboot queue since that rides usb_state, which T1/T3 skip).
+    if agent_up_at is not None:
+        remaining = _FIRST_REBOOT_SETTLE_S - (time.time() - agent_up_at)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+    try:
+        await pve_cmds.qm_guest_exec(vmid, "reboot", protected=protected)
+    except Exception:  # noqa: BLE001
+        pass
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        await asyncio.sleep(5)
+        if await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10):
+            try:
+                await pve_cmds.qm_guest_exec_shell(vmid, "bash /usr/local/scripts/update.sh",
+                                                   exec_timeout=300, outer_timeout=360, protected=protected)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("provision loop: update.sh failed on %s VM %s: %s", tier.upper(), vmid, e)
+            break
+    return True
+
+
+async def _provision_pci_tier(agent, tier: str, pci_vidpids, template: int,
+                              start: int, end: int) -> int:
+    """Provision one T1/T3 VM per FREE controller (the physical device count is the
+    natural cap). Allocates the lowest free VMID in the guarded [start,end] block
+    (above the 90000 floor, skipping PROTECTED + in-use ids). Returns the count."""
+    from . import pve_cmds
+    if not pci_vidpids or not template:
+        return 0
+    free = await _free_pci_controllers(agent, pci_vidpids)
+    if not free:
+        return 0
+    protected = _protected_vmids(agent)
+    try:
+        in_use = set(await pve_cmds.list_all_vmids())
+    except Exception:  # noqa: BLE001
+        in_use = set()
+    provisioned = 0
+    for addr, vidpid in free:
+        vmid = None
+        for cand in range(int(start), int(end) + 1):
+            if cand < _VMID_DEFAULT_START or cand in in_use or cand in protected:
+                continue
+            vmid = cand
+            in_use.add(cand)
+            break
+        if vmid is None:
+            logger.warning("provision loop: %s — no free VMID in %s-%s for controller %s",
+                           tier.upper(), start, end, addr)
+            break
+        try:
+            await _clone_and_provision_pci(agent, vmid, addr, vidpid, template, tier)
+            provisioned += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("provision loop: %s clone failed for controller %s: %s",
+                           tier.upper(), addr, e)
+    return provisioned
 
 
 async def _clone_and_provision(agent, vmid: int, bus: str,
