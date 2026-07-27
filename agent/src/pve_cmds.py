@@ -137,6 +137,35 @@ async def is_template(vmid: Any, kind: Optional[str] = None) -> bool:
 # the process (an agent restart naturally rebuilds it). Only SUCCESSFUL
 # resolutions are cached: a None (miss / transient lspci failure) is NOT stored,
 # so it self-heals on the next call instead of permanently mis-tiering the VM.
+async def list_host_pci_by_vidpid(vidpids) -> Dict[str, str]:
+    """Enumerate PRESENT host PCI functions whose ``vvvv:pppp`` is in ``vidpids``.
+
+    Returns ``{pci_addr: vidpid}`` with FULL-domain addresses (e.g.
+    ``0000:01:00.0``) — the form ``qm set -hostpciN`` expects. This is the inverse
+    of ``pci_passthrough_vidpids`` (which reads a VM's attached devices): here we
+    scan the HOST so the provisioner can find T1/T3 controllers to pass through.
+    Empty on any failure (best-effort, never raises)."""
+    want = {str(v).strip().lower() for v in (vidpids or ()) if v}
+    out: Dict[str, str] = {}
+    if not want:
+        return out
+    # -D: full-domain addresses; -n: numeric vendor:device (no name lookup).
+    rc, o, _ = await _run(["lspci", "-Dn"], check=False, timeout=15)
+    if rc != 0:
+        return out
+    for line in o.decode(errors="replace").lower().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        addr = parts[0]  # e.g. "0000:01:00.0"
+        # The class code ("0280:") is 4hex+colon+SPACE; the vendor:device is the
+        # contiguous 4hex:4hex token after it — same shape _lspci_vidpid matches.
+        m = re.search(r"\b([0-9a-f]{4}:[0-9a-f]{4})\b", line[len(addr):])
+        if m and m.group(1) in want:
+            out[addr] = m.group(1)
+    return out
+
+
 _lspci_vidpid_cache: Dict[str, str] = {}
 
 
