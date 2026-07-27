@@ -180,6 +180,27 @@ def _t3_pci_vidpids(agent) -> Set[str]:
     return _pci_vidpid_set(_usb_cfg(agent).get("t3_pci_vidpids"))
 
 
+def _host_t1_excluded(agent) -> bool:
+    """Per-host T1 opt-out. A host in ``usb_config.t1_exclude_hosts`` does NOT get
+    its T1 controller PCI-passed — e.g. a T1 card wired to USB HUBS that you want
+    used in HUB MODE, so the dongles on it stay on the host USB bus and pass
+    through individually as T2/USB clients instead of the whole card → one T1 VM.
+
+    Match is case-insensitive, exact OR prefix (so 'sim-svr-05' matches a full
+    hostname 'sim-svr-05' and a prefix like 'sim-svr-05-...'). Empty list = every
+    host with a matching controller runs T1 (the default)."""
+    hn = (getattr(agent, "hostname", "") or "").strip().lower()
+    if not hn:
+        return False
+    raw = _usb_cfg(agent).get("t1_exclude_hosts")
+    items = raw if isinstance(raw, list) else str(raw or "").replace(",", " ").split()
+    for h in items:
+        entry = str(h or "").strip().lower()
+        if entry and (hn == entry or hn.startswith(entry)):
+            return True
+    return False
+
+
 # Cache the per-VM tier map — passthrough rarely changes, and resolving PCI
 # (qm config + lspci) for every VM on each ~60s telemetry tick is wasteful.
 _vm_tier_cache: Dict[str, Any] = {"ts": 0.0, "tiers": {}}
@@ -2308,7 +2329,15 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     pci_provisioned = 0
     if ap_on and images:
         _pci_tpl = images[0]["template"]
-        pci_provisioned += await _provision_pci_tier(agent, "t1", _t1_pci_vidpids(agent), _pci_tpl, start, end)
+        # Per-host T1 opt-out: an excluded host keeps its T1 controller in HUB MODE —
+        # skip the PCI pass so its dongles stay on the USB bus and the T2 pass below
+        # picks them up as individual USB clients.
+        if _host_t1_excluded(agent):
+            logger.info("auto-provision: host %s in t1_exclude_hosts — skipping T1 (hub "
+                        "mode: dongles pass through as T2/USB instead of PCI)",
+                        getattr(agent, "hostname", "?"))
+        else:
+            pci_provisioned += await _provision_pci_tier(agent, "t1", _t1_pci_vidpids(agent), _pci_tpl, start, end)
         pci_provisioned += await _provision_pci_tier(agent, "t3", _t3_pci_vidpids(agent), _pci_tpl, start, end)
         if pci_provisioned:
             logger.info("auto-provision: provisioned %d T1/T3 PCI VM(s) this tick", pci_provisioned)
