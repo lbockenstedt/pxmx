@@ -378,6 +378,11 @@ class ProxmoxAgent:
         # can resume client-simulation mode immediately instead of idling until
         # the hub re-pushes UPDATE_CONFIG. Refreshed on every UPDATE_CONFIG.
         self.config: Dict[str, Any] = self._load_persisted_config()
+        # True once the hub (re)confirms client_simulation config THIS session (an
+        # UPDATE_CONFIG carrying client_simulation). The USB-provision loop waits for
+        # this before acting so it never provisions on a stale cached toggle — e.g.
+        # auto-prov turned OFF while this spoke was down (the cache still says ON).
+        self._cs_config_synced: bool = False
         self.signer = MessageSigner(self.secret or "")
         self.hostname = socket.gethostname()
         self.agent_type = "pxmx-agent"
@@ -1752,6 +1757,11 @@ class ProxmoxAgent:
                         # Persist the MERGED config so a restart resumes from the
                         # full last-known config (not just the last partial push).
                         self._save_persisted_config(self.config)
+                        # The hub has (re)confirmed CS config this session — release
+                        # the USB-provision loop's startup guard so it can act on a
+                        # toggle we KNOW is current, not a possibly-stale cache.
+                        if "client_simulation" in (data or {}):
+                            self._cs_config_synced = True
                         new_cs = bool((self.config.get("client_simulation") or {}).get("enabled"))
                         if old_cs != new_cs:
                             await self._set_cs_enabled(new_cs)
@@ -2769,7 +2779,27 @@ class ProxmoxAgent:
             interval = max(15, int(os.environ.get("USB_PROVISION_INTERVAL_S", "60")))
         except Exception:
             pass
-        await asyncio.sleep(10)  # let the first telemetry/config settle
+        # Guard: never provision on a STALE cached toggle. Wait for the hub to
+        # (re)confirm config this session (an UPDATE_CONFIG carrying
+        # client_simulation) before the first provision pass. If it doesn't within
+        # USB_PROVISION_CONFIG_WAIT_S (default 300), proceed on cached config with a
+        # warning so a genuinely hub-offline host still auto-provisions eventually.
+        # Replaces the old fixed 10s settle, which raced the hub's reconnect push
+        # and provisioned VMs on the stale toggle before the fresh OFF arrived.
+        cfg_wait_s = 300
+        try:
+            cfg_wait_s = max(0, int(os.environ.get("USB_PROVISION_CONFIG_WAIT_S", "300")))
+        except Exception:
+            pass
+        waited = 0.0
+        while not self._cs_config_synced and waited < cfg_wait_s:
+            await asyncio.sleep(2)
+            waited += 2
+        if self._cs_config_synced:
+            logger.info("usb_provision: hub config confirmed after %.0fs — starting provision passes", waited)
+        else:
+            logger.warning("usb_provision: hub config NOT confirmed after %ds — proceeding on cached config; "
+                           "auto-provision may act on stale settings until the hub reconnects", cfg_wait_s)
         while True:
             try:
                 # Feed the rolling 1h cpu/mem window the auto-provision brain
