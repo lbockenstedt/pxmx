@@ -180,6 +180,24 @@ def _t3_pci_vidpids(agent) -> Set[str]:
     return _pci_vidpid_set(_usb_cfg(agent).get("t3_pci_vidpids"))
 
 
+async def cs_pci_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
+    """Present host PCI devices matching the T1/T3 allow-lists — for the WebUI PCI
+    tab. Returns ``{'t1_pci_devices': [...], 't3_pci_devices': [...]}``, each a list
+    of ``{address, vidpid, name}`` (the agent's ``_run`` shells out to lspci, so
+    this is async). Best-effort — empty list on any failure, never raises."""
+    from . import pve_cmds
+    out: Dict[str, List[Dict[str, Any]]] = {"t1_pci_devices": [], "t3_pci_devices": []}
+    for key, vidpids in (("t1_pci_devices", _t1_pci_vidpids(agent)),
+                         ("t3_pci_devices", _t3_pci_vidpids(agent))):
+        try:
+            found = await pve_cmds.list_host_pci_by_vidpid(vidpids)  # {addr: vidpid}
+            out[key] = [{"address": a, "vidpid": v, "name": v}
+                        for a, v in sorted(found.items())]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("cs_pci_telemetry %s failed: %s", key, e)
+    return out
+
+
 def _host_t1_excluded(agent) -> bool:
     """Per-host T1 opt-out. A host in ``usb_config.t1_exclude_hosts`` does NOT get
     its T1 controller PCI-passed — e.g. a T1 card wired to USB HUBS that you want
