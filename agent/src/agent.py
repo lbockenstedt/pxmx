@@ -1228,23 +1228,59 @@ class ProxmoxAgent:
         try:
             backup_dir = ur.snapshot_code(install_dir, ts, tree_list=["src"],
                                           state_dir=AGENT_STATE_DIR)
+            # Verify the snapshot captured a COMPLETE tree before trusting it as a
+            # rollback target. A truncated snapshot (the cs-svr-05 20:40 corruption)
+            # is worse than no update — it strands rollback on broken code. If we
+            # can't take a valid snapshot we ABORT the update (return) rather than
+            # swap in new code with no way back; the next cycle retries.
+            _snap = pathlib.Path(backup_dir) / "src" / "agent.py"
+            if not (_snap.is_file()
+                    and "async def run(self)" in _snap.read_text(errors="replace")):
+                logger.error("pre-update snapshot at %s is INCOMPLETE (src/agent.py "
+                             "missing/truncated) — aborting update to keep a valid "
+                             "rollback point; retrying next cycle.", backup_dir)
+                return
             ur.write_pending(backup_dir, from_version=current, to_version=new_ver,
                              ts=ts, state_dir=AGENT_STATE_DIR,
                              extra={"service_unit": "lm-pxmx-agent", "deadline": 90})
         except Exception as e:
-            logger.warning(f"pre-update snapshot failed (rollback disabled): {e}")
+            logger.error("pre-update snapshot failed (%s) — aborting update to keep "
+                         "a valid rollback point; retrying next cycle.", e)
+            return
         src = pathlib.Path(repo_dir) / "agent"
         dst = pathlib.Path(install_dir)
+        # ATOMIC per-item swap. The old code did `rmtree(dest)` then an in-place
+        # `copytree` — if the update was interrupted mid-copytree (killed, OOM,
+        # host bounce) it left a PARTIAL src/ tree that bricked startup (the
+        # cs-svr-05 0.09 crash-loop: a truncated agent.py whose run() returned
+        # immediately). Now each item is built under a `.new-<pid>` temp path
+        # FULLY first (dest untouched), then renamed into place — so dest is
+        # always either the complete old tree or the complete new tree, never a
+        # half-written one. A crash leaves only stale temp dirs, cleaned below.
+        pid = os.getpid()
         for item in src.iterdir():
             if item.name in {".env", "venv"}:
                 continue
             dest = dst / item.name
-            if dest.is_dir():
-                shutil.rmtree(dest)
+            tmp_new = dst / f".{item.name}.new-{pid}"
+            tmp_old = dst / f".{item.name}.old-{pid}"
+            for _p in (tmp_new, tmp_old):   # clear leftovers from a prior aborted run
+                if _p.is_dir():
+                    shutil.rmtree(_p, ignore_errors=True)
+                elif _p.exists():
+                    try:
+                        _p.unlink()
+                    except OSError:
+                        pass
             if item.is_dir():
-                shutil.copytree(str(item), str(dest))
+                shutil.copytree(str(item), str(tmp_new))   # full copy; dest intact
+                if dest.exists():
+                    os.rename(str(dest), str(tmp_old))      # move old aside (atomic)
+                os.rename(str(tmp_new), str(dest))          # move new in (atomic)
+                shutil.rmtree(str(tmp_old), ignore_errors=True)
             else:
-                shutil.copy2(str(item), str(dest))
+                shutil.copy2(str(item), str(tmp_new))
+                os.replace(str(tmp_new), str(dest))         # atomic file replace
         # Refresh install_dir/VERSION from the repo root so an agent installed
         # before the .NN migration doesn't keep a stale old-format copy that
         # get_version() would fall back to. Mirrors install_agent.sh.
@@ -1271,6 +1307,16 @@ class ProxmoxAgent:
             )
         except Exception as e:  # pragma: no cover - script missing / not executable
             logger.debug(f"could not schedule update watchdog: {e}")
+        # Clear the healthy marker BEFORE restarting so the new version MUST
+        # re-prove health (re-auth → _touch_healthy_marker). Otherwise our own
+        # marker survives into a broken new version that never clears it (e.g. a
+        # corrupt tree whose run() returns before run()'s own clear), and the
+        # rollback watchdog sees a "healthy" marker and declines to roll back —
+        # exactly how the cs-svr-05 crash-loop escaped the safety net.
+        try:
+            self._clear_healthy_marker()
+        except Exception:  # noqa: BLE001
+            pass
         logger.info("Self-update applied — exiting so systemd relaunches on the new code")
         # Exit NON-ZERO (3) and let systemd relaunch us. We deliberately do NOT
         # `systemctl restart` ourselves: that runs inside our own cgroup, so
