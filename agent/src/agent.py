@@ -2478,6 +2478,14 @@ class ProxmoxAgent:
                             logger.debug(f"compute_vm_tiers failed: {_te}")
                             tiers = getattr(self, "_last_tiers", {}) or {}
                         (self._last_phase_ms or {})["tiers_ms"] = int((time.time() - _t_e) * 1000)
+                        # Present T1/T3 PCI devices (host lspci ∩ the t1/t3 allow-lists)
+                        # for the WebUI PCI tab. Best-effort; cache so a transient lspci
+                        # miss keeps the last-known list instead of blanking the tab.
+                        try:
+                            self._last_pci = await usb_provision.cs_pci_telemetry(self)
+                        except Exception as _pe:  # noqa: BLE001
+                            logger.debug(f"cs_pci_telemetry failed: {_pe}")
+                            self._last_pci = getattr(self, "_last_pci", None) or {"t1_pci_devices": [], "t3_pci_devices": []}
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         await self.send_cs_event("CS_TELEMETRY", cs_body)
                         # Signature of the present USB set (dongles). A plug/unplug
@@ -2678,6 +2686,9 @@ class ProxmoxAgent:
             "usb_state":        usb.get("usb_state") or [],
             "present_usb":      usb.get("present_usb") or [],
             "unknown_usb":      usb.get("unknown_usb") or [],
+            # Present T1/T3 PCI devices (host lspci ∩ the allow-lists) — WebUI PCI tab.
+            "t1_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t1_pci_devices", []),
+            "t3_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t3_pci_devices", []),
             # Auto-provision diagnostic — WHY the last pass provisioned nothing
             # (or did). Surfaced through the cs spoke → hub cache → WebUI
             # Auto-Provisioning card so a silent gate (no dongle_vidpids / no
