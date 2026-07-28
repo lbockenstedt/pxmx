@@ -427,11 +427,26 @@ def _normalize_toggle(v: Any) -> str:
 
 
 def _toggle_on(usb_cfg: Dict[str, Any]) -> bool:
-    """The toggle arrives under two key names depending on the cs spoke:
-    ``usb_auto_provision`` (webui-spoke 6-key blob) or ``auto_provision``
-    (lm-spoke full 27-key payload). Accept either."""
-    return (_normalize_toggle(usb_cfg.get("usb_auto_provision")) == "on"
-            or _normalize_toggle(usb_cfg.get("auto_provision")) == "on")
+    """Whether auto-provision is ON. Gates ALL cloning — T2 USB *and* the T1/T3
+    PCI pass — so a false positive here provisions VMs the operator turned off.
+
+    The toggle arrives under two key names: ``usb_auto_provision`` (the key the
+    hub UI writes — routes.cs_toggle_auto_provision — and the SOURCE the cs spoke
+    derives the other from: cs_settings sets ``auto_provision`` =
+    normalize(usb_auto_provision)) or ``auto_provision`` (older lm-spoke
+    full-payload path). They are a source + its mirror, NOT independent votes.
+
+    The hub's toggle pushes ONLY ``usb_auto_provision`` (a partial config update),
+    so a stale ``auto_provision`` can linger in the agent's merged config after
+    the UI flips off. The previous OR-of-both then kept provisioning alive — T1/T3
+    controllers got cloned with auto-prov visibly off. Fix: honor the
+    authoritative ``usb_auto_provision`` whenever it is present; fall back to
+    ``auto_provision`` only when usb_auto_provision is absent from the blob
+    entirely. A present-but-off authoritative key now wins over a stale mirror."""
+    for key in ("usb_auto_provision", "auto_provision"):
+        if key in usb_cfg and str(usb_cfg.get(key) or "").strip() != "":
+            return _normalize_toggle(usb_cfg.get(key)) == "on"
+    return False
 
 
 def _cfg_first(usb_cfg: Dict[str, Any], keys: tuple, default: Any = None) -> Any:
