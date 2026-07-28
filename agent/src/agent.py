@@ -2338,18 +2338,27 @@ class ProxmoxAgent:
                             _timed(self.get_node_stats())),
                         timeout=_COLLECT_DEADLINE_S)
                     self._last_metrics, self._last_vms, self._last_nodes = metrics, vms, nodes
-                except asyncio.TimeoutError:
-                    # Collect wedged (busy host / lock held by a stuck op). Reuse the
-                    # last-known snapshot this tick so the LOOP keeps advancing and
-                    # relaying (a downstream 'STALE' badge is honest; a frozen loop
-                    # is not) — next tick re-collects live.
+                    self._collect_stale = False
+                except Exception as _ce:
+                    # Collect wedged OR errored (busy host / lock held by a stuck op /
+                    # pvesh failure). Reuse the last-known snapshot this tick so the
+                    # LOOP keeps advancing and RELAYING — a frozen loop makes the host
+                    # age out to "offline" on the hub even though the agent is actually
+                    # connected. A downstream 'telemetry stale' badge is honest; going
+                    # dark is not. Next tick re-collects live.
+                    # WAS `except asyncio.TimeoutError` only, so a NON-timeout collect
+                    # error escaped to the outer handler and aborted the whole tick
+                    # before the frame was sent → last_seen stopped advancing → the
+                    # "offline while still connected" bug. `except Exception` does NOT
+                    # catch CancelledError, so task cancellation still propagates.
                     metrics = getattr(self, "_last_metrics", None) or {}
                     vms = getattr(self, "_last_vms", None) or {"vms": []}
                     nodes = getattr(self, "_last_nodes", None) or {"nodes": []}
                     _m_ms = _v_ms = _n_ms = -1
-                    logger.warning("telemetry collect exceeded %.0fs (busy host / stuck op) "
-                                   "— using last-known snapshot this tick, retrying next tick",
-                                   _COLLECT_DEADLINE_S)
+                    self._collect_stale = True
+                    logger.warning("telemetry collect failed/exceeded %.0fs (%s: %s) — using "
+                                   "last-known snapshot this tick, retrying next tick",
+                                   _COLLECT_DEADLINE_S, type(_ce).__name__, _ce)
                 self._last_phase_ms = {
                     "metrics_ms":    _m_ms,
                     "vm_list_ms":    _v_ms,
@@ -2700,6 +2709,11 @@ class ProxmoxAgent:
                 "interval_s":   getattr(self, "_last_interval_s", None),  # cadence of the PREVIOUS tick
                 "last_tick_done_ts": getattr(self, "_last_tick_done_ts", None),
                 "phase_ms":     dict(getattr(self, "_last_phase_ms", {}) or {}),
+                # True when THIS frame carries a reused snapshot because the live
+                # collect failed/timed out — the frame still flows (keeps the host
+                # in-contact) but the VM/node data is stale. The hub read path shows
+                # a 'telemetry stale' badge instead of a false 'fresh'.
+                "stale_collect": bool(getattr(self, "_collect_stale", False)),
                 "vm_count":     len(vms),
                 "node_count":   len(nodes_list),
                 # Reconnect context (Details page): how many times the WS has
