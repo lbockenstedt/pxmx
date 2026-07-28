@@ -350,12 +350,16 @@ PENDING="$STATE_DIR/pending_update.json"
 # 0 if the component is healthy (marker present) OR booted-but-pending-auth
 # (active, not crash-looping); 1 if still failing (crash-loop / failed / unknown).
 unit_ok() {
-    [ -f "$HEALTHY" ] && return 0
     local a n
-    a="$(systemctl show "$UNIT" -p ActiveState --value 2>/dev/null || echo "")"
     n="$(systemctl show "$UNIT" -p NRestarts --value 2>/dev/null || echo 0)"
     n="${n:-0}"
-    [ "$a" = "active" ] && [ "$n" -lt 3 ] && return 0
+    # A crash-loop (NRestarts>=3) is NEVER ok — even with a (stale) healthy marker,
+    # a unit that keeps restarting has not come up cleanly. Check this FIRST so a
+    # stale marker can't override it.
+    [ "$n" -ge 3 ] && return 1
+    [ -f "$HEALTHY" ] && return 0
+    a="$(systemctl show "$UNIT" -p ActiveState --value 2>/dev/null || echo "")"
+    [ "$a" = "active" ] && return 0
     return 1
 }
 
@@ -365,11 +369,21 @@ clear_and_prune() {
 }
 
 # 1) Wait up to DEADLINE for the new code to boot + re-auth (healthy marker).
+#    A healthy marker only counts when the unit is NOT crash-looping: a STALE
+#    marker (left by the OLD version, never cleared by a broken new one that
+#    exits before it can clear it) must never mask a crash-loop. NRestarts>=3
+#    means the new code isn't staying up, so the marker is stale — fall through
+#    to rollback. (The cs-svr-05 escape: a stale 0.07 marker made this exit 0.)
 waited=0
 while [ "$waited" -lt "$DEADLINE" ]; do
     if [ -f "$HEALTHY" ]; then
-        clear_and_prune
-        exit 0
+        _n="$(systemctl show "$UNIT" -p NRestarts --value 2>/dev/null || echo 0)"; _n="${_n:-0}"
+        if [ "$_n" -lt 3 ]; then
+            clear_and_prune
+            exit 0
+        fi
+        echo "lm-component-update-restart: $UNIT has a healthy marker but NRestarts=$_n (crash-loop) — stale marker; rolling back." >&2
+        break
     fi
     sleep 5; waited=$((waited + 5))
 done
