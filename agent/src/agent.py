@@ -1433,22 +1433,82 @@ class ProxmoxAgent:
             await asyncio.sleep(600)
 
     async def _sd_watchdog_loop(self):
-        """Feed systemd's WatchdogSec on a fixed cadence, independent of the
-        websocket state (so a long disconnect backoff doesn't falsely trip the
-        watchdog while a genuine event-loop hang still does). Pairs with
-        WatchdogSec=60 + NotifyAccess=main in lm-pxmx-agent.service (Phase G).
-        No-op outside systemd (_sd_notify checks NOTIFY_SOCKET)."""
-        interval = 20
-        try:
-            interval = max(5, int(os.environ.get("LM_SD_NOTIFY_INTERVAL_S", "20")))
-        except Exception:
-            pass
-        _sd_notify("READY=1")  # harmless under Type=simple
-        while True:
+        """Feed systemd's WatchdogSec only while the telemetry loop is ACTUALLY
+        ADVANCING. Pairs with WatchdogSec=60 + NotifyAccess=main in
+        lm-pxmx-agent.service. No-op outside systemd (_sd_notify checks
+        NOTIFY_SOCKET).
+
+        This used to ping on a bare timer, which reported liveness for the
+        watchdog coroutine rather than for the agent. An agent whose telemetry
+        had seized still ran the event loop, so ``asyncio.sleep`` kept returning
+        and systemd was told "healthy" every 20s indefinitely — three hosts sat
+        wedged for six hours with `Restart=always` never firing, because nothing
+        had crashed. ``_COLLECT_DEADLINE_S`` above already names this failure
+        ("the frozen tick #N the operator saw"); the liveness signal simply was
+        not wired to it.
+
+        Progress = ``_last_tick_done_ts``, stamped only when a telemetry tick
+        COMPLETES (a raising tick takes the except path and leaves it untouched).
+        Deliberately NOT gated on the websocket: a disconnected-but-healthy agent
+        keeps ticking and must keep feeding, which is the property the old fixed
+        cadence was protecting. Stop feeding and systemd restarts us inside
+        WatchdogSec.
+        """
+        def _env_int(name, default, floor=1):
             try:
-                _sd_notify("WATCHDOG=1")
-            except Exception:
-                pass
+                return max(floor, int(os.environ.get(name, str(default))))
+            except (TypeError, ValueError):
+                return default
+
+        interval = _env_int("LM_SD_NOTIFY_INTERVAL_S", 20, floor=5)
+        # A tick is overdue after N cadences (the cadence itself is dynamic: ~60s
+        # idle, ~3s during provisioning), floored so a slow collect on a busy host
+        # — bounded by _COLLECT_DEADLINE_S — can never look like a stall.
+        stall_mult = _env_int("LM_PXMX_WATCHDOG_STALL_MULT", 3)
+        stall_floor = _env_int("LM_PXMX_WATCHDOG_STALL_FLOOR_S", 180)
+        # Before the first tick completes (startup: spoke resolve, auth, first
+        # collect) there is no progress signal yet, so feed unconditionally.
+        startup_grace = _env_int("LM_PXMX_WATCHDOG_STARTUP_GRACE_S", 300)
+        started = time.time()
+
+        _sd_notify("READY=1")  # harmless under Type=simple
+        starved_since = None
+        while True:
+            feed, why = True, ""
+            try:
+                last = getattr(self, "_last_tick_done_ts", None)
+                if last is None:
+                    if (time.time() - started) > startup_grace:
+                        feed = False
+                        why = (f"no telemetry tick completed within {startup_grace}s of start")
+                else:
+                    cadence = getattr(self, "_last_interval_s", None) or 60
+                    stall_after = max(stall_floor, stall_mult * cadence)
+                    age = time.time() - last
+                    if age > stall_after:
+                        feed = False
+                        why = (f"last telemetry tick completed {age:.0f}s ago "
+                               f"(cadence {cadence}s, stall threshold {stall_after:.0f}s)")
+            except Exception as e:  # noqa: BLE001
+                # Fail OPEN: a defect in this check must never restart a healthy
+                # agent. Only an affirmative stall verdict withholds the ping.
+                logger.debug("sd watchdog progress check failed (feeding anyway): %s", e)
+                feed, why = True, ""
+
+            if feed:
+                if starved_since is not None:
+                    logger.warning("agent watchdog: telemetry advancing again after %.0fs "
+                                   "— resuming systemd pings", time.time() - starved_since)
+                    starved_since = None
+                try:
+                    _sd_notify("WATCHDOG=1")
+                except Exception:  # noqa: BLE001
+                    pass
+            elif starved_since is None:
+                # Log the verdict ONCE; systemd restarts us within WatchdogSec.
+                starved_since = time.time()
+                logger.error("agent watchdog: WEDGED — %s. Withholding systemd pings so "
+                             "WatchdogSec restarts this agent.", why)
             await asyncio.sleep(interval)
 
     async def _resolve_spoke_url(self) -> None:
@@ -2337,6 +2397,14 @@ class ProxmoxAgent:
             finally:
                 heartbeat_task.cancel()
                 telemetry_task.cancel()
+                # Clear the socket reference. _HubLogRelayHandler.emit gates on
+                # `agent.websocket is not None` to decide send-now vs buffer; the
+                # attribute was only ever assigned on connect, so after the FIRST
+                # connect it stayed truthy forever and the bounded-deque buffer
+                # path became unreachable. Every record then spawned a
+                # fire-and-forget task against a dead socket for the whole
+                # disconnect gap. Reset it so the buffer works as designed.
+                self.websocket = None
                 # Handler stays installed (added in __init__) so records logged
                 # during the disconnect gap are buffered and flushed on the next
                 # connect, instead of being dropped.
@@ -2351,9 +2419,17 @@ class ProxmoxAgent:
                 }
                 await self.websocket.send(encode_frame(self.signer, msg))
                 await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error(f"Heartbeat failed: {e}")
-                await asyncio.sleep(5)
+                # The socket is gone. RETURN instead of retrying every 5s forever:
+                # the connection owner cancels this task and reconnects, so the old
+                # behaviour just spun on a dead socket, emitting an ERROR record
+                # every 5s for the whole disconnect gap — each of which the log
+                # relay then tried to ship over that same dead socket.
+                logger.warning("Heartbeat send failed (%s) — ending heartbeat; "
+                               "the connect loop will reconnect.", e)
+                return
 
     async def _telemetry_loop(self):
         while True:
