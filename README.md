@@ -8,6 +8,55 @@ auto-provisioning "brain" lives.
 
 For the topology and where the brain lives, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
+<!-- INSTALLERS:START -->
+## Installation
+
+Every installer in this repo, with every flag and environment variable it accepts.
+Installers are idempotent — re-running one updates code and preserves credentials.
+
+### Proxmox spoke — `install_pxmx.sh`
+
+```bash
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/install_pxmx.sh \
+  | sudo bash -s -- --hub lm-hub.lrbtechnologies.com
+```
+
+Run this in the **spoke container**. The host agent below is a separate install.
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--hub URL` | Hub WebSocket URL. A bare host is fine — `lm-hub.example.com` becomes `wss://lm-hub.example.com:443`, `host:port` gets a `wss://` prefix, and an explicit `ws://`/`wss://` is left alone. Omit it to auto-discover the hub (DNS `lm-hub.<suffix>`, then mDNS `_lm-hub._tcp.local.`). |
+| `--id`, `--name` | Pin the spoke id. Omitted, the id derives from the hostname, so a renamed clone reconnects under its new name. |
+| `--secret` | Pre-shared spoke secret. |
+| `--hub-secret` | Hub PSK for auto-approval. Without it the spoke lands in *pending approval* in the WebUI. |
+| `--all-prereqs` | Accepted and ignored — kept so the hub's install-module call doesn't abort. |
+| `--tls-verify` | Verify the hub's TLS certificate. Requires `--tls-ca-cert`. |
+| `--tls-ca-cert PATH` | CA certificate used for that verification. |
+| `--loopback` | Spoke and agent are on the same box — talk over loopback. |
+| `--infra-only` | Host-level infrastructure only — no spoke runtime. |
+
+**Environment overrides:** `HUB_URL` (same normalization as `--hub`), `SPOKE_ID`., `HUB_SECRET`, `LM_COMP_UPDATE_GUARD`
+
+### Proxmox host agent — `agent/install_agent.sh`
+
+Run this **on the Proxmox host** (not in a container). This is where the
+Client-Sim auto-provisioning brain runs.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh | sudo bash
+```
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--spoke-ip IP` | Spoke address. Omit it and the installer auto-detects a co-located LM spoke LXC. |
+| `--spoke-url URL` | Full spoke URL, pinned — takes precedence over `--spoke-ip`. |
+| `--id` | Pin the agent id. Omitted, it derives from the hostname at startup, so a cloned and renamed node reconnects under its new name (the hub correlates it to the old one by install UUID). |
+| `--secret` | Pre-shared agent secret. |
+
+**Environment overrides:** `SPOKE_IP`, `SPOKE_URL`, `AGENT_SECRET`,
+`LM_COMP_UPDATE_GUARD`.
+<!-- INSTALLERS:END -->
+
 ## Operators
 
 ### What it does
