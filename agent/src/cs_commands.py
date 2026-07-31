@@ -27,6 +27,7 @@ from typing import Any, Dict, Set
 
 from . import pve_cmds
 from . import cs_sim
+from . import usb_provision
 from .cs_guard import GuardError, resolve_protected_vmids
 from .pve_cmds import PveError
 
@@ -132,6 +133,14 @@ async def handle_cs_command(agent, action: str,
 
     # ── Fast op: stop a running fleet reclone. Must be handled here (not via
     # run_long_op) so it isn't blocked behind the batch holding _LONG_OP_SEM.
+    if action == "proxmox_reclone_clear":
+        # Fast, local: drops a FINISHED batch's failed-count + log so old errors
+        # stop rendering under Reclone All. Refused while a batch is running.
+        cleared = usb_provision.clear_reclone_state()
+        return {"cleared": bool(cleared),
+                "message": ("" if cleared else
+                            "a reclone batch is running — stop it before clearing")}
+
     if action == "proxmox_reclone_stop":
         stopped = cs_sim.request_reclone_stop()
         return {"status": "SUCCESS", "stopped": stopped,

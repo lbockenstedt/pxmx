@@ -536,6 +536,25 @@ def current_reclone_state() -> Dict[str, Any]:
     return dict(_reclone_state)
 
 
+def clear_reclone_state() -> bool:
+    """Clear a FINISHED reclone batch's state (failed count + per-VM log).
+
+    After a batch ends, _reclone_state keeps status/failed/log so the operator
+    can see what happened -- but nothing ever clears it, so a batch that failed
+    two VMs a week ago still renders as red errors under Reclone All forever,
+    and a later clean run is read against stale failures.
+
+    REFUSES while a batch is running: clearing mid-run would blank the progress
+    bar the operator is watching and lose the record of what just failed. Stop it
+    first (proxmox_reclone_stop), then clear.
+    """
+    global _reclone_state
+    if _reclone_state.get("status") == "running":
+        return False
+    _reclone_state = {}
+    return True
+
+
 def start_reclone_batch(total: int, rtype: str = "manual") -> bool:
     """Begin a fleet-reclone batch. Returns False (refuses) if one is already
     running — the handler treats that as a 409/conflict so a second click while
