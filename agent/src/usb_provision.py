@@ -1016,6 +1016,16 @@ async def _guest_health_probe(vid: int) -> "Optional[Dict[str, bool]]":
         "associated":     "ip route show default 2>/dev/null | grep -qE 'dev wl'",
         "gateway_ok":     "ping -c1 -W2 \"$(ip route 2>/dev/null | awk '/default/{print $3; exit}')\" >/dev/null 2>&1",
         "driver_crash":   "dmesg 2>/dev/null | tail -300 | grep -qiE 'firmware crash|deauthenticat|rtw.*fail|rtl8.*firmware'",
+        # sees_aps: does the radio see ANY AP at all? A dongle that enumerates,
+        # loads its driver, and still scans NOTHING in an AP-saturated lab is
+        # failed hardware -- distinct from "not associated", which is equally
+        # consistent with a wrong PSK or a downed SSID. Reads CACHED scan
+        # results only (nmcli --rescan no / iw scan dump): triggering an active
+        # scan would disrupt a working client, and this check runs fleet-wide.
+        "sees_aps":       ("nmcli -t -f SSID dev wifi list --rescan no 2>/dev/null "
+                           "| grep -q . || "
+                           "iw dev \"$(ls /sys/class/net 2>/dev/null | grep -m1 -E '^wl')\" "
+                           "scan dump 2>/dev/null | grep -q '^BSS'"),
     }
     try:
         if not await pve_cmds.qm_agent_ping(vid):
@@ -1029,18 +1039,72 @@ async def _guest_health_probe(vid: int) -> "Optional[Dict[str, bool]]":
         return None
 
 
+async def _guest_visible_ssids(vid: int) -> "Optional[list]":
+    """The SSIDs this client's radio can currently SEE, from its cached scan.
+
+    Turns "no_scan" from a verdict into evidence: an empty list on a box whose
+    neighbours see a dozen APs is a dead radio, and for no_assoc it answers the
+    next question immediately -- is the SSID we want even on air? Read-only and
+    CACHE-ONLY (nmcli --rescan no / iw scan dump): forcing a live scan would
+    disrupt a working client, and this runs per unhealthy client per probe.
+
+    Returns None when it cannot be determined (QGA down, no tooling) -- callers
+    must not read that as "sees nothing", which is the whole point of the check.
+    """
+    from . import pve_cmds
+    script = (
+        "nmcli -t -f SIGNAL,SSID dev wifi list --rescan no 2>/dev/null "
+        "| awk -F: 'NF>1 && $2!=\"\" {print $1\"|\"$2}' | sort -rn | head -12; "
+        "test -s /dev/null"
+    )
+    try:
+        out = await pve_cmds.qm_guest_exec_shell_out(vid, script)
+    except Exception:  # noqa: BLE001
+        return None
+    if out is None:
+        return None
+    seen, rows = set(), []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        sig, _, ssid = line.partition("|")
+        ssid = ssid.strip()
+        if not ssid or ssid in seen:
+            continue
+        seen.add(ssid)
+        try:
+            rows.append({"ssid": ssid, "signal": int(sig)})
+        except ValueError:
+            rows.append({"ssid": ssid, "signal": None})
+    return rows
+
+
 def _classify_guest_health(probe) -> str:
     """Map a _guest_health_probe result to a state + the remediation it implies:
       unknown    (QGA down)                → never escalate blind
       no_driver  (USB present, no netdev)  → reboot (cheap) / flag in UI
-      no_assoc   (netdev up, not associated) → dongle/RF suspect → reclone/swap
+      no_scan    (netdev up, sees NO APs)  → dead radio → reclone/swap/quarantine
+      no_assoc   (netdev up, sees APs, not associated) → dongle/RF suspect
       no_gateway (associated, no L3)       → INFRA problem → ALARM, do NOT reclone
-      healthy."""
+      healthy.
+
+    no_scan vs no_assoc matters because they imply different faults: a radio
+    that scans NOTHING is almost certainly dead hardware, while one that sees
+    APs but will not join is equally consistent with a wrong PSK or a downed
+    SSID -- an infra/config fault a reclone should not be chasing. Both climb
+    the same ladder today; separating them makes the UI honest and leaves room
+    to treat them differently later."""
     if probe is None:
         return "unknown"
     if not probe.get("netdev_present"):
         return "no_driver"
     if not probe.get("associated"):
+        # Only consult sees_aps on the NOT-associated path. An associated client
+        # may legitimately hold an empty scan cache, so testing it fleet-wide
+        # would false-flag healthy dongles.
+        if probe.get("sees_aps") is False:
+            return "no_scan"
         return "no_assoc"
     if not probe.get("gateway_ok"):
         return "no_gateway"
@@ -1208,13 +1272,22 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             g = gh.get(bus) or {}
             streak = int(g.get("streak", 0)) + 1 if g.get("cand") == _hs else 1
             confirmed = streak >= _VISIBLE_CONFIRM
+            # Capture what the radio can SEE for the wifi-side faults. Only for
+            # those states (not every unhealthy client) so a no_driver box, whose
+            # radio cannot scan by definition, does not pay for a guest exec.
+            _ssids = g.get("ssids")
+            if _hs in ("no_scan", "no_assoc"):
+                _got = await _guest_visible_ssids(vid)
+                if _got is not None:
+                    _ssids = _got
             gh[bus] = {"state": _hs if confirmed else "healthy", "cand": _hs,
-                       "streak": streak, "probe": _hp, "vmid": vid, "at": now}
+                       "streak": streak, "probe": _hp, "vmid": vid, "at": now,
+                       "ssids": _ssids}
             dirty = True
             if not confirmed:
                 continue                               # still watching — no action yet
             if streak == _VISIBLE_CONFIRM:             # alarm once, on confirmation
-                _lvl = (logging.ERROR if _hs in ("no_gateway", "no_driver")
+                _lvl = (logging.ERROR if _hs in ("no_gateway", "no_driver", "no_scan")
                         else logging.WARNING)
                 logger.log(_lvl, "dongle health: VM %s bus %s CONFIRMED %s over %d "
                            "probes (probe=%s)", vid, bus, _hs, streak, _hp)
@@ -1239,11 +1312,29 @@ async def dongle_health_check_and_recover(agent, present) -> int:
     return acted
 
 
+def current_visible_ssids() -> "Dict[str, list]":
+    """``{str(vmid): [{ssid, signal}, ...]}`` — what each unhealthy client's radio
+    can SEE, for stamping onto CS telemetry beside the health state. Turns a
+    no_scan verdict into evidence (empty list while its neighbours see a dozen
+    APs = dead radio) and answers the obvious no_assoc follow-up: is the SSID we
+    want even on air? Absent for healthy clients — never collected for them."""
+    try:
+        out: "Dict[str, list]" = {}
+        for rec in (load_usb_state().get("guest_health") or {}).values():
+            vid, ssids = rec.get("vmid"), rec.get("ssids")
+            if vid is not None and isinstance(ssids, list):
+                out[str(vid)] = ssids
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def current_guest_health() -> "Dict[str, str]":
     """``{str(vmid): in-guest health state}`` from ``usb_state.guest_health`` —
     for stamping the CS telemetry VM rows so the Hub UI can flag a dongle that is
     lsusb-visible but has no driver / never associated / has no gateway. States:
-    healthy / no_driver / no_assoc / no_gateway / not_visible. Best-effort."""
+    healthy / no_driver / no_scan / no_assoc / no_gateway / not_visible.
+    Best-effort."""
     try:
         out: "Dict[str, str]" = {}
         for rec in (load_usb_state().get("guest_health") or {}).values():
@@ -1566,9 +1657,10 @@ def _dongle_recovery_view(hh: Optional[dict], dr: Optional[dict],
         # → the guest-blind ladder; no_driver/no_assoc → the visible-but-broken
         # ladder (device enumerates but has no working driver / never associated).
         gs = str((gh_state or {}).get("state") or "")
-        if gs in ("no_driver", "no_assoc"):
+        if gs in ("no_driver", "no_assoc", "no_scan"):
             _max = len(_HEALTH_LADDER_VISIBLE)
             _what = ("USB present but no driver loaded" if gs == "no_driver"
+                     else "radio sees NO APs — dead dongle suspected" if gs == "no_scan"
                      else "driver up but not associated")
             return {"state": "guest_broken", "stage": stage, "attempts": n,
                     "max": _max, "last_attempt": hh.get("last_attempt"),

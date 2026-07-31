@@ -1040,6 +1040,31 @@ async def wait_guest_gone(vmid: int, kind: str, timeout: int = 360) -> bool:
     return False
 
 
+async def qm_guest_exec_shell_out(vmid: Any, script: str, *,
+                                  exec_timeout: int = 20,
+                                  outer_timeout: int = 30,
+                                  protected: Optional[Set[int]] = None) -> Optional[str]:
+    """Like ``qm_guest_exec_shell`` but returns the guest's STDOUT, not just rc.
+
+    ``qm guest exec`` prints a JSON envelope -- {"exitcode":0,"out-data":"..."} --
+    so the guest's actual output has to be pulled out of ``out-data``. Returns
+    None when the exec fails or the envelope cannot be parsed; callers treat that
+    as "unknown", never as "empty".
+    """
+    vid = assert_sim_vm(vmid, protected or set())
+    rc, out, _ = await _run(["qm", "guest", "exec", str(vid),
+                             "--timeout", str(exec_timeout), "--",
+                             "bash", "-c", script],
+                            check=False, timeout=outer_timeout)
+    if rc != 0 or not out:
+        return None
+    try:
+        import json as _json
+        return str((_json.loads(out) or {}).get("out-data") or "")
+    except Exception:  # noqa: BLE001 — non-JSON envelope: hand back the raw text
+        return out
+
+
 async def qm_guest_exec_shell(vmid: Any, script: str, *,
                               exec_timeout: int = 60,
                               outer_timeout: int = 90,
