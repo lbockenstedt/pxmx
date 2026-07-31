@@ -331,6 +331,19 @@ _VISIBLE_CONFIRM = int(os.environ.get("LM_PXMX_HEALTH_VISIBLE_CONFIRM", "3") or 
 # box that can't take the stamp doesn't reboot-loop). Past the cap it's logged at
 # ERROR for an operator (reclone territory).
 _HOSTNAME_FIX_MAX = int(os.environ.get("LM_PXMX_HOSTNAME_FIX_MAX", "3") or 3)
+# Max VMs the hostname audit will re-stamp+REBOOT in a single pass. Without this
+# the audit acted on its whole backlog at once: when the always-true predicate in
+# qm_guest_exec_shell was fixed, every silently-mismatched VM on a host became
+# actionable in the SAME pass and the audit rebooted them together — the fleet
+# went offline and, once the clients aged out, their sim tags were cleared. The
+# audit runs every _HEALTH_CHECK_INTERVAL_S (300s), so a small cap still
+# converges a host in minutes while keeping the fleet serving.
+_HOSTNAME_FIX_MAX_PER_PASS = int(
+    os.environ.get("LM_PXMX_HOSTNAME_FIX_PER_PASS", "2") or 2)
+# Same protection for the dongle-health ladder, whose lsusb presence probe was
+# fixed in the same change (it had always reported "dongle present").
+_HEALTH_MAX_PER_PASS = int(
+    os.environ.get("LM_PXMX_HEALTH_MAX_PER_PASS", "2") or 2)
 
 # First (immediate) post-clone reboot settle window: once the freshly-cloned
 # guest's QGA agent first answers, let the box run at least this long before
@@ -1300,6 +1313,11 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             logger.warning("dongle health: stage '%s' for VM %s failed: %s",
                            stage, vid, e)
     for bus, vmid in list(b2v.items()):
+        if acted >= _HEALTH_MAX_PER_PASS:
+            logger.info("dongle health: per-pass cap (%d) reached — remaining "
+                        "unhealthy clients are handled on later passes",
+                        _HEALTH_MAX_PER_PASS)
+            break
         try:
             vid = int(vmid)
         except (TypeError, ValueError):
@@ -1502,6 +1520,11 @@ async def hostname_audit_and_restamp(agent) -> int:
         logger.debug("hostname audit: host VM enumeration failed (%s) — "
                      "auditing the dongle map only", e)
     for vid in candidates:
+        if acted >= _HOSTNAME_FIX_MAX_PER_PASS:
+            logger.info("hostname audit: per-pass cap (%d) reached — remaining "
+                        "misnamed VMs converge on later passes",
+                        _HOSTNAME_FIX_MAX_PER_PASS)
+            break
         expected = _vm_name(vid)
         if not expected:
             continue                                   # unmapped vmid — no identity to enforce

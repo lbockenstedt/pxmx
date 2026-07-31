@@ -63,7 +63,6 @@ def _aval(v):
 
 def test_audit_probes_non_usb_vms(harness, monkeypatch):
     probed, _ = harness
-    monkeypatch.setitem(sys.modules, "src.cs_guard", _guard())
     _run(up.hostname_audit_and_restamp(_Agent()))
     assert 90001 in probed, "the T2 dongle VM must still be audited"
     assert 90002 in probed, "a non-USB (T1/T3) sim VM must NOW be audited"
@@ -71,22 +70,51 @@ def test_audit_probes_non_usb_vms(harness, monkeypatch):
 
 def test_audit_skips_protected_below_floor_and_templates(harness, monkeypatch):
     probed, _ = harness
-    monkeypatch.setitem(sys.modules, "src.cs_guard", _guard())
     _run(up.hostname_audit_and_restamp(_Agent()))
     assert 1001 not in probed, "protected vmid must never be audited"
     assert 5 not in probed, "below the 90000 floor must never be audited"
     assert 90003 not in probed, "a template must never be re-stamped or rebooted"
 
 
-def _guard():
-    m = types.ModuleType("src.cs_guard")
 
-    def is_sim_vm(vmid, protected, sim_min=90000):
-        try:
-            v = int(vmid)
-        except (TypeError, ValueError):
-            return False
-        return v >= sim_min and v not in set(protected)
 
-    m.is_sim_vm = is_sim_vm
-    return m
+def test_audit_reboots_at_most_N_vms_per_pass(monkeypatch):
+    """A per-pass cap keeps a backlog from becoming a fleet-wide reboot wave.
+
+    Regression: fixing the always-true predicate in qm_guest_exec_shell made
+    every silently-mismatched VM on a host actionable in the SAME pass, so the
+    audit re-stamped and rebooted them together. The fleet went offline and,
+    once the clients aged past the tag window, their sim tags were cleared —
+    observed as whole servers losing their labels at once.
+    """
+    stamped = []
+    state = {"bus_to_vmid": {f"1-{i}": 90000 + i for i in range(1, 8)}}
+    monkeypatch.setattr(up, "load_usb_state", lambda: state)
+    monkeypatch.setattr(up, "save_usb_state", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(up, "_protected_vmids", lambda a: {1001})
+    monkeypatch.setattr(up, "_vm_name", lambda v: f"client-{v}")
+    monkeypatch.setattr(up, "_hostname_stamp_script", lambda n: f"stamp {n}")
+
+    fake = types.SimpleNamespace()
+    fake.list_qemu_vmids = lambda: _aval([])
+    fake.is_template = lambda v, k=None: _aval(False)
+    fake.qm_agent_ping = lambda v: _aval(True)
+    # EVERY VM is misnamed → without a cap all 7 would be rebooted in one pass.
+    fake.qm_guest_exec_shell_out = lambda v, s, **k: _aval("sim-rpi-0000")
+
+    async def _shell(v, script, **k):
+        stamped.append(v)
+        return True
+    fake.qm_guest_exec_shell = _shell
+    fake.qm_guest_exec = lambda v, c: _aval(True)
+    # hostname_audit_and_restamp does `from . import pve_cmds` INSIDE the
+    # function, which shadows any module-global patch — the stub has to go into
+    # sys.modules so that local import resolves to it.
+    monkeypatch.setitem(sys.modules, "src.pve_cmds", fake)
+    monkeypatch.setattr(up, "pve_cmds", fake, raising=False)
+    monkeypatch.setattr(up.asyncio, "sleep", lambda *_a, **_k: _aval(None))
+
+    acted = _run(up.hostname_audit_and_restamp(_Agent()))
+    assert acted == up._HOSTNAME_FIX_MAX_PER_PASS, acted
+    assert len(set(stamped)) == up._HOSTNAME_FIX_MAX_PER_PASS, stamped
+    assert up._HOSTNAME_FIX_MAX_PER_PASS < 7, "cap must be below the backlog size"
