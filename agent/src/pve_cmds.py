@@ -835,12 +835,60 @@ async def pct_set(vmid: int, *args: str, protected: Optional[Set[int]] = None) -
 
 
 async def qm_clone(template: Any, vmid: Any, name: str, *,
-                   protected: Optional[Set[int]] = None, timeout: int = 600) -> None:
-    """``qm clone <template> <vmid> --name <name>``. Template is the source
-    (below the sim floor, unguarded); the target vmid is guarded."""
+                   protected: Optional[Set[int]] = None, pool: Optional[str] = None,
+                   timeout: int = 600) -> None:
+    """``qm clone <template> <vmid> --name <name> [--pool <pool>]``. Template is
+    the source (below the sim floor, unguarded); the target vmid is guarded.
+
+    ``pool`` places the new VM in a Proxmox resource pool at CLONE time — the
+    only moment it can be set in one shot (``qm set`` has no --pool; retrofitting
+    an existing VM needs ``pvesh set /pools/<id>``, see :func:`pool_add_vms`)."""
     vid = assert_sim_vm(vmid, protected or set())
-    await _run(["qm", "clone", str(int(template)), str(vid), "--name", name],
-               timeout=timeout)
+    argv = ["qm", "clone", str(int(template)), str(vid), "--name", name]
+    if pool:
+        argv += ["--pool", str(pool)]
+    await _run(argv, timeout=timeout)
+
+
+async def list_pools() -> List[str]:
+    """Proxmox resource pool IDs on this host (``pvesh get /pools``).
+
+    Read-only; returns [] on any failure so a UI dropdown degrades to "no pools"
+    rather than erroring. Pools are cluster-wide, so every host reports the same
+    set — the spoke unions them anyway in case a host is a standalone node."""
+    rc, out, _ = await _run(["pvesh", "get", "/pools", "--output-format", "json"],
+                            check=False, timeout=20)
+    if rc != 0 or not out:
+        return []
+    try:
+        data = json.loads(out.decode("utf-8", "replace") or "[]")
+    except Exception:  # noqa: BLE001
+        return []
+    ids = []
+    for p in (data or []):
+        pid = str((p or {}).get("poolid") or (p or {}).get("id") or "").strip()
+        if pid:
+            ids.append(pid)
+    return sorted(set(ids))
+
+
+async def pool_add_vms(pool: str, vmids: List[int]) -> Dict[str, Any]:
+    """Add existing VMs to a resource pool (``pvesh set /pools/<id> --vms a,b``).
+
+    Used to retrofit VMs that were cloned before a pool was configured. Proxmox
+    errors if a VM already belongs to ANOTHER pool, so those are reported rather
+    than silently skipped — moving a VM between pools is an operator decision."""
+    pool = str(pool or "").strip()
+    vms = [int(v) for v in (vmids or [])]
+    if not pool or not vms:
+        return {"status": "SUCCESS", "added": 0, "message": "nothing to do"}
+    rc, out, err = await _run(
+        ["pvesh", "set", f"/pools/{pool}", "--vms", ",".join(str(v) for v in vms)],
+        check=False, timeout=60)
+    if rc != 0:
+        return {"status": "ERROR", "added": 0,
+                "message": (err or out or b"").decode("utf-8", "replace")[:300]}
+    return {"status": "SUCCESS", "added": len(vms)}
 
 
 async def pct_clone(source: Any, vmid: Any, hostname: str, *,

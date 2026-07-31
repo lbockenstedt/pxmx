@@ -198,6 +198,18 @@ async def cs_pci_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
     return out
 
 
+def _sim_pool(agent) -> Optional[str]:
+    """Proxmox resource pool that auto-provisioned sim clients join, or None.
+
+    Set in the WebUI (Config -> auto-provisioning) and delivered in usb_config.
+    Applied at CLONE time, which is the only one-shot way to set it (``qm set``
+    has no --pool). A pool that does not exist makes the clone fail, so the UI
+    populates its dropdown from the pools the hosts actually report rather than
+    letting an operator free-type one."""
+    v = str(_usb_cfg(agent).get("sim_pool") or "").strip()
+    return v or None
+
+
 def _host_t1_excluded(agent) -> bool:
     """Per-host T1 opt-out. A host in ``usb_config.t1_exclude_hosts`` does NOT get
     its T1 controller PCI-passed — e.g. a T1 card wired to USB HUBS that you want
@@ -3144,7 +3156,8 @@ async def _clone_and_provision_pci(agent, vmid: int, pci_addr: str, vidpid: str,
     from . import pve_cmds
     protected = _protected_vmids(agent)
     name = _vm_name(vmid) or f"sim-{vmid}-{tier}"
-    await pve_cmds.qm_clone(template, vmid, name, protected=protected, timeout=600)
+    await pve_cmds.qm_clone(template, vmid, name, protected=protected,
+                            pool=_sim_pool(agent), timeout=600)
     await pve_cmds.qm_set(vmid, "--onboot", "1", "--startup", "order=2,up=60", protected=protected)
     await pve_cmds.qm_set(vmid, "-hostpci0", f"{pci_addr},pcie=1", protected=protected)
     vlan = (agent.config.get("client_simulation") or {}).get("usb_config", {}).get("vlan_nic")
@@ -3242,7 +3255,8 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
     from . import pve_cmds
     protected = _protected_vmids(agent)
     name = _vm_name(vmid) or f"sim-{vmid}-{info.get('type', 'wireless')}"
-    await pve_cmds.qm_clone(template, vmid, name, protected=protected, timeout=600)
+    await pve_cmds.qm_clone(template, vmid, name, protected=protected,
+                            pool=_sim_pool(agent), timeout=600)
     await pve_cmds.qm_set(vmid, "--onboot", "1", "--startup", "order=2,up=60",
                          protected=protected)
     await pve_cmds.qm_set(vmid, "-usb0", f"host={bus}", protected=protected)

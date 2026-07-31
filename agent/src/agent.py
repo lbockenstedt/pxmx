@@ -61,6 +61,7 @@ from . import cs_sim
 from . import watchdogs
 from . import usb_provision
 from . import pve_cmds
+from . import cs_guard
 from . import managed_crontab
 from . import console_relay
 from . import template_ops
@@ -1997,6 +1998,38 @@ class ProxmoxAgent:
                             result = await pve_cmds.retag_tenant(
                                 data.get("old_tag", ""), data.get("new_tag", ""))
                         except Exception as e:
+                            result = {"status": "ERROR", "message": str(e)}
+
+                    elif cmd_type == "PXMX_LIST_POOLS":
+                        # Proxmox resource pools on this host, for the WebUI
+                        # dropdown. Read-only; an empty list means "no pools
+                        # defined", which the UI shows rather than free-typing a
+                        # pool name that would make every clone fail.
+                        try:
+                            result = {"status": "SUCCESS",
+                                      "pools": await pve_cmds.list_pools()}
+                        except Exception as e:  # noqa: BLE001
+                            result = {"status": "ERROR", "message": str(e), "pools": []}
+
+                    elif cmd_type == "PXMX_POOL_ADD_VMS":
+                        # Retrofit: add already-cloned sim VMs to the pool. The
+                        # pool is normally set at CLONE time (qm clone --pool),
+                        # so this exists only for VMs provisioned before a pool
+                        # was configured. Guarded to the sim VMID range so it can
+                        # never sweep a non-sim VM into the pool.
+                        try:
+                            _pool = str((data or {}).get("pool") or "").strip()
+                            _prot = usb_provision._protected_vmids(self)
+                            _req = (data or {}).get("vmids")
+                            if _req:
+                                _cand = [int(v) for v in _req]
+                            else:
+                                _cand = await pve_cmds.list_qemu_vmids()
+                            _vms = [v for v in _cand if cs_guard.is_sim_vm(v, _prot)]
+                            _skipped = [v for v in _cand if v not in _vms]
+                            result = await pve_cmds.pool_add_vms(_pool, _vms)
+                            result["skipped_not_sim"] = _skipped
+                        except Exception as e:  # noqa: BLE001
                             result = {"status": "ERROR", "message": str(e)}
 
                     elif cmd_type == "PXMX_APPLY_SIM_TAGS":
