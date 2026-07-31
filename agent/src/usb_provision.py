@@ -1635,6 +1635,30 @@ async def _vm_usb_bus(vid: int) -> Optional[str]:
     return None
 
 
+async def _vm_has_pci_passthrough(vid: int) -> bool:
+    """True if the VM has ANY ``hostpciN`` line — i.e. it is a T1/T3 PCI VM.
+
+    The VMID allocator needs this because a T1/T3 VM is EXACTLY "a VM with no
+    USB passthrough", which is also the shape of a half-cloned zombie. Without
+    this check the T2 allocator walked from the bottom of the block, found the
+    freshly-provisioned T1 VMs (which deliberately keep no usb_state), classed
+    them as zombies and DESTROYED them to take their VMIDs for dongles.
+
+    Observed on a clean build: T1 took 90001-90004 with all four controllers at
+    15:50, T2 reclaimed them, T1 re-provisioned the same four cards onto 90005+
+    at 16:01, T2 ate those too, and the cycle repeated until the dongles ran out
+    — leaving the surviving T1s at the TOP of the block (90012-90015). Read from
+    the outside that looks like "T1 provisioned last"; it was actually T1 going
+    first every time and being eaten. Each cycle also cost four clone+destroy
+    pairs, which is real load on the host."""
+    from . import pve_cmds
+    try:
+        cfg = await pve_cmds.qm_config(vid)
+    except Exception:  # noqa: BLE001 — unknown → treat as occupied, never reclaim
+        return True
+    return any(str(k).startswith("hostpci") for k in (cfg or {}))
+
+
 async def _vm_has_usb_passthrough(vid: int) -> bool:
     """True if the VM has ANY usb passthrough — ``host=<bus>`` OR
     ``host=<vid:pid>`` — i.e. it's a real dongle VM, NOT a half-cloned zombie.
@@ -2894,6 +2918,16 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                             # re-track it (or it stays harmlessly untracked).
                             vid += 1
                             continue
+                        if await _vm_has_pci_passthrough(vid):
+                            # T1/T3 PCI VM. It has no usb0 and keeps no
+                            # usb_state BY DESIGN, so the zombie test below
+                            # would happily destroy it and hand its VMID to a
+                            # dongle — which is exactly what was happening, in a
+                            # loop, every provision pass.
+                            logger.debug("provision loop: VMID %s is a T1/T3 PCI VM "
+                                         "— skipping (not a zombie)", vid)
+                            vid += 1
+                            continue
                         if not await _reclaim_zombie_vmid(agent, vid):
                             vid += 1
                             continue
@@ -3069,13 +3103,15 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
     for chk in range(start, gap_max):
         if chk in active_set:
             continue
-        # Guard 2 — a vid on the host with a USB passthrough but NOT tracked is a
-        # real untracked (vidpid-form) dongle VM: occupied, not a fillable gap.
+        # Guard 2 — a vid on the host with a USB *or* PCI passthrough but NOT
+        # tracked is a real VM (an untracked vidpid-form dongle, or a T1/T3 PCI
+        # VM, which is never tracked by design): occupied, not a fillable gap.
         # Skip it (the allocator skips it too); otherwise the audit sheds the
         # highest tracked VM every pass trying to fill an occupied slot. A vid
         # not on the host is truly free → a real gap. Only on-host vids cost a
         # qm_config, so the stale-existing race is limited to a 1-tick miss.
-        if chk in existing and await _vm_has_usb_passthrough(chk):
+        if chk in existing and (await _vm_has_usb_passthrough(chk)
+                                or await _vm_has_pci_passthrough(chk)):
             continue
         lowest_gap = chk
         break
