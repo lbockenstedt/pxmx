@@ -1039,6 +1039,56 @@ async def _guest_health_probe(vid: int) -> "Optional[Dict[str, bool]]":
         return None
 
 
+async def _guest_failure_sim_active(vid: int) -> "Optional[bool]":
+    """Is this client running a sim that DELIBERATELY breaks association?
+
+    assoc_fail / ssidpw_fail / auth_fail / port_flap exist to make a client fail
+    to associate -- that is the product working. To the dongle-health ladder it
+    is indistinguishable from a broken radio, so without this the fleet would
+    reboot, reclone and finally QUARANTINE the dongles of every client running an
+    intentional failure sim, destroying their VMs mid-test.
+
+    Resolved by the client's OWN parser (ini-parser + common.sh: derive_username,
+    derive_bucket, the user-overrides simulation_id pin) rather than re-reading
+    simulation.conf here -- the bucket/user/global merge has real precedence
+    rules and a second implementation of them would drift.
+
+    Returns None when it cannot be determined; callers treat that as "maybe",
+    not "no". Getting this wrong in the permissive direction leaves a broken
+    dongle un-quarantined for a while; getting it wrong the other way destroys a
+    working test VM. The no_scan class is never gated on this, so a genuinely
+    dead radio is still caught regardless.
+    """
+    from . import pve_cmds
+    script = (
+        "set +e; "
+        "[ -r /usr/local/scripts/simulation.conf ] || exit 3; "
+        ". /usr/local/scripts/ini-parser.sh >/dev/null 2>&1 || exit 3; "
+        ". /usr/local/scripts/common.sh    >/dev/null 2>&1 || exit 3; "
+        "process_ini_file /usr/local/scripts/simulation.conf >/dev/null 2>&1 || exit 3; "
+        "derive_username >/dev/null 2>&1; derive_bucket >/dev/null 2>&1; "
+        "sid=\"s${bucket}\"; "
+        "u=$(get_value \"$username\" simulation_id 2>/dev/null); "
+        "case \"$u\" in s[0-9]) sid=\"$u\";; esac; "
+        "for k in assoc_fail ssidpw_fail auth_fail port_flap; do "
+        "  v=$(get_value \"$sid\" \"$k\" 2>/dev/null); "
+        "  [ \"$v\" = on ] && { echo ACTIVE; exit 0; }; "
+        "done; echo IDLE; exit 0"
+    )
+    try:
+        out = await pve_cmds.qm_guest_exec_shell_out(vid, script)
+    except Exception:  # noqa: BLE001
+        return None
+    if out is None:
+        return None
+    t = (out or "").strip()
+    if "ACTIVE" in t:
+        return True
+    if "IDLE" in t:
+        return False
+    return None          # exit 3 / unparseable -> unknown, NOT "no"
+
+
 async def _guest_visible_ssids(vid: int) -> "Optional[list]":
     """The SSIDs this client's radio can currently SEE, from its cached scan.
 
@@ -1291,6 +1341,31 @@ async def dongle_health_check_and_recover(agent, present) -> int:
                         else logging.WARNING)
                 logger.log(_lvl, "dongle health: VM %s bus %s CONFIRMED %s over %d "
                            "probes (probe=%s)", vid, bus, _hs, streak, _hp)
+            # SSID VISIBLE + a deliberate failure sim running => the client is
+            # SUPPOSED to be unassociated. Do not climb the ladder: rebooting,
+            # recloning and finally quarantining a dongle mid-test destroys a
+            # working VM and the test with it. Operator rule: "if a failure sim
+            # is running but the SSID is seen, do not QT the dongle; if no SSID
+            # is seen that is ALWAYS a problem."
+            #
+            # Scoped to no_assoc ONLY. no_scan (radio sees nothing at all) is
+            # never gated on this — no failure sim makes a radio blind, so that
+            # stays a hardware fault and still escalates to quarantine.
+            if _hs == "no_assoc":
+                _fs = await _guest_failure_sim_active(vid)
+                if _fs is not False:      # True or UNKNOWN -> hold off
+                    gh[bus] = dict(gh.get(bus) or {},
+                                   held_by_sim=True, held_unknown=(_fs is None))
+                    if streak == _VISIBLE_CONFIRM:
+                        logger.info(
+                            "dongle health: VM %s bus %s no_assoc but a failure "
+                            "sim is %s and APs ARE visible — NOT escalating "
+                            "(intentional test failure, not a bad dongle)",
+                            vid, bus, "active" if _fs else "indeterminate")
+                    dirty = health.pop(bus, None) is not None or dirty
+                    continue
+                gh[bus] = dict(gh.get(bus) or {}, held_by_sim=False,
+                               held_unknown=False)
             if _hs == "no_gateway":
                 # Associated (L2 up) but the gateway is unreachable ~15 min → an
                 # UPSTREAM/infra problem, NOT the dongle. Rebooting/recloning won't
