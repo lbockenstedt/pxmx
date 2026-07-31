@@ -2000,16 +2000,24 @@ class ProxmoxAgent:
                         except Exception as e:
                             result = {"status": "ERROR", "message": str(e)}
 
-                    elif cmd_type == "PXMX_LIST_POOLS":
-                        # Proxmox resource pools on this host, for the WebUI
-                        # dropdown. Read-only; an empty list means "no pools
-                        # defined", which the UI shows rather than free-typing a
-                        # pool name that would make every clone fail.
+                    elif cmd_type == "PXMX_GET_IDENTITY":
+                        # "Where does this agent think it is pointing?" Each pxmx
+                        # host is meant to dial its OWN cs spoke; when telemetry
+                        # lands on the wrong spoke (or nowhere), the pinned URL is
+                        # the fact that settles it. A spoke can only ask agents
+                        # CONNECTED to it, so the fleet answer is assembled by
+                        # asking every spoke — an agent under none is connected
+                        # nowhere.
                         try:
-                            result = {"status": "SUCCESS",
-                                      "pools": await pve_cmds.list_pools()}
+                            result = {
+                                "status": "SUCCESS",
+                                "agent_id": self.agent_id,
+                                "hostname": self.hostname,
+                                "spoke_url": self.spoke_url or "",
+                                "spoke_ip": self.spoke_ip or "",
+                            }
                         except Exception as e:  # noqa: BLE001
-                            result = {"status": "ERROR", "message": str(e), "pools": []}
+                            result = {"status": "ERROR", "message": str(e)}
 
                     elif cmd_type == "PXMX_POOL_ADD_VMS":
                         # Retrofit: add already-cloned sim VMs to the pool. The

@@ -43,51 +43,10 @@ def test_sim_pool_read_and_trimmed():
     assert up._sim_pool(_Agent("  sim-clients  ")) == "sim-clients"
 
 
-# ── listing ──────────────────────────────────────────────────────────────────
-def test_list_pools_parses_poolid(monkeypatch):
-    _stub_run(monkeypatch, 0, json.dumps(
-        [{"poolid": "sim-clients"}, {"poolid": "lab"}, {"poolid": "sim-clients"}]))
-    assert _run(pve_cmds.list_pools()) == ["lab", "sim-clients"]
-
-
-@pytest.mark.parametrize("rc,out", [(1, ""), (0, ""), (0, "not json"), (0, "[]")])
-def test_list_pools_degrades_to_empty(monkeypatch, rc, out):
-    # A dropdown that can't load must show "no pools", never raise.
-    _stub_run(monkeypatch, rc, out)
-    assert _run(pve_cmds.list_pools()) == []
-
-
-def test_schema_payload_is_not_mistaken_for_pools(monkeypatch):
-    # THE bug: pvesh answered with the endpoint SCHEMA, and a naive parse turned
-    # its keys into dropdown entries named "command" and "poolid".
-    _stub_run(monkeypatch, 0, json.dumps({
-        "command": {"description": "..."},
-        "poolid": {"type": "string"},
-        "info": {},
-    }))
-    assert _run(pve_cmds.list_pools()) == []
-
-
-def test_bare_string_elements_are_ignored(monkeypatch):
-    # A list of schema field NAMES must not become pools.
-    _stub_run(monkeypatch, 0, json.dumps(["command", "poolid", "comment"]))
-    assert _run(pve_cmds.list_pools()) == []
-
-
-def test_data_envelope_is_unwrapped(monkeypatch):
-    _stub_run(monkeypatch, 0, json.dumps({"data": [{"poolid": "sim-clients"}]}))
-    assert _run(pve_cmds.list_pools()) == ["sim-clients"]
-
-
-def test_single_pool_object(monkeypatch):
-    _stub_run(monkeypatch, 0, json.dumps({"poolid": "sim-clients", "comment": "x"}))
-    assert _run(pve_cmds.list_pools()) == ["sim-clients"]
-
-
-def test_entries_without_a_poolid_are_dropped(monkeypatch):
-    _stub_run(monkeypatch, 0, json.dumps(
-        [{"poolid": "lab"}, {"comment": "no id here"}, {"poolid": ""}]))
-    assert _run(pve_cmds.list_pools()) == ["lab"]
+# NOTE: pool LISTING is vm_inventory.list_pools (Proxmox API, pre-existing and
+# already strict). A second shell-based lister here shadowed the existing
+# PXMX_LIST_POOLS handler and turned a pvesh schema payload into pools named
+# "command"/"poolid"; it was removed rather than fixed twice.
 
 
 # ── clone places the VM in the pool ──────────────────────────────────────────
