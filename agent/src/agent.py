@@ -2736,6 +2736,10 @@ class ProxmoxAgent:
             _health = usb_provision.current_guest_health()
         except Exception:  # noqa: BLE001 — health is advisory; never block a frame
             _health = {}
+        try:
+            _ssids = usb_provision.current_visible_ssids()
+        except Exception:  # noqa: BLE001 — same: advisory, never blocks a frame
+            _ssids = {}
         vms = []
         for v in (vms_resp or {}).get("vms", []) or []:
             v = v or {}
@@ -2760,6 +2764,9 @@ class ProxmoxAgent:
                 # maps vmid→client and stamps it on the Clients row so the Hub UI
                 # can flag "USB present but no driver loaded", etc. None = no data.
                 "health":          _health.get(str(v.get("vmid"))),
+                # What this client's radio can see. Only present for wifi-side
+                # faults (no_scan / no_assoc) — healthy clients are not probed.
+                "visible_ssids":   _ssids.get(str(v.get("vmid"))),
                 "_agent_hostname": self.hostname,
             })
 
