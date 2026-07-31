@@ -1441,9 +1441,13 @@ def current_guest_health() -> "Dict[str, str]":
 
 
 async def hostname_audit_and_restamp(agent) -> int:
-    """Audit each running managed VM's IN-GUEST hostname against its expected
+    """Audit EVERY managed sim VM's IN-GUEST hostname against its expected
     identity (``_vm_name(vmid)`` from vm_names.json) and re-stamp + reboot any
-    whose clone-time stamp silently failed — the guest still carries the TEMPLATE
+    whose clone-time stamp silently failed.
+
+    Covers all tiers. This used to walk ``bus_to_vmid`` — the USB dongle map,
+    i.e. T2 only — so T1/T3 PCI-passthrough VMs were never audited and a
+    mis-stamped one stayed misnamed (and therefore untagged) forever — the guest still carries the TEMPLATE
     hostname (e.g. ``sim-rpi-0000``). A mis-named clone never matches its
     registered client, so it gets no sim tags and reports the wrong identity;
     this converges it. The Proxmox config name (``qm clone --name``) is set
@@ -1457,20 +1461,61 @@ async def hostname_audit_and_restamp(agent) -> int:
     for an operator, reclone territory). Never raises. Returns VMs re-stamped."""
     import time as _t
     from . import pve_cmds
+    from . import cs_guard
     st = load_usb_state()
     b2v = st.get("bus_to_vmid") or {}
     fixes = st.setdefault("hostname_fix", {})
     now = _t.time()
     acted = 0
     dirty = False
-    for bus, vmid in list(b2v.items()):
+    # Candidate VMs = every managed sim VM on this host, NOT just the dongle map.
+    # bus_to_vmid holds T2 (USB) VMs only — that is literally how compute_vm_tiers
+    # defines T2 — so auditing it alone left T1/T3 (PCI-passthrough) VMs with NO
+    # hostname enforcement. A mis-stamped T1 kept the template hostname forever,
+    # never matched its registered client, and so never got sim tags. There is no
+    # pci_to_vmid map to add (PCI auto-provisioning is still pending), so
+    # enumerate the host and filter with the standard sim guard: the 90000 floor
+    # plus the protected set. vm_names.json is keyed by vmid across the whole
+    # range and is tier-agnostic, so the identity source already covers T1/T3.
+    protected = _protected_vmids(agent)
+    candidates: List[int] = []
+    seen_vids = set()
+    b2v_vids = set()
+    for vmid in list(b2v.values()):
         try:
             vid = int(vmid)
         except (TypeError, ValueError):
             continue
+        b2v_vids.add(vid)
+        if vid not in seen_vids:
+            seen_vids.add(vid)
+            candidates.append(vid)
+    try:
+        for vid in await pve_cmds.list_qemu_vmids():
+            if vid in seen_vids:
+                continue
+            if not cs_guard.is_sim_vm(vid, protected):
+                continue          # below the 90000 floor or protected — never touch
+            seen_vids.add(vid)
+            candidates.append(vid)
+    except Exception as e:  # noqa: BLE001 — fall back to the dongle map alone
+        logger.debug("hostname audit: host VM enumeration failed (%s) — "
+                     "auditing the dongle map only", e)
+    for vid in candidates:
         expected = _vm_name(vid)
         if not expected:
             continue                                   # unmapped vmid — no identity to enforce
+        if vid not in b2v_vids:
+            # Newly in scope (non-T2). Templates share the sim VMID range and a
+            # template must never be re-stamped or rebooted, so check explicitly
+            # rather than relying on "its QGA is down" — a running template would
+            # otherwise be a candidate. T2s came from the dongle map and are
+            # provisioned clones by construction, so they skip the extra call.
+            try:
+                if await pve_cmds.is_template(vid, "qemu"):
+                    continue
+            except Exception:  # noqa: BLE001 — unknown → treat as template, skip
+                continue
         rec = fixes.get(str(vid)) or {}
         if int(rec.get("attempts", 0)) >= _HOSTNAME_FIX_MAX:
             continue                                   # gave up — operator/reclone territory
