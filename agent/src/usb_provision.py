@@ -1524,19 +1524,28 @@ async def hostname_audit_and_restamp(agent) -> int:
         try:
             if not await pve_cmds.qm_agent_ping(vid):
                 continue                               # QGA down — can't audit
-            # Hostname correct? Express the compare AS a shell exit code so the
-            # bool return of qm_guest_exec_shell is the answer (0 = matches).
-            ok = await pve_cmds.qm_guest_exec_shell(
-                vid, f'[ "$(hostname)" = "{expected}" ]',
-                exec_timeout=15, outer_timeout=25)
-            if ok is None or ok:
+            # READ the hostname and compare here, rather than expressing the
+            # compare as an in-guest exit code. Two reasons: the exit-code form
+            # silently always-passed for as long as qm_guest_exec_shell returned
+            # the qm process rc (see its docstring), and the actual name is what
+            # an operator needs in the log — "wrong hostname" without saying what
+            # it IS turns every occurrence into an ssh session.
+            actual = await pve_cmds.qm_guest_exec_shell_out(
+                vid, "hostname", exec_timeout=15, outer_timeout=25)
+            if actual is None:
+                continue                 # UNKNOWN (exec failed) — no strike, retry later
+            actual = actual.strip()
+            if not actual:
+                continue                 # empty is not evidence of a mismatch
+            if actual == expected:
                 dirty = fixes.pop(str(vid), None) is not None or dirty  # clear any strike
                 continue
             # MISMATCH → re-stamp the correct hostname, then reboot to apply.
             attempts = int(rec.get("attempts", 0)) + 1
-            logger.warning("hostname audit: VM %s wrong in-guest hostname (expected "
-                           "'%s') — re-stamp + reboot (attempt %d/%d)",
-                           vid, expected, attempts, _HOSTNAME_FIX_MAX)
+            logger.warning("hostname audit: VM %s wrong in-guest hostname "
+                           "(is '%s', expected '%s') — re-stamp + reboot "
+                           "(attempt %d/%d)",
+                           vid, actual, expected, attempts, _HOSTNAME_FIX_MAX)
             stamped = False
             for _ in range(3):
                 if await pve_cmds.qm_guest_exec_shell(
@@ -1552,12 +1561,13 @@ async def hostname_audit_and_restamp(agent) -> int:
                     pass
                 acted += 1
             fixes[str(vid)] = {"attempts": attempts, "last": now,
-                               "expected": expected, "stamped": stamped}
+                               "expected": expected, "actual": actual,
+                               "stamped": stamped}
             dirty = True
             if attempts >= _HOSTNAME_FIX_MAX:
                 logger.error("hostname audit: VM %s still misnamed after %d re-stamp "
-                             "attempts — needs operator/reclone (expected '%s')",
-                             vid, attempts, expected)
+                             "attempts — needs operator/reclone (is '%s', "
+                             "expected '%s')", vid, attempts, actual, expected)
         except Exception as e:  # noqa: BLE001 — one bad VM never sinks the audit
             logger.warning("hostname audit: VM %s check/restamp failed: %s", vid, e)
     if dirty:

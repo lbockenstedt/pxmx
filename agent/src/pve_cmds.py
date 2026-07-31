@@ -1068,22 +1068,47 @@ async def qm_guest_exec_shell_out(vmid: Any, script: str, *,
 async def qm_guest_exec_shell(vmid: Any, script: str, *,
                               exec_timeout: int = 60,
                               outer_timeout: int = 90,
-                              protected: Optional[Set[int]] = None) -> bool:
+                              protected: Optional[Set[int]] = None) -> Optional[bool]:
     """Run a ``bash -c <script>`` inside the guest with an explicit PVE
     ``--timeout`` (synchronous — PVE waits for completion before returning).
+
+    Returns True/False for the GUEST script's exit status, or None when the
+    result is UNKNOWN (qm itself failed, or the envelope had no exitcode).
+
+    CRITICAL: this used to ``return rc == 0`` — the exit code of the ``qm``
+    PROCESS, not of the script inside the guest. ``qm guest exec`` returns 0
+    whenever the exec MECHANISM worked and reports the guest's real status in
+    its JSON envelope ({"exitcode":N,"exited":1,"out-data":...}). So every
+    predicate built on this was permanently True: the hostname audit's
+    ``[ "$(hostname)" = "<expected>" ]`` compare always said "matches" and never
+    re-stamped a single misnamed clone; the lsusb dongle-presence probe always
+    said "present"; every guest-health check always said "healthy". Actions
+    fared no better — a hostname stamp that failed INSIDE the guest was recorded
+    as successful, which is one way a clone ends up misnamed in the first place.
 
     Mirrors the bash hostname/override writes (proxmox-agent.sh 2025-2046):
     ``qm guest exec <vmid> --timeout <t> -- bash -c '<script>'``. The explicit
     ``--timeout`` is mandatory — without it PVE defaults to async
     fire-and-forget and the caller races the next step. ``hostnamectl`` is
-    deliberately avoided here (D-Bus may be unready post-boot and can hang).
-    Best-effort: returns the exec rc == 0."""
+    deliberately avoided here (D-Bus may be unready post-boot and can hang)."""
     vid = assert_sim_vm(vmid, protected or set())
-    rc, _, _ = await _run(["qm", "guest", "exec", str(vid),
-                            "--timeout", str(exec_timeout), "--",
-                            "bash", "-c", script],
-                           check=False, timeout=outer_timeout)
-    return rc == 0
+    rc, out, _ = await _run(["qm", "guest", "exec", str(vid),
+                             "--timeout", str(exec_timeout), "--",
+                             "bash", "-c", script],
+                            check=False, timeout=outer_timeout)
+    if rc != 0 or not out:
+        return None                      # the exec itself failed → UNKNOWN
+    try:
+        import json as _json
+        env = _json.loads(out)
+    except Exception:  # noqa: BLE001 — non-JSON envelope → unknown, never "ok"
+        return None
+    if not isinstance(env, dict) or env.get("exitcode") is None:
+        return None
+    try:
+        return int(env["exitcode"]) == 0
+    except (TypeError, ValueError):
+        return None
 
 
 async def vzdump(vmid: Any, dumpdir: str, *, compress: str = "zstd",
