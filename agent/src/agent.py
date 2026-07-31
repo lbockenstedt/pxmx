@@ -202,6 +202,15 @@ _AGENT_DEFAULT_PORT = "443"
 # frame anyway (with last-known tiers). Normal is ~4s; this only trips when a
 # mass delete/clone makes the per-VM passthrough probes block on locked VMs.
 _TIERS_DEADLINE_S = float(os.environ.get("LM_PXMX_TIERS_DEADLINE_S", "8") or 8)
+# Deadlines for the two REMAINING unbounded awaits in the telemetry hot loop.
+# collect and compute_vm_tiers were bounded after earlier stalls, but
+# cs_pci_telemetry (shells out to lspci per device) and the CS_TELEMETRY send
+# were not — so on a host busy provisioning/deleting the loop could sit in one of
+# them for tens of seconds. The loop had already CHOSEN the 3s active cadence;
+# the delay was the body, not the sleep, which is why the UI showed a 45s-old
+# frame while the agent reported interval_s=3s.
+_PCI_DEADLINE_S = float(os.environ.get("LM_PXMX_PCI_DEADLINE_S", "8") or 8)
+_CS_SEND_DEADLINE_S = float(os.environ.get("LM_PXMX_CS_SEND_DEADLINE_S", "10") or 10)
 # Overall watchdog on the metrics+vms+nodes collect. Even with per-call deadlines
 # inside get_vm_list/get_node_stats, a mass op — or a lock held by a stuck
 # delete/clone that the collect blocks on — can wedge the whole telemetry tick for
@@ -2475,6 +2484,7 @@ class ProxmoxAgent:
     async def _telemetry_loop(self):
         while True:
             try:
+                _body_t0 = time.time()
                 # Resolve cluster name once after startup
                 if not self._cluster_resolved:
                     self.cluster_name = await self._fetch_cluster_name()
@@ -2645,12 +2655,35 @@ class ProxmoxAgent:
                         # for the WebUI PCI tab. Best-effort; cache so a transient lspci
                         # miss keeps the last-known list instead of blanking the tab.
                         try:
-                            self._last_pci = await usb_provision.cs_pci_telemetry(self)
+                            # Bounded like tiers: lspci can block on a host under
+                            # heavy qm load, and the PCI tab is cosmetic next to
+                            # the VM list the operator is actually waiting on.
+                            self._last_pci = await asyncio.wait_for(
+                                usb_provision.cs_pci_telemetry(self),
+                                timeout=_PCI_DEADLINE_S)
+                        except asyncio.TimeoutError:
+                            self._last_pci = getattr(self, "_last_pci", None) or {"t1_pci_devices": [], "t3_pci_devices": []}
+                            logger.warning(
+                                "cs_pci_telemetry exceeded %.0fs (busy host) — shipping "
+                                "telemetry with the last-known PCI list", _PCI_DEADLINE_S)
                         except Exception as _pe:  # noqa: BLE001
                             logger.debug(f"cs_pci_telemetry failed: {_pe}")
                             self._last_pci = getattr(self, "_last_pci", None) or {"t1_pci_devices": [], "t3_pci_devices": []}
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
-                        await self.send_cs_event("CS_TELEMETRY", cs_body)
+                        # Bounded like the AGENT_TELEMETRY send above. An
+                        # unbounded send stalls the WHOLE loop behind a
+                        # backpressured spoke/hub — precisely when the operator
+                        # most needs the stream (a mass clone/delete generates the
+                        # most traffic AND the most UI churn).
+                        try:
+                            await asyncio.wait_for(
+                                self.send_cs_event("CS_TELEMETRY", cs_body),
+                                timeout=_CS_SEND_DEADLINE_S)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "CS_TELEMETRY send exceeded %.0fs (backpressured spoke) "
+                                "— skipping this frame; the loop keeps ticking",
+                                _CS_SEND_DEADLINE_S)
                         # Signature of the present USB set (dongles). A plug/unplug
                         # must propagate in seconds, but a USB change flips none of
                         # the VM/node/prov flags — so fold it into the fast-tick
@@ -2724,6 +2757,16 @@ class ProxmoxAgent:
                 # between telemetry frames (not just the per-phase durations).
                 self._last_interval_s = interval
                 self._last_tick_done_ts = time.time()
+                # TOTAL loop-body time, separate from the per-collect phases. The
+                # phases only cover the bounded collects; a stall anywhere else
+                # (PCI probe, a backpressured send) showed up ONLY as a stale
+                # frame age with healthy-looking phase_ms, which reads as
+                # "spoke/hub relay lag" when the agent itself is the one stuck.
+                # Recording it makes body-vs-sleep answerable at a glance.
+                try:
+                    (self._last_phase_ms or {})["body_ms"] = int((self._last_tick_done_ts - _body_t0) * 1000)
+                except Exception:  # noqa: BLE001 — diagnostics only
+                    pass
                 await asyncio.sleep(interval)
             except Exception as e:
                 logger.error(f"Telemetry push failed: {e}")
