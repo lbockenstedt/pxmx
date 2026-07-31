@@ -165,12 +165,6 @@ class ProxmoxSpoke(BaseSpoke):
         if cmd == "GET_VM_INFO":
             return await self._get_vm_info(data)
 
-        if cmd in ("CREATE_VM", "AGENT_CREATE_VM"):
-            return await self._route_vm_cmd("CREATE_VM", data)
-
-        if cmd in ("DELETE_VM", "AGENT_DELETE_VM"):
-            return await self._route_vm_cmd("DELETE_VM", data)
-
         # Hypervisors view VM lifecycle (unguarded — any vmid; cs_guard does NOT
         # apply — these are real tenant VMs, not the sim 90000 floor).
         # #4 migration: the spoke builds the qm/pct/pvesm/vzdump command string
@@ -357,8 +351,6 @@ class ProxmoxSpoke(BaseSpoke):
 
         # VNC console: agent fetches a Proxmox vncproxy {ticket, port} via local
         # pvesh (fast); the hub opens the authenticated WSS itself.
-        if cmd == "VNC_PROXY":
-            return await self._route_vm_cmd("VNC_PROXY", data, timeout=15.0)
 
         # VNC console (agent-terminates-WSS): the hub tells the agent to open a
         # Proxmox vncwebsocket locally and relay frames over the existing
@@ -1130,21 +1122,6 @@ class ProxmoxSpoke(BaseSpoke):
             agent_id = next(iter(self.control_plane.connected_agents))
         return agent_id
 
-    async def _route_vm_cmd(self, cmd: str, data: Dict[str, Any],
-                            timeout: float = 15.0) -> Dict[str, Any]:
-        """Route a still-typed VM command (VNC_PROXY) to the correct agent via
-        unique_id. The mutating families now use the RUN_COMMAND paths below."""
-        agent_id = self._resolve_agent_for_vm(data)
-        if not agent_id:
-            return {"status": "ERROR", "message": "No agents connected"}
-        return await self.control_plane.send_to_agent(cmd, data, agent_id=agent_id,
-                                                      timeout=timeout)
-
-    # ── Mutating VM lifecycle via RUN_COMMAND (#4 family #5) ───────────────────
-    # The spoke builds qm/pct/pvesm/vzdump/pvesh command strings; the dumb Agent
-    # runs them and returns {ok, rc, stdout, stderr}. cs_guard does NOT apply
-    # (unguarded tenant VMs). The Agent's typed handlers stay as a rollback
-    # fallback (a rolled-back spoke uses the typed path; RUN_COMMAND is generic).
 
     async def _vm_action_one(self, agent_id: str, item: Dict[str, Any],
                              action: str) -> Dict[str, Any]:

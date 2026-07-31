@@ -1904,9 +1904,6 @@ class ProxmoxAgent:
                         result = {"status": "SUCCESS",
                                   "message": f"Log level → {logging.getLevelName(level)}"}
 
-                    elif cmd_type == "SHELLEXEC":
-                        result = {"status": "ERROR", "message": "SHELLEXEC is disabled"}
-
                     elif cmd_type == "RUN_COMMAND":
                         # Remote Console: the hub relayed a signed RUN_COMMAND
                         # down through the owning spoke (Global-Admin gated +
@@ -2279,30 +2276,6 @@ class ProxmoxAgent:
                         except Exception as e:
                             logger.exception("PXMX_CREATE_VM failed")
                             result = {"status": "ERROR", "message": str(e)}
-
-                    elif cmd_type == "VNC_PROXY":
-                        # VNC console: ask Proxmox for a vncproxy ticket+port via
-                        # local pvesh (root-authed, no API token needed). The hub
-                        # opens the authenticated wss://<host>:8006/vncwebsocket
-                        # itself using the cs-hub API token and relays bytes.
-                        # Returns {ticket, port, node, host} the hub needs to
-                        # build the WSS URL.
-                        try:
-                            node = data.get("node") or ""
-                            vmtype = (data.get("type") or "qemu").lower()
-                            vmid = data.get("vmid")
-                            path = f"/nodes/{node}/{vmtype}/{vmid}/vncproxy"
-                            vnc = await self._pvesh_action(
-                                "create", path, "--websocket", "1", json_out=True)
-                            result = {
-                                "status": "SUCCESS",
-                                "ticket": (vnc or {}).get("ticket") or "",
-                                "port": (vnc or {}).get("port"),
-                                "node": node,
-                                "host": node or self.config.get("hostname") or "",
-                            }
-                        except Exception as e:
-                            result = {"status": "ERROR", "message": f"vncproxy: {e}"}
 
                     elif cmd_type == "VNC_START":
                         # Hub→spoke→agent: open a Proxmox vncwebsocket HERE and
