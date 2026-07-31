@@ -2562,6 +2562,27 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     await _vmid_gap_audit(agent, state, start, end, now, existing, present)
     save_usb_state(state)
 
+    # usb_config MUST have arrived before we provision anything. The hub delivers
+    # it after the agent connects, so every agent RESTART opens a window where
+    # _usb_cfg is empty — and in that window _t1_pci_vidpids/_t3_pci_vidpids are
+    # empty too, which makes the T1/T3 pass below a silent no-op while the T2 pass
+    # still runs. The T2 VMs it creates then hold the dongles plugged into the
+    # controller cards, and a controller whose dongle a T2 VM owns can no longer be
+    # PCI-passed — so T1 stays blocked until those VMs are torn down. Net effect:
+    # "the first VMs were T2" and T1 never gets its cards, which is exactly
+    # backwards from the mandatory T1 -> T3 -> T2 order.
+    #
+    # Waiting costs one tick on a cold start; provisioning the wrong tier costs a
+    # manual teardown, so hold until we can actually tell the tiers apart.
+    if not _usb_cfg(agent):
+        _provision_reason = "usb_config not delivered yet"
+        logger.info("auto-provision: usb_config has not arrived from the spoke yet "
+                    "— holding off provisioning this tick so the T1/T3 PCI pass "
+                    "isn't skipped (which would let T2 claim the controllers' "
+                    "dongles and block T1)")
+        return {"provisioned": 0, "torn_down": len(torn_down),
+                "reason": _provision_reason}
+
     if not images:
         # Silent gate made loud — the #2 cause of "nothing provisions"; previously
         # returned with no log line. Surface it in the log + telemetry.
