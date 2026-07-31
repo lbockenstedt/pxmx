@@ -2006,6 +2006,45 @@ class ProxmoxAgent:
                         except Exception as e:
                             result = {"status": "ERROR", "message": str(e)}
 
+                    elif cmd_type in ("OS_UPDATE_CHECK", "OS_UPDATE_APPLY"):
+                        # Fleet OS updates, hub-orchestrated. The agent runs ON the
+                        # Proxmox HOST, so this is the one node type where an
+                        # update touches the hypervisor itself — hence
+                        # dist-upgrade (what Proxmox documents) and NEVER an
+                        # automatic reboot: the host is running the whole client
+                        # fleet. A reboot is a separate explicit operator action.
+                        #
+                        # Refuses while a provision/reclone batch is running: an
+                        # apt transaction that restarts pve services mid-clone is
+                        # how you get a half-created VM.
+                        try:
+                            from . import os_update
+                            busy = None
+                            try:
+                                pr = usb_provision.current_prov_run()
+                                if pr.get("running"):
+                                    busy = "a provisioning batch is running"
+                                elif usb_provision.current_reclone_state().get("status") == "running":
+                                    busy = "a reclone batch is running"
+                                elif usb_provision.current_deleting_vmids():
+                                    busy = "VMs are being deleted"
+                            except Exception:  # noqa: BLE001 — never block on a status probe
+                                busy = None
+                            if cmd_type == "OS_UPDATE_APPLY" and busy:
+                                result = {"status": "ERROR", "busy": True,
+                                          "message": f"refusing to apply updates: {busy}"}
+                            elif cmd_type == "OS_UPDATE_CHECK":
+                                result = await asyncio.to_thread(
+                                    os_update.check_updates,
+                                    bool((data or {}).get("refresh", True)))
+                            else:
+                                result = await asyncio.to_thread(os_update.apply_updates)
+                            result.setdefault("status", "SUCCESS")
+                            result["node_id"] = self.agent_id
+                            result["hostname"] = self.hostname
+                        except Exception as e:  # noqa: BLE001
+                            result = {"status": "ERROR", "message": str(e)}
+
                     elif cmd_type == "PXMX_GET_IDENTITY":
                         # "Where does this agent think it is pointing?" Each pxmx
                         # host is meant to dial its OWN cs spoke; when telemetry
