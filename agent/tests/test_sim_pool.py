@@ -57,6 +57,39 @@ def test_list_pools_degrades_to_empty(monkeypatch, rc, out):
     assert _run(pve_cmds.list_pools()) == []
 
 
+def test_schema_payload_is_not_mistaken_for_pools(monkeypatch):
+    # THE bug: pvesh answered with the endpoint SCHEMA, and a naive parse turned
+    # its keys into dropdown entries named "command" and "poolid".
+    _stub_run(monkeypatch, 0, json.dumps({
+        "command": {"description": "..."},
+        "poolid": {"type": "string"},
+        "info": {},
+    }))
+    assert _run(pve_cmds.list_pools()) == []
+
+
+def test_bare_string_elements_are_ignored(monkeypatch):
+    # A list of schema field NAMES must not become pools.
+    _stub_run(monkeypatch, 0, json.dumps(["command", "poolid", "comment"]))
+    assert _run(pve_cmds.list_pools()) == []
+
+
+def test_data_envelope_is_unwrapped(monkeypatch):
+    _stub_run(monkeypatch, 0, json.dumps({"data": [{"poolid": "sim-clients"}]}))
+    assert _run(pve_cmds.list_pools()) == ["sim-clients"]
+
+
+def test_single_pool_object(monkeypatch):
+    _stub_run(monkeypatch, 0, json.dumps({"poolid": "sim-clients", "comment": "x"}))
+    assert _run(pve_cmds.list_pools()) == ["sim-clients"]
+
+
+def test_entries_without_a_poolid_are_dropped(monkeypatch):
+    _stub_run(monkeypatch, 0, json.dumps(
+        [{"poolid": "lab"}, {"comment": "no id here"}, {"poolid": ""}]))
+    assert _run(pve_cmds.list_pools()) == ["lab"]
+
+
 # ── clone places the VM in the pool ──────────────────────────────────────────
 def test_qm_clone_passes_pool_flag(monkeypatch):
     argv = []

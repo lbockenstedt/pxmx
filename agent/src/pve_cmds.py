@@ -850,12 +850,31 @@ async def qm_clone(template: Any, vmid: Any, name: str, *,
     await _run(argv, timeout=timeout)
 
 
+# Keys that appear in a pvesh SCHEMA/usage payload rather than in real pool
+# data. When pvesh answers with the endpoint description instead of the
+# collection, a naive parse turns these into "pools" and they show up in the UI
+# dropdown as selectable entries named "command"/"poolid".
+_POOL_SCHEMA_KEYS = frozenset({
+    "command", "poolid", "id", "info", "data", "errors", "description",
+    "parameters", "returns", "properties", "type", "items", "method", "path",
+    "permissions", "protected", "proxyto", "optional", "format",
+})
+
+
 async def list_pools() -> List[str]:
     """Proxmox resource pool IDs on this host (``pvesh get /pools``).
 
     Read-only; returns [] on any failure so a UI dropdown degrades to "no pools"
     rather than erroring. Pools are cluster-wide, so every host reports the same
-    set — the spoke unions them anyway in case a host is a standalone node."""
+    set — the spoke unions them anyway in case a host is a standalone node.
+
+    Deliberately STRICT about what counts as a pool. pvesh does not always answer
+    with the collection: depending on version/arguments it can return a
+    ``{"data": [...]}`` envelope, a single object, or the endpoint's SCHEMA. The
+    first cut iterated whatever came back and lifted a name out of each element,
+    so a schema payload produced dropdown entries called "command" and "poolid".
+    A pool is now only accepted when it is a dict carrying a non-empty
+    ``poolid``, and schema-ish names are rejected outright."""
     rc, out, _ = await _run(["pvesh", "get", "/pools", "--output-format", "json"],
                             check=False, timeout=20)
     if rc != 0 or not out:
@@ -864,11 +883,30 @@ async def list_pools() -> List[str]:
         data = json.loads(out.decode("utf-8", "replace") or "[]")
     except Exception:  # noqa: BLE001
         return []
+    # Unwrap the shapes pvesh actually emits.
+    if isinstance(data, dict):
+        inner = data.get("data")
+        if isinstance(inner, list):
+            data = inner
+        elif isinstance(data.get("poolid"), str) and data["poolid"].strip():
+            data = [data]                      # a single pool object
+        else:
+            logger.debug("list_pools: unexpected dict payload (keys=%s) — no pools",
+                         sorted(data.keys())[:12])
+            return []
+    if not isinstance(data, list):
+        return []
     ids = []
-    for p in (data or []):
-        pid = str((p or {}).get("poolid") or (p or {}).get("id") or "").strip()
-        if pid:
-            ids.append(pid)
+    for p in data:
+        if not isinstance(p, dict):
+            continue                           # a bare string is schema noise, not a pool
+        raw = p.get("poolid")
+        if not isinstance(raw, str):
+            continue                           # schema entries carry a dict here
+        pid = raw.strip()
+        if not pid or pid.lower() in _POOL_SCHEMA_KEYS:
+            continue
+        ids.append(pid)
     return sorted(set(ids))
 
 
