@@ -108,9 +108,13 @@ def test_audit_reboots_at_most_N_vms_per_pass(monkeypatch):
     fake.qm_guest_exec_shell = _shell
     fake.qm_guest_exec = lambda v, c: _aval(True)
     # hostname_audit_and_restamp does `from . import pve_cmds` INSIDE the
-    # function, which shadows any module-global patch — the stub has to go into
-    # sys.modules so that local import resolves to it.
+    # function, which shadows any module-global patch. `from . import X` resolves
+    # via getattr on the PACKAGE, so once another test has imported the real
+    # module, patching sys.modules alone is not enough — the package attribute
+    # wins and the test silently runs against the real `qm`. Patch both.
+    import importlib
     monkeypatch.setitem(sys.modules, "src.pve_cmds", fake)
+    monkeypatch.setattr(importlib.import_module("src"), "pve_cmds", fake, raising=False)
     monkeypatch.setattr(up, "pve_cmds", fake, raising=False)
     monkeypatch.setattr(up.asyncio, "sleep", lambda *_a, **_k: _aval(None))
 
