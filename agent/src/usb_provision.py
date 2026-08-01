@@ -1070,6 +1070,27 @@ async def _guest_health_probe(vid: int) -> "Optional[Dict[str, bool]]":
                            "| grep -q . || "
                            "iw dev \"$(ls /sys/class/net 2>/dev/null | grep -m1 -E '^wl')\" "
                            "scan dump 2>/dev/null | grep -q '^BSS'"),
+        # radio_dead_hint: the radio reports an IMPOSSIBLE transmit power, which
+        # means it never completed RF init. A working dongle sits around 13-20
+        # dBm; a dead one reports -100. Observed on a failed Archer T2U Nano
+        # (2357:011e) whose driver bound cleanly, whose netdev reached
+        # UP,LOWER_UP, and which still refused every scan -- nothing else in this
+        # probe set could tell it apart from "no APs in range".
+        #
+        # This is a HINT, never a verdict on its own: some Realtek out-of-tree
+        # drivers report a bogus txpower regardless of actual state, so acting on
+        # it alone would quarantine healthy dongles. It only carries weight when
+        # the radio is ALSO not associated and seeing nothing, and it is
+        # confirmed by _guest_radio_scan_refused() before anything is shed.
+        # Read-only (iw dev info), so it is safe to run fleet-wide -- unlike an
+        # active scan, which would disrupt a working client.
+        "radio_dead_hint": (
+            "W=$(ls /sys/class/net 2>/dev/null | grep -m1 -E '^wl'); "
+            "[ -n \"$W\" ] || exit 1; "
+            "tp=$(iw dev \"$W\" info 2>/dev/null "
+            "| sed -n 's/.*txpower \\(-\\{0,1\\}[0-9]\\{1,\\}\\).*/\\1/p' | head -1); "
+            "[ -n \"$tp\" ] && [ \"$tp\" -le -50 ]"
+        ),
     }
     try:
         if not await pve_cmds.qm_agent_ping(vid):
@@ -1080,6 +1101,44 @@ async def _guest_health_probe(vid: int) -> "Optional[Dict[str, bool]]":
                 vid, script, exec_timeout=15, outer_timeout=25))
         return out
     except Exception:  # noqa: BLE001 — QGA hiccup → 'unknown', skip
+        return None
+
+
+async def _guest_radio_scan_refused(vid: int) -> "Optional[bool]":
+    """Confirm a dead radio by asking the driver to scan and seeing it REFUSE.
+
+    This is the one signal a simulation cannot fake, and that distinction is the
+    whole point. assoc_fail / ssidpw_fail and friends make a client fail to JOIN,
+    and a client in a dead RF corner sees nothing either -- both look identical
+    to ``sees_aps == False``, which is why the ladder has to be sim-aware and
+    slow. But no simulation, and no absence of APs, makes the kernel reject the
+    scan request itself. ``command failed: Operation not permitted (-1)`` means
+    the driver declined, i.e. the hardware never brought RF up.
+
+    Deliberately NOT part of _guest_health_probe: this triggers an ACTIVE scan,
+    which disrupts a working client's association and scan cache. It is only
+    called once a client is already classified as broken, where there is nothing
+    left to disrupt.
+
+    Returns True (refused → dead), False (scan worked → NOT a dead radio), or
+    None when the guest agent did not answer — callers must not escalate on None.
+    """
+    from . import pve_cmds
+    script = (
+        "W=$(ls /sys/class/net 2>/dev/null | grep -m1 -E '^wl'); "
+        "[ -n \"$W\" ] || exit 1; "
+        "ip link set \"$W\" up 2>/dev/null; "
+        # rc==0 only when the scan was REFUSED. An empty-but-successful scan
+        # exits non-zero here and is therefore NOT treated as a dead radio.
+        "iw dev \"$W\" scan 2>&1 "
+        "| grep -qiE 'not permitted|not supported|network is down|resource busy'"
+    )
+    try:
+        if not await pve_cmds.qm_agent_ping(vid):
+            return None
+        return bool(await pve_cmds.qm_guest_exec_shell(
+            vid, script, exec_timeout=30, outer_timeout=45))
+    except Exception:  # noqa: BLE001 — QGA hiccup → unknown, never escalate
         return None
 
 
@@ -1178,6 +1237,9 @@ def _classify_guest_health(probe) -> str:
     """Map a _guest_health_probe result to a state + the remediation it implies:
       unknown    (QGA down)                → never escalate blind
       no_driver  (USB present, no netdev)  → reboot (cheap) / flag in UI
+      radio_dead (netdev up, sees NO APs, impossible txpower) → RF never came up
+                 → straight to quarantine once confirmed; reboot/reclone cannot
+                   fix hardware and only burn provisioning cycles
       no_scan    (netdev up, sees NO APs)  → dead radio → reclone/swap/quarantine
       no_assoc   (netdev up, sees APs, not associated) → dongle/RF suspect
       no_gateway (associated, no L3)       → INFRA problem → ALARM, do NOT reclone
@@ -1198,6 +1260,15 @@ def _classify_guest_health(probe) -> str:
         # may legitimately hold an empty scan cache, so testing it fleet-wide
         # would false-flag healthy dongles.
         if probe.get("sees_aps") is False:
+            # radio_dead is a STRICTER no_scan: the radio also reports an
+            # impossible txpower, so it never completed RF init. Kept separate
+            # because it earns a different remedy — a reboot or reclone cannot
+            # revive hardware that never brought RF up, and climbing the full
+            # ladder just burns provisioning cycles on a dongle that will never
+            # work. Still only a candidate here: the caller confirms with
+            # _guest_radio_scan_refused() before shedding anything.
+            if probe.get("radio_dead_hint"):
+                return "radio_dead"
             return "no_scan"
         return "no_assoc"
     if not probe.get("gateway_ok"):
@@ -1375,7 +1446,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             # those states (not every unhealthy client) so a no_driver box, whose
             # radio cannot scan by definition, does not pay for a guest exec.
             _ssids = g.get("ssids")
-            if _hs in ("no_scan", "no_assoc"):
+            if _hs in ("no_scan", "no_assoc", "radio_dead"):
                 _got = await _guest_visible_ssids(vid)
                 if _got is not None:
                     _ssids = _got
@@ -1386,7 +1457,8 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             if not confirmed:
                 continue                               # still watching — no action yet
             if streak == _VISIBLE_CONFIRM:             # alarm once, on confirmation
-                _lvl = (logging.ERROR if _hs in ("no_gateway", "no_driver", "no_scan")
+                _lvl = (logging.ERROR
+                        if _hs in ("no_gateway", "no_driver", "no_scan", "radio_dead")
                         else logging.WARNING)
                 logger.log(_lvl, "dongle health: VM %s bus %s CONFIRMED %s over %d "
                            "probes (probe=%s)", vid, bus, _hs, streak, _hp)
@@ -1422,6 +1494,39 @@ async def dongle_health_check_and_recover(agent, present) -> int:
                 # Clear the recovery counter (not a dongle fault). This is the
                 # mid-run-broken-client hole, now visible in the Hub UI ('no gw').
                 dirty = health.pop(bus, None) is not None or dirty
+                continue
+            if _hs == "radio_dead":
+                # Confirm before shedding. The txpower hint alone is not enough:
+                # some Realtek out-of-tree drivers report a bogus value on a
+                # perfectly good dongle, and quarantining working hardware is a
+                # worse outcome than a slow ladder. _guest_radio_scan_refused
+                # asks the driver to scan and checks whether it REFUSES — the one
+                # signal no simulation and no absence of APs can produce.
+                _refused = await _guest_radio_scan_refused(vid)
+                if _refused is not True:
+                    # Unconfirmed (scan worked, or QGA went away). Fall back to
+                    # the normal no_scan handling rather than trusting the hint.
+                    logger.info(
+                        "dongle health: VM %s bus %s looked radio_dead (impossible "
+                        "txpower) but the scan was %s — treating as no_scan and "
+                        "climbing the normal ladder",
+                        vid, bus,
+                        "accepted" if _refused is False else "indeterminate")
+                    await _escalate(bus, vid, _HEALTH_LADDER_VISIBLE,
+                                    "lsusb-visible but no_scan")
+                    continue
+                # Proven dead: RF never initialised. A reboot or reclone cannot
+                # revive hardware, and climbing the ladder would burn several
+                # provisioning cycles and a VM rebuild before reaching the same
+                # place. Go straight to the quarantine rung.
+                logger.error(
+                    "dongle health: VM %s bus %s RADIO DEAD — impossible txpower "
+                    "AND the driver refused to scan. Neither is producible by a "
+                    "failure sim, so this is hardware. Quarantining the bus "
+                    "without climbing the ladder (probe=%s)", vid, bus, _hp)
+                await _escalate(bus, vid, ["quarantine"],
+                                "radio never initialised (txpower impossible, "
+                                "scan refused)")
                 continue
             # no_driver / no_assoc confirmed → climb the VISIBLE-broken sub-ladder
             # (reboot → reclone → quarantine); usb_reset/reattach are useless once
