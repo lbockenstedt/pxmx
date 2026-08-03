@@ -60,6 +60,7 @@ from . import cs_commands
 from . import cs_sim
 from . import watchdogs
 from . import usb_provision
+from . import usb_diagnostics
 from . import pve_cmds
 from . import cs_guard
 from . import managed_crontab
@@ -211,6 +212,13 @@ _TIERS_DEADLINE_S = float(os.environ.get("LM_PXMX_TIERS_DEADLINE_S", "8") or 8)
 # frame while the agent reported interval_s=3s.
 _PCI_DEADLINE_S = float(os.environ.get("LM_PXMX_PCI_DEADLINE_S", "8") or 8)
 _CS_SEND_DEADLINE_S = float(os.environ.get("LM_PXMX_CS_SEND_DEADLINE_S", "10") or 10)
+# Missing-dongle diagnostics shell out to journalctl + uhubctl, so they get the
+# same bounded treatment as the PCI scan. Purely informational — a timeout ships
+# the last-known snapshot rather than holding up the VM data the operator waits
+# on. Runs on a slow cadence (see _USB_DIAG_INTERVAL_S): the kernel-log window is
+# a day wide, so re-scanning it every telemetry tick is pure waste.
+_USB_DIAG_DEADLINE_S = float(os.environ.get("LM_PXMX_USB_DIAG_DEADLINE_S", "20") or 20)
+_USB_DIAG_INTERVAL_S = float(os.environ.get("LM_PXMX_USB_DIAG_INTERVAL_S", "300") or 300)
 # Overall watchdog on the metrics+vms+nodes collect. Even with per-call deadlines
 # inside get_vm_list/get_node_stats, a mass op — or a lock held by a stuck
 # delete/clone that the collect blocks on — can wedge the whole telemetry tick for
@@ -2681,6 +2689,28 @@ class ProxmoxAgent:
                         except Exception as _pe:  # noqa: BLE001
                             logger.debug(f"cs_pci_telemetry failed: {_pe}")
                             self._last_pci = getattr(self, "_last_pci", None) or {"t1_pci_devices": [], "t3_pci_devices": []}
+                        # Missing-dongle diagnostics on a SLOW cadence — the
+                        # kernel window is a day wide and uhubctl/journalctl are
+                        # subprocesses, so re-running them every tick would cost
+                        # far more than the signal changes. Cached between runs;
+                        # a failure keeps the last snapshot rather than blanking
+                        # the panel (an empty panel reads as "no problem", which
+                        # is the one thing it must never say by accident).
+                        _ud_last = getattr(self, "_last_usb_diag_ts", 0.0)
+                        if (time.time() - _ud_last) >= _USB_DIAG_INTERVAL_S:
+                            try:
+                                self._last_usb_diag = await asyncio.wait_for(
+                                    usb_diagnostics.collect(self),
+                                    timeout=_USB_DIAG_DEADLINE_S)
+                                self._last_usb_diag_ts = time.time()
+                            except asyncio.TimeoutError:
+                                self._last_usb_diag_ts = time.time()
+                                logger.warning(
+                                    "usb_diagnostics exceeded %.0fs — shipping the "
+                                    "last-known dongle diagnostic", _USB_DIAG_DEADLINE_S)
+                            except Exception as _de:  # noqa: BLE001
+                                self._last_usb_diag_ts = time.time()
+                                logger.debug(f"usb_diagnostics failed: {_de}")
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         # Bounded like the AGENT_TELEMETRY send above. An
                         # unbounded send stalls the WHOLE loop behind a
@@ -2923,6 +2953,11 @@ class ProxmoxAgent:
             # loop exactly like quarantine, so the WebUI "available dongles" count
             # must subtract these too or it overcounts.
             "excluded":         usb.get("excluded") or [],
+            # Missing-dongle diagnostics + probable cause (roster of every dongle
+            # ever seen vs what's on the bus now, kernel evidence, autosuspend
+            # settings, controllers, uhubctl PPPS capability). Collected on a slow
+            # cadence in the telemetry loop; see usb_diagnostics.collect.
+            "usb_diagnostics":  getattr(self, "_last_usb_diag", None) or {},
             # Present T1/T3 PCI devices (host lspci ∩ the allow-lists) — WebUI PCI tab.
             "t1_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t1_pci_devices", []),
             "t3_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t3_pci_devices", []),
