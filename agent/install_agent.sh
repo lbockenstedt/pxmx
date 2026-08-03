@@ -79,6 +79,120 @@ else
     echo "       apt-get install -y uhubctl"
 fi
 
+# ── Host power-management kernel parameters ────────────────────────────────
+# Aggressive PCIe/USB power management is what makes dongles vanish from lsusb
+# with NO kernel error — the silent multi-day decay that only a reboot or a
+# physical replug recovers (the in-guest usb_reset rung cannot help:
+# /sys/bus/usb/devices/<bus>/authorized stops existing once the device is gone).
+#
+# Target line on every pxmx CS agent host:
+#   GRUB_CMDLINE_LINUX_DEFAULT="quiet pcie_aspm=off intel_iommu=on pcie_power_pm=off usbcore.autosuspend=-1"
+#
+# NOTE the sign on autosuspend. It is a DELAY IN SECONDS, not a boolean:
+#   =2   kernel default (suspend after 2s idle)
+#   =1   suspend after 1s — MORE aggressive than default (found in the field,
+#        set in the belief it meant "enabled/on")
+#   =-1  the ONLY value that disables autosuspend outright
+# An existing "=1" is therefore REPLACED, never left alone.
+#
+# Sets the parameters and refreshes the bootloader, but deliberately does NOT
+# reboot — that is the operator's call on a hypervisor running VMs. The runtime
+# fallback below takes effect immediately for already-attached devices.
+# Skip with LM_SKIP_KERNEL_PARAMS=1.
+LM_KERNEL_PARAMS="pcie_aspm=off intel_iommu=on pcie_power_pm=off usbcore.autosuspend=-1"
+
+_lm_apply_cmdline() {
+    # $1 = file, $2 = "grub" | "cmdline". Ensures every key=value in
+    # $LM_KERNEL_PARAMS: an existing key has its VALUE replaced, a missing key is
+    # appended. Returns 0 only if the file actually changed.
+    #
+    # awk + atomic replace rather than `sed -i`: sed's in-place flag differs
+    # between GNU and BSD (BSD reads the next argument as a backup suffix, so
+    # `sed -i -E` silently edits nothing), and a boot-config edit is the last
+    # place to rely on that. awk behaves identically everywhere, which also makes
+    # this testable off-host.
+    local f="$1" kind="$2" tmp
+    [ -f "$f" ] || return 1
+    tmp="$f.lm-tmp.$$"
+    awk -v P="$LM_KERNEL_PARAMS" -v KIND="$kind" '
+        function esc(s) { gsub(/\./, "\\.", s); return s }
+        # Canonical result: strip every managed key wherever it sits, then
+        # re-append all of them in the declared order. Replacing in place would
+        # leave each host ordered by whatever it happened to have first, so two
+        # hosts with the same effective settings would still diff — this makes
+        # /etc/default/grub byte-identical across the fleet. Unmanaged params
+        # keep their position and are never touched.
+        function ensure(l,   i, n, a, kv, re) {
+            n = split(P, a, " ")
+            for (i = 1; i <= n; i++) {
+                split(a[i], kv, "=")
+                re = "[[:space:]]*" esc(kv[1]) "=[^[:space:]\"]*"
+                gsub(re, "", l)
+            }
+            gsub(/[[:space:]]+/, " ", l); sub(/^ /, "", l); sub(/ $/, "", l)
+            for (i = 1; i <= n; i++) l = (l == "" ? a[i] : l " " a[i])
+            return l
+        }
+        KIND == "grub" && /^GRUB_CMDLINE_LINUX_DEFAULT=/ && !seen {
+            seen = 1
+            inner = $0
+            sub(/^GRUB_CMDLINE_LINUX_DEFAULT="/, "", inner)
+            sub(/"[[:space:]]*$/, "", inner)
+            $0 = "GRUB_CMDLINE_LINUX_DEFAULT=\"" ensure(inner) "\""
+        }
+        KIND == "cmdline" && NR == 1 { $0 = ensure($0) }
+        { print }' "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
+    # Never leave a truncated or unchanged boot config behind.
+    [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
+    if cmp -s "$f" "$tmp"; then rm -f "$tmp"; return 1; fi
+    cp -a "$f" "$f.lm-bak-$(date +%Y%m%d-%H%M%S)"
+    mv "$tmp" "$f"
+    return 0
+}
+
+if [ "${LM_SKIP_KERNEL_PARAMS:-0}" = "1" ]; then
+    echo "🔌 Kernel power-management params: skipped (LM_SKIP_KERNEL_PARAMS=1)"
+else
+    echo "🔌 Applying kernel params: $LM_KERNEL_PARAMS"
+    _lm_boot_changed=0
+    # Proxmox uses systemd-boot (/etc/kernel/cmdline, ZFS/UEFI installs) OR GRUB.
+    # Update whichever is present — some hosts carry both files, and keeping the
+    # inactive one consistent is harmless.
+    if [ -f /etc/kernel/cmdline ] && command -v proxmox-boot-tool >/dev/null 2>&1; then
+        if _lm_apply_cmdline /etc/kernel/cmdline cmdline; then
+            _lm_boot_changed=1
+            proxmox-boot-tool refresh >/dev/null 2>&1 \
+                && echo "   ✔ /etc/kernel/cmdline updated + proxmox-boot-tool refreshed" \
+                || echo "   ⚠ /etc/kernel/cmdline updated but proxmox-boot-tool refresh FAILED — run it by hand"
+        fi
+    fi
+    if [ -f /etc/default/grub ] && command -v update-grub >/dev/null 2>&1; then
+        if _lm_apply_cmdline /etc/default/grub grub; then
+            _lm_boot_changed=1
+            update-grub >/dev/null 2>&1 \
+                && echo "   ✔ /etc/default/grub updated + update-grub run" \
+                || echo "   ⚠ /etc/default/grub updated but update-grub FAILED — run it by hand"
+        fi
+    fi
+    if [ "$_lm_boot_changed" = "1" ]; then
+        grep -h '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub 2>/dev/null | sed 's/^/     /'
+        echo "   ⚠ REBOOT REQUIRED for the kernel parameters to take effect."
+    else
+        echo "   ✔ already set (no bootloader change needed)"
+    fi
+    # Runtime fallback: pin currently-attached USB devices on now, so a host that
+    # will not be rebooted for a while stops suspending its dongles today. Devices
+    # that enumerate later still follow the old default until reboot — which is
+    # exactly why the kernel parameter above is the real fix.
+    _lm_pinned=0
+    for _f in /sys/bus/usb/devices/*/power/control; do
+        [ -w "$_f" ] || continue
+        if echo on > "$_f" 2>/dev/null; then _lm_pinned=$((_lm_pinned + 1)); fi
+    done
+    [ "$_lm_pinned" -gt 0 ] && echo "   ✔ pinned $_lm_pinned attached USB device(s) to power/control=on"
+    echo "   verify after reboot: cat /sys/module/usbcore/parameters/autosuspend   (expect -1)"
+fi
+
 echo "🚀 Installing Proxmox Local Agent..."
 
 INSTALL_DIR="/opt/lm/pxmx/agent"
