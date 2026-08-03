@@ -2889,7 +2889,8 @@ class ProxmoxAgent:
             usb = usb_provision.cs_usb_telemetry(self)
         except Exception as exc:  # noqa: BLE001
             logger.warning("cs telemetry: usb scan failed: %s", exc)
-            usb = {"usb_state": [], "present_usb": [], "unknown_usb": []}
+            usb = {"usb_state": [], "present_usb": [], "unknown_usb": [],
+                   "quarantine": []}
 
         return {
             "node":             node,
@@ -2911,6 +2912,13 @@ class ProxmoxAgent:
             "usb_state":        usb.get("usb_state") or [],
             "present_usb":      usb.get("present_usb") or [],
             "unknown_usb":      usb.get("unknown_usb") or [],
+            # Quarantined dongles (dmesg kernel USB errors — bus-id + reason +
+            # strikes + recovers_in_s). cs_usb_telemetry has always returned this,
+            # but the frame dropped it here, so the cs spoke's body.get("quarantine")
+            # was permanently [] → the WebUI QT tile and fleet 🚫 N QT pill never
+            # rendered and a sidelined dongle was only visible in the auto-provision
+            # card's "no eligible dongles (quarantined=[...])" reason string.
+            "quarantine":       usb.get("quarantine") or [],
             # Present T1/T3 PCI devices (host lspci ∩ the allow-lists) — WebUI PCI tab.
             "t1_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t1_pci_devices", []),
             "t3_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t3_pci_devices", []),
