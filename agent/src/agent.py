@@ -2890,7 +2890,7 @@ class ProxmoxAgent:
         except Exception as exc:  # noqa: BLE001
             logger.warning("cs telemetry: usb scan failed: %s", exc)
             usb = {"usb_state": [], "present_usb": [], "unknown_usb": [],
-                   "quarantine": []}
+                   "quarantine": [], "excluded": []}
 
         return {
             "node":             node,
@@ -2919,6 +2919,10 @@ class ProxmoxAgent:
             # rendered and a sidelined dongle was only visible in the auto-provision
             # card's "no eligible dongles (quarantined=[...])" reason string.
             "quarantine":       usb.get("quarantine") or [],
+            # Excluded buses (destroy-fail / anti-churn). Culled by the provision
+            # loop exactly like quarantine, so the WebUI "available dongles" count
+            # must subtract these too or it overcounts.
+            "excluded":         usb.get("excluded") or [],
             # Present T1/T3 PCI devices (host lspci ∩ the allow-lists) — WebUI PCI tab.
             "t1_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t1_pci_devices", []),
             "t3_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t3_pci_devices", []),

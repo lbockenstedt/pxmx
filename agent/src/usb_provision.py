@@ -2011,7 +2011,8 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
     empty). Mirrors the legacy cs bash agent's telemetry body so the cs speak's
     ``_apply_proxmox_telemetry_state`` ingests it unchanged."""
     empty: Dict[str, List[Dict[str, Any]]] = {"usb_state": [], "present_usb": [],
-                                              "unknown_usb": [], "quarantine": []}
+                                              "unknown_usb": [], "quarantine": [],
+                                              "excluded": []}
     try:
         certified = _dongle_vidpids(agent)
         ignored = _ignored_vidpids(agent)
@@ -2136,8 +2137,30 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "name": pe.get("product") or bus,
                 "vidpid": pe.get("vidpid") or "",
             })
+        # Excluded buses (destroy-fail / anti-churn exclusions set on admin
+        # delete). The provision loop culls these exactly like quarantine, so an
+        # "available dongles" count that ignores them OVERCOUNTS. Time-limited:
+        # cleared once the bus goes absent or exclude_cooldown elapses, so ship
+        # expires_at/expires_in_s for a live countdown. A legacy bare-1 value
+        # (pre-timestamp) has no since → already expired, reported as None.
+        excluded: List[Dict[str, Any]] = []
+        for bus, val in (st.get("excluded_buses") or {}).items():
+            since = float(val) if isinstance(val, (int, float)) and float(val) > 1e9 else None
+            expires_at = (since + EXCLUDE_COOLDOWN_S) if since is not None else None
+            pe = present_by_bus.get(bus) or {}
+            excluded.append({
+                "bus_path": bus,
+                "since": since,
+                "expires_at": expires_at,
+                "expires_in_s": max(0, int(expires_at - _now))
+                                if expires_at is not None else None,
+                "present": bus in present_by_bus,
+                "name": pe.get("product") or bus,
+                "vidpid": pe.get("vidpid") or "",
+            })
         return {"usb_state": usb_state, "present_usb": present,
-                "unknown_usb": unknown, "quarantine": quarantined}
+                "unknown_usb": unknown, "quarantine": quarantined,
+                "excluded": excluded}
     except Exception as exc:  # noqa: BLE001
         logger.warning("cs_usb_telemetry: failed: %s", exc)
         return empty
