@@ -2995,7 +2995,6 @@ class ProxmoxAgent:
             "template_lock":    str(cs_cfg.get("template_lock", "") or ""),
             "provision_halt":   usb_provision.current_provision_halt(),
             "delete_gate":      usb_provision.current_delete_gate(),
-            "gate_averages":    usb_provision.current_gate_averages(),
             "prov_run":         usb_provision.current_prov_run(),
             "deleting_vmids":   usb_provision.current_deleting_vmids(),
             "reclone_vmids":    usb_provision.current_reclone_vmids(),

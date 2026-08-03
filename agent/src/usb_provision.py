@@ -62,7 +62,7 @@ from .usb_quarantine import (  # noqa: E402
 from . import usb_resource_gate  # noqa: E402
 from .usb_resource_gate import (  # noqa: E402
     sample_resources, _current_cpu_pct, _resource_1h_average,
-    current_provision_halt, current_delete_gate, current_gate_averages,
+    current_provision_halt, current_delete_gate,
     _run_delete_gate, _load_delete_gate_cooldown, _save_delete_gate_cooldown,
     _load_resource_cache, _save_resource_cache,
 )
@@ -431,9 +431,10 @@ def set_refresh_paused(value: bool) -> None:
 def refresh_paused() -> bool:
     return _refresh_paused
 
-# The gate 1h-averages (_cpu_1h_avg/_mem_1h_avg) and the delete-gate decision
-# trace (_delete_gate) live in usb_resource_gate (surfaced via its current_*
-# accessors, re-exported above).
+# The delete-gate decision trace (_delete_gate) lives in usb_resource_gate
+# (surfaced via its current_* accessors, re-exported above). Its ``reason``
+# already carries the 1h cpu/mem averages vs their thresholds, which is why the
+# separate gate_averages telemetry key + its accessor were removed.
 
 # Auto-provision diagnostic state — WHY the last pass provisioned nothing (or did).
 # Surfaced in CS_TELEMETRY → WebUI Auto-Provisioning card so a silent gate (no
@@ -2365,7 +2366,6 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     cpu_instant = _cpu_hist[-1][1] if _cpu_hist else None
     # Surface the exact 1h averages the gates decide on (WebUI shows these next
     # to the display CPU 1H / Mem 1H so the operator sees what auto-prov uses).
-    usb_resource_gate.set_1h_averages(cpu_avg, mem_avg)
 
     state = load_usb_state()
     existing = set(await pve_cmds.list_all_vmids())

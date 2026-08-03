@@ -58,8 +58,6 @@ _provision_halt: Optional[Dict[str, Any]] = None
 # persisted resource ring each tick). Surfaced separately from the spoke's own
 # display average so the operator can see BOTH: the CPU 1H tile (display) AND the
 # exact number the auto-prov gate decides on.
-_cpu_1h_avg: Optional[float] = None
-_mem_1h_avg: Optional[float] = None
 
 # Delete-gate decision trace — surfaced every tick so the WebUI can show WHY the
 # gate did or didn't shed a VM (the operator couldn't tell before: it silently
@@ -190,15 +188,6 @@ def mem_samples() -> List[Tuple[float, float]]:
     return _mem_samples
 
 
-def set_1h_averages(cpu_avg: Optional[float], mem_avg: Optional[float]) -> None:
-    """Publish the exact 1h averages the gates decide on (rounded like the delete
-    gate does), so the WebUI shows what auto-prov acts on. Called by the brain
-    each tick and by ``_run_delete_gate``."""
-    global _cpu_1h_avg, _mem_1h_avg
-    _cpu_1h_avg = round(cpu_avg, 1) if cpu_avg is not None else None
-    _mem_1h_avg = round(mem_avg, 1) if mem_avg is not None else None
-
-
 def current_provision_halt() -> Optional[Dict[str, Any]]:
     """Agent-computed resource halt (``{halted, reason}`` or ``None``) for the
     telemetry body. Set by ``run_provision_loop`` when cpu/mem cross the
@@ -211,12 +200,6 @@ def current_delete_gate() -> Optional[Dict[str, Any]]:
     eligible-candidate count, and the human reason it did/didn't shed a VM) so
     the WebUI can show what auto-prov is deciding on. None until the first pass."""
     return _delete_gate
-
-
-def current_gate_averages() -> Dict[str, Any]:
-    """The 1h averages the gates ACT on (distinct from the spoke's display avg)
-    so the UI can show what the auto-prov decision uses."""
-    return {"cpu_1h_avg": _cpu_1h_avg, "mem_1h_avg": _mem_1h_avg}
 
 
 def _load_delete_gate_cooldown() -> float:
@@ -256,7 +239,6 @@ async def _run_delete_gate(agent, usb_cfg: Dict[str, Any]) -> Optional[int]:
     now = time.time()
     cpu_avg = _resource_1h_average(_cpu_samples)
     mem_avg = _resource_1h_average(_mem_samples)
-    set_1h_averages(cpu_avg, mem_avg)
     cpu_del_thr = usb_provision._pct_setting(usb_cfg, "cpu_delete_threshold", 90)
     mem_del_thr = usb_provision._pct_setting(usb_cfg, "mem_delete_threshold", 90)
     state = usb_state_store.load_usb_state()
