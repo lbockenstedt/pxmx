@@ -2700,6 +2700,17 @@ class ProxmoxAgent:
                         # a failure keeps the last snapshot rather than blanking
                         # the panel (an empty panel reads as "no problem", which
                         # is the one thing it must never say by accident).
+                        # This node's Proxmox name, resolved ONCE — the cs
+                        # telemetry body needs it to scope its VM list to the
+                        # local node, and _cs_telemetry_body is sync so it
+                        # cannot await. Falls back to the short hostname inside
+                        # local_node_name (Proxmox requires node == hostname).
+                        if not getattr(self, "_local_node", ""):
+                            try:
+                                self._local_node = await pve_cmds.local_node_name()
+                            except Exception as _ne:  # noqa: BLE001
+                                logger.debug(f"local_node_name failed: {_ne}")
+                                self._local_node = ""
                         _ud_last = getattr(self, "_last_usb_diag_ts", 0.0)
                         if (time.time() - _ud_last) >= _USB_DIAG_INTERVAL_S:
                             try:
@@ -2891,8 +2902,34 @@ class ProxmoxAgent:
             _ssids = usb_provision.current_visible_ssids()
         except Exception:  # noqa: BLE001 — same: advisory, never blocks a frame
             _ssids = {}
+        # Scope the VM list to THIS node. get_vm_list sources /cluster/resources,
+        # which is cluster-WIDE, so on a 4-node cluster every host was reporting
+        # the whole cluster's VMs — all four agents shipped the identical
+        # "vms=73" while their USB counts differed, and the per-host card showed
+        # a cluster total where an operator reads a local one. Each entry
+        # carries the owning ``node`` (vm_inventory._vm_entry), so the filter is
+        # exact.
+        #
+        # Fail OPEN: if the node name can't be resolved, or no VM matches it
+        # (name mismatch / an older agent that predates the ``node`` field),
+        # keep the unfiltered list. Showing a cluster-wide count is a much
+        # smaller failure than blanking the fleet's VM list entirely.
+        _all_vms = (vms_resp or {}).get("vms", []) or []
+        _local = str(getattr(self, "_local_node", "") or self.hostname or "").strip()
+        if _local and _all_vms:
+            _mine = [v for v in _all_vms
+                     if str(((v or {}).get("node") or "")).strip() == _local]
+            if _mine:
+                _all_vms = _mine
+            elif not getattr(self, "_warned_node_scope", False):
+                self._warned_node_scope = True
+                logger.warning(
+                    "cs telemetry: no VM reports node=%r (seen: %s) — shipping the "
+                    "UNFILTERED cluster-wide list; the per-host VM count will be a "
+                    "cluster total", _local,
+                    sorted({str((v or {}).get("node") or "?") for v in _all_vms})[:5])
         vms = []
-        for v in (vms_resp or {}).get("vms", []) or []:
+        for v in _all_vms:
             v = v or {}
             vms.append({
                 "vmid":            v.get("vmid"),
