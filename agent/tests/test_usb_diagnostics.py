@@ -415,3 +415,86 @@ def test_purge_is_idempotent(tmp_path):
     ud = _setup(tmp_path)
     ud.purge_history()
     assert ud.purge_history()["purged"] == []
+
+
+# ── bus renumbering must not invent dongles ──────────────────────────────────
+# Field reference: a host with 14 T2 + 4 T1 = 18 physical dongles and NO swaps
+# reported "23 ever seen" after two reboots. Kernel bus NUMBERS are assigned in
+# controller enumeration order and shift between boots; the port chain does not.
+# Keying history on the raw bus path invented a new dongle each time.
+
+def _p(vidpid="2357:012d"):
+    return {"vidpid": vidpid, "product": "802.11ac nic", "type": "wireless"}
+
+
+def test_renumbered_bus_does_not_inflate_the_roster(tmp_path, monkeypatch):
+    ud = _setup(tmp_path)
+    # Boot 1: one dongle on controller X port 1, seen as bus 3.
+    monkeypatch.setattr(ud, "usb_device_controller", lambda b: "0000:80:14.0")
+    ud.record_presence({"3-1": _p()}, T0)
+    # Boot 2: same physical port, kernel now calls it bus 5.
+    roster = ud.record_presence({"5-1": _p()}, T0 + 86400)
+    assert len(roster) == 1, f"roster inflated to {len(roster)}: {sorted(roster)}"
+    assert "5-1" in roster and "3-1" not in roster
+
+
+def test_renumbering_preserves_first_seen_so_dwell_survives(tmp_path, monkeypatch):
+    """The merged entry must keep the ORIGINAL first_seen, or a long-established
+    dongle would look brand new after every reboot and drop out of inventory."""
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud, "usb_device_controller", lambda b: "0000:80:14.0")
+    ud.record_presence({"3-1": _p()}, T0)
+    roster = ud.record_presence({"5-1": _p()}, T0 + 86400)
+    assert roster["5-1"]["first_seen"] == T0
+    assert ud._is_established(roster["5-1"]) is True
+
+
+def test_eighteen_dongles_stay_eighteen_across_a_reboot(tmp_path, monkeypatch):
+    """The reported fleet shape: 18 physical dongles, renumbered, no swaps."""
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud, "usb_device_controller", lambda b: "0000:80:14.0")
+    boot1 = {f"{3 + i}-1": _p() for i in range(18)}
+    ud.record_presence(boot1, T0)
+    boot2 = {f"{21 + i}-1": _p() for i in range(18)}      # every bus renumbered
+    roster = ud.record_presence(boot2, T0 + 86400)
+    assert len(roster) == 18, f"expected 18, got {len(roster)}"
+    assert ud.missing_dongles(roster, boot2, T0 + 86400) == []
+
+
+def test_different_port_is_a_different_dongle(tmp_path, monkeypatch):
+    """A genuinely new port must still register as new — the merge keys on the
+    PORT chain, not merely on the controller."""
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud, "usb_device_controller", lambda b: "0000:80:14.0")
+    ud.record_presence({"3-1": _p()}, T0)
+    roster = ud.record_presence({"3-2": _p()}, T0 + 60)
+    assert len(roster) == 2
+
+
+def test_same_port_on_a_different_controller_is_distinct(tmp_path, monkeypatch):
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud, "usb_device_controller",
+                        lambda b: "0000:80:14.0" if b.startswith("3") else "0000:97:00.0")
+    ud.record_presence({"3-1": _p()}, T0)
+    roster = ud.record_presence({"9-1": _p()}, T0 + 60)
+    assert len(roster) == 2
+
+
+def test_no_controller_means_no_merge(tmp_path, monkeypatch):
+    """Without a controller there is no stable identity — never guess."""
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud, "usb_device_controller", lambda b: "")
+    ud.record_presence({"3-1": _p()}, T0)
+    roster = ud.record_presence({"5-1": _p()}, T0 + 60)
+    assert len(roster) == 2
+
+
+def test_a_still_present_old_bus_is_never_absorbed(tmp_path, monkeypatch):
+    """Two dongles genuinely on the same port chain of the same controller
+    cannot both be present; if the old path IS still present it is a real second
+    device and must not be merged away."""
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud, "usb_device_controller", lambda b: "0000:80:14.0")
+    ud.record_presence({"3-1": _p()}, T0)
+    roster = ud.record_presence({"3-1": _p(), "5-1": _p()}, T0 + 60)
+    assert len(roster) == 2

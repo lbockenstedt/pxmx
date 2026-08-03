@@ -263,6 +263,24 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
         _ctrl = usb_device_controller(bus)
         if _ctrl:
             e["pci_controller"] = _ctrl
+        # Self-healing rename. When a reboot renumbers the bus, THIS dongle shows
+        # up under a new path while its old entry lingers as a phantom "missing"
+        # row. Same physical port (same stable id) + the old path no longer
+        # present => it is the same device, so absorb the old entry's history and
+        # drop it. Without this the roster grows by a few entries per reboot and
+        # every one of them reports as a permanent loss.
+        _sid = _stable_id(bus, _ctrl)
+        if _sid:
+            e["stable_id"] = _sid
+            for _ob, _oe in list(roster.items()):
+                if (_ob != bus and (_oe or {}).get("stable_id") == _sid
+                        and _ob not in (present_by_bus or {})):
+                    _of = (_oe or {}).get("first_seen")
+                    if isinstance(_of, (int, float)):
+                        e["first_seen"] = min(e.get("first_seen", _of), _of)
+                    roster.pop(_ob, None)
+                    logger.info("usb_diagnostics: %s renumbered to %s (same port "
+                                "%s) — merged history", _ob, bus, _sid)
         e.setdefault("first_seen", now)
         e["last_seen"] = now
         e["missing_since"] = None
@@ -281,6 +299,21 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
         roster[bus] = e
     _save_roster(roster)
     return roster
+
+
+def _stable_id(bus: str, controller: str) -> str:
+    """A dongle identity that survives a reboot: ``<pci_addr>:<port chain>``.
+
+    The kernel BUS NUMBER in a path like ``3-1`` is assigned in controller
+    enumeration order and can shift between boots; the port chain after the dash
+    (``1``, ``2.3``) is the physical topology and does not. Keying history on the
+    raw bus path therefore invents a NEW dongle every time the numbering moves —
+    a host with 18 physical dongles and two reboots reported 23 "ever seen",
+    which is where the phantom missing entries came from.
+    """
+    if not controller or "-" not in bus:
+        return ""
+    return f"{controller}:{bus.split('-', 1)[1]}"
 
 
 def _observed_s(entry: Dict[str, Any]) -> Optional[int]:
