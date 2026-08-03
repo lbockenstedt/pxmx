@@ -198,3 +198,53 @@ def test_evidence_on_a_different_bus_does_not_explain_this_loss():
     got = _causes(_missing("3-2"), _kernel({"3-9": {"link_error": 12}}), [], [], {})
     assert "Link / enumeration errors" not in got
     assert any(c.startswith("Silent") for c in got)
+
+
+# ── PCI passthrough: absent but EXPECTED ─────────────────────────────────────
+# ~4 dongles per host sit behind a USB controller card handed to a VM (T1/T3 PCI
+# passthrough). The host correctly stops seeing them; counting those as losses
+# would keep the panel permanently red during normal operation.
+
+def test_passed_through_dongles_are_not_counted_missing(tmp_path):
+    ud = _setup(tmp_path)
+    ud.record_presence({"3-1": _dongle(), "9-1": _dongle()}, T0)
+    # Stamp controllers as record_presence would have while they were present.
+    r = ud._load_roster()
+    r["3-1"]["pci_controller"] = "0000:97:00.0"      # card later given to a VM
+    r["9-1"]["pci_controller"] = "0000:80:14.0"      # stays on the host
+    ud._save_roster(r)
+
+    out = ud.missing_dongles(ud._load_roster(), {}, T0 + 60, {"0000:97:00.0"})
+    by_bus = {m["bus_path"]: m for m in out}
+    assert by_bus["3-1"]["passed_through"] is True
+    assert by_bus["9-1"]["passed_through"] is False
+
+
+def test_unknown_controller_is_never_assumed_passed_through(tmp_path):
+    """A roster entry predating controller stamping must read as a real loss,
+    not be silently excused."""
+    ud = _setup(tmp_path)
+    ud.record_presence({"3-1": _dongle()}, T0)
+    r = ud._load_roster(); r["3-1"].pop("pci_controller", None); ud._save_roster(r)
+    out = ud.missing_dongles(ud._load_roster(), {}, T0 + 60, {"0000:97:00.0"})
+    assert out[0]["passed_through"] is False
+
+
+def test_no_passthrough_set_means_everything_is_a_real_loss(tmp_path):
+    ud = _setup(tmp_path)
+    ud.record_presence({"3-1": _dongle()}, T0)
+    r = ud._load_roster(); r["3-1"]["pci_controller"] = "0000:97:00.0"; ud._save_roster(r)
+    assert ud.missing_dongles(ud._load_roster(), {}, T0 + 60, set())[0]["passed_through"] is False
+
+
+def test_controller_path_is_parsed_from_sysfs_realpath(monkeypatch, tmp_path):
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud.os.path, "realpath",
+                        lambda p: "/sys/devices/pci0000:80/0000:80:14.0/usb3/3-1")
+    assert ud.usb_device_controller("3-1") == "0000:80:14.0"
+
+
+def test_controller_path_unresolvable_is_empty(monkeypatch, tmp_path):
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud.os.path, "realpath", lambda p: "/sys/bus/usb/devices/3-1")
+    assert ud.usb_device_controller("3-1") == ""

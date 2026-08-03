@@ -128,6 +128,13 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
         e["vidpid"] = (info or {}).get("vidpid") or e.get("vidpid") or ""
         e["product"] = (info or {}).get("product") or e.get("product") or ""
         e["type"] = (info or {}).get("type") or e.get("type") or ""
+        # Owning PCI controller, captured WHILE PRESENT — a device that is gone
+        # can no longer be walked up the sysfs tree, so this is the only chance
+        # to record where it lived. It is what lets a missing dongle be
+        # attributed to a passed-through controller rather than reported lost.
+        _ctrl = usb_device_controller(bus)
+        if _ctrl:
+            e["pci_controller"] = _ctrl
         e.setdefault("first_seen", now)
         e["last_seen"] = now
         e["missing_since"] = None
@@ -149,9 +156,18 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
 
 
 def missing_dongles(roster: Dict[str, Any], present_by_bus: Dict[str, Any],
-                    now: Optional[float] = None) -> List[Dict[str, Any]]:
-    """Roster entries whose bus is no longer on the host, newest loss first."""
+                    now: Optional[float] = None,
+                    passthrough_addrs: Optional[set] = None) -> List[Dict[str, Any]]:
+    """Roster entries whose bus is no longer on the host, newest loss first.
+
+    Each entry carries ``passed_through``: True when the dongle's last-known PCI
+    controller is now bound to vfio-pci, i.e. the whole controller was handed to
+    a VM (T1/T3 PCI passthrough) and the host is SUPPOSED to stop seeing it.
+    Roughly 4 dongles per host are permanently in this state, so counting them
+    as losses would keep the panel permanently red for normal operation.
+    """
     now = time.time() if now is None else now
+    pt = passthrough_addrs or set()
     out: List[Dict[str, Any]] = []
     for bus, e in (roster or {}).items():
         if bus in (present_by_bus or {}):
@@ -167,6 +183,8 @@ def missing_dongles(roster: Dict[str, Any], present_by_bus: Dict[str, Any],
             "last_seen": e.get("last_seen"),
             "missing_since": ms,
             "missing_for_s": int(now - float(ms)) if isinstance(ms, (int, float)) else None,
+            "pci_controller": e.get("pci_controller") or "",
+            "passed_through": bool(e.get("pci_controller") and e["pci_controller"] in pt),
         })
     out.sort(key=lambda x: -(x.get("missing_since") or 0))
     return out
@@ -221,27 +239,92 @@ def usb_power_settings() -> List[Dict[str, Any]]:
     return out
 
 
+# PCI drivers that mean "this controller has been handed to a VM". A controller
+# bound to vfio-pci is no longer the host's: every USB device behind it leaves
+# the host's device list BY DESIGN (T1/T3 PCI passthrough hands a whole USB
+# controller card to a guest). Those dongles are not lost — they are exactly
+# where they are supposed to be.
+_PASSTHROUGH_DRIVERS = ("vfio-pci", "pci-stub")
+
+
+def _pci_driver(addr: str) -> str:
+    """Driver currently bound to a PCI address ('' when unbound)."""
+    try:
+        return os.path.basename(os.path.realpath(
+            f"/sys/bus/pci/devices/{addr}/driver"))
+    except OSError:
+        return ""
+
+
+def usb_device_controller(bus: str) -> str:
+    """PCI address of the controller a USB bus hangs off, '' if undetermined.
+
+    Resolved from the sysfs topology: /sys/bus/usb/devices/3-1 realpaths to
+    .../pci0000:80/0000:80:14.0/usb3/3-1, so the LAST PCI address before the
+    usbN component owns the device. This is what lets a missing dongle be
+    attributed to a controller — and therefore tell a genuine loss apart from a
+    controller that was passed through to a VM.
+    """
+    try:
+        real = os.path.realpath(f"/sys/bus/usb/devices/{bus}")
+    except OSError:
+        return ""
+    last = ""
+    for part in real.split(os.sep):
+        if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", part):
+            last = part
+        elif part.startswith("usb") and last:
+            break
+    return last
+
+
 def usb_controllers() -> List[Dict[str, Any]]:
-    """xHCI/EHCI controllers with the count of USB devices currently under each.
+    """USB controllers with device counts AND their current PCI driver binding.
 
     The PCI address is what an operator would unbind/rebind to force a full
     re-enumeration (the closest no-reboot equivalent of a power cycle), so it is
-    surfaced verbatim. The device count is what makes a controller-wide loss
-    visible: all dongles vanishing off ONE controller reads very differently
-    from losses scattered across several.
+    surfaced verbatim. The device count makes a controller-wide loss visible:
+    all dongles vanishing off ONE controller reads very differently from losses
+    scattered across several.
+
+    ``passthrough`` is the important one. A controller bound to vfio-pci has
+    been handed to a VM (T1/T3 PCI passthrough), so the host CORRECTLY stops
+    seeing every dongle behind it — historically ~4 per host. Without this the
+    diagnostic reported those as missing dongles, which is a false alarm that
+    would train an operator to ignore the panel.
     """
     out: List[Dict[str, Any]] = []
+    seen = set()
+    # Host-bound controllers, enumerated through their driver as before.
     for drv in ("xhci_hcd", "ehci-pci", "ehci_hcd"):
         for path in sorted(glob.glob(f"/sys/bus/pci/drivers/{drv}/0000:*")):
             addr = os.path.basename(path)
+            seen.add(addr)
             buses, devices = [], 0
             for usbdir in sorted(glob.glob(os.path.join(path, "usb*"))):
                 buses.append(os.path.basename(usbdir))
-                # Every non-interface child under this root hub is a device.
                 devices += len([d for d in glob.glob(os.path.join(usbdir, "*-*"))
                                 if ":" not in os.path.basename(d)])
-            out.append({"driver": drv, "pci_address": addr,
-                        "root_hubs": buses, "device_count": devices})
+            out.append({"driver": drv, "pci_address": addr, "root_hubs": buses,
+                        "device_count": devices, "passthrough": False})
+    # Passed-through controllers are NOT under an xhci_hcd driver dir — find them
+    # by PCI class (0c03 = USB controller) and report them explicitly, so a card
+    # that vanished from the host is visible as "given to a VM" rather than
+    # simply absent.
+    for path in sorted(glob.glob("/sys/bus/pci/devices/0000:*")):
+        addr = os.path.basename(path)
+        if addr in seen:
+            continue
+        try:
+            with open(os.path.join(path, "class")) as f:
+                if not f.read().strip().startswith("0x0c03"):
+                    continue
+        except OSError:
+            continue
+        drv = _pci_driver(addr)
+        out.append({"driver": drv or "(unbound)", "pci_address": addr,
+                    "root_hubs": [], "device_count": 0,
+                    "passthrough": drv in _PASSTHROUGH_DRIVERS})
     return out
 
 
@@ -495,16 +578,26 @@ async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dic
             present_by_bus = present or {}
         now = time.time()
         roster = record_presence(present_by_bus, now)
-        missing = missing_dongles(roster, present_by_bus, now)
+        controllers = usb_controllers()
+        # Controllers handed to a VM. Dongles behind them leave the host BY
+        # DESIGN (T1/T3 PCI passthrough), so they must not be counted as losses.
+        pt_addrs = {c["pci_address"] for c in controllers if c.get("passthrough")}
+        missing_all = missing_dongles(roster, present_by_bus, now, pt_addrs)
+        passed = [m for m in missing_all if m.get("passed_through")]
+        missing = [m for m in missing_all if not m.get("passed_through")]
         kernel = await kernel_usb_events()
         power = usb_power_settings()
-        controllers = usb_controllers()
         uhub = await uhubctl_support()
         return {
             "generated_at": now,
             "present_count": len(present_by_bus or {}),
             "known_count": len(roster or {}),
             "missing": missing,
+            # Absent-but-EXPECTED: their controller is passed through to a VM.
+            # Reported separately so the headline "missing" count means "lost"
+            # and nothing else — ~4 per host live here permanently.
+            "passed_through": passed,
+            "passthrough_controllers": sorted(pt_addrs),
             "kernel": kernel,
             "power": power,
             "controllers": controllers,
