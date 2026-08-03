@@ -196,13 +196,27 @@ def usb_power_settings() -> List[Dict[str, Any]]:
         if not vid or not pid:
             continue
         ctrl = _read("power/control")
+        _delay_raw = _read("power/autosuspend_delay_ms")
+        try:
+            _delay_ms = int(_delay_raw) if _delay_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            _delay_ms = None
         out.append({
             "bus_path": bus,
             "vidpid": f"{vid}:{pid}",
             "product": _read("product") or bus,
             "control": ctrl,
-            "autosuspend_delay_ms": _read("power/autosuspend_delay_ms"),
-            "autosuspend_enabled": ctrl == "auto",
+            "autosuspend_delay_ms": _delay_raw,
+            # control=auto ALONE does not mean the device will suspend.
+            # usbcore.autosuspend=-1 disables autosuspend by setting a NEGATIVE
+            # default delay while power/control legitimately stays "auto" — so
+            # testing control alone false-flags a host that is already fixed
+            # (observed: a host booted with usbcore.autosuspend=-1 still showed
+            # 4/17 "auto" and was told to set the parameter it already had).
+            # Both conditions are required: auto AND a non-negative delay.
+            "autosuspend_delay_ms_val": _delay_ms,
+            "autosuspend_enabled": (ctrl == "auto"
+                                    and _delay_ms is not None and _delay_ms >= 0),
         })
     return out
 
@@ -427,8 +441,10 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
         out.append({
             "cause": "USB autosuspend",
             "confidence": "medium",
-            "detail": f"{len(auto)} of {len(power or [])} present device(s) have "
-                      "power/control=auto, so the kernel may suspend them. A "
+            "detail": f"{len(auto)} of {len(power or [])} present device(s) can "
+                      "actually suspend (power/control=auto AND a non-negative "
+                      "autosuspend delay — control=auto with a negative delay "
+                      "does NOT suspend). A "
                       "dongle whose firmware doesn't resume cleanly drops off the "
                       "bus and never returns — the classic slow multi-day decay. "
                       "Inferred from the surviving dongles (a device that's gone "
