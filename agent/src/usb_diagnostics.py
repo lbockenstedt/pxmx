@@ -56,12 +56,25 @@ def _text(raw) -> str:
 
 PXMLIB = "/var/lib/pxmx"
 USB_PRESENCE_FILE = f"{PXMLIB}/usb_presence.json"
+# Boot-anchored baseline: what the host could see shortly after THIS boot.
+# Kept in its own file rather than as a key inside the roster, whose every key
+# is treated as a bus path by missing_dongles().
+USB_BOOT_FILE = f"{PXMLIB}/usb_boot_baseline.json"
+# A baseline captured more than this long into a boot is NOT a boot snapshot
+# (the agent was restarted mid-session); reported as such rather than trusted.
+BOOT_BASELINE_GRACE_S = 900
 
 # How far back the diagnostic kernel scan looks. The quarantine scanner uses
 # 180s (it must react fast); a dongle count that decays over days needs a window
 # wide enough to hold the event that removed one. journalctl reads a compressed
 # on-disk journal, so this stays cheap.
 DIAG_KERNEL_WINDOW_S = 86400
+
+# A dongle only counts as INVENTORY once it has been around this long. A stick
+# plugged in briefly — bench-testing, a swap, a wrong port — should not become a
+# permanent "missing" entry the moment it is unplugged again. Anything younger
+# is reported as transient and kept out of the headline loss count.
+INVENTORY_MIN_AGE_S = 4 * 3600
 
 # A roster entry not seen for this long is dropped — a dongle genuinely removed
 # from the host shouldn't be reported "missing" forever.
@@ -87,6 +100,121 @@ _KERNEL_PATTERNS = [
 # Bus id on a kernel USB line ("usb 3-1.2: ..."), matching the sysfs bus_path
 # every other module keys dongles by.
 _KERNEL_BUS_RE = re.compile(r"usb (\d+-[\d.]+)")
+
+
+# ── boot baseline ────────────────────────────────────────────────────────────
+
+def boot_id() -> str:
+    """Kernel boot id — changes on every reboot, stable across agent restarts.
+    Anchors the baseline to a BOOT rather than to a process lifetime."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _uptime_s() -> Optional[float]:
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _load_boot_baseline() -> Dict[str, Any]:
+    try:
+        if os.path.exists(USB_BOOT_FILE) and os.path.getsize(USB_BOOT_FILE) > 0:
+            with open(USB_BOOT_FILE) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug("usb_diagnostics: boot baseline read failed: %s", e)
+    return {}
+
+
+def capture_boot_baseline(present_by_bus: Dict[str, Any],
+                          now: Optional[float] = None) -> Dict[str, Any]:
+    """Snapshot the dongles visible for THIS boot; re-captured only on reboot.
+
+    The roster answers "was this ever here", which spans reboots and therefore
+    mixes real losses with bus RENUMBERING and with controllers that were handed
+    to a VM. A boot baseline answers the unambiguous question instead: what could
+    this host see at boot, and what has it lost since? Bus ids are stable within
+    a boot, so a difference against this set is a real loss with no caveats.
+
+    ``trusted`` is False when the baseline had to be taken well into a boot
+    (agent installed or restarted mid-session) — it is then a mid-life sample,
+    not a boot snapshot, and the UI must not present it as one.
+    """
+    now = time.time() if now is None else now
+    bid = boot_id()
+    cur = _load_boot_baseline()
+    if cur.get("boot_id") == bid and bid:
+        return cur
+    up = _uptime_s()
+    baseline = {
+        "boot_id": bid,
+        "captured_at": now,
+        "uptime_s_at_capture": up,
+        "trusted": bool(up is not None and up <= BOOT_BASELINE_GRACE_S),
+        "count": len(present_by_bus or {}),
+        # Controller per bus, captured NOW — the baseline is taken at boot, which
+        # is BEFORE the VMs claim their PCI controllers, so the ~4 dongles per
+        # host destined for T1/T3 passthrough ARE in this snapshot. Recording
+        # where each one lived is what lets them be recognised as "handed to a
+        # VM" later instead of counted as losses. Held here rather than read from
+        # the roster so the classification survives a roster reset.
+        "buses": {b: {"vidpid": (i or {}).get("vidpid") or "",
+                      "product": (i or {}).get("product") or b,
+                      "pci_controller": usb_device_controller(b)}
+                  for b, i in (present_by_bus or {}).items()},
+    }
+    try:
+        os.makedirs(PXMLIB, exist_ok=True)
+        tmp = f"{USB_BOOT_FILE}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(baseline, f)
+        os.replace(tmp, USB_BOOT_FILE)
+        logger.info("usb_diagnostics: boot baseline captured — %d dongle(s), "
+                    "%.0fs into boot%s", baseline["count"], up or -1,
+                    "" if baseline["trusted"] else " (NOT a boot snapshot)")
+    except OSError as e:
+        logger.debug("usb_diagnostics: boot baseline write failed: %s", e)
+    return baseline
+
+
+def lost_since_boot(baseline: Dict[str, Any], present_by_bus: Dict[str, Any],
+                    passthrough_addrs: Optional[set] = None,
+                    roster: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Buses present at boot that are gone NOW — the unambiguous loss count.
+
+    Bus ids are stable within a boot, so unlike the roster this cannot be
+    confused by renumbering. Entries whose controller has since been passed
+    through to a VM are still excluded: those left the host on purpose.
+    """
+    pt = passthrough_addrs or set()
+    ros = roster or {}
+    out: List[Dict[str, Any]] = []
+    for bus, info in ((baseline or {}).get("buses") or {}).items():
+        if bus in (present_by_bus or {}):
+            continue
+        # Baseline's own record first — written while the dongle was present at
+        # boot. The roster is a fallback for baselines predating this stamping.
+        ctrl = ((info or {}).get("pci_controller")
+                or (ros.get(bus) or {}).get("pci_controller") or "")
+        out.append({"bus_path": bus,
+                    "vidpid": (info or {}).get("vidpid") or "",
+                    "product": (info or {}).get("product") or bus,
+                    "pci_controller": ctrl,
+                    "observed_s": _observed_s(ros.get(bus) or {}),
+                    "established": _is_established(ros.get(bus) or {}),
+                    # Absent because its controller went to a VM — expected, not
+                    # a loss. Reported rather than dropped so the count stays
+                    # explainable ("4 of 5 absent are passthrough").
+                    "passed_through": bool(ctrl and ctrl in pt)})
+    out.sort(key=lambda x: x["bus_path"])
+    return out
 
 
 # ── presence roster ──────────────────────────────────────────────────────────
@@ -155,6 +283,43 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
     return roster
 
 
+def _observed_s(entry: Dict[str, Any]) -> Optional[int]:
+    """Seconds between a roster entry's first and last sighting."""
+    fs, ls = (entry or {}).get("first_seen"), (entry or {}).get("last_seen")
+    if isinstance(fs, (int, float)) and isinstance(ls, (int, float)) and ls >= fs:
+        return int(ls - fs)
+    return None
+
+
+def _is_established(entry: Dict[str, Any]) -> bool:
+    """True once a dongle has been present long enough to count as inventory.
+
+    A dongle can legitimately be connected and then removed. Without this, any
+    stick plugged in for ten minutes became a permanent "missing" row the moment
+    it was pulled — noise that would bury the real losses.
+    """
+    obs = _observed_s(entry)
+    return obs is not None and obs >= INVENTORY_MIN_AGE_S
+
+
+def purge_history() -> Dict[str, Any]:
+    """Delete the presence roster + boot baseline. Operator-triggered reset for
+    after a deliberate hardware change (dongles moved, ports rewired, a card
+    pulled), where the recorded history describes a machine that no longer
+    exists and would otherwise report permanent phantom losses. The next pass
+    rebuilds both from what is actually attached."""
+    removed = []
+    for f in (USB_PRESENCE_FILE, USB_BOOT_FILE):
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+                removed.append(os.path.basename(f))
+        except OSError as e:
+            logger.warning("usb_diagnostics: purge failed for %s: %s", f, e)
+    logger.info("usb_diagnostics: history purged (%s)", ", ".join(removed) or "nothing to remove")
+    return {"purged": removed}
+
+
 def missing_dongles(roster: Dict[str, Any], present_by_bus: Dict[str, Any],
                     now: Optional[float] = None,
                     passthrough_addrs: Optional[set] = None) -> List[Dict[str, Any]]:
@@ -183,6 +348,10 @@ def missing_dongles(roster: Dict[str, Any], present_by_bus: Dict[str, Any],
             "last_seen": e.get("last_seen"),
             "missing_since": ms,
             "missing_for_s": int(now - float(ms)) if isinstance(ms, (int, float)) else None,
+            # How long it was actually around before vanishing. Below
+            # INVENTORY_MIN_AGE_S it was never really part of the inventory.
+            "observed_s": _observed_s(e),
+            "established": _is_established(e),
             "pci_controller": e.get("pci_controller") or "",
             "passed_through": bool(e.get("pci_controller") and e["pci_controller"] in pt),
         })
@@ -303,7 +472,13 @@ def usb_controllers() -> List[Dict[str, Any]]:
             buses, devices = [], 0
             for usbdir in sorted(glob.glob(os.path.join(path, "usb*"))):
                 buses.append(os.path.basename(usbdir))
-                devices += len([d for d in glob.glob(os.path.join(usbdir, "*-*"))
+                # RECURSIVE. Direct children of the root hub miss everything
+                # behind an external hub (17-2.1, 17-2.3 …), which is where most
+                # dongles actually live — a host with 11 present dongles was
+                # reporting 3, making the per-controller counts useless for
+                # spotting "they all went off ONE controller".
+                devices += len([d for d in glob.glob(os.path.join(usbdir, "**", "*-*"),
+                                                     recursive=True)
                                 if ":" not in os.path.basename(d)])
             out.append({"driver": drv, "pci_address": addr, "root_hubs": buses,
                         "device_count": devices, "passthrough": False})
@@ -503,6 +678,35 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
             "remedy": "Re-seat or replace the cable/dongle; if it repeats on the "
                       "same PORT with different dongles, the port is at fault.",
         })
+    # Disconnect WITHOUT a link error. The kernel saw the device leave the bus
+    # cleanly — no protocol fault, no enumeration retry, it simply stopped being
+    # there. That is the electrical/PHY signature (VBUS drop, marginal cable or
+    # port, a hub dropping a downstream port), NOT a software or driver fault.
+    #
+    # This branch was missing, and its absence was silent in the worst way:
+    # `disconnect` counts landed in `hit`, which made the "no kernel evidence"
+    # fallback below think evidence existed, so a host whose dongles ONLY logged
+    # disconnects produced an EMPTY cause list. Three of four lab hosts showed
+    # 23-140 disconnects and no probable cause at all.
+    if hit.get("disconnect") and not hit.get("link_error"):
+        _n = hit["disconnect"]
+        out.append({
+            "cause": "Clean disconnect (no link error)",
+            "confidence": "high" if _n >= len(missing_buses) else "medium",
+            "detail": f"{_n} USB disconnect event(s) on the missing bus(es) with "
+                      "NO accompanying link error. The device left the bus "
+                      "cleanly rather than failing to talk — that points at "
+                      "power/PHY (VBUS drop, marginal cable or port, a hub "
+                      "dropping its downstream port), not at the driver or the "
+                      "USB stack.",
+            "evidence": "kernel: USB disconnect on the missing bus, no -71/-110",
+            "remedy": ("Power-cycle the port: uhubctl -a cycle -l <hub>"
+                       if (uhubctl or {}).get("supported") else
+                       "Re-seat the dongle / try a powered hub; no PPPS hub here, "
+                       "so the fallback is an xHCI unbind/rebind") +
+                      ". If it recurs on the SAME port with a different dongle, "
+                      "the port or its power supply is at fault.",
+        })
     if totals.get("controller_fault"):
         out.append({
             "cause": "USB controller fault",
@@ -578,13 +782,30 @@ async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dic
             present_by_bus = present or {}
         now = time.time()
         roster = record_presence(present_by_bus, now)
+        # Boot baseline FIRST — the authoritative "what should be here". Bus ids
+        # are stable within a boot, so a diff against it is a real loss with none
+        # of the roster's cross-reboot caveats (renumbering, controllers handed
+        # to a VM, dongles physically moved between ports).
+        baseline = capture_boot_baseline(present_by_bus, now)
         controllers = usb_controllers()
         # Controllers handed to a VM. Dongles behind them leave the host BY
         # DESIGN (T1/T3 PCI passthrough), so they must not be counted as losses.
         pt_addrs = {c["pci_address"] for c in controllers if c.get("passthrough")}
         missing_all = missing_dongles(roster, present_by_bus, now, pt_addrs)
         passed = [m for m in missing_all if m.get("passed_through")]
-        missing = [m for m in missing_all if not m.get("passed_through")]
+        _m_real = [m for m in missing_all if not m.get("passed_through")]
+        missing = [m for m in _m_real if m.get("established")]
+        missing_transient = [m for m in _m_real if not m.get("established")]
+        lost_all = lost_since_boot(baseline, present_by_bus, pt_addrs, roster)
+        # Split: a dongle absent because its controller was passed through to a
+        # VM is exactly where it should be. Only the remainder is a real loss.
+        _real = [m for m in lost_all if not m.get("passed_through")]
+        lost_passthrough = [m for m in lost_all if m.get("passed_through")]
+        # Only ESTABLISHED dongles (>= INVENTORY_MIN_AGE_S observed) count as
+        # losses. A stick that was plugged in briefly and pulled is transient,
+        # not missing inventory.
+        lost = [m for m in _real if m.get("established")]
+        lost_transient = [m for m in _real if not m.get("established")]
         kernel = await kernel_usb_events()
         power = usb_power_settings()
         uhub = await uhubctl_support()
@@ -598,11 +819,25 @@ async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dic
             # and nothing else — ~4 per host live here permanently.
             "passed_through": passed,
             "passthrough_controllers": sorted(pt_addrs),
+            # THE headline number: present at boot, gone now. Unambiguous.
+            "lost_since_boot": lost,
+            "boot_passthrough": lost_passthrough,
+            # Seen too briefly to be inventory — surfaced, never counted.
+            "lost_transient": lost_transient,
+            "missing_transient": missing_transient,
+            "inventory_min_age_s": INVENTORY_MIN_AGE_S,
+            "boot_baseline": {k: v for k, v in (baseline or {}).items() if k != "buses"},
             "kernel": kernel,
             "power": power,
             "controllers": controllers,
             "uhubctl": uhub,
-            "causes": correlate(missing, kernel, power, controllers, uhub),
+            # Correlate against the BOOT-derived losses when the baseline is a
+            # true boot snapshot — that set is exactly "what should be here and
+            # is not". Fall back to the roster when the baseline was taken
+            # mid-boot (agent installed/restarted late), where it is only a
+            # sample and the roster is the better evidence.
+            "causes": correlate(lost if baseline.get("trusted") else missing,
+                                kernel, power, controllers, uhub),
         }
     except Exception as e:  # noqa: BLE001
         logger.warning("usb_diagnostics.collect failed: %s", e)

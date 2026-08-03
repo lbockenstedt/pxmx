@@ -214,6 +214,24 @@ async def handle_cs_command(agent, action: str,
             return {"status": "SUCCESS", "action": "clear_usb_quarantine",
                     "bus": bus, "cleared": True, "unbound": unbound, "message": msg}
 
+        if action == "clear_usb_history":
+            # Purge the missing-dongle HISTORY: the presence roster + the boot
+            # baseline. For after a deliberate hardware change (dongles moved,
+            # ports rewired, a controller card pulled) where the recorded history
+            # describes a machine that no longer exists and would otherwise
+            # report permanent phantom losses. Distinct from clear_usb_quarantine
+            # (fault state) and clear_usb_exclusions (destroy-fail bookkeeping):
+            # this only forgets what USED to be attached. The next pass rebuilds
+            # both files from what is actually there, and the boot baseline is
+            # re-captured mid-boot — so it is marked untrusted until the next
+            # reboot rather than pretending to be a boot snapshot.
+            from . import usb_diagnostics
+            r = usb_diagnostics.purge_history()
+            n = len(r.get("purged") or [])
+            return {"status": "SUCCESS", "action": "clear_usb_history", **r,
+                    "message": (f"purged dongle history ({', '.join(r['purged'])})"
+                                if n else "no dongle history to purge")}
+
         if action == "clear_usb_exclusions":
             # Clear the destroy-fail bus EXCLUSIONS (usb_state.json) — what repeated
             # spin-up/down teardowns trip — + release STALE assignments (a bus stuck

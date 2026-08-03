@@ -51,6 +51,7 @@ def _setup(tmp_path):
     lib.mkdir()
     _ud.PXMLIB = str(lib)
     _ud.USB_PRESENCE_FILE = f"{lib}/usb_presence.json"
+    _ud.USB_BOOT_FILE = f"{lib}/usb_boot_baseline.json"
     return _ud
 
 
@@ -248,3 +249,169 @@ def test_controller_path_unresolvable_is_empty(monkeypatch, tmp_path):
     ud = _setup(tmp_path)
     monkeypatch.setattr(ud.os.path, "realpath", lambda p: "/sys/bus/usb/devices/3-1")
     assert ud.usb_device_controller("3-1") == ""
+
+
+# ── disconnect-only evidence must produce a cause ────────────────────────────
+# Regression: `disconnect` counts landed in the per-bus hit map but no branch
+# read them, AND their presence suppressed the "no kernel evidence" fallback —
+# so a host whose dongles only logged disconnects got an EMPTY cause list.
+# Three of four lab hosts (23-140 disconnects) showed no probable cause at all.
+
+def test_disconnect_only_produces_a_cause():
+    got = _ud.correlate(_missing(), _kernel({"3-2": {"disconnect": 4}}),
+                        [], [], {"supported": True})
+    assert got, "disconnect-only evidence produced NO cause"
+    assert got[0]["cause"] == "Clean disconnect (no link error)"
+
+
+def test_disconnect_cause_points_at_power_not_driver():
+    c = _ud.correlate(_missing(), _kernel({"3-2": {"disconnect": 9}}),
+                      [], [], {"supported": True})[0]
+    assert "power/PHY" in c["detail"]
+    assert "uhubctl" in c["remedy"]
+
+
+def test_disconnect_remedy_adapts_when_no_ppps_hub():
+    c = _ud.correlate(_missing(), _kernel({"3-2": {"disconnect": 9}}),
+                      [], [], {"supported": False})[0]
+    assert "unbind" in c["remedy"] and "uhubctl -a cycle" not in c["remedy"]
+
+
+def test_link_error_outranks_a_bare_disconnect():
+    """A link error is the more specific diagnosis; disconnect must not
+    duplicate it (svr-01 had both and should report the link error)."""
+    causes = _causes(_missing(), _kernel({"3-2": {"link_error": 6, "disconnect": 3}}),
+                     [], [], {})
+    assert "Link / enumeration errors" in causes
+    assert "Clean disconnect (no link error)" not in causes
+
+
+def test_disconnect_on_another_bus_is_not_credited():
+    causes = _causes(_missing("3-2"), _kernel({"9-9": {"disconnect": 50}}),
+                     [], [], {"supported": True})
+    assert "Clean disconnect (no link error)" not in causes
+    assert any(c.startswith("Silent") for c in causes)
+
+
+# ── boot baseline: the authoritative "what should be here" ───────────────────
+# The roster spans reboots, so it mixes real losses with bus RENUMBERING and
+# with controllers handed to VMs. Bus ids are stable WITHIN a boot, so a diff
+# against a boot snapshot is unambiguous. Crucially the snapshot is taken at
+# boot — BEFORE the VMs claim their PCI controllers — so the ~4 per host bound
+# for passthrough are in it and must not later read as losses.
+
+def _baseline(buses, boot="boot-a", trusted=True):
+    return {"boot_id": boot, "captured_at": T0, "trusted": trusted,
+            "count": len(buses), "buses": buses}
+
+
+def test_lost_since_boot_is_the_simple_difference(tmp_path):
+    ud = _setup(tmp_path)
+    b = _baseline({"3-1": {"vidpid": "x", "pci_controller": "0000:80:14.0"},
+                   "9-1": {"vidpid": "y", "pci_controller": "0000:80:14.0"}})
+    out = ud.lost_since_boot(b, {"3-1": _dongle()}, set(), {})
+    assert [m["bus_path"] for m in out] == ["9-1"]
+    assert out[0]["passed_through"] is False
+
+
+def test_passthrough_dongles_present_at_boot_are_not_losses(tmp_path):
+    """The reported case: the baseline is captured BEFORE the VM takes the
+    controller, so those dongles are in it and vanish later by design."""
+    ud = _setup(tmp_path)
+    b = _baseline({"3-1": {"vidpid": "x", "pci_controller": "0000:97:00.0"},
+                   "3-2": {"vidpid": "x", "pci_controller": "0000:97:00.0"},
+                   "9-1": {"vidpid": "y", "pci_controller": "0000:80:14.0"}})
+    out = ud.lost_since_boot(b, {}, {"0000:97:00.0"}, {})
+    by = {m["bus_path"]: m for m in out}
+    assert by["3-1"]["passed_through"] is True
+    assert by["3-2"]["passed_through"] is True
+    assert by["9-1"]["passed_through"] is False      # the only real loss
+
+
+def test_baseline_controller_beats_a_missing_roster(tmp_path):
+    """Classification must survive a roster reset — the baseline holds its own
+    controller record precisely so it does not depend on the roster."""
+    ud = _setup(tmp_path)
+    b = _baseline({"3-1": {"vidpid": "x", "pci_controller": "0000:97:00.0"}})
+    assert ud.lost_since_boot(b, {}, {"0000:97:00.0"}, {})[0]["passed_through"] is True
+
+
+def test_roster_controller_used_when_baseline_predates_stamping(tmp_path):
+    ud = _setup(tmp_path)
+    b = _baseline({"3-1": {"vidpid": "x"}})          # no pci_controller
+    ros = {"3-1": {"pci_controller": "0000:97:00.0"}}
+    assert ud.lost_since_boot(b, {}, {"0000:97:00.0"}, ros)[0]["passed_through"] is True
+
+
+def test_baseline_recaptured_only_on_reboot(tmp_path, monkeypatch):
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud, "boot_id", lambda: "boot-a")
+    monkeypatch.setattr(ud, "_uptime_s", lambda: 60.0)
+    first = ud.capture_boot_baseline({"3-1": _dongle()}, T0)
+    assert first["count"] == 1 and first["trusted"] is True
+    # Same boot, more dongles now — baseline must NOT move.
+    again = ud.capture_boot_baseline({"3-1": _dongle(), "9-1": _dongle()}, T0 + 500)
+    assert again["count"] == 1
+    # Reboot → fresh capture.
+    monkeypatch.setattr(ud, "boot_id", lambda: "boot-b")
+    after = ud.capture_boot_baseline({"3-1": _dongle(), "9-1": _dongle()}, T0 + 900)
+    assert after["count"] == 2 and after["boot_id"] == "boot-b"
+
+
+def test_late_capture_is_marked_untrusted(tmp_path, monkeypatch):
+    """Agent installed/restarted hours into a boot: a mid-life sample, not a
+    boot snapshot, and must not be presented as one."""
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud, "boot_id", lambda: "boot-c")
+    monkeypatch.setattr(ud, "_uptime_s", lambda: 40000.0)
+    assert ud.capture_boot_baseline({"3-1": _dongle()}, T0)["trusted"] is False
+
+
+# ── inventory qualifier: a briefly-attached dongle is not "missing" ──────────
+# A dongle can legitimately be plugged in and removed. Without a dwell test any
+# stick present for ten minutes became a permanent missing row the moment it was
+# pulled, burying the real losses.
+
+def test_dongle_seen_briefly_is_not_established(tmp_path):
+    ud = _setup(tmp_path)
+    ud.record_presence({"3-1": _dongle()}, T0)
+    roster = ud.record_presence({"3-1": _dongle()}, T0 + 600)     # 10 min
+    ud.record_presence({}, T0 + 700)
+    out = ud.missing_dongles(ud._load_roster(), {}, T0 + 800)
+    assert out[0]["established"] is False
+    assert out[0]["observed_s"] == 600
+
+
+def test_dongle_present_over_four_hours_is_inventory(tmp_path):
+    ud = _setup(tmp_path)
+    ud.record_presence({"3-1": _dongle()}, T0)
+    ud.record_presence({"3-1": _dongle()}, T0 + ud.INVENTORY_MIN_AGE_S + 60)
+    out = ud.missing_dongles(ud._load_roster(), {}, T0 + ud.INVENTORY_MIN_AGE_S + 600)
+    assert out[0]["established"] is True
+
+
+def test_exactly_the_threshold_counts(tmp_path):
+    ud = _setup(tmp_path)
+    ud.record_presence({"3-1": _dongle()}, T0)
+    ud.record_presence({"3-1": _dongle()}, T0 + ud.INVENTORY_MIN_AGE_S)
+    assert ud.missing_dongles(ud._load_roster(), {}, T0 + 99999)[0]["established"] is True
+
+
+# ── purge ────────────────────────────────────────────────────────────────────
+
+def test_purge_removes_roster_and_baseline(tmp_path, monkeypatch):
+    ud = _setup(tmp_path)
+    monkeypatch.setattr(ud, "boot_id", lambda: "boot-a")
+    monkeypatch.setattr(ud, "_uptime_s", lambda: 30.0)
+    ud.record_presence({"3-1": _dongle()}, T0)
+    ud.capture_boot_baseline({"3-1": _dongle()}, T0)
+    assert ud._load_roster() and ud._load_boot_baseline()
+    out = ud.purge_history()
+    assert sorted(out["purged"]) == ["usb_boot_baseline.json", "usb_presence.json"]
+    assert ud._load_roster() == {} and ud._load_boot_baseline() == {}
+
+
+def test_purge_is_idempotent(tmp_path):
+    ud = _setup(tmp_path)
+    ud.purge_history()
+    assert ud.purge_history()["purged"] == []
