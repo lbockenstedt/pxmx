@@ -1276,6 +1276,43 @@ def _classify_guest_health(probe) -> str:
     return "healthy"
 
 
+def build_idle_reason(culled: Dict[str, List[str]], any_present: bool,
+                      sim_phy: str) -> str:
+    """The provision loop's reason string when no dongle is left to place a VM on.
+
+    That state is NOT automatically a fault. The fleet is meant to run EVERY
+    dongle, so "every dongle is already driving a VM" is the goal, and reporting
+    it as ``no eligible dongles`` made a fully-deployed host read as broken on
+    the Auto-Provisioning card.
+
+    So: lead with the deployed COUNT whenever at least one dongle is in use, and
+    reserve the fault wording for when nothing is deployed and something is
+    genuinely wrong (none present, all sidelined, all the wrong type). Sidelined
+    counts still ride along — "8 in use; 2 quarantined" must not read the same
+    as a clean 8.
+
+    Callers that key on this string must accept BOTH prefixes; see
+    ``fleet_health_alert._eval_dongle_shed``.
+    """
+    n_assigned = len(culled.get("assigned") or [])
+    sidelined = []
+    if culled.get("quarantined"):
+        sidelined.append(f"{len(culled['quarantined'])} quarantined")
+    if culled.get("excluded"):
+        sidelined.append(f"{len(culled['excluded'])} excluded")
+    if culled.get("type"):
+        sidelined.append(f"{len(culled['type'])} wrong type for sim_phy={sim_phy}")
+    if n_assigned:
+        return (f"all dongles deployed ({n_assigned} in use"
+                + (f"; {', '.join(sidelined)}" if sidelined else "") + ")")
+    detail = "; ".join(f"{k}={v}" for k, v in culled.items() if v)
+    if not any_present:
+        detail = "none present"
+    elif not detail:
+        detail = f"none match sim_phy={sim_phy}"
+    return f"no eligible dongles ({detail})"
+
+
 def _usb_port_reset(bus: str) -> bool:
     """Host-side USB reset — de-authorize then re-authorize the device so it
     re-enumerates (the guest's usb-host sees a re-plug). Best-effort."""
@@ -2890,16 +2927,18 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
 
     ordered = preferred + overflow
     if not ordered:
-        # Silent gate made loud — every dongle is assigned/excluded/quarantined,
-        # type-mismatched, or none is present. Name the per-bus cause so the card
-        # + log are self-diagnosing (previously an un-diagnosable generic label).
-        detail = "; ".join(f"{k}={v}" for k, v in culled.items() if v)
-        if not present:
-            detail = "none present"
-        elif not detail:
-            detail = f"none match sim_phy={sim_phy}"
-        _provision_reason = f"no eligible dongles ({detail})"
-        logger.info("auto-provision: no eligible dongles (%s)", detail)
+        # Nothing left to place a VM on. That is NOT automatically a fault: the
+        # fleet is meant to run every dongle, so "every dongle is already driving
+        # a VM" is the GOAL STATE, not a shortage. Reporting it as "no eligible
+        # dongles" made a fully-deployed host read as broken on the card.
+        #
+        # So lead with the deployed count whenever at least one dongle is in use,
+        # and only fall back to the fault wording when nothing is deployed and
+        # something is genuinely wrong (none present, all sidelined, all the
+        # wrong type). Sidelined counts still ride along — a host at
+        # "8 deployed, 2 quarantined" must not look identical to a clean 8.
+        _provision_reason = build_idle_reason(culled, bool(present), sim_phy)
+        logger.info("auto-provision: %s", _provision_reason)
         return {"provisioned": pci_provisioned, "torn_down": len(torn_down)}
 
     existing_after = set(await pve_cmds.list_all_vmids())
