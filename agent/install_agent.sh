@@ -59,6 +59,26 @@ echo "📦 Installing system dependencies..."
 apt-get update
 apt-get install -y python3-pip python3-venv git curl jq
 
+# uhubctl — per-port USB power switching, used by the missing-dongle diagnostic
+# (Setup → Diagnostics) to report whether this host can power-cycle its USB ports
+# instead of needing a reboot. Installed SEPARATELY and best-effort on purpose:
+# it is a diagnostic aid, not a runtime dependency, so a host whose repos lack
+# the package must still get a working agent. Folding it into the line above
+# would abort the whole install on a single unavailable package.
+#
+# Note the agent probes for a PPPS-capable hub at runtime — installing the binary
+# does NOT mean port power cycling will work here. Most on-board root hubs do not
+# support it; the Diagnostics badge reports the real verdict per host.
+if command -v uhubctl >/dev/null 2>&1; then
+    echo "   ✔ uhubctl already present ($(uhubctl -v 2>/dev/null | head -1))"
+elif apt-get install -y uhubctl >/dev/null 2>&1; then
+    echo "   ✔ uhubctl installed (USB port power diagnostics)"
+else
+    echo "   ⚠ uhubctl unavailable — USB port power-cycle diagnostics will report"
+    echo "     'not installed'. Everything else works. Install later with:"
+    echo "       apt-get install -y uhubctl"
+fi
+
 echo "🚀 Installing Proxmox Local Agent..."
 
 INSTALL_DIR="/opt/lm/pxmx/agent"
