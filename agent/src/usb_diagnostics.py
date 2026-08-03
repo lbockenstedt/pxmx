@@ -43,6 +43,17 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("PxmxAgent")
 
+
+def _text(raw) -> str:
+    """Decode ``pve_cmds._run`` output. It returns (rc, stdout, stderr) as
+    BYTES; treating stdout as str raised
+    ``TypeError: a bytes-like object is required, not 'str'`` on the first
+    ``"usb" not in line`` and took the whole collect() down, so every host
+    reported an EMPTY diagnostic while the presence roster kept updating."""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", "replace")
+    return raw or ""
+
 PXMLIB = "/var/lib/pxmx"
 USB_PRESENCE_FILE = f"{PXMLIB}/usb_presence.json"
 
@@ -242,7 +253,8 @@ async def uhubctl_support() -> Dict[str, Any]:
                            "install_hint": "apt-get install -y uhubctl",
                            "error": ""}
     try:
-        rc, ver, _ = await pve_cmds._run(["uhubctl", "-v"], check=False, timeout=10)
+        rc, _ver, _ = await pve_cmds._run(["uhubctl", "-v"], check=False, timeout=10)
+        ver = _text(_ver)
     except FileNotFoundError:
         out["error"] = "uhubctl not installed"
         return out
@@ -255,7 +267,8 @@ async def uhubctl_support() -> Dict[str, Any]:
     out["installed"] = True
     out["version"] = (ver or "").strip().splitlines()[0] if ver else ""
     try:
-        rc, listing, err = await pve_cmds._run(["uhubctl"], check=False, timeout=20)
+        rc, _listing, _err = await pve_cmds._run(["uhubctl"], check=False, timeout=20)
+        listing, err = _text(_listing), _text(_err)
     except Exception as e:  # noqa: BLE001
         out["error"] = f"hub listing failed: {e}"
         return out
@@ -299,9 +312,10 @@ async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S) -> Dict[str, A
     out: Dict[str, Any] = {"window_s": int(window_s), "totals": {},
                            "by_bus": {}, "samples": [], "available": False}
     try:
-        rc, log, _ = await pve_cmds._run(
+        rc, _log, _ = await pve_cmds._run(
             ["journalctl", "-k", "--no-pager", "-o", "cat",
              "--since", f"-{int(window_s)}s"], check=False, timeout=30)
+        log = _text(_log)
     except Exception as e:  # noqa: BLE001
         logger.debug("usb_diagnostics: journalctl failed: %s", e)
         return out
@@ -309,7 +323,14 @@ async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S) -> Dict[str, A
         return out
     out["available"] = True
     for line in log.splitlines():
-        if "usb" not in line.lower() and "hcd" not in line.lower():
+        # "hub" matters as much as "usb"/"hcd": the kernel logs over-current
+        # against the HUB, e.g. "hub 2-0:1.0: over-current condition on port 3",
+        # which contains neither of the other two — so the single most
+        # actionable cause (a port shutting itself off) was being filtered out
+        # before it ever reached the pattern list. Caught by a test feeding a
+        # real over-current line.
+        _l = line.lower()
+        if "usb" not in _l and "hcd" not in _l and "hub " not in _l:
             continue
         for cat, rx in _KERNEL_PATTERNS:
             if not rx.search(line):

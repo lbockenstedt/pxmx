@@ -134,6 +134,15 @@ async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str
         return {}
     if rc != 0 or not out:
         return {}
+    # ``_run`` returns stdout as BYTES. Iterating it yields bytes lines, and
+    # _USB_DMESG_ERROR_RE is a STR pattern, so re.search raised
+    # "cannot use a string pattern on a bytes-like object" on the very first
+    # line — every time, since this function was written. The caller wraps it in
+    # `except Exception` and logs at DEBUG, so it silently returned {} forever:
+    # dmesg-based quarantine, which is the ONLY automatic quarantine path, never
+    # fired once. Decode before matching.
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", "replace")
     errors: Dict[str, int] = {}
     for line in out.splitlines():
         m = _USB_DMESG_ERROR_RE.search(line)

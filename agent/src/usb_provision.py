@@ -2593,7 +2593,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         dmesg_errs = await scan_dmesg_usb_errors()
     except Exception as _e:  # noqa: BLE001
         dmesg_errs = {}
-        logger.debug("provision loop: dmesg USB scan failed: %s", _e)
+        # WARNING, not debug: this is the ONLY automatic quarantine path, and a
+        # debug-level swallow is what hid a permanent TypeError here for the
+        # entire life of the function — quarantine never fired and nothing said so.
+        logger.warning("provision loop: dmesg USB scan failed (%s) — dongle "
+                       "quarantine detection is INACTIVE this pass", _e)
     if dmesg_errs:
         _watched = set(present) | set(state.get("bus_to_vmid") or {})
         for _bus, _n in dmesg_errs.items():
