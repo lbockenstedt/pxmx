@@ -61,6 +61,7 @@ from . import cs_sim
 from . import watchdogs
 from . import usb_provision
 from . import usb_diagnostics
+from . import guest_watchdog
 from . import pve_cmds
 from . import cs_guard
 from . import managed_crontab
@@ -219,6 +220,9 @@ _CS_SEND_DEADLINE_S = float(os.environ.get("LM_PXMX_CS_SEND_DEADLINE_S", "10") o
 # a day wide, so re-scanning it every telemetry tick is pure waste.
 _USB_DIAG_DEADLINE_S = float(os.environ.get("LM_PXMX_USB_DIAG_DEADLINE_S", "20") or 20)
 _USB_DIAG_INTERVAL_S = float(os.environ.get("LM_PXMX_USB_DIAG_INTERVAL_S", "300") or 300)
+# Guest-agent watchdog sweep. Generous vs the others because a hard recovery
+# waits up to STOP_WAIT_S for a VM to stop, and several may need it in one pass.
+_GUEST_WD_DEADLINE_S = float(os.environ.get("LM_PXMX_GUEST_WD_DEADLINE_S", "180") or 180)
 # Overall watchdog on the metrics+vms+nodes collect. Even with per-call deadlines
 # inside get_vm_list/get_node_stats, a mass op — or a lock held by a stuck
 # delete/clone that the collect blocks on — can wedge the whole telemetry tick for
@@ -2711,6 +2715,27 @@ class ProxmoxAgent:
                             except Exception as _de:  # noqa: BLE001
                                 self._last_usb_diag_ts = time.time()
                                 logger.debug(f"usb_diagnostics failed: {_de}")
+                        # QEMU guest-agent watchdog (port of proxmox/check_guest.sh)
+                        # on the bash script's own */5 cadence. Recovers VMs whose
+                        # guest OS hung — the case the dongle ladder deliberately
+                        # abstains from ("never escalate blind" when QGA is down).
+                        # Bounded: a wedged `qm stop` must not stall the telemetry
+                        # loop. A timeout leaves the pass half-done, which is safe
+                        # — every action is idempotent and re-evaluated next pass.
+                        _gw_last = getattr(self, "_last_guest_wd_ts", 0.0)
+                        if (time.time() - _gw_last) >= guest_watchdog.WATCHDOG_INTERVAL_S:
+                            self._last_guest_wd_ts = time.time()
+                            try:
+                                await asyncio.wait_for(
+                                    guest_watchdog.run_pass(self),
+                                    timeout=_GUEST_WD_DEADLINE_S)
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "guest_watchdog pass exceeded %.0fs — abandoning "
+                                    "this sweep; it resumes on the next cadence",
+                                    _GUEST_WD_DEADLINE_S)
+                            except Exception as _ge:  # noqa: BLE001
+                                logger.debug(f"guest_watchdog failed: {_ge}")
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         # Bounded like the AGENT_TELEMETRY send above. An
                         # unbounded send stalls the WHOLE loop behind a
@@ -2958,6 +2983,10 @@ class ProxmoxAgent:
             # settings, controllers, uhubctl PPPS capability). Collected on a slow
             # cadence in the telemetry loop; see usb_diagnostics.collect.
             "usb_diagnostics":  getattr(self, "_last_usb_diag", None) or {},
+            # Guest-agent watchdog: last sweep's outcome (checked/responding +
+            # which VMs were reset / power-cycled / started). Surfaced so an
+            # unexplained VM restart is attributable instead of a mystery.
+            "guest_watchdog":   guest_watchdog.current_guest_watchdog(),
             # Present T1/T3 PCI devices (host lspci ∩ the allow-lists) — WebUI PCI tab.
             "t1_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t1_pci_devices", []),
             "t3_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t3_pci_devices", []),
