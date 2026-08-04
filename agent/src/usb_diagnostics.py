@@ -527,13 +527,15 @@ def pci_location(addr: str, slots: Optional[Dict[str, str]] = None) -> Dict[str,
     ``onboard`` (bool or None when genuinely undetermined), ``vendor``, and
     ``label`` — a human string like ``"PCIe slot 1"`` or ``"onboard"``.
 
-    ``onboard`` is None rather than False when the board exposes no slot table
-    AND the vendor is not recognised chipset silicon: saying "add-in card" on a
-    guess would send someone to pull a card that is soldered down.
+    ``label`` is '' when the answer is genuinely unknown. It NEVER hedges: a
+    string like "add-in card or onboard" tells an operator nothing they didn't
+    already know, so an empty label (which callers omit entirely) is better than
+    a confident-looking non-answer.
     """
+    unknown = {"pci_address": addr or "", "slot": None, "onboard": None,
+               "vendor": "", "label": ""}
     if not addr:
-        return {"pci_address": "", "slot": None, "onboard": None,
-                "vendor": "", "label": "unknown"}
+        return unknown
     if slots is None:
         slots = _pci_slot_map()
     dbd = addr.rsplit(".", 1)[0]                  # strip the function
@@ -542,16 +544,31 @@ def pci_location(addr: str, slots: Optional[Dict[str, str]] = None) -> Dict[str,
     vendor = _PCI_VENDOR_NAMES.get(vid, vid or "")
     # Firmware-provided name (ACPI _DSM), e.g. "Onboard USB" on server boards.
     fw_label = _sysfs_read(f"/sys/bus/pci/devices/{addr}/label")
+    # PCI bus number. Everything on bus 00 hangs off the root complex, i.e. it
+    # is integrated silicon; an add-in card always sits on a higher bus behind a
+    # PCIe root port. This is what makes onboard-vs-card answerable on boards
+    # that publish NO ACPI slot table -- which is most of them, and is why this
+    # used to return the useless "add-in card or onboard" hedge.
+    try:
+        bus_no = int(addr.split(":")[1], 16)
+    except (IndexError, ValueError):
+        bus_no = -1
     if slot:
         onboard, label = False, f"PCIe slot {slot}"
     elif slots:
         # The board DOES publish a slot table and this controller is not in it,
-        # so it is integrated. This is the reliable branch.
+        # so it is integrated. The most reliable branch.
+        onboard, label = True, "onboard"
+    elif bus_no == 0:
         onboard, label = True, "onboard"
     elif vid in _CHIPSET_VENDORS:
-        onboard, label = True, "onboard (chipset)"
+        onboard, label = True, "onboard"
+    elif bus_no > 0:
+        # Definitely a card, just no slot NUMBER without an ACPI slot table.
+        # Still worth saying: it narrows a hunt to the expansion slots.
+        onboard, label = False, "add-in card" + (f" ({vendor})" if vendor else "")
     else:
-        onboard, label = None, "add-in card or onboard (no slot table)"
+        return unknown
     if fw_label:
         label = f"{label} · {fw_label}"
     return {"pci_address": addr, "slot": slot, "onboard": onboard,
@@ -566,10 +583,14 @@ def usb_port_of(bus: str) -> str:
 
 def usb_location(bus: str, controller: str = "",
                  slots: Optional[Dict[str, str]] = None) -> str:
-    """One-line physical location: ``'PCIe slot 1 · port 3'``."""
+    """One-line physical location: ``'PCIe slot 1 · port 3'``.
+
+    Either half may be unknown; joins only the parts that are, so an
+    undeterminable controller yields ``'port 3'`` and not ``' · port 3'``.
+    """
     loc = pci_location(controller or usb_device_controller(bus), slots)
     port = usb_port_of(bus)
-    return f"{loc['label']} · port {port}" if port else loc["label"]
+    return " · ".join(p for p in (loc["label"], f"port {port}" if port else "") if p)
 
 
 def location_for(bus: str, slots: Optional[Dict[str, str]] = None,
