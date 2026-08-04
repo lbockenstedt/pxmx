@@ -641,6 +641,34 @@ fi
 
 systemctl daemon-reload
 systemctl enable --now lm-pxmx-net-watchdog.timer --no-block 2>/dev/null || true
+# ── KSM (kernel samepage merging) ───────────────────────────────────────────
+# These hosts run a dozen-plus near-identical sim VMs cloned from one template,
+# so their guest memory is highly dedupable. ksmtuned only starts KSM once free
+# memory drops below KSM_THRES_COEF PERCENT of total; the stock 20 waits until
+# the host is nearly full, which is far too late. 80 keeps KSM working
+# essentially all the time -- a little CPU for a lot of reclaimed RAM.
+# The agent re-asserts this on every start (host_tuning.py), so deployed hosts
+# pick it up without a reinstall; this covers a fresh box.
+KSM_THRES_COEF_WANT="${LM_KSM_THRES_COEF:-80}"
+if [ -f /etc/ksmtuned.conf ]; then
+    if grep -qE '^[[:space:]]*#?[[:space:]]*KSM_THRES_COEF[[:space:]]*=' /etc/ksmtuned.conf; then
+        # Rewrite in place, commented or not -- appending past a commented
+        # default leaves two plausible-looking lines in the file.
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*KSM_THRES_COEF[[:space:]]*=.*|KSM_THRES_COEF=${KSM_THRES_COEF_WANT}|" /etc/ksmtuned.conf
+    else
+        echo "KSM_THRES_COEF=${KSM_THRES_COEF_WANT}" >> /etc/ksmtuned.conf
+    fi
+    systemctl enable --now ksmtuned >/dev/null 2>&1 || true
+    systemctl restart ksmtuned >/dev/null 2>&1 || true
+    if systemctl is-active --quiet ksmtuned; then
+        echo "🧠 ksmtuned running (KSM_THRES_COEF=${KSM_THRES_COEF_WANT})"
+    else
+        echo "   ⚠ ksmtuned configured but NOT running — check: systemctl status ksmtuned"
+    fi
+else
+    echo "   ⚠ /etc/ksmtuned.conf absent — ksm-control-daemon not installed; skipping KSM tuning"
+fi
+
 systemctl enable lm-pxmx-agent
 systemctl restart lm-pxmx-agent
 

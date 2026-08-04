@@ -57,6 +57,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 from .security_utils import MessageSigner, encode_frame, split_frame
 from . import cs_commands
+from . import host_tuning
 from . import cs_sim
 from . import watchdogs
 from . import usb_provision
@@ -1704,6 +1705,12 @@ class ProxmoxAgent:
         _consecutive_auth_fails = 0
         asyncio.create_task(self._update_check_loop())
         asyncio.create_task(self._sd_watchdog_loop())
+        # Host tuning, re-asserted on every start. The installer applies the
+        # same settings, but an installer-only change reaches NEW hosts and
+        # silently skips every deployed one -- which is how a setting ends up
+        # true on some boxes and not others with nothing reporting it. Off the
+        # event loop: it shells out to systemctl.
+        asyncio.create_task(asyncio.to_thread(host_tuning.apply_all))
         # Slow periodic jobs, deliberately OFF the telemetry loop so they
         # can never starve the systemd watchdog (see _slow_jobs_loop).
         asyncio.create_task(self._slow_jobs_loop())
