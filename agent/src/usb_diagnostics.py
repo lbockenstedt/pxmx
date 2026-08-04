@@ -533,7 +533,7 @@ def pci_location(addr: str, slots: Optional[Dict[str, str]] = None) -> Dict[str,
     a confident-looking non-answer.
     """
     unknown = {"pci_address": addr or "", "slot": None, "onboard": None,
-               "vendor": "", "label": ""}
+               "vendor": "", "vidpid": "", "label": ""}
     if not addr:
         return unknown
     if slots is None:
@@ -541,7 +541,14 @@ def pci_location(addr: str, slots: Optional[Dict[str, str]] = None) -> Dict[str,
     dbd = addr.rsplit(".", 1)[0]                  # strip the function
     slot = slots.get(dbd)
     vid = _sysfs_read(f"/sys/bus/pci/devices/{addr}/vendor")
+    did = _sysfs_read(f"/sys/bus/pci/devices/{addr}/device")
     vendor = _PCI_VENDOR_NAMES.get(vid, vid or "")
+    # PCI vid:pid of the CONTROLLER CARD itself (not the dongle). Identifies the
+    # exact model, so a card can be matched to a purchase order or an errata
+    # note without opening the chassis -- 'ASMedia' narrows it, '1b21:2142'
+    # names it. Same 4-hex-digit form lspci prints.
+    vidpid = f"{vid[2:]}:{did[2:]}" if (vid[:2] == "0x" and did[:2] == "0x") else ""
+    card = " ".join(p for p in (vendor if vendor != vid else "", vidpid) if p)
     # Firmware-provided name (ACPI _DSM), e.g. "Onboard USB" on server boards.
     fw_label = _sysfs_read(f"/sys/bus/pci/devices/{addr}/label")
     # PCI bus number. Everything on bus 00 hangs off the root complex, i.e. it
@@ -566,13 +573,17 @@ def pci_location(addr: str, slots: Optional[Dict[str, str]] = None) -> Dict[str,
     elif bus_no > 0:
         # Definitely a card, just no slot NUMBER without an ACPI slot table.
         # Still worth saying: it narrows a hunt to the expansion slots.
-        onboard, label = False, "add-in card" + (f" ({vendor})" if vendor else "")
+        onboard, label = False, "add-in card"
     else:
         return unknown
+    # Name the card on every branch -- knowing an onboard controller is an
+    # Intel a36d is as useful as knowing the add-in card is an ASMedia 2142.
+    if card:
+        label = f"{label} ({card})"
     if fw_label:
         label = f"{label} · {fw_label}"
     return {"pci_address": addr, "slot": slot, "onboard": onboard,
-            "vendor": vendor, "label": label}
+            "vendor": vendor, "vidpid": vidpid, "label": label}
 
 
 def usb_port_of(bus: str) -> str:
