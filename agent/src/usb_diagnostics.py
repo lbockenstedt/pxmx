@@ -621,6 +621,20 @@ def location_for(bus: str, slots: Optional[Dict[str, str]] = None,
     return ((r or {}).get(bus) or {}).get("location") or ""
 
 
+def controller_for(bus: str, roster: Optional[Dict[str, Any]] = None) -> str:
+    """Owning controller PCI address, live if present else from the roster.
+
+    Sidelined dongles are grouped by this to tell 'three bad dongles' apart from
+    'one bad card'. A display string would collide across two identical cards;
+    the PCI address never does.
+    """
+    ctrl = usb_device_controller(bus)
+    if ctrl:
+        return ctrl
+    r = roster if roster is not None else _load_roster()
+    return ((r or {}).get(bus) or {}).get("pci_controller") or ""
+
+
 def usb_device_controller(bus: str) -> str:
     """PCI address of the controller a USB bus hangs off, '' if undetermined.
 
