@@ -1407,6 +1407,24 @@ async def dongle_health_check_and_recover(agent, present) -> int:
         broken path (_HEALTH_LADDER_VISIBLE). One stage per _HEALTH_ATTEMPT_
         COOLDOWN_S so the guest has time to recover between attempts."""
         nonlocal dirty, acted
+        # A QUARANTINED bus is one the system has already given up on -- and a
+        # PERMANENT one (5 strikes) is never coming back on its own. Climbing the
+        # recovery ladder on it is pure thrash: usb_reset writes authorized 0/1,
+        # which the kernel logs as a disconnect plus an instant re-enumeration,
+        # so the agent manufactures the very "flapping" that quarantined the bus.
+        # Measured on svr-01: 1005 such events in 24h on ONE controller, while
+        # three identical nodes logged zero. The provisioning paths all consult
+        # _read_quarantine(); this path never did.
+        #
+        # Non-permanent quarantine still self-clears after an hour and gets
+        # retried by the normal provisioning pass, so nothing is lost by not
+        # resetting it here.
+        try:
+            _qt = (_read_quarantine() or {}).get(bus) or {}
+            if _qt.get("permanent") or int(_qt.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
+                return
+        except Exception:  # noqa: BLE001 — never block recovery on a read error
+            pass
         h = health.setdefault(bus, {"fails": 0, "last_attempt": 0.0, "stage": ""})
         if now - float(h.get("last_attempt", 0)) < _HEALTH_ATTEMPT_COOLDOWN_S:
             return                                     # cooling down
