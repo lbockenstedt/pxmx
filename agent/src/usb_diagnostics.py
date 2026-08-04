@@ -34,6 +34,7 @@ which is a materially different fix from link errors or autosuspend.
 """
 
 import asyncio
+import copy as _copy
 import glob
 import json
 import logging
@@ -229,12 +230,34 @@ def lost_since_boot(baseline: Dict[str, Any], present_by_bus: Dict[str, Any],
 
 # ── presence roster ──────────────────────────────────────────────────────────
 
+_ROSTER_CACHE: Optional[tuple] = None
+
+
 def _load_roster() -> Dict[str, Any]:
+    """Presence roster, cached on the file's (mtime_ns, size).
+
+    Re-parsed only when the file actually changes. cs_usb_telemetry loads this
+    on every telemetry tick -- every 3s while provisioning is active -- and a
+    JSON parse per tick for a file that changes once every few minutes is the
+    kind of steady drain that does not look like a bug in any single profile.
+    A DEEP copy is returned: record_presence mutates the entries it is handed,
+    and a shallow dict() shares the nested per-bus dicts, so the cache would be
+    poisoned by every caller. Deep-copying ~20 small dicts is microseconds --
+    still far cheaper than the file read and JSON parse it replaces.
+    """
+    global _ROSTER_CACHE
     try:
-        if os.path.exists(USB_PRESENCE_FILE) and os.path.getsize(USB_PRESENCE_FILE) > 0:
-            with open(USB_PRESENCE_FILE) as f:
-                d = json.load(f)
-            return d if isinstance(d, dict) else {}
+        st = os.stat(USB_PRESENCE_FILE)
+        if st.st_size <= 0:
+            return {}
+        key = (st.st_mtime_ns, st.st_size)
+        if _ROSTER_CACHE is not None and _ROSTER_CACHE[0] == key:
+            return _copy.deepcopy(_ROSTER_CACHE[1])
+        with open(USB_PRESENCE_FILE) as f:
+            d = json.load(f)
+        d = d if isinstance(d, dict) else {}
+        _ROSTER_CACHE = (key, d)
+        return _copy.deepcopy(d)
     except (OSError, json.JSONDecodeError) as e:
         logger.debug("usb_diagnostics: roster read failed: %s", e)
     return {}
@@ -487,8 +510,20 @@ def _pci_driver(addr: str) -> str:
 # address is domain:bus:device (NO function). A controller that appears there
 # is in a physical slot; a chipset controller does not appear at all. That
 # presence/absence IS the onboard-vs-card answer where firmware provides it.
+_SLOT_MAP_CACHE: Optional[Dict[str, str]] = None
+
+
 def _pci_slot_map() -> Dict[str, str]:
-    """``{'0000:04:00': '1'}`` — physical slot number by domain:bus:device."""
+    """``{'0000:04:00': '1'}`` — physical slot number by domain:bus:device.
+
+    Cached for the life of the process: the ACPI slot table is fixed while the
+    box is up, and this is called from cs_usb_telemetry, which the telemetry
+    loop runs every 3s while provisioning is active (20x/min). A glob per tick
+    for a constant is pure waste.
+    """
+    global _SLOT_MAP_CACHE
+    if _SLOT_MAP_CACHE is not None:
+        return _SLOT_MAP_CACHE
     out: Dict[str, str] = {}
     for p in glob.glob("/sys/bus/pci/slots/*/address"):
         try:
@@ -498,6 +533,7 @@ def _pci_slot_map() -> Dict[str, str]:
             continue
         if addr:
             out[addr] = os.path.basename(os.path.dirname(p))
+    _SLOT_MAP_CACHE = out
     return out
 
 
@@ -635,6 +671,12 @@ def controller_for(bus: str, roster: Optional[Dict[str, Any]] = None) -> str:
     return ((r or {}).get(bus) or {}).get("pci_controller") or ""
 
 
+# bus_path -> controller PCI address. A sysfs realpath per problem dongle per
+# 3s tick; the mapping cannot change without the device re-enumerating, and a
+# re-enumeration under a NEW bus path gets its own key.
+_CTRL_CACHE: Dict[str, str] = {}
+
+
 def usb_device_controller(bus: str) -> str:
     """PCI address of the controller a USB bus hangs off, '' if undetermined.
 
@@ -644,6 +686,9 @@ def usb_device_controller(bus: str) -> str:
     attributed to a controller — and therefore tell a genuine loss apart from a
     controller that was passed through to a VM.
     """
+    cached = _CTRL_CACHE.get(bus)
+    if cached is not None:
+        return cached
     try:
         real = os.path.realpath(f"/sys/bus/usb/devices/{bus}")
     except OSError:
@@ -654,6 +699,11 @@ def usb_device_controller(bus: str) -> str:
             last = part
         elif part.startswith("usb") and last:
             break
+    # Only cache a POSITIVE result. A miss means the device is not on the bus
+    # right now, and caching that would pin a dongle as "unknown controller"
+    # for the rest of the process even after it comes back.
+    if last:
+        _CTRL_CACHE[bus] = last
     return last
 
 
