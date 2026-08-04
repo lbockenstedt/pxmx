@@ -1112,6 +1112,25 @@ def record_port_reset(bus: str, now: Optional[float] = None) -> None:
         logger.debug("usb_diagnostics: reset log write failed: %s", e)
 
 
+def agent_reset_recently(bus: str, within_s: float, now: Optional[float] = None) -> bool:
+    """Did the AGENT re-enumerate *bus* within the last *within_s* seconds?
+
+    Lets a detector tell its own side effects apart from a hardware fault. Both
+    usb_reset (authorized 0/1) and reattach (qm set -delete usbN / -usbN host=)
+    take the device away from the VM holding it, which is indistinguishable from
+    the dongle dropping its own passthrough unless the agent remembers doing it.
+    """
+    if not bus:
+        return False
+    now = time.time() if now is None else now
+    try:
+        hist = (_load_reset_log() or {}).get(bus) or []
+        return any(isinstance(t, (int, float)) and 0 <= (now - t) <= within_s
+                   for t in hist)
+    except Exception:  # noqa: BLE001 — never block a detector on this
+        return False
+
+
 def _load_reset_log() -> Dict[str, List[float]]:
     try:
         if os.path.exists(USB_RESET_LOG_FILE):

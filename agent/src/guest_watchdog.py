@@ -168,6 +168,15 @@ async def run_pass(agent, now: Optional[float] = None) -> Dict[str, Any]:
 
     in_flight = _in_flight_vmids()
     settling = _recently_cloned_vmids(now)
+    # VMs the DONGLE-HEALTH ladder just acted on. It reboots a VM as one of its
+    # rungs, and a rebooting VM is QGA-silent by design -- indistinguishable
+    # from hung. Each path honours only its own cooldown, so without this the
+    # two recovery systems act on the same VM in turn, each one's action
+    # tripping the other's trigger.
+    try:
+        settling = settling | usb_provision.recently_actioned_vmids(now)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("guest_watchdog: ladder-action lookup failed: %s", e)
     state = _load()
 
     for vid in sorted(int(v) for v in (vmids or [])):

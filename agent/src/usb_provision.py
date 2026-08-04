@@ -1326,6 +1326,31 @@ def build_idle_reason(culled: Dict[str, List[str]], any_present: bool,
     return f"no eligible dongles ({detail})"
 
 
+def recently_actioned_vmids(now: Optional[float] = None,
+                            within_s: Optional[float] = None) -> Set[int]:
+    """VMIDs the dongle-health ladder acted on recently.
+
+    For OTHER recovery paths to skip: a VM the ladder just rebooted is silent by
+    design for a minute or two, and reads identically to a hung guest.
+    """
+    now = time.time() if now is None else now
+    win = _HEALTH_ATTEMPT_COOLDOWN_S if within_s is None else within_s
+    out: Set[int] = set()
+    try:
+        for rec in (load_usb_state().get("dongle_health") or {}).values():
+            r = rec or {}
+            ts, vid = r.get("last_attempt"), r.get("vmid")
+            if (isinstance(ts, (int, float)) and vid not in (None, "")
+                    and 0 <= (now - float(ts)) < win):
+                try:
+                    out.add(int(vid))
+                except (TypeError, ValueError):
+                    continue
+    except Exception as e:  # noqa: BLE001 — never block a caller on this
+        logger.debug("recently_actioned_vmids: %s", e)
+    return out
+
+
 def _usb_port_reset(bus: str) -> bool:
     """Host-side USB reset — de-authorize then re-authorize the device so it
     re-enumerates (the guest's usb-host sees a re-plug). Best-effort."""
@@ -1352,8 +1377,19 @@ def _usb_port_reset(bus: str) -> bool:
 
 async def _reattach_usb(vid: int, bus: str) -> bool:
     """Hot detach + re-add the bus passthrough (``qm set -delete usbN`` then
-    ``-usbN host=<bus>``) so QEMU re-grabs the dongle without a full reboot."""
+    ``-usbN host=<bus>``) so QEMU re-grabs the dongle without a full reboot.
+
+    Recorded like usb_reset: this DELIBERATELY takes the dongle away from the
+    VM, which the detach detector would otherwise count as the dongle dropping
+    its own passthrough -- three of those and the bus is quarantined for
+    "chronic detach" on perfectly good hardware.
+    """
     from . import pve_cmds
+    try:
+        from . import usb_diagnostics as _ud
+        _ud.record_port_reset(bus)
+    except Exception:  # noqa: BLE001 — attribution is never worth a failure
+        pass
     try:
         cfg = await pve_cmds.qm_config(vid)
     except Exception:  # noqa: BLE001
@@ -1441,6 +1477,13 @@ async def dongle_health_check_and_recover(agent, present) -> int:
         h["fails"] += 1
         h["last_attempt"] = now
         h["stage"] = stage
+        # Stamp the VM so guest_watchdog can tell that THIS ladder just acted on
+        # it. The two recovery paths are independent and each honours only its
+        # OWN cooldown, so without this the ladder can qm_stop_force/qm_start a
+        # VM and the watchdog -- probing 300s later, mid-boot -- reads it as hung
+        # and escalates to its own reset. Two recovery systems fighting over one
+        # VM, each provoking the other's trigger.
+        h["vmid"] = vid
         dirty = True
         acted += 1
         logger.warning("dongle health: VM %s bus %s %s — recovery stage '%s' "
@@ -2798,6 +2841,28 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 detached_since[bus] = now
                 continue
             if now - float(since) >= _DETACHED_GRACE_S:
+                # Did WE take this dongle away? usb_reset and reattach both
+                # detach it from the VM on purpose, and that is byte-for-byte
+                # what "the dongle dropped its passthrough" looks like from
+                # here. Without this check the recovery ladder feeds the detach
+                # detector, three strikes quarantine the bus for "chronic
+                # detach", and known-good hardware is permanently sidelined by
+                # the very machinery meant to rescue it. Observed exactly that.
+                #
+                # The window spans the grace period plus the attribution window,
+                # so a reset that landed just before the grace expired still
+                # counts as ours.
+                try:
+                    from . import usb_diagnostics as _ud
+                    if _ud.agent_reset_recently(
+                            bus, _DETACHED_GRACE_S + _ud.RESET_ATTRIBUTION_S, now):
+                        logger.info("provision loop: bus %s detached right after an "
+                                    "agent-initiated reset/reattach — not counting a "
+                                    "strike", bus)
+                        detached_since.pop(bus, None)   # re-arm, no strike
+                        continue
+                except Exception:  # noqa: BLE001 — fail OPEN: still detect faults
+                    pass
                 rec = detach_reclones.get(bus)
                 if rec and (now - float(rec.get("first", now))) > _DETACH_STRIKE_WINDOW_S:
                     rec = None  # window expired → fresh episode
