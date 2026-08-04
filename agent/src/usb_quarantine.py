@@ -56,6 +56,12 @@ _USB_DMESG_ERROR_RE = re.compile(
     r"error -71\b|error -110\b|can't set config|cannot enable port|reset .*fail"
     r")", re.IGNORECASE)
 _DMESG_USB_WINDOW_S = 180        # look back this far in the kernel log
+# Server-side prefilter for the above regex — same alternatives, ERE syntax, no
+# capture group. journalctl matches this in C so Python only ever sees hits.
+_DMESG_GREP = (r"device descriptor read|unable to enumerate|not accepting address|"
+               r"error -71|error -110|can't set config|cannot enable port|reset .*fail")
+# Hard cap on lines handed back, so a pathological flood cannot be unbounded.
+_DMESG_MAX_LINES = int(os.environ.get("LM_PXMX_DMESG_MAX_LINES", "2000") or 2000)
 _DMESG_USB_QUARANTINE_MIN = 3    # >= this many error lines in-window → quarantine
 
 
@@ -127,10 +133,27 @@ async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str
     quarantined and not re-provisioned. Best-effort via ``journalctl -k``; empty
     dict on any failure (never quarantines on missing data)."""
     from . import pve_cmds  # deferred — avoid a top-level import cycle
+    # Filter in journalctl (C) rather than in Python. This runs every 60s over a
+    # 180s window, so every line is read THREE times; on a host whose controller
+    # is failing the kernel log floods with exactly these messages, and decoding
+    # + regexing all of it three times a minute is a steady CPU burn that does
+    # not depend on provisioning firing at all. --grep does the same match in C
+    # and hands back only the hits; -n caps a pathological flood.
+    #
+    # This is the same treatment kernel_usb_events already got; it was never
+    # carried across to here, and this path only started doing real work at all
+    # once the bytes/str crash was fixed -- before that it raised on line one and
+    # cost nothing.
+    base = ["journalctl", "-k", "--no-pager", "-o", "cat",
+            "--since", f"-{int(window_s)}s", "-n", str(_DMESG_MAX_LINES)]
     try:
-        rc, out, _ = await pve_cmds._run(
-            ["journalctl", "-k", "--no-pager", "-o", "cat",
-             "--since", f"-{int(window_s)}s"], check=False, timeout=10)
+        rc, out, _ = await pve_cmds._run(base + ["-g", _DMESG_GREP],
+                                         check=False, timeout=10)
+        if rc != 0:
+            # Older journalctl has no -g. Fall back to the unfiltered read so a
+            # missing flag degrades to "slower", never to "quarantine stops
+            # working" -- this is the only automatic quarantine path.
+            rc, out, _ = await pve_cmds._run(base, check=False, timeout=10)
     except Exception:  # noqa: BLE001
         return {}
     if rc != 0 or not out:
