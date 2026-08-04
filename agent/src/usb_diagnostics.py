@@ -572,6 +572,23 @@ def usb_location(bus: str, controller: str = "",
     return f"{loc['label']} · port {port}" if port else loc["label"]
 
 
+def location_for(bus: str, slots: Optional[Dict[str, str]] = None,
+                 roster: Optional[Dict[str, Any]] = None) -> str:
+    """Physical location of a bus — live when present, else from the roster.
+
+    The dongles an operator actually needs to FIND are the quarantined and
+    excluded ones, and those are frequently ABSENT: a dongle that dropped off
+    the bus cannot be walked up the sysfs tree. Falling back to the location
+    recorded while it was still present is the whole reason that field is
+    persisted. Returns '' when neither source knows.
+    """
+    ctrl = usb_device_controller(bus)
+    if ctrl:
+        return usb_location(bus, ctrl, slots)
+    r = roster if roster is not None else _load_roster()
+    return ((r or {}).get(bus) or {}).get("location") or ""
+
+
 def usb_device_controller(bus: str) -> str:
     """PCI address of the controller a USB bus hangs off, '' if undetermined.
 

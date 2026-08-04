@@ -2089,6 +2089,20 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 unknown.append({"bus_path": name, "vidpid": vidpid,
                                 "name": product, "description": desc})
 
+        # Physical location resolver for the PROBLEM dongles only. The slot
+        # table and roster are read once here rather than per entry.
+        try:
+            from . import usb_diagnostics as _usbdiag
+            _slots = _usbdiag._pci_slot_map()
+            _roster = _usbdiag._load_roster()
+            def _loc(b):
+                try:
+                    return _usbdiag.location_for(b, _slots, _roster)
+                except Exception:
+                    return ""
+        except Exception:          # older/partial agent -- never break telemetry
+            def _loc(b):
+                return ""
         usb_state: List[Dict[str, Any]] = []
         try:
             st = load_usb_state()
@@ -2136,6 +2150,11 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                                                   detach_reclones.get(bus),
                                                   guest_health.get(bus)),
             })
+            # Where to go LOOK -- stamped ONLY on problem dongles: one that is
+            # climbing the recovery ladder or has gone missing. A healthy dongle
+            # does not need finding, and this costs a sysfs walk per entry.
+            if usb_state[-1]["recovery"] or ms is not None:
+                usb_state[-1]["location"] = _loc(bus)
         # Quarantined dongles (dmesg kernel USB errors — the ONLY quarantine path)
         # for the WebUI badge: bus-id + reason + when, so an admin can see WHY a
         # dongle is sidelined and that it auto-recovers after QUARANTINE_RECOVERY_S.
@@ -2160,6 +2179,10 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 if (since is not None and not permanent) else None
             quarantined.append({
                 "bus_path": bus,
+                # Where to go LOOK. Only stamped on problem dongles (quarantined
+                # + excluded) -- the healthy ones don't need finding, and this
+                # costs a sysfs walk per entry.
+                "location": _loc(bus),
                 "reason": e.get("reason") or "quarantined",
                 "since": since,
                 # 5-strike state — permanent buses never auto-recover; strikes is
@@ -2188,6 +2211,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
             pe = present_by_bus.get(bus) or {}
             excluded.append({
                 "bus_path": bus,
+                "location": _loc(bus),
                 "since": since,
                 "expires_at": expires_at,
                 "expires_in_s": max(0, int(expires_at - _now))
