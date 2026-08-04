@@ -52,6 +52,7 @@ def _setup(tmp_path):
     _ud.PXMLIB = str(lib)
     _ud.USB_PRESENCE_FILE = f"{lib}/usb_presence.json"
     _ud.USB_BOOT_FILE = f"{lib}/usb_boot_baseline.json"
+    _ud.USB_KERNEL_FILE = f"{lib}/usb_kernel_events.json"
     return _ud
 
 

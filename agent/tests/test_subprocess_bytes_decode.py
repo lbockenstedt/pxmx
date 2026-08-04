@@ -47,6 +47,24 @@ _state = _load("usb_state_store", "usb_state_store.py")
 _uq = _load("usb_quarantine", "usb_quarantine.py")
 _ud = _load("usb_diagnostics", "usb_diagnostics.py")
 
+# Hermetic state: kernel_usb_events now ACCUMULATES into a persisted file, so
+# without redirecting it these tests would read/write the real /var/lib/pxmx and
+# leak counts between runs.
+import tempfile as _tf
+_ud.PXMLIB = _tf.mkdtemp()
+_ud.USB_PRESENCE_FILE = f"{_ud.PXMLIB}/usb_presence.json"
+_ud.USB_BOOT_FILE = f"{_ud.PXMLIB}/usb_boot_baseline.json"
+_ud.USB_KERNEL_FILE = f"{_ud.PXMLIB}/usb_kernel_events.json"
+
+
+def _reset_kernel_state():
+    """Each kernel test must start from an empty accumulator."""
+    import os as _os
+    try:
+        _os.remove(_ud.USB_KERNEL_FILE)
+    except OSError:
+        pass
+
 KERNEL_LOG = (
     "usb 3-1.2: device descriptor read/64, error -71\n"
     "usb 3-1.2: unable to enumerate USB device\n"
@@ -78,6 +96,7 @@ def _install(mod, pve):
 # ── usb_diagnostics.kernel_usb_events ────────────────────────────────────────
 
 def _kernel(as_bytes):
+    _reset_kernel_state()
     _install(_ud, _FakePve({"journalctl": KERNEL_LOG}, as_bytes))
     return asyncio.run(_ud.kernel_usb_events(3600))
 

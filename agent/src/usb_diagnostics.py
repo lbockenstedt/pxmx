@@ -33,6 +33,7 @@ disappearance with a clean log points at VBUS/PHY (→ power-cycle territory),
 which is a materially different fix from link errors or autosuspend.
 """
 
+import asyncio
 import glob
 import json
 import logging
@@ -60,6 +61,15 @@ USB_PRESENCE_FILE = f"{PXMLIB}/usb_presence.json"
 # Kept in its own file rather than as a key inside the roster, whose every key
 # is treated as a bus path by missing_dongles().
 USB_BOOT_FILE = f"{PXMLIB}/usb_boot_baseline.json"
+# Rolling kernel-event accumulator. Each pass reads only the log SINCE THE LAST
+# SCAN and folds it into hourly buckets, so a 24h view costs one ~5-minute read
+# per pass instead of re-reading the whole day every time (which is what pulled
+# 2.4 GB into the agent and got it watchdog-killed). Persisted because the agent
+# restarts often enough that an in-memory accumulator would keep resetting.
+USB_KERNEL_FILE = f"{PXMLIB}/usb_kernel_events.json"
+# First run has no "last scan" to read from; seed with this much rather than the
+# full window, so a cold start is cheap too.
+KERNEL_SEED_WINDOW_S = 3600
 # A baseline captured more than this long into a boot is NOT a boot snapshot
 # (the agent was restarted mid-session); reported as such rather than trusted.
 BOOT_BASELINE_GRACE_S = 900
@@ -605,35 +615,27 @@ async def uhubctl_support() -> Dict[str, Any]:
     return out
 
 
-async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S) -> Dict[str, Any]:
-    """Categorised kernel USB events over *window_s*, totals + per-bus.
+# Server-side filter so journalctl returns only the lines we categorise. Without
+# it a 24h kernel read pulled the WHOLE journal into the agent (2.4 GB peak,
+# ~1.7 cores) and the per-line regex sweep ran ON THE EVENT LOOP — starving the
+# systemd watchdog and getting the agent SIGABRT'd every ~110s. Keep in sync with
+# _KERNEL_PATTERNS.
+_JOURNAL_GREP = (r"over-?current|overcurrent|insufficient available bus power|"
+                 r"device descriptor read|unable to enumerate|not accepting address|"
+                 r"error -71|error -110|can't set config|cannot enable port|"
+                 r"USB disconnect, device number|xhci_hcd|ehci_hcd")
+# Hard ceiling on lines pulled back even after filtering, so a pathological host
+# can never balloon the agent again. 5000 is far more than the counts need.
+_JOURNAL_MAX_LINES = int(os.environ.get("LM_PXMX_JOURNAL_MAX_LINES", "5000") or 5000)
 
-    Returns ``{"window_s", "totals": {cat: n}, "by_bus": {bus: {cat: n}},
-    "samples": [recent raw lines], "available": bool}``. ``available`` false
-    means the journal could not be read at all — the UI must then say "no data"
-    rather than "no errors", which are very different diagnoses.
-    """
-    from . import pve_cmds
-    out: Dict[str, Any] = {"window_s": int(window_s), "totals": {},
-                           "by_bus": {}, "samples": [], "available": False}
-    try:
-        rc, _log, _ = await pve_cmds._run(
-            ["journalctl", "-k", "--no-pager", "-o", "cat",
-             "--since", f"-{int(window_s)}s"], check=False, timeout=30)
-        log = _text(_log)
-    except Exception as e:  # noqa: BLE001
-        logger.debug("usb_diagnostics: journalctl failed: %s", e)
-        return out
-    if rc != 0 or not log:
-        return out
-    out["available"] = True
+
+def _parse_kernel_lines(log: str) -> Dict[str, Any]:
+    """Pure CPU: categorise pre-filtered kernel lines. Run OFF the event loop."""
+    out: Dict[str, Any] = {"totals": {}, "by_bus": {}, "samples": []}
     for line in log.splitlines():
         # "hub" matters as much as "usb"/"hcd": the kernel logs over-current
-        # against the HUB, e.g. "hub 2-0:1.0: over-current condition on port 3",
-        # which contains neither of the other two — so the single most
-        # actionable cause (a port shutting itself off) was being filtered out
-        # before it ever reached the pattern list. Caught by a test feeding a
-        # real over-current line.
+        # against the HUB (e.g. "hub 2-0:1.0: over-current condition on port 3"),
+        # which contains neither of the other two.
         _l = line.lower()
         if "usb" not in _l and "hcd" not in _l and "hub " not in _l:
             continue
@@ -649,6 +651,128 @@ async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S) -> Dict[str, A
             if len(out["samples"]) < 25:
                 out["samples"].append(line.strip()[:300])
             break
+    return out
+
+
+def _load_kernel_state() -> Dict[str, Any]:
+    try:
+        if os.path.exists(USB_KERNEL_FILE) and os.path.getsize(USB_KERNEL_FILE) > 0:
+            with open(USB_KERNEL_FILE) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug("usb_diagnostics: kernel state read failed: %s", e)
+    return {}
+
+
+def _save_kernel_state(d: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(PXMLIB, exist_ok=True)
+        tmp = f"{USB_KERNEL_FILE}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, USB_KERNEL_FILE)
+    except OSError as e:
+        logger.debug("usb_diagnostics: kernel state write failed: %s", e)
+
+
+def _fold_kernel_delta(state: Dict[str, Any], parsed: Dict[str, Any],
+                       now: float, window_s: int) -> Dict[str, Any]:
+    """Merge one delta scan into hourly buckets and drop anything past *window_s*.
+
+    Bucketing by hour is what makes the rolling window cheap AND bounded: at most
+    24 small dicts, evicted by age, so the accumulator can never grow with log
+    volume the way a raw event list would.
+    """
+    buckets = {k: v for k, v in (state.get("buckets") or {}).items()
+               if str(k).isdigit() and (now - int(k)) <= window_s}
+    hour = str(int(now // 3600) * 3600)
+    b = buckets.setdefault(hour, {"totals": {}, "by_bus": {}})
+    for cat, n in (parsed.get("totals") or {}).items():
+        b["totals"][cat] = int(b["totals"].get(cat, 0)) + int(n)
+    for bus, cats in (parsed.get("by_bus") or {}).items():
+        dst = b["by_bus"].setdefault(bus, {})
+        for cat, n in (cats or {}).items():
+            dst[cat] = int(dst.get(cat, 0)) + int(n)
+    # Newest samples win, capped — they are illustrative, not a log.
+    samples = (parsed.get("samples") or []) + (state.get("samples") or [])
+    return {"buckets": buckets, "samples": samples[:25], "last_scan_ts": now}
+
+
+def _sum_kernel_buckets(state: Dict[str, Any]) -> Dict[str, Any]:
+    totals: Dict[str, int] = {}
+    by_bus: Dict[str, Dict[str, int]] = {}
+    for b in (state.get("buckets") or {}).values():
+        for cat, n in ((b or {}).get("totals") or {}).items():
+            totals[cat] = totals.get(cat, 0) + int(n)
+        for bus, cats in ((b or {}).get("by_bus") or {}).items():
+            dst = by_bus.setdefault(bus, {})
+            for cat, n in (cats or {}).items():
+                dst[cat] = dst.get(cat, 0) + int(n)
+    return {"totals": totals, "by_bus": by_bus}
+
+
+async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S,
+                            now: Optional[float] = None) -> Dict[str, Any]:
+    """Categorised kernel USB events over a rolling *window_s*.
+
+    Reads ONLY the journal since the last scan and folds it into hourly buckets,
+    so a 24h view costs one ~5-minute read per pass. The original re-read the
+    entire day every pass: 2.4 GB resident, ~1.7 cores, and the regex sweep ran
+    on the event loop — which starved the systemd watchdog and got the agent
+    SIGABRT'd every ~110s. Now bounded three ways: delta-only read, server-side
+    ``--grep``, and a hard line cap; the parse runs in a worker thread.
+
+    ``available`` false means the journal could not be read AT ALL — the UI must
+    say "no data", not "no errors". ``covers_s`` is the span actually
+    accumulated so far, which is < window_s until the buckets fill.
+    """
+    from . import pve_cmds
+    now = time.time() if now is None else now
+    state = await asyncio.to_thread(_load_kernel_state)
+    last = state.get("last_scan_ts")
+    # Delta since the last scan, clamped: never longer than the window (an agent
+    # down for days must not ask for days), never shorter than a few seconds of
+    # overlap so an event landing between passes is not missed.
+    if isinstance(last, (int, float)) and 0 < last <= now:
+        since = min(window_s, max(60.0, (now - last) + 10.0))
+    else:
+        since = min(window_s, float(KERNEL_SEED_WINDOW_S))   # cold start
+
+    out: Dict[str, Any] = {"window_s": int(window_s), "totals": {}, "by_bus": {},
+                           "samples": [], "available": False, "truncated": False,
+                           "filtered": True, "scanned_s": int(since),
+                           "covers_s": 0}
+    base = ["journalctl", "-k", "--no-pager", "-o", "cat",
+            "--since", f"-{int(since)}s", "-n", str(_JOURNAL_MAX_LINES)]
+    try:
+        rc, _log, _err = await pve_cmds._run(base + ["-g", _JOURNAL_GREP],
+                                             check=False, timeout=30)
+        if rc != 0:
+            # Older systemd has no --grep. Fall back to the capped unfiltered
+            # read — still bounded, so it cannot balloon the agent.
+            logger.debug("usb_diagnostics: journalctl -g unsupported (%s) — "
+                         "capped unfiltered read instead",
+                         _text(_err).strip()[:120])
+            rc, _log, _ = await pve_cmds._run(base, check=False, timeout=30)
+            out["filtered"] = False
+        log = _text(_log)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("usb_diagnostics: journalctl failed: %s", e)
+        return out
+    if rc != 0:
+        return out
+    out["available"] = True
+    parsed = {"totals": {}, "by_bus": {}, "samples": []}
+    if log:
+        out["truncated"] = (log.count("\n") + 1) >= _JOURNAL_MAX_LINES
+        parsed = await asyncio.to_thread(_parse_kernel_lines, log)
+    state = _fold_kernel_delta(state, parsed, now, window_s)
+    await asyncio.to_thread(_save_kernel_state, state)
+    out.update(_sum_kernel_buckets(state))
+    out["samples"] = state.get("samples") or []
+    _keys = [int(k) for k in (state.get("buckets") or {}) if str(k).isdigit()]
+    out["covers_s"] = int(now - min(_keys)) if _keys else 0
     return out
 
 
@@ -809,18 +933,23 @@ async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dic
     try:
         from . import usb_provision
         if present_by_bus is None:
-            present = usb_provision.scan_present_dongles(
+            present = await asyncio.to_thread(
+                usb_provision.scan_present_dongles,
                 usb_provision._dongle_vidpids(agent),
                 usb_provision._certified_types(agent))
             present_by_bus = present or {}
         now = time.time()
-        roster = record_presence(present_by_bus, now)
+        # Every sysfs walk + roster write below is SYNCHRONOUS file I/O. On a host
+        # with many devices that is enough to stall the event loop, and the
+        # systemd watchdog is fed from telemetry-tick completion — so blocking
+        # here gets the agent SIGABRT'd. Offloaded to a worker thread.
+        roster = await asyncio.to_thread(record_presence, present_by_bus, now)
         # Boot baseline FIRST — the authoritative "what should be here". Bus ids
         # are stable within a boot, so a diff against it is a real loss with none
         # of the roster's cross-reboot caveats (renumbering, controllers handed
         # to a VM, dongles physically moved between ports).
-        baseline = capture_boot_baseline(present_by_bus, now)
-        controllers = usb_controllers()
+        baseline = await asyncio.to_thread(capture_boot_baseline, present_by_bus, now)
+        controllers = await asyncio.to_thread(usb_controllers)
         # Controllers handed to a VM. Dongles behind them leave the host BY
         # DESIGN (T1/T3 PCI passthrough), so they must not be counted as losses.
         pt_addrs = {c["pci_address"] for c in controllers if c.get("passthrough")}
@@ -840,7 +969,7 @@ async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dic
         lost = [m for m in _real if m.get("established")]
         lost_transient = [m for m in _real if not m.get("established")]
         kernel = await kernel_usb_events()
-        power = usb_power_settings()
+        power = await asyncio.to_thread(usb_power_settings)
         uhub = await uhubctl_support()
         return {
             "generated_at": now,

@@ -13,6 +13,7 @@ existing ``usb_provision.X`` callers (and its own internal unqualified calls) ar
 unchanged.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -143,12 +144,20 @@ async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str
     # fired once. Decode before matching.
     if isinstance(out, bytes):
         out = out.decode("utf-8", "replace")
-    errors: Dict[str, int] = {}
-    for line in out.splitlines():
-        m = _USB_DMESG_ERROR_RE.search(line)
-        if m:
-            errors[m.group(1)] = errors.get(m.group(1), 0) + 1
-    return errors
+
+    # Parse OFF the event loop. The window is short (180s) so this is normally
+    # small, but the provision loop shares the loop with telemetry — and tick
+    # completion is what feeds the systemd watchdog, so a busy host must not be
+    # able to stall it here.
+    def _count(text: str) -> Dict[str, int]:
+        errs: Dict[str, int] = {}
+        for line in text.splitlines():
+            m = _USB_DMESG_ERROR_RE.search(line)
+            if m:
+                errs[m.group(1)] = errs.get(m.group(1), 0) + 1
+        return errs
+
+    return await asyncio.to_thread(_count, out)
 
 
 def quarantine_bus(bus: str, reason: str) -> None:
