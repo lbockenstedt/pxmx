@@ -2428,6 +2428,20 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
         return empty
 
 
+def _hub_reserve_enabled(agent) -> bool:
+    """Whether hub-attached dongles are held as a reserve (default ON).
+
+    Off via ``usb_hub_reserve: false`` for a host that genuinely needs every
+    dongle in service at once and accepts the shared-bandwidth trade.
+    """
+    v = _usb_cfg(agent).get("usb_hub_reserve")
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off")
+    return bool(v)
+
+
 def _bus_sort_key(bus: str):
     """Selection order for a dongle bus: DIRECT card ports before hub-attached.
 
@@ -3205,6 +3219,31 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     preferred.sort(key=_bus_sort_key)
     overflow.sort(key=_bus_sort_key)
     ordered = preferred + overflow
+    # ── hub dongles are a RESERVE, not just last in line ────────────────────
+    # Ordering alone does not achieve "use hub dongles as backup": with more
+    # slots than dongles the loop provisions EVERY free bus in the same pass, so
+    # hub-attached ones get consumed too and are merely started later.
+    #
+    # Holding them back until no direct port is free makes them a genuine hot
+    # spare -- they come into service only when a direct port is assigned,
+    # quarantined, excluded or gone. Self-correcting without extra bookkeeping:
+    # the loop re-evaluates every pass, so the moment direct capacity runs out
+    # the reserve is released, and when a direct port frees up the reserve is
+    # simply not drawn on again.
+    #
+    # A hub tier shares one upstream link and one 500mA budget, so keeping
+    # clients off it while the card has room is also the better placement.
+    if _hub_reserve_enabled(agent):
+        _direct = [b for b in ordered if "." not in str(b)]
+        _hubbed = [b for b in ordered if "." in str(b)]
+        if _direct and _hubbed:
+            logger.info("provision: holding %d hub-attached dongle(s) in reserve "
+                        "while %d direct card port(s) are still free (%s)",
+                        len(_hubbed), len(_direct), ", ".join(_hubbed[:6]))
+            ordered = _direct
+        elif _hubbed:
+            logger.info("provision: no free direct card ports — releasing %d "
+                        "reserve dongle(s) behind hub(s)", len(_hubbed))
     if not ordered:
         # Nothing left to place a VM on. That is NOT automatically a fault: the
         # fleet is meant to run every dongle, so "every dongle is already driving
