@@ -885,6 +885,94 @@ def usb_controllers() -> List[Dict[str, Any]]:
     return out
 
 
+# ── USB hub topology ────────────────────────────────────────────────────────
+# Built ahead of the planned hub rollout so the diagnostic is ready the day one
+# is fitted, rather than discovered afterwards from a confusing symptom.
+#
+# A hub changes three things this module already cares about:
+#   * bus paths gain a tier ("16-2.1" = port 1 of a hub in port 2) and those
+#     DO renumber across reboots, unlike a PCI card's direct ports;
+#   * a POWERED hub is usually PPPS-capable, which is the only way to cut VBUS
+#     on one port -- a far less destructive recovery rung than usb_reset, which
+#     yanks the device out from under a VM that holds it;
+#   * an UNPOWERED hub splits one 500mA upstream port across everything behind
+#     it, and an 802.11ac dongle draws ~300-450mA under load.
+
+# Lab-tested ceiling: more than this many dongles behind one hub misbehaves.
+# Matches the USB spec's 7 downstream ports per tier and the power budget above.
+HUB_DONGLE_CEILING = int(os.environ.get("LM_PXMX_HUB_DONGLE_CEILING", "7") or 7)
+
+_USB_HUB_CLASS = "09"
+
+
+def hub_topology(ppps_hubs: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Every USB hub on the host, what hangs off it, and whether it can cut power.
+
+    Pure sysfs, no subprocess -- this module runs on a watchdog-fed path and has
+    already cost the fleet one outage by doing expensive work there.
+
+    Per hub: ``ports`` (maxchild), the child DEVICE paths (interfaces excluded),
+    ``self_powered`` and ``max_power_mA`` from the USB descriptor, whether
+    ``uhubctl`` reported it PPPS-capable, and any ``warnings`` worth acting on.
+    Root hubs (usbN) are included but flagged, since they are the controller
+    itself and mostly do NOT support per-port power switching.
+    """
+    names = _usb_device_names()
+    devices = [n for n in names if ":" not in n]
+    # uhubctl identifies hubs as "<bus>-<port>" too, so a direct match works.
+    ppps = {str((h or {}).get("hub") or "") for h in (ppps_hubs or [])}
+    out: List[Dict[str, Any]] = []
+    for name in sorted(devices):
+        d = f"/sys/bus/usb/devices/{name}"
+        if _sysfs_read(f"{d}/bDeviceClass") != _USB_HUB_CLASS:
+            continue
+        try:
+            ports = int(_sysfs_read(f"{d}/maxchild") or 0)
+        except ValueError:
+            ports = 0
+        # Children are one tier deeper: "16-2" -> "16-2.1"; a root hub "usb16"
+        # owns the bare "16-N" paths.
+        m = re.match(r"usb(\d+)$", name)
+        if m:
+            prefix, is_root = m.group(1) + "-", True
+        else:
+            prefix, is_root = name + ".", False
+        kids = [n for n in devices
+                if n.startswith(prefix) and "." not in n[len(prefix):]]
+        # bmAttributes bit 6 (0x40) = self-powered. A bus-powered hub shares one
+        # upstream 500mA budget across everything behind it.
+        try:
+            attrs = int(_sysfs_read(f"{d}/bmAttributes") or "0", 16)
+        except ValueError:
+            attrs = 0
+        self_powered = bool(attrs & 0x40)
+        raw_pw = _sysfs_read(f"{d}/bMaxPower") or ""
+        try:
+            max_power = int(re.sub(r"[^0-9]", "", raw_pw) or 0)
+        except ValueError:
+            max_power = 0
+        warnings: List[str] = []
+        if len(kids) > HUB_DONGLE_CEILING:
+            warnings.append(
+                f"{len(kids)} devices behind this hub — tested ceiling is "
+                f"{HUB_DONGLE_CEILING}; expect enumeration and power problems above it")
+        if not is_root and not self_powered and len(kids) > 2:
+            warnings.append(
+                "bus-powered hub carrying multiple devices — one 500mA upstream "
+                "budget shared across them; an 802.11ac dongle draws ~300-450mA "
+                "under load. Use a POWERED hub")
+        out.append({
+            "bus_path": name, "is_root_hub": is_root,
+            "product": _sysfs_read(f"{d}/product"),
+            "ports": ports, "attached": len(kids), "children": kids,
+            "self_powered": self_powered, "max_power_mA": max_power,
+            "ppps": name in ppps,
+            "pci_controller": usb_device_controller(name),
+            "warnings": warnings,
+        })
+    return out
+
+
 async def uhubctl_support() -> Dict[str, Any]:
     """Whether the ``uhubctl`` per-port power-cycle path is available HERE.
 
@@ -1332,6 +1420,12 @@ async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dic
             "power": power,
             "controllers": controllers,
             "uhubctl": uhub,
+            # Hub tier: what hangs off each hub, whether it can cut per-port
+            # power, and whether it is over the tested 7-dongle ceiling or
+            # bus-powered. Empty on a host with no external hub -- which is the
+            # current fleet, so this ships dark until one is fitted.
+            "hubs": hub_topology((uhub or {}).get("ppps_hubs")),
+            "hub_dongle_ceiling": HUB_DONGLE_CEILING,
             # Correlate against the BOOT-derived losses when the baseline is a
             # true boot snapshot — that set is exactly "what should be here and
             # is not". Fall back to the roster when the baseline was taken
