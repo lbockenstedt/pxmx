@@ -21,6 +21,7 @@ come back as ``{status: ERROR, message: ...}`` so the hub can ACK them.
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, Set
@@ -199,6 +200,62 @@ async def handle_cs_command(agent, action: str,
             return {"status": "SUCCESS",
                     "message": f"killed {r['killed_qm_pids']} qm pids, "
                                f"unlocked {len(r['unlocked_vmids'])} VMs", **r}
+
+        if action == "usb_probe":
+            # LIVE presence probe for one bus path, for the WebUI "Replace
+            # Dongle" flow. Deliberately reads sysfs on demand rather than
+            # riding the telemetry frame: telemetry idles at 60s (and is now
+            # capped at 15s even under load), which is far too slow to tell
+            # someone "yes, that is the one you just pulled" while their hand is
+            # still in the chassis. This is a handful of file reads.
+            from . import usb_diagnostics as _ud
+            bus = str(data.get("bus_path") or "").strip()
+            if not bus:
+                return {"status": "ERROR", "message": "bus_path required"}
+            base = f"/sys/bus/usb/devices/{bus}"
+            present = os.path.exists(base)
+
+            def _rd(path):
+                try:
+                    with open(path) as f:
+                        return f.read().strip()
+                except OSError:
+                    return ""
+
+            def _ident(b):
+                d = f"/sys/bus/usb/devices/{b}"
+                vid, pid = _rd(f"{d}/idVendor"), _rd(f"{d}/idProduct")
+                return {"bus_path": b,
+                        "vidpid": f"{vid}:{pid}" if (vid and pid) else "",
+                        "product": _rd(f"{d}/product"),
+                        # Serial is what distinguishes a REPLACEMENT from the
+                        # same stick reseated -- two dongles of one model share
+                        # a vid:pid, so vid:pid alone cannot tell them apart.
+                        "serial": _rd(f"{d}/serial")}
+
+            ctrl = _ud.usb_device_controller(bus) if present else ""
+            out = {"status": "SUCCESS", "action": "usb_probe", "bus": bus,
+                   "present": present,
+                   "location": _ud.location_for(bus) if present else "",
+                   "pci_address": ctrl}
+            if present:
+                out.update(_ident(bus))
+            # Everything else currently on the SAME controller, so the UI can
+            # say "a new dongle appeared on port 3" and can show the operator
+            # which neighbouring ports are still populated -- the difference
+            # between pulling the right stick and pulling its neighbour.
+            sibs = []
+            if ctrl:
+                prefix = bus.split("-", 1)[0] + "-"
+                try:
+                    for name in sorted(os.listdir("/sys/bus/usb/devices")):
+                        if not name.startswith(prefix) or ":" in name:
+                            continue
+                        sibs.append(_ident(name))
+                except OSError:
+                    pass
+            out["siblings"] = sibs
+            return out
 
         if action == "clear_usb_quarantine":
             # Clear the dmesg quarantine store (usb_quarantine.json, incl. the

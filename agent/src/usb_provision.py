@@ -2105,10 +2105,22 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                     return _usbdiag.controller_for(b, _roster)
                 except Exception:
                     return ""
+            def _card(b):
+                # vid:pid of the CONTROLLER CARD, kept as its own field rather
+                # than only embedded in the location string: the entry already
+                # carries the DONGLE's vidpid, and two identical-looking ids on
+                # one row are ambiguous unless they are labelled separately.
+                try:
+                    return _usbdiag.pci_location(_usbdiag.controller_for(b, _roster),
+                                                 _slots).get("vidpid") or ""
+                except Exception:
+                    return ""
         except Exception:          # older/partial agent -- never break telemetry
             def _loc(b):
                 return ""
             def _ctrl(b):
+                return ""
+            def _card(b):
                 return ""
         usb_state: List[Dict[str, Any]] = []
         try:
@@ -2163,6 +2175,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
             if usb_state[-1]["recovery"] or ms is not None:
                 usb_state[-1]["location"] = _loc(bus)
                 usb_state[-1]["pci_address"] = _ctrl(bus)
+                usb_state[-1]["card_vidpid"] = _card(bus)
         # Quarantined dongles (dmesg kernel USB errors — the ONLY quarantine path)
         # for the WebUI badge: bus-id + reason + when, so an admin can see WHY a
         # dongle is sidelined and that it auto-recovers after QUARANTINE_RECOVERY_S.
@@ -2192,6 +2205,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 # costs a sysfs walk per entry.
                 "location": _loc(bus),
                 "pci_address": _ctrl(bus),
+                "card_vidpid": _card(bus),
                 "reason": e.get("reason") or "quarantined",
                 "since": since,
                 # 5-strike state — permanent buses never auto-recover; strikes is
@@ -2222,6 +2236,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "bus_path": bus,
                 "location": _loc(bus),
                 "pci_address": _ctrl(bus),
+                "card_vidpid": _card(bus),
                 "since": since,
                 "expires_at": expires_at,
                 "expires_in_s": max(0, int(expires_at - _now))
