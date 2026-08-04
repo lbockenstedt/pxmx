@@ -261,6 +261,7 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
     """
     now = time.time() if now is None else now
     roster = _load_roster()
+    _slots = _pci_slot_map()          # read once, identical for every device
     for bus, info in (present_by_bus or {}).items():
         e = roster.get(bus) or {}
         e["vidpid"] = (info or {}).get("vidpid") or e.get("vidpid") or ""
@@ -273,6 +274,11 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
         _ctrl = usb_device_controller(bus)
         if _ctrl:
             e["pci_controller"] = _ctrl
+            # Physical location, recorded for the SAME reason as the controller:
+            # once the device is gone the sysfs walk is impossible, so "which
+            # card / which port was it in" has to be captured while it is here.
+            e["location"] = usb_location(bus, _ctrl, _slots)
+            e["port"] = usb_port_of(bus)
         # Self-healing rename. When a reboot renumbers the bus, THIS dongle shows
         # up under a new path while its old entry lingers as a phantom "missing"
         # row. Same physical port (same stable id) + the old path no longer
@@ -468,6 +474,104 @@ def _pci_driver(addr: str) -> str:
         return ""
 
 
+# ── Physical location of a USB controller ───────────────────────────────────
+# "Which card is this dongle on, and which port of it?" A bare PCI address
+# (0000:80:14.0) does not answer that for anyone standing at the rack.
+#
+# Deliberately sysfs-only — NO subprocess. lspci/dmidecode would give prettier
+# vendor strings and the board's printed slot label, but this module already
+# cost the fleet an outage by doing expensive work on a watchdog-fed loop, and
+# every field below is a file read of a few bytes.
+
+# ACPI exposes physical slots at /sys/bus/pci/slots/<N>/address, where the
+# address is domain:bus:device (NO function). A controller that appears there
+# is in a physical slot; a chipset controller does not appear at all. That
+# presence/absence IS the onboard-vs-card answer where firmware provides it.
+def _pci_slot_map() -> Dict[str, str]:
+    """``{'0000:04:00': '1'}`` — physical slot number by domain:bus:device."""
+    out: Dict[str, str] = {}
+    for p in glob.glob("/sys/bus/pci/slots/*/address"):
+        try:
+            with open(p) as f:
+                addr = f.read().strip()
+        except OSError:
+            continue
+        if addr:
+            out[addr] = os.path.basename(os.path.dirname(p))
+    return out
+
+
+# Chipset silicon — an Intel/AMD USB controller is integrated in practice.
+# Only used as a FALLBACK when firmware exposes no slot table at all; the slot
+# map is authoritative whenever it exists.
+_CHIPSET_VENDORS = {"0x8086": "Intel", "0x1022": "AMD"}
+_PCI_VENDOR_NAMES = {
+    "0x8086": "Intel", "0x1022": "AMD", "0x1b21": "ASMedia",
+    "0x1912": "Renesas", "0x1106": "VIA", "0x1b73": "Fresco Logic",
+    "0x104c": "TI", "0x12d8": "Pericom",
+}
+
+
+def _sysfs_read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def pci_location(addr: str, slots: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Where a USB controller physically lives.
+
+    Returns ``slot`` (physical slot number, None when onboard/unknown),
+    ``onboard`` (bool or None when genuinely undetermined), ``vendor``, and
+    ``label`` — a human string like ``"PCIe slot 1"`` or ``"onboard"``.
+
+    ``onboard`` is None rather than False when the board exposes no slot table
+    AND the vendor is not recognised chipset silicon: saying "add-in card" on a
+    guess would send someone to pull a card that is soldered down.
+    """
+    if not addr:
+        return {"pci_address": "", "slot": None, "onboard": None,
+                "vendor": "", "label": "unknown"}
+    if slots is None:
+        slots = _pci_slot_map()
+    dbd = addr.rsplit(".", 1)[0]                  # strip the function
+    slot = slots.get(dbd)
+    vid = _sysfs_read(f"/sys/bus/pci/devices/{addr}/vendor")
+    vendor = _PCI_VENDOR_NAMES.get(vid, vid or "")
+    # Firmware-provided name (ACPI _DSM), e.g. "Onboard USB" on server boards.
+    fw_label = _sysfs_read(f"/sys/bus/pci/devices/{addr}/label")
+    if slot:
+        onboard, label = False, f"PCIe slot {slot}"
+    elif slots:
+        # The board DOES publish a slot table and this controller is not in it,
+        # so it is integrated. This is the reliable branch.
+        onboard, label = True, "onboard"
+    elif vid in _CHIPSET_VENDORS:
+        onboard, label = True, "onboard (chipset)"
+    else:
+        onboard, label = None, "add-in card or onboard (no slot table)"
+    if fw_label:
+        label = f"{label} · {fw_label}"
+    return {"pci_address": addr, "slot": slot, "onboard": onboard,
+            "vendor": vendor, "label": label}
+
+
+def usb_port_of(bus: str) -> str:
+    """Physical port on the controller's root hub. ``'16-3'`` → ``'3'``;
+    ``'16-2.4'`` → ``'2.4'`` (port 4 of a hub plugged into port 2)."""
+    return bus.split("-", 1)[1] if "-" in bus else ""
+
+
+def usb_location(bus: str, controller: str = "",
+                 slots: Optional[Dict[str, str]] = None) -> str:
+    """One-line physical location: ``'PCIe slot 1 · port 3'``."""
+    loc = pci_location(controller or usb_device_controller(bus), slots)
+    port = usb_port_of(bus)
+    return f"{loc['label']} · port {port}" if port else loc["label"]
+
+
 def usb_device_controller(bus: str) -> str:
     """PCI address of the controller a USB bus hangs off, '' if undetermined.
 
@@ -507,6 +611,9 @@ def usb_controllers() -> List[Dict[str, Any]]:
     """
     out: List[Dict[str, Any]] = []
     seen = set()
+    # Read the ACPI slot table ONCE and pass it down — it is identical for every
+    # controller and does not change while the box is up.
+    slots = _pci_slot_map()
     # Host-bound controllers, enumerated through their driver as before.
     for drv in ("xhci_hcd", "ehci-pci", "ehci_hcd"):
         for path in sorted(glob.glob(f"/sys/bus/pci/drivers/{drv}/0000:*")):
@@ -524,7 +631,9 @@ def usb_controllers() -> List[Dict[str, Any]]:
                                                      recursive=True)
                                 if ":" not in os.path.basename(d)])
             out.append({"driver": drv, "pci_address": addr, "root_hubs": buses,
-                        "device_count": devices, "passthrough": False})
+                        "device_count": devices, "passthrough": False,
+                        **{f"loc_{k}": v for k, v in pci_location(addr, slots).items()
+                           if k != "pci_address"}})
     # Passed-through controllers are NOT under an xhci_hcd driver dir — find them
     # by PCI class (0c03 = USB controller) and report them explicitly, so a card
     # that vanished from the host is visible as "given to a VM" rather than
@@ -542,7 +651,9 @@ def usb_controllers() -> List[Dict[str, Any]]:
         drv = _pci_driver(addr)
         out.append({"driver": drv or "(unbound)", "pci_address": addr,
                     "root_hubs": [], "device_count": 0,
-                    "passthrough": drv in _PASSTHROUGH_DRIVERS})
+                    "passthrough": drv in _PASSTHROUGH_DRIVERS,
+                    **{f"loc_{k}": v for k, v in pci_location(addr, slots).items()
+                       if k != "pci_address"}})
     return out
 
 
