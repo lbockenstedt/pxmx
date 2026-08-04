@@ -220,6 +220,12 @@ _CS_SEND_DEADLINE_S = float(os.environ.get("LM_PXMX_CS_SEND_DEADLINE_S", "10") o
 # a day wide, so re-scanning it every telemetry tick is pure waste.
 _USB_DIAG_DEADLINE_S = float(os.environ.get("LM_PXMX_USB_DIAG_DEADLINE_S", "20") or 20)
 _USB_DIAG_INTERVAL_S = float(os.environ.get("LM_PXMX_USB_DIAG_INTERVAL_S", "300") or 300)
+# Ceiling on the 3s "provisioning is active" telemetry cadence. A burst that
+# runs longer than this is not a burst -- it is something stuck (classically a
+# failing USB controller looping reclone-on-detach), and 20 ticks/min of
+# synchronous sysfs walking neither fixes it nor observes anything new.
+_FAST_CADENCE_MAX_S = float(os.environ.get("LM_PXMX_FAST_CADENCE_MAX_S", "600") or 600)
+_FAST_CADENCE_BACKOFF_S = float(os.environ.get("LM_PXMX_FAST_CADENCE_BACKOFF_S", "15") or 15)
 # Guest-agent watchdog sweep. Generous vs the others because a hard recovery
 # waits up to STOP_WAIT_S for a VM to stop, and several may need it in one pass.
 _GUEST_WD_DEADLINE_S = float(os.environ.get("LM_PXMX_GUEST_WD_DEADLINE_S", "180") or 180)
@@ -2846,10 +2852,53 @@ class ProxmoxAgent:
                                   or usb_provision.current_reclone_state().get("status") == "running")
                         if active:
                             interval = 3
+                            # CEILING on the fast cadence. 3s exists so the UI
+                            # tracks a provisioning BURST in near real time --
+                            # something that finishes in a minute or two. It was
+                            # never meant to be a steady state, and there is a
+                            # fault mode that makes it one: a failing controller
+                            # detaches dongles continuously, reclone-on-detach
+                            # keeps a reclone permanently "running", `active`
+                            # never goes false, and the agent sits at 20 telemetry
+                            # ticks a MINUTE indefinitely -- each one a synchronous
+                            # sysfs walk. Reported as the agent eating CPU.
+                            #
+                            # This surfaced only once scan_dmesg_usb_errors was
+                            # repaired (it had raised on every call since it was
+                            # written, so quarantine never fired and no reclone
+                            # storm was possible). Correct detection, uncapped
+                            # response.
+                            #
+                            # After _FAST_CADENCE_MAX_S of CONTINUOUS fast ticking,
+                            # back off: sustained activity means something is stuck,
+                            # and polling it 20x/min is not what unsticks it.
+                            _fs = getattr(self, "_fast_since", None)
+                            if _fs is None:
+                                self._fast_since = _now
+                            elif (_now - _fs) > _FAST_CADENCE_MAX_S:
+                                interval = _FAST_CADENCE_BACKOFF_S
+                                if not getattr(self, "_fast_capped", False):
+                                    self._fast_capped = True
+                                    logger.warning(
+                                        "telemetry cadence capped: provisioning/reclone has been "
+                                        "continuously active for %.0fs — backing off %ss->%ss. "
+                                        "A reclone that never completes usually means a failing "
+                                        "USB controller detaching dongles in a loop; check the "
+                                        "quarantine list for several ports on ONE card.",
+                                        _now - _fs, 3, _FAST_CADENCE_BACKOFF_S)
+                        else:
+                            if getattr(self, "_fast_capped", False):
+                                logger.info("telemetry cadence back to normal — "
+                                            "provisioning/reclone idle")
+                            self._fast_since = None
+                            self._fast_capped = False
                     except Exception:  # noqa: BLE001 — cadence hint only
                         pass
                 if _now < getattr(self, "_vm_change_fast_until", 0):
-                    interval = min(interval, 3)
+                    # The VM-change burst is self-limiting (a short window after a
+                    # change), so it is not capped -- but it must not undercut the
+                    # cap above, or the ceiling would be trivially bypassed.
+                    interval = min(interval, 3) if not getattr(self, "_fast_capped", False) else interval
                 # Record the cadence chosen this tick + when we finished, so the
                 # detail page can show the effective interval and the true gap
                 # between telemetry frames (not just the per-phase durations).
