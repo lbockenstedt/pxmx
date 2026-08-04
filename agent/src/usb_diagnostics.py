@@ -791,6 +791,44 @@ def usb_device_controller(bus: str) -> str:
     return last
 
 
+def _usb_device_names() -> List[str]:
+    """Every USB device name from the FLAT /sys/bus/usb/devices listing.
+
+    One listdir. Entries are named by port chain -- ``usb16``, ``16-1``,
+    ``16-1.2``, ``16-0:1.0`` -- so a device behind an external hub is already
+    present at the top level and needs no tree walk to find.
+    """
+    try:
+        return os.listdir("/sys/bus/usb/devices")
+    except OSError:
+        return []
+
+
+def _devices_behind_root_hub(root_hub: str, names: Optional[List[str]] = None) -> int:
+    """Count USB devices behind ``usbN``, INCLUDING those behind external hubs.
+
+    This replaced a ``glob(usbdir + "/**/*-*", recursive=True)``. That walk did
+    produce the right answer, and it very nearly took the fleet down: sysfs
+    device directories nest (16-1 -> 16-1.2 -> ...) and carry per-endpoint and
+    per-power subdirectories, so the recursive descent ran 60+ levels deep and
+    effectively never returned. Because usb_controllers runs in a thread, every
+    subsequent call added ANOTHER stuck thread -- 11 of them observed pinned at
+    ~85% CPU each, 934% total, with RSS climbing as each accumulated results.
+    py-spy showed all eleven inside _rlistdir.
+
+    The recursion was never necessary. /sys/bus/usb/devices is FLAT: a device
+    behind a hub still appears there as '16-1.2'. Matching the bus-number prefix
+    is one listdir and gives the identical count. Names containing ':' are
+    INTERFACES (16-0:1.0), not devices, and are excluded exactly as before.
+    """
+    m = re.match(r"usb(\d+)$", root_hub or "")
+    if not m:
+        return 0
+    prefix = m.group(1) + "-"
+    return sum(1 for n in (names if names is not None else _usb_device_names())
+               if n.startswith(prefix) and ":" not in n)
+
+
 def usb_controllers() -> List[Dict[str, Any]]:
     """USB controllers with device counts AND their current PCI driver binding.
 
@@ -819,14 +857,7 @@ def usb_controllers() -> List[Dict[str, Any]]:
             buses, devices = [], 0
             for usbdir in sorted(glob.glob(os.path.join(path, "usb*"))):
                 buses.append(os.path.basename(usbdir))
-                # RECURSIVE. Direct children of the root hub miss everything
-                # behind an external hub (17-2.1, 17-2.3 …), which is where most
-                # dongles actually live — a host with 11 present dongles was
-                # reporting 3, making the per-controller counts useless for
-                # spotting "they all went off ONE controller".
-                devices += len([d for d in glob.glob(os.path.join(usbdir, "**", "*-*"),
-                                                     recursive=True)
-                                if ":" not in os.path.basename(d)])
+                devices += _devices_behind_root_hub(os.path.basename(usbdir))
             out.append({"driver": drv, "pci_address": addr, "root_hubs": buses,
                         "device_count": devices, "passthrough": False,
                         **{f"loc_{k}": v for k, v in pci_location(addr, slots).items()
