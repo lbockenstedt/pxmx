@@ -1461,6 +1461,25 @@ class ProxmoxAgent:
                 logger.debug(f"Update check: {e}")
             await asyncio.sleep(600)
 
+    def _tiers_fallback(self, vms) -> Dict[str, str]:
+        """Best tier map available when compute_vm_tiers could not finish.
+
+        Prefers the last SUCCESSFUL map; falls back to the USB-only
+        classification, which needs no subprocess. The old fallback was
+        last-known-or-EMPTY, and last-known is empty on a fresh agent -- so a
+        host whose first few passes timed out shipped every VM unclassified and
+        stayed that way. Observed as the Class column reading all-unknown fleet
+        wide while the agent was CPU-starved.
+        """
+        last = getattr(self, "_last_tiers", None)
+        if last:
+            return dict(last)
+        try:
+            return usb_provision.usb_tiers_only((vms or {}).get("vms", []) or [])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("tiers fallback failed: %s", e)
+            return {}
+
     async def _slow_jobs_loop(self):
         """Periodic jobs that are NOT part of building a telemetry frame.
 
@@ -2753,14 +2772,14 @@ class ProxmoxAgent:
                                 timeout=_TIERS_DEADLINE_S)
                             self._last_tiers = tiers
                         except asyncio.TimeoutError:
-                            tiers = getattr(self, "_last_tiers", {}) or {}
+                            tiers = self._tiers_fallback(vms)
                             logger.warning(
                                 "compute_vm_tiers exceeded %.0fs (busy host / mass op) "
-                                "— shipping telemetry with last-known tiers so VM "
-                                "changes aren't held up", _TIERS_DEADLINE_S)
+                                "— shipping telemetry with %d fallback tier(s) so VM "
+                                "changes aren't held up", _TIERS_DEADLINE_S, len(tiers))
                         except Exception as _te:
-                            logger.debug(f"compute_vm_tiers failed: {_te}")
-                            tiers = getattr(self, "_last_tiers", {}) or {}
+                            logger.warning("compute_vm_tiers failed: %s", _te)
+                            tiers = self._tiers_fallback(vms)
                         (self._last_phase_ms or {})["tiers_ms"] = int((time.time() - _t_e) * 1000)
                         # Present T1/T3 PCI devices (host lspci ∩ the t1/t3 allow-lists)
                         # for the WebUI PCI tab. Best-effort; cache so a transient lspci

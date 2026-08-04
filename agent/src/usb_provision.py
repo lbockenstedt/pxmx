@@ -249,6 +249,37 @@ _vm_tier_cache: Dict[str, Any] = {"ts": 0.0, "tiers": {}}
 _VM_TIER_TTL = 60.0
 
 
+def usb_tiers_only(vms) -> Dict[str, str]:
+    """T2 tiers alone, from the persisted USB state. NO subprocess, no awaits.
+
+    compute_vm_tiers needs a `qm config` probe per VM to resolve T1/T3, and on a
+    busy host that can blow its deadline -- at which point the caller falls back
+    to the LAST-KNOWN map, which is empty on a fresh agent. The result was every
+    VM rendering as unclassified with nothing obviously broken.
+
+    T2 needs none of that: a VM holding a dongle is recorded in usb_state's
+    bus_to_vmid, which is a local file. So the cheap majority stays classifiable
+    even when the expensive part times out -- these hosts run ~14 T2 to 4 T1, so
+    this recovers most of the picture rather than none of it.
+    """
+    try:
+        st = load_usb_state()
+        usb_vmids = {str(v) for v in (st.get("bus_to_vmid") or {}).values()
+                     if str(v).lstrip("-").isdigit()}
+    except Exception:  # noqa: BLE001
+        return {}
+    out: Dict[str, str] = {}
+    for v in (vms or []):
+        vid = v.get("vmid") if isinstance(v, dict) else v
+        if vid in (None, ""):
+            continue
+        if isinstance(v, dict) and v.get("is_template"):
+            continue
+        if str(vid) in usb_vmids:
+            out[str(vid)] = "t2"
+    return out
+
+
 async def compute_vm_tiers(agent, vms) -> Dict[str, str]:
     """Authoritative per-VM tier map ``{str(vmid): 't1'|'t2'|'t3'}``, classified by
     PASSTHROUGH — the reliable signal, independent of any guest self-report:
