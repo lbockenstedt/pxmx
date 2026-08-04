@@ -26,6 +26,15 @@ logger = logging.getLogger("PxmxAgent")
 # (every 3s while provisioning). IPs/MACs barely change, so cache them:
 _IFACE_TTL_OK = 120.0    # fully resolved (has an IP, or a stopped VM's config MAC): 2 min
                          # (was 300 — a running VM's IP change went unseen for 5 min)
+# Backoff ceiling for a VM that keeps failing to yield an IP. Some guests can
+# NEVER yield one -- a client running ssidpw_fail / assoc_fail / auth_fail is
+# unable to associate BY DESIGN -- so a fixed short retry means those VMs are
+# re-probed forever, every tick, at full concurrency. Measured on a node with a
+# large sim fleet: ~4.4 subprocess spawns/sec sustained, 86% of all syscall time
+# in futex contention between the spawning threads, and the agent pinned at 900%+
+# CPU. Each miss doubles the retry interval up to this cap, so a permanently
+# IP-less VM settles to one probe every few minutes instead of every tick.
+_IFACE_TTL_MISS_MAX = 900.0
 _IFACE_TTL_MISS = 60.0   # running VM with no IP yet (guest agent booting / not answering):
                          # retry every 60s instead of riding the 4s timeout each tick
 
@@ -205,7 +214,12 @@ async def annotate_vm_interfaces(agent, vms: List[Dict[str, Any]]) -> None:
     if cache is None:
         cache = agent._iface_cache = {}
     now = time.time()
-    sem = asyncio.Semaphore(16)
+    # 4, not 16. Every permit is a `pvesh`/`qm` subprocess -- a Perl process
+    # costing ~150MB RSS and 10-20% CPU for its short life -- and 16 of them at
+    # once is 4x any other fan-out in this agent (pve_cmds and usb_provision both
+    # use 4). Combined with the retry storm above it was spawning ~4.4
+    # processes/sec forever.
+    sem = asyncio.Semaphore(4)
 
     async def _one(v):
         key = str(v.get("vmid"))
@@ -214,7 +228,15 @@ async def annotate_vm_interfaces(agent, vms: List[Dict[str, Any]]) -> None:
         # Cache hit: same power state AND still within TTL (longer once resolved,
         # short while a running guest hasn't yielded an IP). Reuse — no round-trip.
         if ent is not None and ent.get("status") == status:
-            ttl = _IFACE_TTL_OK if ent.get("ok") else _IFACE_TTL_MISS
+            # Exponential backoff on consecutive misses, capped. A guest that is
+            # simply slow to boot resolves on the next tick or two and never
+            # reaches a long TTL; one that can never resolve stops being probed
+            # every tick within a few minutes.
+            if ent.get("ok"):
+                ttl = _IFACE_TTL_OK
+            else:
+                _n = int(ent.get("misses", 1))
+                ttl = min(_IFACE_TTL_MISS * (2 ** max(0, _n - 1)), _IFACE_TTL_MISS_MAX)
             if (now - ent.get("ts", 0.0)) < ttl:
                 v["interfaces"] = ent["interfaces"]
                 v["ips"] = list(ent.get("ips") or [])
@@ -233,8 +255,11 @@ async def annotate_vm_interfaces(agent, vms: List[Dict[str, Any]]) -> None:
             ok = bool(ips)
         else:
             ok = any(i.get("mac") for i in ifaces)
+        # Consecutive-miss counter drives the backoff; any success resets it.
+        _prev = int((ent or {}).get("misses", 0)) if ent is not None else 0
         cache[key] = {"interfaces": ifaces, "ips": ips, "ts": now,
-                      "status": status, "ok": ok}
+                      "status": status, "ok": ok,
+                      "misses": 0 if ok else _prev + 1}
 
     try:
         # 6s (was 12s) overall deadline: with per-VM timeout at 2s + the cache,
