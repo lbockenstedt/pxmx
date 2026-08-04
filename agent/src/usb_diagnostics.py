@@ -1056,6 +1056,102 @@ _JOURNAL_GREP = (r"over-?current|overcurrent|insufficient available bus power|"
 _JOURNAL_MAX_LINES = int(os.environ.get("LM_PXMX_JOURNAL_MAX_LINES", "5000") or 5000)
 
 
+# ── attribution: which kernel events did WE cause? ──────────────────────────
+# The recovery ladder's usb_reset rung writes /sys/.../authorized 0 then 1. The
+# kernel logs that as "USB disconnect" followed by "new ... USB device" -- and
+# "disconnect" is one of the categories _KERNEL_PATTERNS counts as evidence.
+#
+# That makes the diagnostic CIRCULAR: the agent resets a dongle because it looks
+# unhealthy, the reset logs a disconnect, and the disconnect is then counted as
+# evidence the dongle is unhealthy. On one host 1005 such events accumulated in
+# 24h, every one of them self-inflicted, which is exactly the trap this closes.
+#
+# The agent knows when it reset a bus, so it can subtract its own work. Resets
+# are recorded here and kernel events on that bus within the attribution window
+# are reported SEPARATELY rather than being silently dropped -- a reset that
+# provokes a genuine link error is still worth seeing.
+USB_RESET_LOG_FILE = f"{PXMLIB}/usb_resets.json"
+# A reset's disconnect + re-enumeration land within a second or two; 15s is
+# generous without swallowing an unrelated fault minutes later.
+RESET_ATTRIBUTION_S = float(os.environ.get("LM_PXMX_RESET_ATTRIBUTION_S", "15") or 15)
+_RESET_LOG_TTL_S = DIAG_KERNEL_WINDOW_S      # only useful as far back as we scan
+
+
+def record_port_reset(bus: str, now: Optional[float] = None) -> None:
+    """Note that WE just re-enumerated *bus*. Called by the usb_reset rung.
+
+    Best-effort and never raises: failing to record makes an event look
+    spontaneous, which is the safe direction (it over-reports hardware faults
+    rather than hiding them).
+    """
+    if not bus:
+        return
+    now = time.time() if now is None else now
+    try:
+        d = {}
+        if os.path.exists(USB_RESET_LOG_FILE):
+            with open(USB_RESET_LOG_FILE) as f:
+                d = json.load(f) or {}
+        if not isinstance(d, dict):
+            d = {}
+        hist = [t for t in (d.get(bus) or []) if isinstance(t, (int, float))
+                and now - t < _RESET_LOG_TTL_S]
+        hist.append(now)
+        d[bus] = hist[-200:]
+        for k in list(d):
+            d[k] = [t for t in (d.get(k) or [])
+                    if isinstance(t, (int, float)) and now - t < _RESET_LOG_TTL_S]
+            if not d[k]:
+                d.pop(k, None)
+        os.makedirs(PXMLIB, exist_ok=True)
+        tmp = f"{USB_RESET_LOG_FILE}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, USB_RESET_LOG_FILE)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug("usb_diagnostics: reset log write failed: %s", e)
+
+
+def _load_reset_log() -> Dict[str, List[float]]:
+    try:
+        if os.path.exists(USB_RESET_LOG_FILE):
+            with open(USB_RESET_LOG_FILE) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def attribute_kernel_events(by_bus: Dict[str, Dict[str, int]],
+                            resets: Optional[Dict[str, List[float]]] = None,
+                            now: Optional[float] = None) -> Dict[str, Any]:
+    """Split per-bus kernel event counts into self-inflicted vs spontaneous.
+
+    A bus we reset N times in the window is credited with up to N disconnects --
+    each reset produces exactly one. Anything beyond that, and every non-
+    disconnect category, is reported as spontaneous: a reset explains a
+    disconnect, it does not explain an over-current.
+    """
+    resets = _load_reset_log() if resets is None else resets
+    now = time.time() if now is None else now
+    self_n, spon_n = 0, 0
+    detail: Dict[str, Dict[str, int]] = {}
+    for bus, cats in (by_bus or {}).items():
+        n_resets = len([t for t in (resets.get(bus) or [])
+                        if isinstance(t, (int, float)) and (now - t) < DIAG_KERNEL_WINDOW_S])
+        disc = int((cats or {}).get("disconnect", 0))
+        credited = min(disc, n_resets)
+        other = sum(int(v) for k, v in (cats or {}).items() if k != "disconnect")
+        spont = (disc - credited) + other
+        self_n += credited
+        spon_n += spont
+        if credited or spont:
+            detail[bus] = {"self_inflicted": credited, "spontaneous": spont,
+                           "resets_by_agent": n_resets}
+    return {"self_inflicted": self_n, "spontaneous": spon_n, "by_bus": detail}
+
+
 def _parse_kernel_lines(log: str) -> Dict[str, Any]:
     """Pure CPU: categorise pre-filtered kernel lines. Run OFF the event loop."""
     out: Dict[str, Any] = {"totals": {}, "by_bus": {}, "samples": []}
@@ -1197,6 +1293,13 @@ async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S,
     state = _fold_kernel_delta(state, parsed, now, window_s)
     await asyncio.to_thread(_save_kernel_state, state)
     out.update(_sum_kernel_buckets(state))
+    # Split the totals by who caused them. Reported alongside, never subtracted
+    # silently: a reset that provokes a genuine link error is still worth
+    # seeing, and hiding events would trade one blind spot for another.
+    try:
+        out["attribution"] = attribute_kernel_events(out.get("by_bus") or {}, now=now)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("usb_diagnostics: attribution failed: %s", e)
     out["samples"] = state.get("samples") or []
     _keys = [int(k) for k in (state.get("buckets") or {}) if str(k).isdigit()]
     out["covers_s"] = int(now - min(_keys)) if _keys else 0

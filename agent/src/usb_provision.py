@@ -1335,6 +1335,15 @@ def _usb_port_reset(bus: str) -> bool:
             f.write("0")
         with open(path, "w") as f:
             f.write("1")
+        # Record it. The kernel logs this as "USB disconnect" + "new ... USB
+        # device", and disconnect is a category the diagnostic counts as
+        # evidence -- so without this the agent's own recovery attempts read
+        # back as proof the dongle is failing.
+        try:
+            from . import usb_diagnostics as _ud
+            _ud.record_port_reset(bus)
+        except Exception:  # noqa: BLE001 — attribution is never worth a failure
+            pass
         return True
     except OSError as e:  # noqa: BLE001
         logger.warning(f"usb reset {bus}: {e}")
