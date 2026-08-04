@@ -2397,6 +2397,30 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
         return empty
 
 
+def _bus_sort_key(bus: str):
+    """Selection order for a dongle bus: DIRECT card ports before hub-attached.
+
+    A dotted path means a hub tier -- ``16-2.1`` is port 1 of a hub plugged into
+    port 2 -- and every extra tier is a worse place to put a client:
+
+      * the whole tier shares ONE upstream link and ONE 500mA budget, while each
+        direct card port gets its own. An 802.11ac dongle draws ~300-450mA under
+        load, so a loaded hub is where power-related faults show up first;
+      * the hub is an additional component that can fail, taking every dongle
+        behind it with it;
+      * hub-attached bus paths RENUMBER across reboots (direct card ports do
+        not), so anything pinned to one is the first to go stale.
+
+    So fill the direct ports first and treat hub ports as spillover. Depth is
+    the primary key; the numeric path breaks ties so 16-3 sorts before 16-10
+    (a plain string sort gets that backwards).
+    """
+    depth = str(bus).count(".")
+    parts = tuple(int(p) if p.isdigit() else 0
+                  for p in re.split(r"[-.]", str(bus)))
+    return (depth, parts, str(bus))
+
+
 def _sim_phy_accepts(sim_phy: str, device_type: str) -> bool:
     # sim_phy is the sim VM's required physical layer (cs domain:
     # wireless | ethernet | any). device_type is the dongle class from the
@@ -3144,6 +3168,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         else:
             culled["type"].append(f"{bus}:{dtype}")
 
+    # Direct card ports first, hub-attached last -- within each tier, so the
+    # sim_phy preference still outranks topology (a matching dongle behind a hub
+    # is still better than a non-matching one on the card).
+    preferred.sort(key=_bus_sort_key)
+    overflow.sort(key=_bus_sort_key)
     ordered = preferred + overflow
     if not ordered:
         # Nothing left to place a VM on. That is NOT automatically a fault: the
