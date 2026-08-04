@@ -180,6 +180,18 @@ def _t3_pci_vidpids(agent) -> Set[str]:
     return _pci_vidpid_set(_usb_cfg(agent).get("t3_pci_vidpids"))
 
 
+def _t2_pci_vidpids(agent) -> Set[str]:
+    """T2 USB-CONTROLLER card VID:PID set (optional).
+
+    Unlike T1/T3 this does not gate anything — a T2 dongle is claimed by USB, not
+    by PCI passthrough. It exists so a controller card can be NAMED as a
+    configured T2 card instead of merely inferred: several controller models are
+    fitted across these hosts, and 'not on the T1 or T3 list' is a weaker claim
+    than 'on the T2 list'. Empty is fine and normal.
+    """
+    return _pci_vidpid_set(_usb_cfg(agent).get("t2_pci_vidpids"))
+
+
 async def cs_pci_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
     """Present host PCI devices matching the T1/T3 allow-lists — for the WebUI PCI
     tab. Returns ``{'t1_pci_devices': [...], 't3_pci_devices': [...]}``, each a list
@@ -2105,6 +2117,35 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                     return _usbdiag.controller_for(b, _roster)
                 except Exception:
                     return ""
+            # T1/T3 allow-lists from hub config -- the same sets that classify a
+            # PASSED-THROUGH device. Resolved once per telemetry pass.
+            _t1_vp, _t3_vp = _t1_pci_vidpids(agent), _t3_pci_vidpids(agent)
+            _t2_vp = _t2_pci_vidpids(agent)
+            def _card_role(b):
+                """Which KIND of card this is, per config: t1 / t3 / t2.
+
+                There are several controller models in these hosts, so a bare
+                vid:pid still leaves 'which card is this' to a lookup. Matching
+                the configured T1/T3 PCI allow-lists answers it directly. A card
+                on neither list that is HOSTING DONGLES is the T2 path by
+                definition -- T2 is the USB-dongle tier -- and this is only ever
+                called for a bus that has a dongle on it.
+                """
+                vp = (_card(b) or "").lower()
+                if not vp:
+                    return "", ""
+                if vp in _t1_vp:
+                    return "t1", "config"
+                if vp in _t3_vp:
+                    return "t3", "config"
+                if vp in _t2_vp:
+                    return "t2", "config"
+                # Not on any configured list. A card HOSTING DONGLES is the T2
+                # path by definition, and this is only called for a bus with a
+                # dongle on it -- but that is a DERIVATION, not something the
+                # config asserts, so it is reported as inferred. Populating
+                # t2_pci_vidpids upgrades it to "config" and names the model.
+                return "t2", "inferred"
             def _card(b):
                 # vid:pid of the CONTROLLER CARD, kept as its own field rather
                 # than only embedded in the location string: the entry already
@@ -2122,6 +2163,8 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 return ""
             def _card(b):
                 return ""
+            def _card_role(b):
+                return "", ""
         usb_state: List[Dict[str, Any]] = []
         try:
             st = load_usb_state()
@@ -2176,6 +2219,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 usb_state[-1]["location"] = _loc(bus)
                 usb_state[-1]["pci_address"] = _ctrl(bus)
                 usb_state[-1]["card_vidpid"] = _card(bus)
+                usb_state[-1]["card_role"], usb_state[-1]["card_role_source"] = _card_role(bus)
         # Quarantined dongles (dmesg kernel USB errors — the ONLY quarantine path)
         # for the WebUI badge: bus-id + reason + when, so an admin can see WHY a
         # dongle is sidelined and that it auto-recovers after QUARANTINE_RECOVERY_S.
@@ -2206,6 +2250,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "location": _loc(bus),
                 "pci_address": _ctrl(bus),
                 "card_vidpid": _card(bus),
+                **dict(zip(("card_role", "card_role_source"), _card_role(bus))),
                 "reason": e.get("reason") or "quarantined",
                 "since": since,
                 # 5-strike state — permanent buses never auto-recover; strikes is
@@ -2237,6 +2282,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "location": _loc(bus),
                 "pci_address": _ctrl(bus),
                 "card_vidpid": _card(bus),
+                **dict(zip(("card_role", "card_role_source"), _card_role(bus))),
                 "since": since,
                 "expires_at": expires_at,
                 "expires_in_s": max(0, int(expires_at - _now))
