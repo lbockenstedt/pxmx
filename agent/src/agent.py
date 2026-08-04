@@ -1484,11 +1484,34 @@ class ProxmoxAgent:
                 try:
                     self._last_usb_diag = await asyncio.wait_for(
                         usb_diagnostics.collect(self), timeout=_USB_DIAG_DEADLINE_S)
+                    # Log the OUTCOME, not just failures. An empty USB
+                    # diagnostics panel has two very different causes -- the
+                    # agent never ran a collect, or it ran and found nothing --
+                    # and without a success line the log cannot tell them apart,
+                    # which is exactly the question asked when the panel is
+                    # blank. One line per interval, so it is cheap.
+                    _d = self._last_usb_diag or {}
+                    logger.info(
+                        "usb_diagnostics: present=%s known=%s missing=%s "
+                        "lost_since_boot=%s passed_through=%s controllers=%s "
+                        "boot_baseline=%s",
+                        _d.get("present_count"), _d.get("known_count"),
+                        len(_d.get("missing") or []),
+                        len(_d.get("lost_since_boot") or []),
+                        len(_d.get("passed_through") or []),
+                        len(_d.get("controllers") or []),
+                        (_d.get("boot_baseline") or {}).get("count"))
                 except asyncio.TimeoutError:
                     logger.warning("usb_diagnostics exceeded %.0fs — keeping the "
                                    "last-known dongle diagnostic", _USB_DIAG_DEADLINE_S)
                 except Exception as e:  # noqa: BLE001
-                    logger.debug(f"usb_diagnostics failed: {e}")
+                    # WARNING, not debug. A debug-level swallow here is how the
+                    # bytes/str TypeError went unnoticed while every host
+                    # reported an empty diagnostic -- the same way the dmesg
+                    # quarantine scanner silently never fired for months. A
+                    # collector that fails every cycle must be loud.
+                    logger.warning("usb_diagnostics failed: %s: %s",
+                                   type(e).__name__, e, exc_info=True)
             if (now - getattr(self, "_last_guest_wd_ts", 0.0)) >= guest_watchdog.WATCHDOG_INTERVAL_S:
                 self._last_guest_wd_ts = now
                 try:
