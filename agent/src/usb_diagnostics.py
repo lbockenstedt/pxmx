@@ -804,6 +804,22 @@ def _usb_device_names() -> List[str]:
         return []
 
 
+def ports_on_bus(bus: str) -> int:
+    """Physical downstream ports on the root hub owning *bus*.
+
+    ``maxchild`` on usbN is the port count the controller actually exposes, so
+    "3 of 4 ports down" can be stated as a fraction instead of a bare count.
+    0 when it cannot be read.
+    """
+    num = str(bus or "").split("-", 1)[0].replace("usb", "")
+    if not num.isdigit():
+        return 0
+    try:
+        return int(_sysfs_read(f"/sys/bus/usb/devices/usb{num}/maxchild") or 0)
+    except ValueError:
+        return 0
+
+
 def _devices_behind_root_hub(root_hub: str, names: Optional[List[str]] = None) -> int:
     """Count USB devices behind ``usbN``, INCLUDING those behind external hubs.
 
@@ -859,7 +875,11 @@ def usb_controllers() -> List[Dict[str, Any]]:
                 buses.append(os.path.basename(usbdir))
                 devices += _devices_behind_root_hub(os.path.basename(usbdir))
             out.append({"driver": drv, "pci_address": addr, "root_hubs": buses,
-                        "device_count": devices, "passthrough": False,
+                        "device_count": devices,
+                        # Physical ports the card exposes, so a fault can be
+                        # reported as "3 of 4" rather than a bare count.
+                        "ports": sum(ports_on_bus(b) for b in buses),
+                        "passthrough": False,
                         **{f"loc_{k}": v for k, v in pci_location(addr, slots).items()
                            if k != "pci_address"}})
     # Passed-through controllers are NOT under an xhci_hcd driver dir — find them

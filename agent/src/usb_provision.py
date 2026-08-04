@@ -2191,6 +2191,24 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
             # PASSED-THROUGH device. Resolved once per telemetry pass.
             _t1_vp, _t3_vp = _t1_pci_vidpids(agent), _t3_pci_vidpids(agent)
             _t2_vp = _t2_pci_vidpids(agent)
+            def _card_ports(b):
+                # Port count of the owning card, stamped so the quarantine panel
+                # can say "port 3 of 4" without a second lookup.
+                try:
+                    return _usbdiag.ports_on_bus(b)
+                except Exception:
+                    return 0
+            def _card_devices(b):
+                # Devices currently present on the whole card. Paired with
+                # card_ports (maxchild) this gives "6 of 7 ports populated",
+                # which is the pair an operator needs: maxchild identifies the
+                # card MODEL (the 4- and 7-port cards here share a vid:pid, so
+                # the id alone cannot), device_count says how loaded it is.
+                try:
+                    num = str(b or "").split("-", 1)[0]
+                    return _usbdiag._devices_behind_root_hub(f"usb{num}")
+                except Exception:
+                    return 0
             def _card_role(b):
                 """Which KIND of card this is, per config: t1 / t3 / t2.
 
@@ -2233,6 +2251,10 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 return ""
             def _card(b):
                 return ""
+            def _card_ports(b):
+                return 0
+            def _card_devices(b):
+                return 0
             def _card_role(b):
                 return "", ""
         usb_state: List[Dict[str, Any]] = []
@@ -2289,6 +2311,8 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 usb_state[-1]["location"] = _loc(bus)
                 usb_state[-1]["pci_address"] = _ctrl(bus)
                 usb_state[-1]["card_vidpid"] = _card(bus)
+                usb_state[-1]["card_ports"] = _card_ports(bus)
+                usb_state[-1]["card_devices"] = _card_devices(bus)
                 usb_state[-1]["card_role"], usb_state[-1]["card_role_source"] = _card_role(bus)
         # Quarantined dongles (dmesg kernel USB errors — the ONLY quarantine path)
         # for the WebUI badge: bus-id + reason + when, so an admin can see WHY a
@@ -2320,6 +2344,8 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "location": _loc(bus),
                 "pci_address": _ctrl(bus),
                 "card_vidpid": _card(bus),
+                "card_ports": _card_ports(bus),
+                "card_devices": _card_devices(bus),
                 **dict(zip(("card_role", "card_role_source"), _card_role(bus))),
                 "reason": e.get("reason") or "quarantined",
                 "since": since,
@@ -2352,6 +2378,8 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "location": _loc(bus),
                 "pci_address": _ctrl(bus),
                 "card_vidpid": _card(bus),
+                "card_ports": _card_ports(bus),
+                "card_devices": _card_devices(bus),
                 **dict(zip(("card_role", "card_role_source"), _card_role(bus))),
                 "since": since,
                 "expires_at": expires_at,
