@@ -91,6 +91,17 @@ INVENTORY_MIN_AGE_S = 4 * 3600
 # from the host shouldn't be reported "missing" forever.
 ROSTER_TTL_S = 30 * 86400
 
+# A dongle that returns after being CONTINUOUSLY absent for at least this long is
+# treated as a physical swap rather than a fault flap. The discriminator is
+# duration: a failing controller drops a port and re-enumerates it within
+# seconds, while a human walking to the rack cannot do it in under minutes.
+REPLACEMENT_MIN_ABSENT_S = float(
+    os.environ.get("LM_PXMX_REPLACEMENT_MIN_ABSENT_S", "300") or 300)
+# Absence samples kept per bus. Turns "I think they drop and come back quickly"
+# into a measurement — a port whose absences are all single-digit seconds is
+# flapping, not being serviced.
+_ABSENCE_SAMPLES = 10
+
 # Kernel lines that explain a disappearance, by category. Ordered most-specific
 # first; a line is counted once, under the first category that matches.
 _KERNEL_PATTERNS = [
@@ -264,6 +275,14 @@ def _load_roster() -> Dict[str, Any]:
 
 
 def _save_roster(d: Dict[str, Any]) -> None:
+    # Invalidate the read cache FIRST. _load_roster keys on (mtime_ns, size),
+    # and record_presence is read-modify-write: a rewrite of the same byte
+    # length inside one mtime tick is indistinguishable from no change, so the
+    # next read would serve the pre-write roster. Caught by a test where a
+    # dongle's return was silently lost. The writer owning invalidation makes
+    # the cache correct regardless of filesystem timestamp resolution.
+    global _ROSTER_CACHE
+    _ROSTER_CACHE = None
     try:
         os.makedirs(PXMLIB, exist_ok=True)
         tmp = f"{USB_PRESENCE_FILE}.tmp"
@@ -285,6 +304,11 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
     now = time.time() if now is None else now
     roster = _load_roster()
     _slots = _pci_slot_map()          # read once, identical for every device
+    _bid = boot_id()
+    try:
+        _pt_addrs = set(passthrough_controllers())
+    except Exception:  # noqa: BLE001 — a missing set must not block the roster
+        _pt_addrs = set()
     for bus, info in (present_by_bus or {}).items():
         e = roster.get(bus) or {}
         e["vidpid"] = (info or {}).get("vidpid") or e.get("vidpid") or ""
@@ -322,7 +346,34 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
                                 "%s) — merged history", _ob, bus, _sid)
         e.setdefault("first_seen", now)
         e["last_seen"] = now
+        _ms = e.get("missing_since")
+        if _ms is not None:
+            try:
+                _absent = max(0.0, now - float(_ms))
+            except (TypeError, ValueError):
+                _absent = 0.0
+            e["last_absence_s"] = round(_absent, 1)
+            _hist = list(e.get("recent_absences") or [])
+            _hist.append(round(_absent, 1))
+            e["recent_absences"] = _hist[-_ABSENCE_SAMPLES:]
+            # A swap, or a flap? Duration decides. Two guards, because both of
+            # these produce a LONG absence that is not a swap:
+            #   * the controller was passed through to a VM -- every dongle
+            #     behind it vanishes for the life of that VM, so a teardown
+            #     would otherwise read as a fleet-wide dongle swap;
+            #   * the host rebooted -- every port repopulates at once, which
+            #     would clear quarantine everywhere in one go.
+            _same_boot = (e.get("missing_boot_id") or "") == (_bid or "")
+            _was_pt = bool(e.get("missing_passthrough"))
+            if (_absent >= REPLACEMENT_MIN_ABSENT_S and _same_boot and not _was_pt):
+                e["replaced_at"] = now
+                e["replaced_after_s"] = round(_absent, 1)
+                logger.info("usb_diagnostics: %s returned after %.0fs absent — "
+                            "treating as a REPLACED dongle (flaps return in seconds)",
+                            bus, _absent)
         e["missing_since"] = None
+        e.pop("missing_boot_id", None)
+        e.pop("missing_passthrough", None)
         roster[bus] = e
     # Stamp the moment each known-but-absent bus went away, and expire entries
     # whose dongle has been gone long enough to count as removed, not lost.
@@ -332,6 +383,18 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
             continue
         if e.get("missing_since") is None:
             e["missing_since"] = now
+            # Captured when it goes absent: on return this is the only way to
+            # tell a serviced port from a reboot.
+            e["missing_boot_id"] = _bid
+        # Passthrough is re-evaluated on EVERY absent pass and latched, not
+        # sampled once. A controller can be handed to a VM after its dongles
+        # have already dropped, and a single sample at disappearance would miss
+        # that -- then the VM teardown hours later would read as a dongle swap
+        # and clear quarantine across the whole card. Sticky OR: if the
+        # controller was passed through at ANY point during the absence, the
+        # absence is not evidence of a human.
+        if (e.get("pci_controller") or "") in _pt_addrs:
+            e["missing_passthrough"] = True
         if now - float(e.get("last_seen") or now) > ROSTER_TTL_S:
             roster.pop(bus, None)
             continue
@@ -486,6 +549,27 @@ def usb_power_settings() -> List[Dict[str, Any]]:
 # controller card to a guest). Those dongles are not lost — they are exactly
 # where they are supposed to be.
 _PASSTHROUGH_DRIVERS = ("vfio-pci", "pci-stub")
+
+
+def passthrough_controllers() -> List[str]:
+    """PCI addresses of USB controllers currently handed to a VM.
+
+    Same derivation usb_controllers() uses for its ``passthrough`` flag, hoisted
+    so record_presence can consult it WITHOUT the recursive sysfs walk that
+    function does per controller -- it runs on the telemetry path.
+    """
+    out: List[str] = []
+    for path in glob.glob("/sys/bus/pci/devices/0000:*"):
+        addr = os.path.basename(path)
+        try:
+            with open(os.path.join(path, "class")) as f:
+                if not f.read().strip().startswith("0x0c03"):
+                    continue
+        except OSError:
+            continue
+        if _pci_driver(addr) in _PASSTHROUGH_DRIVERS:
+            out.append(addr)
+    return out
 
 
 def _pci_driver(addr: str) -> str:

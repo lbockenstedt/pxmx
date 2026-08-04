@@ -222,16 +222,40 @@ async def handle_cs_command(agent, action: str,
                 except OSError:
                     return ""
 
+            def _mac(d):
+                """MAC of the dongle's net interface, '' if it has none here.
+
+                THE identity that actually distinguishes two physically
+                different dongles in this fleet. vid:pid is identical (one
+                model throughout) and so is the SERIAL -- these sticks ship
+                with a shared/blank iSerial, so serial cannot tell a
+                replacement from a reseat. A MAC is burned per device.
+
+                Only readable while the dongle is bound HOST-side; once it is
+                passed through to a VM the host has no netdev for it, so this
+                is '' and the caller must not infer identity from silence.
+                """
+                import glob as _g
+                for pat in (f"{d}/*/net/*/address", f"{d}/net/*/address"):
+                    for hit in sorted(_g.glob(pat)):
+                        v = _rd(hit)
+                        if v:
+                            return v
+                return ""
+
             def _ident(b):
                 d = f"/sys/bus/usb/devices/{b}"
                 vid, pid = _rd(f"{d}/idVendor"), _rd(f"{d}/idProduct")
                 return {"bus_path": b,
                         "vidpid": f"{vid}:{pid}" if (vid and pid) else "",
                         "product": _rd(f"{d}/product"),
-                        # Serial is what distinguishes a REPLACEMENT from the
-                        # same stick reseated -- two dongles of one model share
-                        # a vid:pid, so vid:pid alone cannot tell them apart.
-                        "serial": _rd(f"{d}/serial")}
+                        "serial": _rd(f"{d}/serial"),
+                        "mac": _mac(d),
+                        # devnum increments on EVERY re-enumeration, including a
+                        # fault flap, so it proves "this re-enumerated" and
+                        # never "this is a different device". Shipped for
+                        # evidence, deliberately not used as identity.
+                        "devnum": _rd(f"{d}/devnum")}
 
             ctrl = _ud.usb_device_controller(bus) if present else ""
             out = {"status": "SUCCESS", "action": "usb_probe", "bus": bus,
