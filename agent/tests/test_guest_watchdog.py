@@ -259,3 +259,51 @@ def test_ping_failure_does_not_abort_the_sweep(tmp_path, monkeypatch):
     pve.qm_agent_ping = _boom
     r = _run(pve, prov, tmp_path, monkeypatch, T0)
     assert r["responding"] == 1 and any("90001" in e for e in r["errors"])
+
+
+# ── the slow jobs must NOT run on the telemetry loop ─────────────────────────
+# systemd feeds WatchdogSec only while a TELEMETRY TICK COMPLETES
+# (_sd_watchdog_loop tracks _last_tick_done_ts). Running the guest watchdog
+# inline in that loop — bounded at 180s, and legitimately slow when it
+# stops/starts a hung VM — held the tick open past WatchdogSec=60, so systemd
+# killed the agent as hung and restarted it every ~70s, forever:
+#     lm-pxmx-agent.service: Watchdog timeout (limit 1min)!
+# That took the whole fleet down. This guards the decoupling.
+
+def _agent_src():
+    return (Path(__file__).resolve().parent.parent / "src" / "agent.py").read_text()
+
+
+def _slice(src, start_marker, end_marker):
+    i = src.index(start_marker)
+    return src[i:src.index(end_marker, i + 1)]
+
+
+def test_telemetry_loop_does_not_run_the_slow_jobs():
+    body = _slice(_agent_src(), "async def _telemetry_loop", "def _cs_telemetry_body")
+    assert "guest_watchdog.run_pass" not in body, \
+        "guest watchdog is back on the telemetry loop — it will starve WatchdogSec"
+    assert "usb_diagnostics.collect" not in body, \
+        "usb diagnostics is back on the telemetry loop — it will starve WatchdogSec"
+
+
+def test_slow_jobs_loop_owns_them_and_is_spawned():
+    src = _agent_src()
+    loop = _slice(src, "async def _slow_jobs_loop", "async def _sd_watchdog_loop")
+    assert "guest_watchdog.run_pass" in loop and "usb_diagnostics.collect" in loop
+    assert "asyncio.create_task(self._slow_jobs_loop())" in src, \
+        "_slow_jobs_loop is defined but never started"
+
+
+def test_both_slow_jobs_stay_bounded():
+    """Unbounded, they would wedge their own loop instead — still no good."""
+    loop = _slice(_agent_src(), "async def _slow_jobs_loop", "async def _sd_watchdog_loop")
+    assert loop.count("asyncio.wait_for") >= 2
+
+
+def test_telemetry_body_only_reads_cached_results():
+    """Decoupling must not change frame CONTENT: the body reads caches, never
+    kicks the work itself."""
+    body = _slice(_agent_src(), "def _cs_telemetry_body", "async def _set_cs_enabled")
+    assert "_last_usb_diag" in body and "current_guest_watchdog()" in body
+    assert "await" not in body, "the telemetry body must stay synchronous"

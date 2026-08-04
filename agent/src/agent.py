@@ -1454,6 +1454,54 @@ class ProxmoxAgent:
                 logger.debug(f"Update check: {e}")
             await asyncio.sleep(600)
 
+    async def _slow_jobs_loop(self):
+        """Periodic jobs that are NOT part of building a telemetry frame.
+
+        These used to run INLINE in the telemetry loop, and that starved the
+        systemd watchdog: ``_sd_watchdog_loop`` feeds WatchdogSec only while a
+        telemetry tick COMPLETES (``_last_tick_done_ts``), so a guest-watchdog
+        pass — bounded at 180s, and legitimately slow when it stops/starts a
+        hung VM — held the tick open far past ``WatchdogSec=60``. systemd then
+        killed the agent as hung and restarted it, forever:
+
+            lm-pxmx-agent.service: Watchdog timeout (limit 1min)!
+            lm-pxmx-agent.service: Scheduled restart job
+
+        A ~70s kill/restart cycle on every host, which is what took the fleet
+        down. The liveness signal must track the telemetry loop ALONE, so slow
+        work belongs off it. Nothing is lost: the telemetry body only ever reads
+        the CACHED results (``_last_usb_diag`` / ``current_guest_watchdog()``),
+        so decoupling changes no frame content.
+
+        Each job keeps its own cadence + deadline and its own error isolation —
+        one failing must not stop the other.
+        """
+        await asyncio.sleep(45)   # let boot + the first telemetry ticks settle
+        while True:
+            now = time.time()
+            if (now - getattr(self, "_last_usb_diag_ts", 0.0)) >= _USB_DIAG_INTERVAL_S:
+                self._last_usb_diag_ts = now
+                try:
+                    self._last_usb_diag = await asyncio.wait_for(
+                        usb_diagnostics.collect(self), timeout=_USB_DIAG_DEADLINE_S)
+                except asyncio.TimeoutError:
+                    logger.warning("usb_diagnostics exceeded %.0fs — keeping the "
+                                   "last-known dongle diagnostic", _USB_DIAG_DEADLINE_S)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"usb_diagnostics failed: {e}")
+            if (now - getattr(self, "_last_guest_wd_ts", 0.0)) >= guest_watchdog.WATCHDOG_INTERVAL_S:
+                self._last_guest_wd_ts = now
+                try:
+                    await asyncio.wait_for(guest_watchdog.run_pass(self),
+                                           timeout=_GUEST_WD_DEADLINE_S)
+                except asyncio.TimeoutError:
+                    logger.warning("guest_watchdog pass exceeded %.0fs — abandoning "
+                                   "this sweep; it resumes next cadence",
+                                   _GUEST_WD_DEADLINE_S)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"guest_watchdog failed: {e}")
+            await asyncio.sleep(15)
+
     async def _sd_watchdog_loop(self):
         """Feed systemd's WatchdogSec only while the telemetry loop is ACTUALLY
         ADVANCING. Pairs with WatchdogSec=60 + NotifyAccess=main in
@@ -1627,6 +1675,9 @@ class ProxmoxAgent:
         _consecutive_auth_fails = 0
         asyncio.create_task(self._update_check_loop())
         asyncio.create_task(self._sd_watchdog_loop())
+        # Slow periodic jobs, deliberately OFF the telemetry loop so they
+        # can never starve the systemd watchdog (see _slow_jobs_loop).
+        asyncio.create_task(self._slow_jobs_loop())
         await self._resolve_spoke_url()
         while True:
             # Re-discover each pass while the URL is still the sentinel so a hub
@@ -2693,60 +2744,6 @@ class ProxmoxAgent:
                         except Exception as _pe:  # noqa: BLE001
                             logger.debug(f"cs_pci_telemetry failed: {_pe}")
                             self._last_pci = getattr(self, "_last_pci", None) or {"t1_pci_devices": [], "t3_pci_devices": []}
-                        # Missing-dongle diagnostics on a SLOW cadence — the
-                        # kernel window is a day wide and uhubctl/journalctl are
-                        # subprocesses, so re-running them every tick would cost
-                        # far more than the signal changes. Cached between runs;
-                        # a failure keeps the last snapshot rather than blanking
-                        # the panel (an empty panel reads as "no problem", which
-                        # is the one thing it must never say by accident).
-                        # This node's Proxmox name, resolved ONCE — the cs
-                        # telemetry body needs it to scope its VM list to the
-                        # local node, and _cs_telemetry_body is sync so it
-                        # cannot await. Falls back to the short hostname inside
-                        # local_node_name (Proxmox requires node == hostname).
-                        if not getattr(self, "_local_node", ""):
-                            try:
-                                self._local_node = await pve_cmds.local_node_name()
-                            except Exception as _ne:  # noqa: BLE001
-                                logger.debug(f"local_node_name failed: {_ne}")
-                                self._local_node = ""
-                        _ud_last = getattr(self, "_last_usb_diag_ts", 0.0)
-                        if (time.time() - _ud_last) >= _USB_DIAG_INTERVAL_S:
-                            try:
-                                self._last_usb_diag = await asyncio.wait_for(
-                                    usb_diagnostics.collect(self),
-                                    timeout=_USB_DIAG_DEADLINE_S)
-                                self._last_usb_diag_ts = time.time()
-                            except asyncio.TimeoutError:
-                                self._last_usb_diag_ts = time.time()
-                                logger.warning(
-                                    "usb_diagnostics exceeded %.0fs — shipping the "
-                                    "last-known dongle diagnostic", _USB_DIAG_DEADLINE_S)
-                            except Exception as _de:  # noqa: BLE001
-                                self._last_usb_diag_ts = time.time()
-                                logger.debug(f"usb_diagnostics failed: {_de}")
-                        # QEMU guest-agent watchdog (port of proxmox/check_guest.sh)
-                        # on the bash script's own */5 cadence. Recovers VMs whose
-                        # guest OS hung — the case the dongle ladder deliberately
-                        # abstains from ("never escalate blind" when QGA is down).
-                        # Bounded: a wedged `qm stop` must not stall the telemetry
-                        # loop. A timeout leaves the pass half-done, which is safe
-                        # — every action is idempotent and re-evaluated next pass.
-                        _gw_last = getattr(self, "_last_guest_wd_ts", 0.0)
-                        if (time.time() - _gw_last) >= guest_watchdog.WATCHDOG_INTERVAL_S:
-                            self._last_guest_wd_ts = time.time()
-                            try:
-                                await asyncio.wait_for(
-                                    guest_watchdog.run_pass(self),
-                                    timeout=_GUEST_WD_DEADLINE_S)
-                            except asyncio.TimeoutError:
-                                logger.warning(
-                                    "guest_watchdog pass exceeded %.0fs — abandoning "
-                                    "this sweep; it resumes on the next cadence",
-                                    _GUEST_WD_DEADLINE_S)
-                            except Exception as _ge:  # noqa: BLE001
-                                logger.debug(f"guest_watchdog failed: {_ge}")
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         # Bounded like the AGENT_TELEMETRY send above. An
                         # unbounded send stalls the WHOLE loop behind a
@@ -3017,7 +3014,7 @@ class ProxmoxAgent:
             # Missing-dongle diagnostics + probable cause (roster of every dongle
             # ever seen vs what's on the bus now, kernel evidence, autosuspend
             # settings, controllers, uhubctl PPPS capability). Collected on a slow
-            # cadence in the telemetry loop; see usb_diagnostics.collect.
+            # cadence by _slow_jobs_loop (deliberately OFF this loop).
             "usb_diagnostics":  getattr(self, "_last_usb_diag", None) or {},
             # Guest-agent watchdog: last sweep's outcome (checked/responding +
             # which VMs were reset / power-cycled / started). Surfaced so an
