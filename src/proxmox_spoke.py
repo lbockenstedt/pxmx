@@ -78,7 +78,8 @@ class ProxmoxSpoke(BaseSpoke):
         cmd = command_type.upper()
 
         if cmd == "GET_VERSION":
-            return {"status": "SUCCESS", "version": self.get_version()}
+            return {"status": "SUCCESS", "version": self.get_version(),
+                    "commit_sha": self.get_local_commit()}
 
         if cmd == "UPDATE_CONFIG":
             self.config = data
@@ -1441,3 +1442,27 @@ class ProxmoxSpoke(BaseSpoke):
             return (Path(__file__).parent.parent / "VERSION").read_text().strip()
         except Exception:
             return "unknown"
+
+    def get_local_commit(self) -> str:
+        """Best-effort ``git rev-parse HEAD`` at the repo root (same directory
+        as the VERSION file in get_version()). '' if this isn't a git
+        checkout or git isn't available — never raises. Process-lifetime
+        cached: the commit only changes on a restart-triggering update."""
+        cached = getattr(self, "_local_commit_cache", None)
+        if cached is not None:
+            return cached
+        from pathlib import Path
+        import subprocess
+        sha = ""
+        try:
+            repo_root = Path(__file__).parent.parent
+            out = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode == 0:
+                sha = out.stdout.strip()
+        except Exception:
+            pass
+        self._local_commit_cache = sha
+        return sha
