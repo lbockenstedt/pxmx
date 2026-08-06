@@ -513,15 +513,25 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
                             result="completed" if ok else "failed",
                             error=(r.get("error") if not ok else None))
 
-    await asyncio.gather(*[_one(c) for c in candidates], return_exceptions=True)
+    try:
+        await asyncio.gather(*[_one(c) for c in candidates], return_exceptions=True)
+    finally:
+        # ALWAYS leave the tracker out of "running", even on cancellation
+        # (e.g. client_simulation toggled off mid-batch — _stop_cs_tasks
+        # cancels this task directly). Without this, a cancelled gather()
+        # raises straight out of the function, skipping everything below and
+        # leaving _reclone_state stuck at "running" forever with no task
+        # left for the Stop button to signal — Clear Errors then refuses
+        # ("N still running (stop first)") permanently, even though nothing
+        # is actually running anymore.
+        st = usb_provision.current_reclone_state()
+        completed = int(st.get("completed", 0))
+        failed = int(st.get("failed", 0))
+        stopped = usb_provision.reclone_stop_requested()
+        batch_status = "interrupted" if stopped else (
+            "completed" if failed == 0 else ("failed" if completed == 0 else "completed"))
+        usb_provision.end_reclone_batch(batch_status)
 
-    st = usb_provision.current_reclone_state()
-    completed = int(st.get("completed", 0))
-    failed = int(st.get("failed", 0))
-    stopped = usb_provision.reclone_stop_requested()
-    batch_status = "interrupted" if stopped else (
-        "completed" if failed == 0 else ("failed" if completed == 0 else "completed"))
-    usb_provision.end_reclone_batch(batch_status)
     term_status = "failed" if (stopped or (failed and not completed)) else "completed"
     msg = (f"fleet reclone stopped: {completed} completed, {failed} failed "
            f"({len(candidates) - completed - failed} skipped)" if stopped

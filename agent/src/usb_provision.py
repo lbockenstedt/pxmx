@@ -456,6 +456,14 @@ _RECLONING_TTL_S = 180.0
 # Published to telemetry by ``current_reclone_state`` (mirrors
 # ``current_prov_run`` / ``current_reclone_vmids``).
 _reclone_state: Dict[str, Any] = {}
+# Real batches finish in minutes. A "running" batch older than this has no
+# live task actually driving it — the batch's asyncio.Task got cancelled
+# (e.g. client_simulation toggled off mid-run via _stop_cs_tasks) before it
+# reached end_reclone_batch(), or something else killed it without cleanup.
+# clear_reclone_state() uses this as a staleness escape hatch so an operator
+# isn't stuck forever behind a "stop it first" that can no longer do anything
+# (the task the stop flag would have been checked by is already gone).
+_RECLONE_STALE_S = 3600
 # Set by request_reclone_stop(); the fleet-reclone batch loop checks it before
 # starting each remaining VM and aborts the rest. Cleared on start_reclone_batch.
 _reclone_stop: bool = False
@@ -617,10 +625,20 @@ def clear_reclone_state() -> bool:
     REFUSES while a batch is running: clearing mid-run would blank the progress
     bar the operator is watching and lose the record of what just failed. Stop it
     first (proxmox_reclone_stop), then clear.
+
+    EXCEPTION: a "running" batch older than _RECLONE_STALE_S is treated as
+    abandoned and cleared anyway. _reclone_all's asyncio.Task is what's
+    supposed to reach end_reclone_batch() and flip status out of "running" —
+    if that task got cancelled (e.g. client_simulation toggled off mid-run)
+    it never gets there, so status sticks at "running" forever with no task
+    left to stop. Without this, "stop it first" is permanent advice that can
+    no longer do anything.
     """
     global _reclone_state
     if _reclone_state.get("status") == "running":
-        return False
+        age = time.time() - float(_reclone_state.get("started_at") or 0)
+        if age < _RECLONE_STALE_S:
+            return False
     _reclone_state = {}
     return True
 
