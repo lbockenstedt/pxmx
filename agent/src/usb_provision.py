@@ -382,9 +382,10 @@ _HEALTH_LADDER_VISIBLE = ["reboot", "reclone", "quarantine"]
 # can span a probe or two; ~3 probes (~15 min sustained) outlasts any burst +
 # its AIMD recovery, so an expected flood never false-flags a healthy dongle.
 _VISIBLE_CONFIRM = int(os.environ.get("LM_PXMX_HEALTH_VISIBLE_CONFIRM", "3") or 3)
-# Max hostname re-stamp+reboot attempts before the audit gives up on a VM (so a
-# box that can't take the stamp doesn't reboot-loop). Past the cap it's logged at
-# ERROR for an operator (reclone territory).
+# Max hostname re-stamp+reboot attempts before the audit gives up re-stamping a
+# VM in place (so a box that can't take the stamp doesn't reboot-loop). Past the
+# cap the VM is destroyed instead — see hostname_audit_and_restamp — so the
+# provisioning loop reclones a fresh one rather than leaving it misnamed forever.
 _HOSTNAME_FIX_MAX = int(os.environ.get("LM_PXMX_HOSTNAME_FIX_MAX", "3") or 3)
 # Max VMs the hostname audit will re-stamp+REBOOT in a single pass. Without this
 # the audit acted on its whole backlog at once: when the always-true predicate in
@@ -1743,8 +1744,12 @@ async def hostname_audit_and_restamp(agent) -> int:
     Fire-and-forget: re-stamp (idempotent) then reboot to apply; the NEXT pass
     verifies (non-blocking — never waits out a reboot). Throttled per VM via
     ``usb_state['hostname_fix']`` {attempts,last} and capped at _HOSTNAME_FIX_MAX
-    so a box that can't take the stamp doesn't reboot-loop (past the cap: ERROR
-    for an operator, reclone territory). Never raises. Returns VMs re-stamped."""
+    so a box that can't take the stamp doesn't reboot-loop. Past the cap the VM
+    is destroyed (PVE-side, no QGA needed) so the provisioning loop reclones a
+    fresh one into the freed slot on a later pass — re-stamp+reboot alone used
+    to just give up silently forever past the cap (operator/reclone territory,
+    with nothing ever surfacing it). Never raises. Returns VMs re-stamped
+    (does NOT count destroys — those free a slot rather than fix one in place)."""
     import time as _t
     from . import pve_cmds
     from . import cs_guard
@@ -1808,10 +1813,36 @@ async def hostname_audit_and_restamp(agent) -> int:
             except Exception:  # noqa: BLE001 — unknown → treat as template, skip
                 continue
         rec = fixes.get(str(vid)) or {}
-        if int(rec.get("attempts", 0)) >= _HOSTNAME_FIX_MAX:
-            continue                                   # gave up — operator/reclone territory
         if now - float(rec.get("last", 0)) < _HEALTH_ATTEMPT_COOLDOWN_S:
-            continue                                   # let a just-fired reboot come back
+            continue                                   # let a just-fired reboot/destroy come back
+        if int(rec.get("attempts", 0)) >= _HOSTNAME_FIX_MAX:
+            # Re-stamp+reboot never took after _HOSTNAME_FIX_MAX tries. This used
+            # to just `continue` (skip) forever — the strike record sat here with
+            # nothing else ever reading it (unlike guest_health's telemetry
+            # pipeline), so the VM was silently abandoned: it kept the template
+            # hostname, never matched its registered client, and no operator was
+            # ever told. Destroy it instead — PVE-side, so it doesn't need QGA up
+            # (which may be exactly why the stamp never took) — and the
+            # provisioning loop's normal reconcile (the same mechanism
+            # reclone-on-detach below uses) notices the freed slot/dongle and
+            # clones a fresh VM into it on a later pass. Works for T1/T2/T3 alike
+            # (destroy_vm resolves bus itself when omitted). On failure the strike
+            # record's `last` is bumped so this retries next pass instead of
+            # being skipped forever by this same check.
+            try:
+                from . import cs_sim
+                await cs_sim.destroy_vm(agent, vid, protected=protected)
+                fixes.pop(str(vid), None)  # fresh clone (new vmid) starts with a clean slate
+                dirty = True
+                logger.error("hostname audit: VM %s still misnamed after %d "
+                             "re-stamp attempts — destroyed for reclone",
+                             vid, _HOSTNAME_FIX_MAX)
+            except Exception as de:  # noqa: BLE001 — best-effort; retried next pass
+                fixes[str(vid)] = {**rec, "last": now}
+                dirty = True
+                logger.warning("hostname audit: reclone-on-giveup for VM %s "
+                               "failed (%s) — will retry next pass", vid, de)
+            continue
         try:
             if not await pve_cmds.qm_agent_ping(vid):
                 continue                               # QGA down — can't audit
@@ -1857,8 +1888,8 @@ async def hostname_audit_and_restamp(agent) -> int:
             dirty = True
             if attempts >= _HOSTNAME_FIX_MAX:
                 logger.error("hostname audit: VM %s still misnamed after %d re-stamp "
-                             "attempts — needs operator/reclone (is '%s', "
-                             "expected '%s')", vid, attempts, actual, expected)
+                             "attempts (is '%s', expected '%s') — will destroy for "
+                             "reclone next pass", vid, attempts, actual, expected)
         except Exception as e:  # noqa: BLE001 — one bad VM never sinks the audit
             logger.warning("hostname audit: VM %s check/restamp failed: %s", vid, e)
     if dirty:

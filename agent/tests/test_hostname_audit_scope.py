@@ -122,3 +122,67 @@ def test_audit_reboots_at_most_N_vms_per_pass(monkeypatch):
     assert acted == up._HOSTNAME_FIX_MAX_PER_PASS, acted
     assert len(set(stamped)) == up._HOSTNAME_FIX_MAX_PER_PASS, stamped
     assert up._HOSTNAME_FIX_MAX_PER_PASS < 7, "cap must be below the backlog size"
+
+
+def _hostname_giveup_harness(monkeypatch, destroy_side_effect=None):
+    """A VM that has already exhausted _HOSTNAME_FIX_MAX re-stamp attempts,
+    ready for the audit's next pass. destroy_side_effect: None → success,
+    else an Exception instance raised by the stubbed destroy_vm."""
+    destroyed = []
+    state = {
+        "bus_to_vmid": {"1-1": 90001},
+        "hostname_fix": {"90001": {"attempts": up._HOSTNAME_FIX_MAX, "last": 0,
+                                   "expected": "client-90001", "actual": "sim-rpi-0000",
+                                   "stamped": True}},
+    }
+    monkeypatch.setattr(up, "load_usb_state", lambda: state)
+    monkeypatch.setattr(up, "save_usb_state", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(up, "_protected_vmids", lambda a: {1001})
+    monkeypatch.setattr(up, "_vm_name", lambda v: f"client-{v}")
+
+    pve = types.SimpleNamespace()
+    pve.list_qemu_vmids = lambda: _aval([])
+    pve.is_template = lambda v, k=None: _aval(False)
+    monkeypatch.setitem(sys.modules, "src.pve_cmds", pve)
+    monkeypatch.setattr(up, "pve_cmds", pve, raising=False)
+
+    cs_sim = types.SimpleNamespace()
+
+    async def _destroy(agent, vmid, **k):
+        destroyed.append(vmid)
+        if destroy_side_effect is not None:
+            raise destroy_side_effect
+        return {"ok": True}
+    cs_sim.destroy_vm = _destroy
+    # `from . import cs_sim` inside the function resolves via getattr on the
+    # PACKAGE (see the per-pass-cap test above for the same gotcha with
+    # pve_cmds) — patch both the module registry and the package attribute.
+    import importlib
+    monkeypatch.setitem(sys.modules, "src.cs_sim", cs_sim)
+    monkeypatch.setattr(importlib.import_module("src"), "cs_sim", cs_sim, raising=False)
+    return destroyed, state
+
+
+def test_audit_destroys_vm_after_max_attempts(monkeypatch):
+    """Past _HOSTNAME_FIX_MAX re-stamp attempts, re-stamping in place is
+    abandoned — the audit used to just skip the VM forever with nothing ever
+    surfacing it. It must now destroy the VM so the provisioning loop reclones
+    a fresh one into the freed slot, and clear the exhausted strike record."""
+    destroyed, state = _hostname_giveup_harness(monkeypatch)
+    _run(up.hostname_audit_and_restamp(_Agent()))
+    assert destroyed == [90001]
+    assert "90001" not in state["hostname_fix"], "strike record must clear on a successful destroy"
+
+
+def test_audit_retries_destroy_after_a_failed_attempt(monkeypatch):
+    """A destroy_vm failure (e.g. a transient PVE API error) must NOT leave the
+    VM permanently stuck — the strike record's `last` is bumped so the next
+    pass (after cooldown) tries destroying it again, instead of the top-of-loop
+    attempts>=MAX check skipping it forever."""
+    destroyed, state = _hostname_giveup_harness(monkeypatch, destroy_side_effect=RuntimeError("qm destroy failed"))
+    _run(up.hostname_audit_and_restamp(_Agent()))
+    assert destroyed == [90001], "a failed destroy must still be attempted"
+    rec = state["hostname_fix"].get("90001")
+    assert rec is not None, "the record must survive a failed destroy so it's retried, not abandoned"
+    assert rec["attempts"] == up._HOSTNAME_FIX_MAX
+    assert rec["last"] > 0, "`last` must be bumped so the retry respects the cooldown, not fire every pass"
