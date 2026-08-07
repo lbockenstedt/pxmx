@@ -139,6 +139,32 @@ async def _expire_pending_commands(agent, vmid: int, kind: str) -> None:
         logger.warning(f"destroy_vm {vmid}: pending-command expire failed: {e}")
 
 
+async def _notify_client_torn_down(agent, vid: int) -> None:
+    """Tell the cs spoke this VM's client registry entry is gone, the moment
+    we know the VM is (or already was) actually gone — not on a delay, not on
+    the next scrub sweep. Previously NOTHING on the destroy side ever told
+    the client registry a VM disappeared (destroy_vm/reclone/quarantine-
+    destroy/missing-dongle shed all funnel through here, and none of them
+    called back), so a client's registry record only ever cleared via a full
+    Purge Clients, the 48h age-based prune_stale sweep, or a human clicking
+    Remove — the tenant Clients tab could show far more rows than the fleet
+    could possibly have. CS_TEARDOWN_CLIENT -> CS_DELETE_CLIENT (hub
+    _CS_INGEST_MAP) reuses the exact handler the human-clicked Remove button
+    hits; this is just a second, automatic caller of the same cleanup.
+
+    Uses the deterministic vm_names.json name (same resolver reclone uses:
+    _reclone_vm_name / usb_provision._vm_name), NOT a live `qm config` read —
+    the VM may already be gone by the time this runs (the already_gone early
+    return), so a live query would just fail. Best-effort; never raises —
+    the destroy itself must never be blocked or failed by this."""
+    try:
+        name = usb_provision._vm_name(vid)
+        if name:
+            await agent.send_cs_event("CS_TEARDOWN_CLIENT", {"hostname": name})
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"destroy_vm {vid}: client-teardown notify failed: {e}")
+
+
 async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
                      protected: Optional[set] = None,
                      exclude_bus_after: bool = False) -> Dict[str, Any]:
@@ -186,6 +212,7 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
         usb_provision.remove_orphan_vm(vid)
         if exclude_bus_after and bus:
             usb_provision.exclude_bus(bus)
+        await _notify_client_torn_down(agent, vid)
         return {"ok": True, "orphaned": False, "bus": bus, "kind": kind,
                 "already_gone": True}
     await _expire_pending_commands(agent, vid, kind)
@@ -207,6 +234,7 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
         usb_provision.remove_orphan_vm(vid)
         if exclude_bus_after and bus:
             usb_provision.exclude_bus(bus)
+        await _notify_client_torn_down(agent, vid)
         return {"ok": True, "orphaned": False, "bus": bus, "kind": kind}
     res = usb_provision.record_destroy_fail(vid, bus or "")
     if res["orphaned"]:
