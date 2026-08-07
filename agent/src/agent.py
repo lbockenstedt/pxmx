@@ -3118,6 +3118,14 @@ class ProxmoxAgent:
             # which VMs were reset / power-cycled / started). Surfaced so an
             # unexplained VM restart is attributable instead of a mystery.
             "guest_watchdog":   guest_watchdog.current_guest_watchdog(),
+            # Per-VM persisted record (last_ok / last_ping_error* /
+            # ping_error_streak) — durable across passes, unlike the
+            # single-pass "guest_watchdog" summary above. A ping that TIMES
+            # OUT (the guest's virtio-serial socket itself is wedged — the
+            # single strongest "OS genuinely hung" signal) now escalates
+            # normally, but this is what makes that streak visible after the
+            # fact instead of only a since-scrolled-away log line.
+            "guest_watchdog_state": guest_watchdog.current_guest_watchdog_state(),
             # Present T1/T3 PCI devices (host lspci ∩ the allow-lists) — WebUI PCI tab.
             "t1_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t1_pci_devices", []),
             "t3_pci_devices":   (getattr(self, "_last_pci", None) or {}).get("t3_pci_devices", []),
