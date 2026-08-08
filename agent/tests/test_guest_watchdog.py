@@ -48,11 +48,19 @@ MIN = 60.0
 class _FakePve:
     """Records every action; answers pings from `alive`."""
 
-    def __init__(self, vmids, alive=(), stopped_after_stop=True):
+    def __init__(self, vmids, alive=(), stopped_after_stop=True, ping_raises=()):
         self._vmids = list(vmids)
         self._alive = set(alive)
         self.actions = []
         self._stopped_after_stop = stopped_after_stop
+        # VMIDs whose ping should RAISE instead of returning a bool — mirrors
+        # what the REAL qm_agent_ping does when the underlying `qm agent
+        # ping` subprocess call itself times out (pve_cmds._run raises
+        # PveError unconditionally on timeout, regardless of check=False) —
+        # the guest's virtio-serial socket is wedged badly enough that even
+        # the ping helper hangs, a STRONGER "guest is dead" signal than a
+        # clean non-zero exit.
+        self._ping_raises = set(ping_raises)
 
     async def list_qemu_vmids(self):
         return list(self._vmids)
@@ -61,6 +69,8 @@ class _FakePve:
         return False
 
     async def qm_agent_ping(self, vmid, protected=None, timeout=None):
+        if int(vmid) in self._ping_raises:
+            raise TimeoutError(f"timeout ({timeout}s): qm agent {vmid} ping")
         return int(vmid) in self._alive
 
     async def start_vm(self, vmid, protected=None, **kw):
@@ -158,6 +168,48 @@ def test_no_heartbeat_starts_the_vm(tmp_path, monkeypatch):
     pve, prov = _FakePve([90001]), _FakeUsbProv()
     r = _run(pve, prov, tmp_path, monkeypatch, T0)
     assert r["started"] == [90001] and ("start", 90001) in pve.actions
+
+
+# ── ping-timeout escalation (bug fix) ────────────────────────────────────────
+# qm_agent_ping raising (the ping helper itself hangs — pve_cmds._run raises
+# unconditionally on timeout, regardless of qm_agent_ping's check=False) used
+# to `continue` past the VM entirely: no last_ok bookkeeping, no escalation,
+# forever. That treated the WORST case (ping hangs) as invisible while a
+# clean non-zero-exit ping escalated normally — backwards. A guest wedged
+# badly enough to hang its own QGA ping helper must escalate at LEAST as
+# readily as a guest that merely refuses the ping cleanly.
+
+def test_ping_timeout_is_treated_as_silent_not_skipped(tmp_path, monkeypatch):
+    pve = _FakePve([90001], ping_raises=[90001])
+    prov = _FakeUsbProv()
+    r = _run(pve, prov, tmp_path, monkeypatch, T0 + 25 * MIN,
+            seed={"90001": {"last_ok": T0}})
+    assert r["power_cycled"] == [90001], (
+        "a ping timeout after 25 min of prior silence must escalate to "
+        "power-cycle exactly like a clean non-responsive ping would")
+    assert r["skipped"] == 0 and 90001 not in r.get("waiting", [])
+
+
+def test_ping_timeout_is_recorded_on_the_persisted_vm_record(tmp_path, monkeypatch):
+    pve = _FakePve([90001], ping_raises=[90001])
+    prov = _FakeUsbProv()
+    _run(pve, prov, tmp_path, monkeypatch, T0 + 5 * MIN,
+        seed={"90001": {"last_ok": T0}})
+    rec = _gw._load()["90001"]
+    assert rec.get("ping_error_streak") == 1
+    assert rec.get("last_ping_error_ts") == T0 + 5 * MIN
+    assert "last_ping_error" in rec
+
+
+def test_ping_error_streak_clears_once_the_guest_responds_again(tmp_path, monkeypatch):
+    pve = _FakePve([90001], ping_raises=[90001])
+    prov = _FakeUsbProv()
+    _run(pve, prov, tmp_path, monkeypatch, T0 + 5 * MIN,
+        seed={"90001": {"last_ok": T0}})
+    assert _gw._load()["90001"].get("ping_error_streak") == 1
+    pve2 = _FakePve([90001], alive=[90001])
+    _run(pve2, prov, tmp_path, monkeypatch, T0 + 6 * MIN)
+    assert "ping_error_streak" not in _gw._load()["90001"]
 
 
 # ── interlocks ───────────────────────────────────────────────────────────────

@@ -99,6 +99,18 @@ def current_guest_watchdog() -> Dict[str, Any]:
     return dict(_last_pass)
 
 
+def current_guest_watchdog_state() -> Dict[str, Any]:
+    """Per-VM persisted watchdog record (last_ok / last_action* /
+    last_ping_error* / ping_error_streak), for the telemetry body / WebUI —
+    durable across passes/restarts, unlike current_guest_watchdog()'s
+    single-pass-only ``errors`` list. Added specifically so a ping-timeout
+    streak on one VM (the "OS is genuinely wedged" signal — see the ping
+    exception handling in run_pass) has something to inspect after the fact
+    instead of a debug log line that already scrolled away. Bounded to VMs
+    currently in the fleet (run_pass prunes anything no longer present)."""
+    return dict(_load())
+
+
 # ── scope ────────────────────────────────────────────────────────────────────
 
 def _in_flight_vmids() -> Set[int]:
@@ -199,13 +211,33 @@ async def run_pass(agent, now: Optional[float] = None) -> Dict[str, Any]:
             alive = await pve_cmds.qm_agent_ping(vid, protected=protected,
                                                  timeout=PING_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001
-            logger.debug("guest_watchdog: ping %s failed: %s", vid, e)
+            # qm_agent_ping passes check=False, so _run only ever raises here
+            # on the TIMEOUT path (PveError, unconditional regardless of
+            # check) — meaning `qm agent ping` ITSELF hung waiting on the
+            # guest's virtio-serial socket. That is a STRONGER signal of a
+            # wedged guest than a clean non-zero exit (QGA not running but
+            # the helper still returns promptly), yet this used to `continue`
+            # past the VM entirely — skipping last_ok/silent_since bookkeeping
+            # and the whole escalation ladder below. The single worst case
+            # (ping hangs) got ZERO reset/power-cycle attempts, forever, while
+            # a guest that cleanly refused the ping escalated normally. Fold
+            # it into the SAME "not alive" path instead of skipping it.
+            logger.warning("guest_watchdog: VM %s ping errored (%s) — "
+                           "treating as not responding", vid, e)
             result["errors"].append(f"{vid}: ping {e}")
-            continue
+            # Persisted (not just this pass's transient `result`) so an
+            # operator has something to look at after the fact — the prior
+            # debug-level log line scrolled away with nothing durable behind
+            # it, which is exactly why this went unnoticed for hours.
+            rec["last_ping_error"] = str(e)[:300]
+            rec["last_ping_error_ts"] = now
+            rec["ping_error_streak"] = int(rec.get("ping_error_streak", 0)) + 1
+            alive = False
 
         if alive:
             rec["last_ok"] = now
             rec.pop("silent_since", None)
+            rec.pop("ping_error_streak", None)
             state[key] = rec
             result["responding"] += 1
             continue
