@@ -57,7 +57,15 @@ fi
 
 echo "📦 Installing system dependencies..."
 apt-get update
-apt-get install -y python3-pip python3-venv git curl jq
+apt-get install -y python3-pip python3-venv git curl jq lldpd
+
+# lldpd — LLDP neighbor discovery (which physical switch/port each host NIC is
+# connected to). A required dependency, not best-effort like uhubctl below: the
+# package install already enables+starts the systemd service on Debian/Ubuntu,
+# but enable it explicitly (idempotent, matches every other service this
+# installer manages) so a host with a stripped-down systemd preset policy
+# doesn't silently end up with the daemon installed but not running.
+systemctl enable --now lldpd >/dev/null 2>&1 || true
 
 # uhubctl — per-port USB power switching, used by the missing-dongle diagnostic
 # (Setup → Diagnostics) to report whether this host can power-cycle its USB ports
