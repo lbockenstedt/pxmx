@@ -1227,17 +1227,38 @@ class ProxmoxAgent:
         import subprocess, shutil, pathlib
         from . import update_recovery as ur
         current = get_version()
+        # Commit hash is the authoritative "did anything actually change"
+        # signal — matches bugfixer/lm's self-update, and unlike VERSION
+        # (bumped by a SEPARATE CI job on push) it can never silently stop
+        # advancing. The old `new_ver == current` gate depended on that CI
+        # job keeping VERSION in lockstep with every real commit; the moment
+        # it falls behind (or is retired — planned once the fleet is on this
+        # fix), this gate would read "unchanged" FOREVER even though
+        # `git pull` kept succeeding — the agent would silently stop
+        # deploying real code changes with no error, while git itself
+        # reported the checkout as up to date. trigger_update() calls this
+        # with NO prior behind-count gate, so this check must stay — its
+        # BASIS is what changed, not its presence.
+        old_hash = subprocess.check_output(
+            ["git", "-C", repo_dir, "rev-parse", "HEAD"], timeout=10
+        ).decode().strip()
         subprocess.check_call(
             ["git", "-C", repo_dir, "pull", "--rebase", "--autostash"],
             timeout=60, stdout=subprocess.DEVNULL,
         )
+        new_hash = subprocess.check_output(
+            ["git", "-C", repo_dir, "rev-parse", "HEAD"], timeout=10
+        ).decode().strip()
         # The version lives at the repo root (VERSION), NOT agent/VERSION —
         # reading agent/VERSION always missed (no such file) and made the
-        # "same version — no restart" short-circuit never fire.
+        # "same version — no restart" short-circuit never fire. Still read
+        # here (below the hash gate) — update_recovery's snapshot/rollback
+        # bookkeeping is keyed by these version STRINGS, not commit hashes;
+        # unaffected by this fix as long as the version-bump CI keeps running.
         new_ver_path = pathlib.Path(repo_dir) / "VERSION"
         new_ver = new_ver_path.read_text().strip() if new_ver_path.exists() else "?"
-        if new_ver == current:
-            return  # same version — no restart needed
+        if new_hash == old_hash:
+            return  # genuinely nothing new to deploy
         # Skip a known-bad version (rolled back before) so we don't crash-loop
         # into the same broken release.
         try:
@@ -1249,7 +1270,11 @@ class ProxmoxAgent:
                 return
         except Exception as e:  # pragma: no cover - update_recovery unavailable
             logger.debug(f"bad-version check skipped: {e}")
-        logger.info(f"Updating pxmx-agent {current} → {new_ver}")
+        # new_ver can legitimately equal current here (the hash gate above is
+        # authoritative; the version-bump CI can lag a real commit by a cycle) —
+        # include the hash so the log line still shows something changed.
+        logger.info(f"Updating pxmx-agent {current} → {new_ver} "
+                   f"({old_hash[:7]} → {new_hash[:7]})")
         # Snapshot the current install-dir code BEFORE the swap so the watchdog
         # can restore it (file-tree rollback — the install dir is non-git) if the
         # new code crashes at boot. belt-and-suspenders alongside the version record.
