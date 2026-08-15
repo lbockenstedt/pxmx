@@ -196,8 +196,20 @@ async def run_pass(agent, now: Optional[float] = None) -> Dict[str, Any]:
         rec = state.get(key) or {}
         result["checked"] += 1
         try:
-            alive = await pve_cmds.qm_agent_ping(vid, protected=protected,
-                                                 timeout=PING_TIMEOUT_S)
+            # Enforce the ping deadline HERE: if the underlying `qm` call wedges
+            # (guest agent silent is exactly when that happens) the coroutine can
+            # hang forever and the sweep never escalates. A timeout is not an
+            # error condition for the ladder — it IS the "not responding" signal,
+            # so it must fall through to escalation, while still being reported.
+            alive = await asyncio.wait_for(
+                pve_cmds.qm_agent_ping(vid, protected=protected,
+                                       timeout=PING_TIMEOUT_S),
+                timeout=PING_TIMEOUT_S + 5)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.info("guest-watchdog: VM %s guest-agent ping timed out "
+                        "(%ss) — treating as unresponsive", vid, PING_TIMEOUT_S)
+            result["errors"].append(f"{vid}: ping timeout after {PING_TIMEOUT_S}s")
+            alive = False
         except Exception as e:  # noqa: BLE001
             logger.debug("guest_watchdog: ping %s failed: %s", vid, e)
             result["errors"].append(f"{vid}: ping {e}")
