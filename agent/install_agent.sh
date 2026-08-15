@@ -57,7 +57,7 @@ fi
 
 echo "📦 Installing system dependencies..."
 apt-get update
-apt-get install -y python3-pip python3-venv git curl jq
+apt-get install -y python3-pip python3-venv git curl jq lldpd
 
 # uhubctl — per-port USB power switching, used by the missing-dongle diagnostic
 # (Setup → Diagnostics) to report whether this host can power-cycle its USB ports
