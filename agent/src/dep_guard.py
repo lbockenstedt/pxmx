@@ -111,7 +111,7 @@ def ensure_requirements(requirements_path: str, timeout: int = 300) -> bool:
     module load, and a dev box missing e.g. ``zeroconf`` must not attempt a
     real ``pip install`` into the test interpreter).
     """
-    if os.environ.get("LM_DEP_GUARD_DISABLE") == "1":
+    if os.environ.get("LM_DEP_GUARD_DISABLE", "0").lower() in ["1", "true"]:
         return True
     if not os.path.isfile(requirements_path):
         # Nothing to check (component has no requirements.txt) — not an error.
