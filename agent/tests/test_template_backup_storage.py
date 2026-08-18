@@ -51,6 +51,7 @@ def _load(modname, fname):
 
 _pve_cmds = _load("pve_cmds", "pve_cmds.py")
 _agent_mod = _load("agent", "agent.py")
+_template_ops = _load("template_ops", "template_ops.py")
 ProxmoxAgent = _agent_mod.ProxmoxAgent
 
 
@@ -165,8 +166,7 @@ def _make_subprocess(monkeypatch, removed, rmtree_calls, list_calls):
 
 
 def _run_backup(data):
-    # _do_template_backup doesn't touch self — call unbound.
-    ProxmoxAgent._do_template_backup(None, data)
+    _template_ops.do_template_backup(data)
 
 
 def test_storage_mode_uses_storage_flag_and_deletes_on_success(monkeypatch):
@@ -230,11 +230,12 @@ def test_storage_mode_rejects_unknown_storage_before_vzdump(monkeypatch):
 
 
 def test_tempdir_mode_back_compat(monkeypatch):
-    """Older hub (no storage in payload) → legacy tempdir + rmtree path."""
+    """Older hub (no storage in payload) → scratch-dir + rmtree path."""
     removed, rmtree_calls, list_calls = [], [], [0]
     _install_fake_httpx(monkeypatch, put_status=200)
 
-    tmpdir = "/tmp/lm-tmpl-backup-XXXX"
+    scratch_parent = "/var/lib/pxmx-template-scratch-test"
+    tmpdir = os.path.join(scratch_parent, "lm-tmpl-backup-XXXX")
     archive_in_tmp = os.path.join(tmpdir, "vzdump-qemu-90025-...vma.zst")
 
     vzdump_calls = []
@@ -248,7 +249,11 @@ def test_tempdir_mode_back_compat(monkeypatch):
     monkeypatch.setattr(_subprocess, "run", fake_run)
     monkeypatch.setattr(_shutil, "which", lambda b: "/usr/bin/vzdump")
     monkeypatch.setattr(_shutil, "rmtree", lambda d, **k: rmtree_calls.append(d))
-    monkeypatch.setattr(_tempfile, "mkdtemp", lambda **k: tmpdir)
+    monkeypatch.setenv("LM_PXMX_TEMPLATE_MIN_FREE_BYTES", "0")
+    monkeypatch.setattr(_os, "makedirs", lambda *a, **k: None)
+    mkdtemp_calls = []
+    monkeypatch.setattr(_tempfile, "mkdtemp",
+                        lambda **k: mkdtemp_calls.append(k) or tmpdir)
     monkeypatch.setattr(_glob, "glob", lambda pat: [archive_in_tmp])
     monkeypatch.setattr(_os.path, "isfile", lambda p: True)
     monkeypatch.setattr(_os.path, "getsize", lambda p: 1234)
@@ -256,9 +261,11 @@ def test_tempdir_mode_back_compat(monkeypatch):
 
     _run_backup({"vmid": 90025,
                  "upload_url": "https://hub/api/templates/t1/upload",
-                 "upload_token": "tok"})
+                 "upload_token": "tok",
+                 "scratch_dir": scratch_parent})
 
     assert any("--dumpdir" in a for a in vzdump_calls), vzdump_calls
+    assert mkdtemp_calls == [{"prefix": "lm-tmpl-backup-", "dir": scratch_parent}]
     assert not any("--storage" in a for a in vzdump_calls), vzdump_calls
     assert rmtree_calls == [tmpdir], rmtree_calls      # tempdir cleaned
     assert removed == [], removed                       # no explicit os.remove (rmtree handles it)

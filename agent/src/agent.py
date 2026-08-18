@@ -1227,6 +1227,24 @@ class ProxmoxAgent:
         import subprocess, shutil, pathlib
         from . import update_recovery as ur
         current = get_version()
+        marker_path = pathlib.Path(install_dir) / ".pxmx_deployed_sha"
+        try:
+            subprocess.check_call(
+                ["git", "-C", repo_dir, "fetch", "--quiet", "origin", "main"],
+                timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            remote_hash = subprocess.check_output(
+                ["git", "-C", repo_dir, "rev-parse", "origin/main"], timeout=10
+            ).decode().strip()
+        except Exception:
+            remote_hash = ""
+        installed_hash = ""
+        try:
+            installed_hash = marker_path.read_text().strip()
+        except OSError:
+            pass
+        if remote_hash and installed_hash == remote_hash:
+            return  # installed tree already matches the remote commit
         # Commit hash is the authoritative "did anything actually change"
         # signal — matches bugfixer/lm's self-update, and unlike VERSION
         # (bumped by a SEPARATE CI job on push) it can never silently stop
@@ -1257,7 +1275,7 @@ class ProxmoxAgent:
         # unaffected by this fix as long as the version-bump CI keeps running.
         new_ver_path = pathlib.Path(repo_dir) / "VERSION"
         new_ver = new_ver_path.read_text().strip() if new_ver_path.exists() else "?"
-        if new_hash == old_hash:
+        if installed_hash and new_hash == installed_hash:
             return  # genuinely nothing new to deploy
         # Skip a known-bad version (rolled back before) so we don't crash-loop
         # into the same broken release.
@@ -1296,7 +1314,9 @@ class ProxmoxAgent:
                 return
             ur.write_pending(backup_dir, from_version=current, to_version=new_ver,
                              ts=ts, state_dir=AGENT_STATE_DIR,
-                             extra={"service_unit": "lm-pxmx-agent", "deadline": 90})
+                             extra={"service_unit": "lm-pxmx-agent", "deadline": 90,
+                                    "from_commit": installed_hash or old_hash,
+                                    "to_commit": new_hash})
         except Exception as e:
             logger.error("pre-update snapshot failed (%s) — aborting update to keep "
                          "a valid rollback point; retrying next cycle.", e)
@@ -1342,6 +1362,10 @@ class ProxmoxAgent:
             shutil.copy2(str(pathlib.Path(repo_dir) / "VERSION"), str(dst / "VERSION"))
         except Exception as e:
             logger.warning(f"self-update: could not refresh {dst}/VERSION: {e}")
+        try:
+            marker_path.write_text(new_hash + "\n")
+        except Exception as e:
+            logger.warning(f"self-update: could not write deployed SHA marker: {e}")
         pip = dst / "venv" / "bin" / "pip"
         req = dst / "requirements.txt"
         if pip.exists() and req.exists():
@@ -1566,8 +1590,9 @@ class ProxmoxAgent:
             if (now - getattr(self, "_last_guest_wd_ts", 0.0)) >= guest_watchdog.WATCHDOG_INTERVAL_S:
                 self._last_guest_wd_ts = now
                 try:
-                    await asyncio.wait_for(guest_watchdog.run_pass(self),
-                                           timeout=_GUEST_WD_DEADLINE_S)
+                    if self.cs_enabled:
+                        await asyncio.wait_for(guest_watchdog.run_pass(self),
+                                               timeout=_GUEST_WD_DEADLINE_S)
                 except asyncio.TimeoutError:
                     logger.warning("guest_watchdog pass exceeded %.0fs — abandoning "
                                    "this sweep; it resumes next cadence",
@@ -2054,7 +2079,7 @@ class ProxmoxAgent:
                         # Debug knob; the runner enforces the allowlist otherwise,
                         # a timeout, and an output cap. Off the loop (subprocess).
                         try:
-                            from command_runner import run_local_command
+                            from .command_runner import run_local_command
                             result = await asyncio.to_thread(
                                 run_local_command,
                                 data.get("command", ""),
@@ -2470,7 +2495,11 @@ class ProxmoxAgent:
                         # the WSS is open. vmid is unguarded — Hypervisors
                         # console targets real tenant VMs, not the sim floor.
                         session_id = data.get("session_id") or ""
-                        if session_id and session_id not in self._vnc_sessions:
+                        if not session_id:
+                            result = {"status": "ERROR",
+                                      "message": "VNC_START requires session_id",
+                                      "session_id": session_id}
+                        elif session_id not in self._vnc_sessions:
                             self._vnc_sessions[session_id] = {
                                 "down_q": asyncio.Queue(), "px_ws": None, "tasks": [],
                             }
@@ -2491,9 +2520,15 @@ class ProxmoxAgent:
                                           "session_id": session_id,
                                           "ticket": ticket}
                         else:
-                            result = {"status": "SUCCESS",
-                                      "session_id": session_id,
-                                      "ticket": self._vnc_sessions[session_id].get("ticket", "")}
+                            sess = self._vnc_sessions.get(session_id)
+                            if sess is None:
+                                result = {"status": "ERROR",
+                                          "message": "VNC session not found",
+                                          "session_id": session_id}
+                            else:
+                                result = {"status": "SUCCESS",
+                                          "session_id": session_id,
+                                          "ticket": sess.get("ticket", "")}
 
                     elif cmd_type == "VNC_FRAME_DOWN":
                         # Browser→Proxmox frame. Buffer onto the session's

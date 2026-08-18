@@ -1008,6 +1008,9 @@ def test_pvesh_create_cmd_quotes_values_adds_json_flag():
     # flags (start with --) stay bare; values get quoted only when needed.
     assert "--ostype l26" in pve_cmd_builder.pvesh_create_cmd(
         "/nodes/n1/qemu", ["--ostype", "l26"])
+    injected = pve_cmd_builder.pvesh_create_cmd(
+        "/nodes/n1/qemu", ["--name", "--output-format yaml", "--full"])
+    assert "--name='--output-format yaml' --full" in injected
 
 
 # ── Family #5: spoke orchestration via RUN_COMMAND ────────────────────────────

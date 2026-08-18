@@ -343,6 +343,7 @@ def test_slow_jobs_loop_owns_them_and_is_spawned():
     src = _agent_src()
     loop = _slice(src, "async def _slow_jobs_loop", "async def _sd_watchdog_loop")
     assert "guest_watchdog.run_pass" in loop and "usb_diagnostics.collect" in loop
+    assert "if self.cs_enabled:" in loop
     assert "asyncio.create_task(self._slow_jobs_loop())" in src, \
         "_slow_jobs_loop is defined but never started"
 
@@ -359,3 +360,9 @@ def test_telemetry_body_only_reads_cached_results():
     body = _slice(_agent_src(), "def _cs_telemetry_body", "async def _set_cs_enabled")
     assert "_last_usb_diag" in body and "current_guest_watchdog()" in body
     assert "await" not in body, "the telemetry body must stay synchronous"
+
+
+def test_run_command_uses_package_relative_runner_import():
+    src = _agent_src()
+    assert "from .command_runner import run_local_command" in src
+    assert "from command_runner import run_local_command" not in src

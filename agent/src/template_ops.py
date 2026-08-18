@@ -17,6 +17,37 @@ import logging
 
 logger = logging.getLogger("PxmxAgent")
 
+DEFAULT_TEMPLATE_SCRATCH_MIN_FREE = 5 * 1024 * 1024 * 1024
+
+
+def _template_scratch_parent(data: Dict[str, Any]) -> str:
+    """Large, persistent filesystem for template archives when no Proxmox
+    storage was explicitly selected. Never falls back to the OS temp dir."""
+    configured = str(data.get("scratch_dir") or
+                     os.environ.get("LM_PXMX_TEMPLATE_SCRATCH_DIR") or "").strip()
+    if configured:
+        return configured
+    for candidate in ("/var/lib/vz/dump", "/var/lib/vz",
+                      "/var/lib/pxmx/template-scratch"):
+        if os.path.isdir(candidate):
+            return candidate
+    return "/var/lib/pxmx/template-scratch"
+
+
+def _make_template_scratch_dir(prefix: str, data: Dict[str, Any]) -> str:
+    import shutil
+    import tempfile
+    parent = _template_scratch_parent(data)
+    os.makedirs(parent, exist_ok=True)
+    min_free = int(os.environ.get("LM_PXMX_TEMPLATE_MIN_FREE_BYTES",
+                                  str(DEFAULT_TEMPLATE_SCRATCH_MIN_FREE)) or 0)
+    if min_free > 0:
+        free = shutil.disk_usage(parent).free
+        if free < min_free:
+            raise RuntimeError(
+                f"scratch dir {parent} has {free} bytes free; need at least {min_free}")
+    return tempfile.mkdtemp(prefix=prefix, dir=parent)
+
 
 def start_template_backup(data: Dict[str, Any]) -> Dict[str, Any]:
     """Kick off a hub-triggered template backup and ACK immediately.
@@ -142,8 +173,9 @@ def do_template_backup(data: Dict[str, Any]) -> None:
                 return
             path = archive_path
         else:
-            # Back-compat (older hub, no storage in payload): local temp dir.
-            tmpdir = tempfile.mkdtemp(prefix="lm-tmpl-backup-")
+            # Back-compat (older hub, no storage in payload): use a large
+            # Proxmox/template scratch path, never the OS temp dir on root.
+            tmpdir = _make_template_scratch_dir("lm-tmpl-backup-", data)
             proc = subprocess.run(
                 [vzdump, str(vmid), "--compress", "zstd", "--mode", "stop",
                  "--dumpdir", tmpdir],
@@ -311,7 +343,7 @@ async def do_template_refresh(agent, data: Dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    tmpdir = tempfile.mkdtemp(prefix="lm-tmpl-refresh-")
+    tmpdir = _make_template_scratch_dir("lm-tmpl-refresh-", data)
     usb_provision.set_refresh_paused(True)  # stop auto-prov fighting the wipe
     ok = False
     try:

@@ -260,6 +260,7 @@ find "$REPO_DIR/agent" -mindepth 1 -maxdepth 1 \
 
 # Copy the repo-root VERSION so get_version() and the install banner report a real version.
 cp "$REPO_DIR/VERSION" "$INSTALL_DIR/VERSION" 2>/dev/null || true
+git -C "$REPO_DIR" rev-parse HEAD > "$INSTALL_DIR/.pxmx_deployed_sha" 2>/dev/null || true
 
 # ── Virtualenv + requirements ──────────────────────────────────────────────────
 if [ ! -d "$INSTALL_DIR/venv" ]; then

@@ -5,7 +5,7 @@ The Proxmox Local Agent is a lightweight service that runs directly on the Proxm
 ## 🛠️ Architecture
 The agent follows a "Push-Pull" model:
 - **Push**: Every 60 seconds, the agent pushes system telemetry (CPU, RAM, Disk) and the current VM list to the Spoke.
-- **Pull**: The Spoke can send specific commands (e.g., `AGENT_GET_VM_INFO`, `AGENT_SHELLEXEC`) which the agent executes and returns.
+- **Pull**: The Spoke can send specific commands (e.g., `GET_VM_LIST`, `GET_NODE_STATS`, `RUN_COMMAND`) which the agent executes and returns.
 
 ## 🚀 Installation
 
@@ -41,8 +41,8 @@ bash install_agent.sh --spoke-ip <SPOKE_IP>
 > reason to override the scheme/port yourself.
 
 ## ⚙️ Configuration
-- **Port**: The agent connects to the Proxmox Spoke on port `8766`.
-- **Authentication**: Uses a shared secret (`pxmx-agent-secret` by default) for a secure handshake.
+- **Port**: With `--spoke-ip`, the installer probes the current agent-listener endpoints and pins the working `/ws/agent` URL (typically `wss://<spoke>:443/ws/agent`; legacy fallback `ws://<spoke>:8766/ws/agent`).
+- **Authentication**: `--secret` sets a pre-shared secret; otherwise an existing `.env` secret is preserved, or the agent connects unauthenticated and waits for WebUI approval.
 - **Systemd**: Installed as `lm-pxmx-agent.service`.
 
 ## 📊 Collected Data

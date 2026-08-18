@@ -800,11 +800,23 @@ def parse_config_tags(run_response: Any) -> List[str]:
 def pvesh_create_cmd(path: str, args: List[str]) -> str:
     """``pvesh create <path> <args...> --output-format json`` — mirrors the
     Agent's ``_pvesh_action('create', path, *args, json_out=True)``. ``args`` is
-    a flat ``["--flag", "value", ...]`` list; values are shell-quoted (flags
-    starting ``--`` are left bare). Used by create-VM-from-ISO."""
+    a flat ``["--flag", "value", ...]`` list; flag positions are emitted bare
+    and value positions are shell-quoted even when the value starts with ``--``.
+    Used by create-VM-from-ISO."""
     parts = ["pvesh", "create", shlex.quote(path)]
-    for a in (args or []):
-        a = str(a)
+    bool_flags = {"--full"}
+    expect_value = False
+    for raw in (args or []):
+        a = str(raw)
+        if expect_value:
+            if a.startswith("--"):
+                parts[-1] = f"{parts[-1]}={shlex.quote(a)}"
+            else:
+                parts.append(shlex.quote(a))
+            expect_value = False
+            continue
         parts.append(a if a.startswith("--") else shlex.quote(a))
+        if a.startswith("--") and a not in bool_flags:
+            expect_value = True
     parts.append("--output-format json")
     return " ".join(parts)

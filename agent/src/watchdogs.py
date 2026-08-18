@@ -458,14 +458,39 @@ async def vm_agent_watchdog_loop(agent) -> None:
 
 async def _ga_scan(agent, settings: Dict[str, Any]) -> None:
     from .cs_guard import SIM_VMIN
+    from . import usb_provision
     state = _read_json(VM_WD_STATE, {})
     if not isinstance(state, dict):
         state = {}
     now = time.time()
     mutated = False
+    try:
+        protected = usb_provision._protected_vmids(agent)
+    except Exception:
+        protected = set()
+    in_flight = set()
+    try:
+        in_flight |= {int(v) for v in (usb_provision.current_deleting_vmids() or [])}
+        in_flight |= {int(v) for v in (usb_provision.current_reclone_vmids() or [])}
+        run = usb_provision.current_prov_run() or {}
+        if run.get("running"):
+            for it in (run.get("items") or []):
+                try:
+                    in_flight.add(int((it or {}).get("vmid")))
+                except (TypeError, ValueError):
+                    continue
+    except Exception as e:
+        logger.debug("vm_agent_watchdog: in-flight lookup failed: %s", e)
 
     vmids = [v for v in await pve_cmds.list_qemu_vmids() if v >= SIM_VMIN]
     for vmid in vmids:
+        if vmid in protected or vmid in in_flight:
+            continue
+        try:
+            if await pve_cmds.is_template(vmid):
+                continue
+        except Exception:
+            pass
         entry = state.get(str(vmid)) or {}
         first_fail = entry.get("first_fail", 0)
         rebooted_at = entry.get("rebooted_at", 0)
