@@ -308,6 +308,26 @@ async def handle_cs_command(agent, action: str,
             # reboot rather than pretending to be a boot snapshot.
             from . import usb_diagnostics
             r = usb_diagnostics.purge_history()
+            # Reflect the purge in telemetry IMMEDIATELY. The WebUI missing-dongle
+            # panel reads the CACHED _last_usb_diag, which _slow_jobs_loop only
+            # recomputes every _USB_DIAG_INTERVAL_S (300s) — unlike the quarantine
+            # / exclusion lists, which ride the fast telemetry loop. Without this
+            # the purge appears to do nothing for up to 5 minutes even on a page
+            # refresh (the reported "not deleting the dongles from the UI" bug).
+            # Scrub the roster/baseline-derived loss fields now (they are exactly
+            # what purge_history just deleted, so [] is accurate) and force a
+            # fresh recompute on the next slow-jobs pass (≤15s) to re-learn from
+            # what is actually attached.
+            _d = getattr(agent, "_last_usb_diag", None)
+            if isinstance(_d, dict):
+                for _k in ("missing", "lost_since_boot", "passed_through",
+                           "boot_passthrough", "lost_transient",
+                           "missing_transient", "causes"):
+                    if _k in _d:
+                        _d[_k] = []
+                _d["known_count"] = 0
+                _d["boot_baseline"] = {}
+            agent._last_usb_diag_ts = 0.0
             n = len(r.get("purged") or [])
             return {"status": "SUCCESS", "action": "clear_usb_history", **r,
                     "message": (f"purged dongle history ({', '.join(r['purged'])})"
