@@ -169,34 +169,95 @@ async def list_host_pci_by_vidpid(vidpids) -> Dict[str, str]:
 _lspci_vidpid_cache: Dict[str, str] = {}
 
 
-async def _lspci_vidpid(addr: str) -> Optional[str]:
-    """Resolve a PCI address to its lowercased ``vvvv:pppp`` via ``lspci -n``,
-    memoized module-level (see ``_lspci_vidpid_cache``)."""
-    if addr in _lspci_vidpid_cache:
-        return _lspci_vidpid_cache[addr]
-    vidpid: Optional[str] = None
-    rc, o2, _ = await _run(["lspci", "-n", "-s", addr], check=False, timeout=10)
-    if rc == 0:
-        # e.g. "01:00.0 0280: 168c:0034 (rev 01)" — vendor:device is the
-        # contiguous 4hex:4hex (the class code "0280:" is followed by a space).
-        m = re.search(r"\b([0-9a-f]{4}:[0-9a-f]{4})\b", o2.decode(errors="replace").lower())
+def _addr_key(addr: str) -> str:
+    """Normalise a PCI address for map lookups: lowercased, WITHOUT the domain
+    prefix (``0000:03:00.0`` → ``03:00.0``). ``lspci -Dn`` prints full-domain
+    addresses while a ``hostpciN`` line or an older ``lspci -s`` may omit the
+    domain, so both sides key on the domain-stripped form."""
+    a = str(addr or "").strip().lower()
+    parts = a.split(":")
+    if len(parts) == 3:  # domain:bus:slot.func → drop the domain
+        a = ":".join(parts[1:])
+    return a
+
+
+async def _build_lspci_map() -> None:
+    """Populate ``_lspci_vidpid_cache`` from a SINGLE ``lspci -Dn`` scan, keyed by
+    the domain-stripped address. One scan for the whole host is both cheaper than
+    a ``lspci -s`` per address AND avoids the ``-s`` selector mismatch (some lspci
+    builds don't match a full-domain address given to ``-s``, returning nothing —
+    which silently left every PCI VM unresolved, i.e. unclassified). Best-effort."""
+    rc, o, _ = await _run(["lspci", "-Dn"], check=False, timeout=15)
+    if rc != 0:
+        return
+    for line in o.decode(errors="replace").lower().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        addr = parts[0]
+        m = re.search(r"\b([0-9a-f]{4}:[0-9a-f]{4})\b", line[len(addr):])
         if m:
-            vidpid = m.group(1)
-    # Cache ONLY a successful resolution; a None (miss / transient failure) is
-    # left uncached so it self-heals next call.
-    if vidpid is not None:
-        _lspci_vidpid_cache[addr] = vidpid
-    return vidpid
+            _lspci_vidpid_cache[_addr_key(addr)] = m.group(1)
+
+
+async def _lspci_vidpid(addr: str) -> Optional[str]:
+    """Resolve a PCI address to its lowercased ``vvvv:pppp``, memoized module-level
+    (see ``_lspci_vidpid_cache``). Resolves from a one-shot ``lspci -Dn`` map so a
+    full-domain ``hostpciN`` address (``0000:03:00.0``) resolves regardless of the
+    local ``lspci -s`` selector behaviour. ``None`` if the address isn't present."""
+    key = _addr_key(addr)
+    if key in _lspci_vidpid_cache:
+        return _lspci_vidpid_cache[key]
+    await _build_lspci_map()
+    return _lspci_vidpid_cache.get(key)
+
+
+def _live_config_text(text: str) -> str:
+    """The LIVE section of a Proxmox VM/CT config — everything before the first
+    ``[snapshot]`` / ``[pending]`` section header. The pmxcfs conf file appends
+    snapshot configs (each ``[name]``) after the current config; a ``hostpciN``
+    inside a snapshot is NOT attached to the running VM, so tier classification
+    must ignore it (``qm config`` already returns only the live section, but the
+    direct file read below sees the whole file)."""
+    out_lines = []
+    for line in text.splitlines():
+        if re.match(r"^\[[^\]]+\]\s*$", line):  # first snapshot/pending header
+            break
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+async def _vm_config_text(vid: int, kind: str) -> Optional[str]:
+    """Raw LIVE VM config text for ``vid``.
+
+    Reads the pmxcfs config file DIRECTLY
+    (``/etc/pve/qemu-server/<vid>.conf`` | ``/etc/pve/lxc/<vid>.conf``) rather than
+    shelling ``qm config``. ``qm config`` spawns perl (~0.5-2s each); probed over
+    EVERY VM in a tier sweep it blew the 8s tiers deadline on hosts with ~20+ VMs,
+    so the sweep perpetually fell back to USB-only and T1/T3 VMs never classified
+    (Class column read e.g. ``0 T1`` despite passed-through radios). A file read is
+    ~instant. Falls back to ``qm``/``pct config`` if the file is unreadable. Returns
+    only the live section (snapshots stripped). None on total failure."""
+    path = ("/etc/pve/lxc/%d.conf" % vid) if kind == "lxc" \
+        else ("/etc/pve/qemu-server/%d.conf" % vid)
+    try:
+        with open(path, "r") as fh:
+            return _live_config_text(fh.read())
+    except Exception:  # noqa: BLE001 — fall back to the (slower) CLI
+        rc, out, _ = await _run(["pct" if kind == "lxc" else "qm", "config", str(vid)],
+                                check=False, timeout=15)
+        return out.decode(errors="replace") if rc == 0 else None
 
 
 async def pci_passthrough_vidpids(vmid: Any, kind: Optional[str] = None) -> Set[str]:
     """Set of PCI-passthrough device VID:PIDs (lowercased ``vvvv:pppp``) attached
-    to ``vmid`` via ``hostpciN:`` lines in ``qm config``, each resolved with
+    to ``vmid`` via ``hostpciN:`` lines in its live config, each resolved with
     ``lspci -n``. This is the T1/T3 tier signal (T1 and T3 are PCI passthrough;
-    T2 is USB). Read-only. Mirrors the bash agent (proxmox-agent.sh:3313 hostpci
-    scrape + lspci -n resolve). Best-effort — returns whatever resolves, empty on
-    any failure; LXC (no PCI passthrough) short-circuits to empty. Resource-mapping
-    passthroughs (``hostpci0: mapping=...``) are skipped (no raw address to resolve)."""
+    T2 is USB). Read-only, via a direct pmxcfs file read (see ``_vm_config_text``)
+    so a full-fleet sweep stays inside the tiers deadline. Best-effort — returns
+    whatever resolves, empty on any failure; LXC (no PCI passthrough) short-circuits
+    to empty. Resource-mapping passthroughs (``hostpci0: mapping=...``) are skipped
+    (no raw address to resolve)."""
     try:
         vid = int(vmid)
     except (TypeError, ValueError):
@@ -206,12 +267,12 @@ async def pci_passthrough_vidpids(vmid: Any, kind: Optional[str] = None) -> Set[
         k = await detect_guest_type(vid)
     if k == "lxc":
         return set()
-    rc, out, _ = await _run(["qm", "config", str(vid)], check=False, timeout=15)
-    if rc != 0:
+    text = await _vm_config_text(vid, k)
+    if not text:
         return set()
     # hostpciN: <addr>[,opt=val,...] — capture the first token (the PCI address).
     addrs: Set[str] = set()
-    for m in re.finditer(r"(?mi)^hostpci\d+:\s*([^\s,]+)", out.decode(errors="replace")):
+    for m in re.finditer(r"(?mi)^hostpci\d+:\s*([^\s,]+)", text):
         tok = m.group(1).strip()
         if not tok or "=" in tok:  # skip resource-mapping form (mapping=...)
             continue
