@@ -222,6 +222,46 @@ def _sim_pool(agent) -> Optional[str]:
     return v or None
 
 
+# Process-lifetime cache of sim pool names already confirmed to exist (or just
+# created) on THIS host — so _ensure_sim_pool only ever hits /pools once per
+# pool name instead of every provisioning tick.
+_verified_sim_pools: set = set()
+
+
+async def _ensure_sim_pool(agent) -> Optional[str]:
+    """Resolve the configured sim pool and create it if this host doesn't
+    have it yet.
+
+    usb_config's sim_pool is ONE value pushed to every host uniformly, but the
+    WebUI dropdown that sets it only lists pools that already exist on the
+    host the operator happened to be looking at when they picked one — a pool
+    that's real on one Proxmox cluster does not exist on a different,
+    unrelated cluster/standalone host. Since a clone with --pool <missing>
+    fails outright (\"403 Permission check failed\"), that mismatch previously
+    wedged auto-provisioning on the other host FOREVER, identically on every
+    retry, with no path to recover short of an operator manually creating the
+    pool. Self-heal instead: create the pool here the first time it's needed.
+    Best-effort — on failure, clone still surfaces its own error same as
+    before (no regression), just without ever getting a second chance."""
+    pool = _sim_pool(agent)
+    if not pool or pool in _verified_sim_pools:
+        return pool
+    from . import vm_inventory
+    try:
+        existing = await vm_inventory.list_pools(agent)
+        if any(p.get("poolid") == pool for p in existing):
+            _verified_sim_pools.add(pool)
+            return pool
+        await agent._pvesh_action("create", "/pools", "--poolid", pool)
+        logger.info("provision loop: created missing Proxmox pool '%s' "
+                    "(configured as the sim pool)", pool)
+        _verified_sim_pools.add(pool)
+    except Exception as e:  # noqa: BLE001 — best-effort, never blocks the pass
+        logger.warning("provision loop: could not verify/create sim pool "
+                       "'%s': %s", pool, e)
+    return pool
+
+
 def _host_t1_excluded(agent) -> bool:
     """Per-host T1 opt-out. A host in ``usb_config.t1_exclude_hosts`` does NOT get
     its T1 controller PCI-passed — e.g. a T1 card wired to USB HUBS that you want
@@ -2608,6 +2648,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     certified_types = _certified_types(agent)
     sim_phy = str(usb_cfg.get("sim_phy") or "any").lower()
     use_all = bool(usb_cfg.get("use_all_dongles", False))
+    # Same self-heal as the template-id validation just below: usb_config's
+    # sim_pool is one value pushed to every host, so make sure THIS host
+    # actually has it before any clone this pass tries to join it (a missing
+    # pool otherwise fails every single clone attempt identically, forever).
+    await _ensure_sim_pool(agent)
     # Validate the configured template ids are actually runnable Proxmox
     # templates before trusting them as clone sources — a stale/deleted
     # template id would otherwise fail every clone silently (bash
