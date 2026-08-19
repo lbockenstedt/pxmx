@@ -423,8 +423,13 @@ class ProxmoxAgent:
         self.install_uuid = self._ensure_install_uuid()
 
         # Proxmox cluster name — resolved on first telemetry push; defaults to hostname.
+        # Re-resolved periodically (not just once) so a host that joins a cluster
+        # after the agent starts, or hits a transient pvesh failure, picks up the
+        # real cluster name instead of reporting its own hostname forever.
         self.cluster_name: str = self.hostname
         self._cluster_resolved: bool = False
+        self._cluster_name_ts: float = 0.0
+        self._cluster_name_ttl: float = 300.0
         # 5s TTL memo for /cluster/resources: the telemetry loop calls
         # get_vm_list() and get_node_stats() back-to-back every ~60s, and BOTH
         # issued a separate pvesh /cluster/resources round-trip — doubling the
@@ -2675,11 +2680,16 @@ class ProxmoxAgent:
         while True:
             try:
                 _body_t0 = time.time()
-                # Resolve cluster name once after startup
-                if not self._cluster_resolved:
-                    self.cluster_name = await self._fetch_cluster_name()
+                # Resolve cluster name on startup, then re-check every TTL — a host
+                # can join/leave a Proxmox cluster, or the first lookup can hit a
+                # transient pvesh failure, so this must not be a one-shot resolution.
+                if (_body_t0 - self._cluster_name_ts) >= self._cluster_name_ttl:
+                    resolved = await self._fetch_cluster_name()
+                    if resolved != self.cluster_name:
+                        logger.info(f"Cluster name resolved: {resolved}")
+                    self.cluster_name = resolved
                     self._cluster_resolved = True
-                    logger.info(f"Cluster name resolved: {self.cluster_name}")
+                    self._cluster_name_ts = _body_t0
 
                 # Per-phase timing for the telemetry-freshness diagnostic (surfaced
                 # on the VM Server detail page). These three pvesh-backed calls are
