@@ -20,7 +20,7 @@ current) instead of commit hashes. VERSION is bumped by a SEPARATE CI job on
 push — if that job ever falls behind a real commit (or is retired), the old
 gate read "unchanged" forever even though `git pull` kept succeeding, so the
 agent silently stopped deploying real code changes with no error. The gate is
-now based on `git rev-parse HEAD` before/after the pull, matching bugfixer/lm.
+now based on `git rev-parse HEAD` before/after the pull, matching ab/lm.
 """
 import ast
 

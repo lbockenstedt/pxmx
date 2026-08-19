@@ -4,7 +4,7 @@ This is the shared backbone page for the Lab Manager (LM) system. It describes t
 
 ## What LM is
 
-LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub** (the `lm` repo) is the control plane + WebUI + state store. It talks to many **spokes**, each wrapping one external system (a Proxmox cluster, an OPNsense firewall, NetBox IPAM, ClearPass NAC, an LDAP directory, Kea DHCP, Unbound DNS, a fleet of switches, a certbot ACME producer, a client-simulation engine). A few spokes **bridge** further out to **agents** that run on remote hosts (pxmx per-host agents on Proxmox nodes, GenericLeafAgent leaf agents, bugfixer as an agent-type client).
+LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub** (the `lm` repo) is the control plane + WebUI + state store. It talks to many **spokes**, each wrapping one external system (a Proxmox cluster, an OPNsense firewall, NetBox IPAM, ClearPass NAC, an LDAP directory, Kea DHCP, Unbound DNS, a fleet of switches, a certbot ACME producer, a client-simulation engine). A few spokes **bridge** further out to **agents** that run on remote hosts (pxmx per-host agents on Proxmox nodes, GenericLeafAgent leaf agents, ab as an agent-type client).
 
 ```
                         ┌──────────────┐
@@ -20,7 +20,7 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
           ▼                                              
    pxmx host agents  (wss to pxmx spoke :443 standalone [DEFAULT, agent→spoke→hub]; or hub /ws/agent → spoke loopback :8443 [all-in-one, --loopback/install_all only])
    GenericLeafAgent leaf agents  (ws/wss to hub /ws/spoke or a SpokeGateway)
-   bugfixer  (agent-type WS client of the hub, not a spoke)
+   ab  (agent-type WS client of the hub, not a spoke)
 ```
 
 ## Topology in detail
@@ -30,7 +30,7 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
 - **Agents** — three flavors:
   - **pxmx per-host agents** run on Proxmox nodes (`pxmx/agent/src/agent.py`). They dial the **pxmx spoke's** agent listener (not the hub directly) over wss; the pxmx spoke relays their frames up to the hub wrapped in `AGENT_RELAY_UP`. This is the path for VM lifecycle, VNC, USB auto-provisioning, and all `CS_*` sim traffic.
   - **GenericLeafAgent** leaf agents (`lm/generic_agent/src/agent.py`) dial the hub `/ws/spoke` (or a SpokeGateway). They are the "call home, then morph into a role later" shape used by the agent-spoke role loader.
-  - **bugfixer** is an **agent-type WS client** of the hub (`module_type="agent"`), not a spoke — it consumes hub logs and can trigger spoke self-updates; it does not register a spoke module.
+  - **ab** is an **agent-type WS client** of the hub (`module_type="agent"`), not a spoke — it consumes hub logs and can trigger spoke self-updates; it does not register a spoke module.
 - **Bridges:**
   - pxmx spoke bridges hub ↔ pxmx-agent (`pxmx/src/control_plane.py` `run_agent_server`).
   - `core/src/gateway/spoke_gateway.py::SpokeGateway` bridges hub ↔ leaf agents on `0.0.0.0:8767` (legacy path).
@@ -74,7 +74,7 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
 
 ## Message signing & keys
 
-- **Signing:** HMAC-SHA256 over canonical JSON (sorted keys, compact separators) in `core/src/security/signer.py::MessageSigner`. Every spoke/agent frame carries a `signature`; bugfixer reimplements the same scheme locally (`bugfixer/hub_agent.py`).
+- **Signing:** HMAC-SHA256 over canonical JSON (sorted keys, compact separators) in `core/src/security/signer.py::MessageSigner`. Every spoke/agent frame carries a `signature`; ab reimplements the same scheme locally (`ab/hub_agent.py`).
 - **Per-spoke session secrets:** `core/src/security/key_manager.py::KeyManager` stores `keys.json`. `generate_first_secret` creates a 1-hour onboarding secret; `rotate_key` rotates every 30 days and keeps **1 previous** key in `history[spoke_id]` so a frame signed just before a rotation still verifies (`get_valid_key` accepts current + 1 previous; `verify_signature` falls back to history).
 - **Hub challenge:** the hub signs its `HUB_VERIFIED` challenge with rotated hub secrets (`hub_secret.json`); the spoke verifies against its `hub_secrets` list. `run_key_rotation_loop` rotates keys due at 30 days.
 - **Key-delivery ordering:** the delivery of a new session secret must be signed with the **pre-rotation** secret (the spoke holds the old key until it accepts the new one) — signing with the post-rotation key drops the push before dispatch and permanently desyncs the spoke.
@@ -89,7 +89,7 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
 
 - **Spokes:** `_SpokeLogRelayHandler` is attached to the **root** logger (no prefix filter), so every INFO+ record is forwarded to the hub. This is why logging at INFO+ at decision points (TLS mode, discovery, command dispatch) surfaces in the hub logs without extra wiring.
 - **pxmx agent:** `WebSocketLogHandler` with a `_RELAY_PREFIXES` filter (`PxmxAgent`, `ProxmoxAgent`, `HubDiscovery`) → `send_log` → `AGENT_LOG` message → spoke `_relay_agent_msg_up` → hub.
-- **Runtime log level:** the WebUI "Enable Debug" button broadcasts `SET_LOG_LEVEL`/`SPOKE_SET_LOG_LEVEL` to all spokes + agents (including bugfixer, which is in `active_connections` as `module_type="agent"`). `core/src/logging_setup.py::set_log_level` flips the root logger at runtime; `LOG_LEVEL` is honored at boot.
+- **Runtime log level:** the WebUI "Enable Debug" button broadcasts `SET_LOG_LEVEL`/`SPOKE_SET_LOG_LEVEL` to all spokes + agents (including ab, which is in `active_connections` as `module_type="agent"`). `core/src/logging_setup.py::set_log_level` flips the root logger at runtime; `LOG_LEVEL` is honored at boot.
 
 ## Self-update & rollback
 
@@ -119,7 +119,7 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
 | `dhcp` | `DHCPSpoke` | `dhcp` | — |
 | `nw` | `NwSpoke` | `nw` | — |
 | `certificates` | `LESpoke` | `le` | — |
-| `agent` | — | `bugfixer` | bugfixer (WS client of hub) |
+| `agent` | — | `ab` | ab (WS client of hub) |
 
 The agent-spoke role loader (`lm/agent/src/agent_spoke.py::_ROLE_MAP`) maps a `--role` to the spoke class + repo URL so a single generic agent box can morph into any of these on `LOAD_ROLE`.
 
@@ -245,7 +245,7 @@ LM is built to pull its own updates and recover from a bad one without leaving a
 
 **The hub update pipeline** (`core/src/update_pipeline.py`):
 - **`perform_update`** — updates the hub itself (git pull for a git install, tarball merge for a non-git install) **and** fans `SPOKE_UPDATE` out to every approved spoke.
-- **`update_spokes_only`** — pushes updates to spokes without touching the hub (used by BugFixer after it lands a fix).
+- **`update_spokes_only`** — pushes updates to spokes without touching the hub (used by AppBuilder after it lands a fix).
 - **`update_agents_only`** — same, filtered to `module_type="agent"` nodes.
 - **Commit-SHA gate** — since the VERSION string was reset (both ends read the same string), "is there an update?" is decided by **commit SHA**, not version string: local `HEAD` vs. the remote branch tip (git install), or remote tip vs. the last-applied commit (tarball install). VERSION comparison is only a final fallback.
 
