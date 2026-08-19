@@ -27,9 +27,23 @@ def _stub_run(monkeypatch, rc, out, capture=None):
 
 
 class _Agent:
-    def __init__(self, pool=None):
+    def __init__(self, pool=None, existing_pools=None, create_error=None):
         usb = {"sim_pool": pool} if pool is not None else {}
         self.config = {"client_simulation": {"usb_config": usb}}
+        self._existing_pools = existing_pools or []
+        self._create_error = create_error
+        self.pvesh_calls = []
+        self.pvesh_action_calls = []
+
+    async def _pvesh(self, path):
+        self.pvesh_calls.append(path)
+        assert path == "/pools"
+        return [{"poolid": p} for p in self._existing_pools]
+
+    async def _pvesh_action(self, verb, path, *args):
+        self.pvesh_action_calls.append((verb, path, *args))
+        if self._create_error:
+            raise RuntimeError(self._create_error)
 
 
 # ── config plumbing ──────────────────────────────────────────────────────────
@@ -92,3 +106,57 @@ def test_pool_add_vms_noop_without_pool_or_vms(monkeypatch):
     assert _run(pve_cmds.pool_add_vms("", [90001]))["added"] == 0
     assert _run(pve_cmds.pool_add_vms("p", []))["added"] == 0
     assert not called, "must not shell out for a no-op"
+
+
+# ── self-heal: create the sim pool on THIS host if it's missing ─────────────
+# usb_config's sim_pool is one value pushed to every host uniformly, but a
+# pool that exists on one Proxmox cluster can be entirely absent on another
+# (or on a standalone host) — the reported bug: every clone attempt failed
+# forever with "403 Permission check failed (pool 'X' does not exist)"
+# because nothing ever created it there.
+
+def _clear_verified_pools():
+    up._verified_sim_pools.clear()
+
+
+def test_ensure_sim_pool_noop_when_unset(monkeypatch):
+    _clear_verified_pools()
+    agent = _Agent(pool=None)
+    assert _run(up._ensure_sim_pool(agent)) is None
+    assert not agent.pvesh_calls and not agent.pvesh_action_calls
+
+
+def test_ensure_sim_pool_noop_when_already_exists(monkeypatch):
+    _clear_verified_pools()
+    agent = _Agent(pool="Simulations", existing_pools=["Simulations", "Other"])
+    assert _run(up._ensure_sim_pool(agent)) == "Simulations"
+    assert agent.pvesh_calls == ["/pools"]
+    assert not agent.pvesh_action_calls, "must not attempt to create a pool that already exists"
+
+
+def test_ensure_sim_pool_creates_when_missing(monkeypatch):
+    _clear_verified_pools()
+    agent = _Agent(pool="Simulations", existing_pools=[])
+    assert _run(up._ensure_sim_pool(agent)) == "Simulations"
+    assert agent.pvesh_calls == ["/pools"]
+    assert agent.pvesh_action_calls == [("create", "/pools", "--poolid", "Simulations")]
+
+
+def test_ensure_sim_pool_caches_across_calls(monkeypatch):
+    _clear_verified_pools()
+    agent = _Agent(pool="Simulations", existing_pools=[])
+    _run(up._ensure_sim_pool(agent))
+    _run(up._ensure_sim_pool(agent))
+    # Second call is served from the process-lifetime cache — no second /pools
+    # read and no second (redundant) create attempt.
+    assert agent.pvesh_calls == ["/pools"]
+    assert agent.pvesh_action_calls == [("create", "/pools", "--poolid", "Simulations")]
+
+
+def test_ensure_sim_pool_swallows_create_failure(monkeypatch):
+    _clear_verified_pools()
+    agent = _Agent(pool="Simulations", existing_pools=[], create_error="pool exists")
+    # Never raises — best-effort; the clone call still surfaces its own error
+    # same as before this fix if the create didn't actually help.
+    assert _run(up._ensure_sim_pool(agent)) == "Simulations"
+    assert agent.pvesh_action_calls == [("create", "/pools", "--poolid", "Simulations")]
