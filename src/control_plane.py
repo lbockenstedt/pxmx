@@ -174,6 +174,12 @@ class PxmxControlPlane(AgentHostingControlPlane):
             rec["nodes"]        = data.get("nodes", {}).get("nodes", [])
             rec["vms"]          = data.get("vms", {}).get("vms", [])
             rec["agent_metrics"] = data.get("metrics", {})
+            # Distinct from "last_seen" (also bumped by plain AGENT_HEARTBEATs,
+            # which carry no nodes/vms) — this marks exactly when THIS agent's
+            # nodes/vms snapshot was taken, so the hub's cross-agent aggregator
+            # (pxmx_node_vm_aggregation._freshest_by_key) can pick the freshest
+            # cluster-mate's report instead of an arbitrary first-seen one.
+            rec["telemetry_ts"] = time.time()
             self._save_disk_cache()
         if "pxmx" in self.modules and hasattr(self.modules["pxmx"], "telemetry_cache"):
             self.modules["pxmx"].telemetry_cache[agent_id] = data
