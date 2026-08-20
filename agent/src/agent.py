@@ -2696,42 +2696,73 @@ class ProxmoxAgent:
                 # the usual stall points on a loaded host — recording how long each
                 # took, per tick, is what pinpoints WHERE the lag is.
                 # Run the three independent collects CONCURRENTLY (they were
-                # serial → wall-time was their SUM). Each is still timed on its
-                # own so the per-phase breakdown stays accurate; wall-time is now
-                # the MAX, so node_stats/metrics overlap the long get_vm_list.
-                async def _timed(coro):
+                # serial → wall-time was their SUM), each under its OWN deadline.
+                # PER-PHASE degradation, not all-or-nothing: a single slow phase
+                # (typically get_vm_list on a multi-node cluster, whose guest-agent
+                # enrichment proxies over SSH to remote nodes) no longer sinks the
+                # whole tick — the phases that finished ship LIVE data while only
+                # the slow one falls back to its last-known snapshot. Previously the
+                # outer wait_for cancelled all three on the first timeout, so a
+                # stalled vm_list blanked nodes+metrics too (host read vms=0 nodes=0)
+                # AND the per-phase timings were discarded (_m/_v/_n = -1), leaving
+                # the operator no way to see WHICH call hung. Now the freshness
+                # panel names the culprit with its real elapsed.
+                async def _timed(name, coro):
+                    """(name, value|None, elapsed_ms, error|None). Bounds the phase
+                    at _COLLECT_DEADLINE_S; never raises except on task cancellation
+                    (which must propagate so a reconnect can tear the loop down)."""
                     _t0 = time.time()
-                    _r = await coro
-                    return _r, int((time.time() - _t0) * 1000)
-                try:
-                    (metrics, _m_ms), (vms, _v_ms), (nodes, _n_ms) = await asyncio.wait_for(
-                        asyncio.gather(
-                            _timed(self.collect_metrics()),
-                            _timed(self.get_vm_list()),
-                            _timed(self.get_node_stats())),
-                        timeout=_COLLECT_DEADLINE_S)
-                    self._last_metrics, self._last_vms, self._last_nodes = metrics, vms, nodes
-                    self._collect_stale = False
-                except Exception as _ce:
-                    # Collect wedged OR errored (busy host / lock held by a stuck op /
-                    # pvesh failure). Reuse the last-known snapshot this tick so the
-                    # LOOP keeps advancing and RELAYING — a frozen loop makes the host
-                    # age out to "offline" on the hub even though the agent is actually
-                    # connected. A downstream 'telemetry stale' badge is honest; going
-                    # dark is not. Next tick re-collects live.
-                    # WAS `except asyncio.TimeoutError` only, so a NON-timeout collect
-                    # error escaped to the outer handler and aborted the whole tick
-                    # before the frame was sent → last_seen stopped advancing → the
-                    # "offline while still connected" bug. `except Exception` does NOT
-                    # catch CancelledError, so task cancellation still propagates.
+                    try:
+                        _r = await asyncio.wait_for(coro, timeout=_COLLECT_DEADLINE_S)
+                        return name, _r, int((time.time() - _t0) * 1000), None
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as _e:  # noqa: BLE001
+                        return name, None, int((time.time() - _t0) * 1000), _e
+                _phase = {n: (val, ms, err) for (n, val, ms, err) in await asyncio.gather(
+                    _timed("metrics",    self.collect_metrics()),
+                    _timed("vm_list",    self.get_vm_list()),
+                    _timed("node_stats", self.get_node_stats()))}
+                (_m_val, _m_ms, _m_err) = _phase["metrics"]
+                (_v_val, _v_ms, _v_err) = _phase["vm_list"]
+                (_n_val, _n_ms, _n_err) = _phase["node_stats"]
+
+                # Each phase independently: keep the LIVE value on success (and
+                # refresh its last-known cache); on failure reuse THIS phase's
+                # last-known snapshot so a slow phase degrades to stale WITHOUT
+                # blanking the phases that succeeded. The loop still always
+                # advances and RELAYS — a frozen loop makes the host age out to
+                # "offline" on the hub even though the agent is still connected; a
+                # 'telemetry stale' badge is honest, going dark is not. _*_ms
+                # carries the REAL elapsed even on failure so the freshness
+                # diagnostic points at the culprit (~25000ms reads as "stalled").
+                if _m_err is None:
+                    metrics = self._last_metrics = _m_val
+                else:
                     metrics = getattr(self, "_last_metrics", None) or {}
+                if _v_err is None:
+                    vms = self._last_vms = _v_val
+                else:
                     vms = getattr(self, "_last_vms", None) or {"vms": []}
+                if _n_err is None:
+                    nodes = self._last_nodes = _n_val
+                else:
                     nodes = getattr(self, "_last_nodes", None) or {"nodes": []}
-                    _m_ms = _v_ms = _n_ms = -1
-                    self._collect_stale = True
-                    logger.warning("telemetry collect failed/exceeded %.0fs (%s: %s) — using "
-                                   "last-known snapshot this tick, retrying next tick",
-                                   _COLLECT_DEADLINE_S, type(_ce).__name__, _ce)
+
+                # stale iff ANY phase fell back. Name the failed phase(s) + how long
+                # each ran before its deadline — turns the old opaque "collect
+                # exceeded 25s" into an actionable "vm_list=25000ms (TimeoutError)"
+                # while the other phases still shipped live.
+                _failed = [(n, _phase[n][1], _phase[n][2])
+                           for n in ("metrics", "vm_list", "node_stats")
+                           if _phase[n][2] is not None]
+                self._collect_stale = bool(_failed)
+                if _failed:
+                    logger.warning(
+                        "telemetry phase(s) failed/exceeded %.0fs — last-known for "
+                        "those, live for the rest: %s", _COLLECT_DEADLINE_S,
+                        ", ".join(f"{n}={ms}ms ({type(e).__name__}: {e})"
+                                  for (n, ms, e) in _failed))
                 self._last_phase_ms = {
                     "metrics_ms":    _m_ms,
                     "vm_list_ms":    _v_ms,

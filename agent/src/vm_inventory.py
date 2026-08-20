@@ -210,6 +210,23 @@ async def annotate_vm_interfaces(agent, vms: List[Dict[str, Any]]) -> None:
     targets = [v for v in vms if v.get("node") and v.get("vmid") not in (None, "")]
     if not targets:
         return
+    # Enrich only THIS node's VMs. get_vm_list sources /cluster/resources
+    # (cluster-WIDE), so on a multi-node cluster ``targets`` also carries VMs
+    # owned by OTHER nodes — and a guest-agent/config probe for a remote VM makes
+    # pvesh PROXY the call over SSH to that node. On a fresh node that just joined
+    # a populated cluster that meant dozens of SSH round-trips per tick, riding
+    # the deadline and stalling the whole vm_list phase (the "telemetry collect
+    # exceeded 25s" symptom). Each remote VM is enriched by ITS OWN owning agent
+    # and the hub aggregates per node, so skipping them here loses nothing —
+    # their interfaces are filled by the frame from the node that hosts them.
+    # Fail OPEN: if the local node name can't be resolved, or NO target matches
+    # it (name mismatch / older list without ``node``), enrich the full list —
+    # a slower tick beats blank IPs. Mirrors the _cs_telemetry_body node filter.
+    _local = str(getattr(agent, "_local_node", "") or getattr(agent, "hostname", "") or "").strip()
+    if _local:
+        _mine = [v for v in targets if str((v.get("node") or "")).strip() == _local]
+        if _mine:
+            targets = _mine
     cache = getattr(agent, "_iface_cache", None)
     if cache is None:
         cache = agent._iface_cache = {}
@@ -292,20 +309,45 @@ async def vm_pool_map(agent) -> dict:
     try:
         pools = await agent._pvesh("/pools")
         out: dict = {}
-        for p in (pools if isinstance(pools, list) else []):
-            if not isinstance(p, dict):
-                continue
-            pid = p.get("poolid")
-            if not pid:
-                continue
-            members = p.get("members")
-            if members is None:
-                detail = await agent._pvesh(f"/pools/{pid}")
-                members = detail.get("members") if isinstance(detail, dict) else None
-            for m in (members if isinstance(members, list) else []):
-                if isinstance(m, dict) and m.get("vmid") is not None:
-                    # First pool seen wins; a VM shouldn't be in two pools.
-                    out.setdefault(m.get("vmid"), pid)
+        pools = [p for p in (pools if isinstance(pools, list) else [])
+                 if isinstance(p, dict) and p.get("poolid")]
+
+        # Pools whose listing already inlines members need no detail round-trip.
+        for p in pools:
+            if isinstance(p.get("members"), list):
+                for m in p["members"]:
+                    if isinstance(m, dict) and m.get("vmid") is not None:
+                        out.setdefault(m.get("vmid"), p.get("poolid"))
+
+        # The rest need a per-pool /pools/{pid} detail fetch. Run them
+        # CONCURRENTLY under a small cap + overall deadline — NOT serially. A
+        # serial loop here was N unbounded pvesh calls (each up to the 15s _pvesh
+        # bound), so on a cluster with several pools whose /pools/{pid} proxies to
+        # a slow/remote node this alone could exceed the 25s telemetry budget and
+        # starve the whole vm_list phase every tick. Best-effort: a pool that
+        # times out is simply absent from the map (its VMs get pool="").
+        _need = [p.get("poolid") for p in pools if not isinstance(p.get("members"), list)]
+        if _need:
+            _sem = asyncio.Semaphore(4)
+
+            async def _members(pid):
+                try:
+                    async with _sem:
+                        detail = await asyncio.wait_for(
+                            agent._pvesh(f"/pools/{pid}"), timeout=4)
+                    return pid, (detail.get("members") if isinstance(detail, dict) else None)
+                except Exception:  # noqa: BLE001
+                    return pid, None
+
+            try:
+                _got = await asyncio.wait_for(
+                    asyncio.gather(*[_members(pid) for pid in _need]), timeout=12)
+            except asyncio.TimeoutError:
+                _got = []
+            for pid, members in _got:
+                for m in (members if isinstance(members, list) else []):
+                    if isinstance(m, dict) and m.get("vmid") is not None:
+                        out.setdefault(m.get("vmid"), pid)
         return out
     except Exception as e:  # noqa: BLE001
         logger.debug(f"pool map unavailable: {e}")
