@@ -184,6 +184,15 @@ if _log_path == "/var/log/lm/pxmx-agent.log":
 logger = logging.getLogger("PxmxAgent")
 
 
+# Commands whose handler can run long enough to blow the spoke's send_to_agent
+# timeout (and the hub's request_response) on a big cluster. While one of these
+# runs, the agent emits AGENT_PROGRESS keepalives so the upstream deadlines are
+# extended instead of the request being killed. Fast commands finish before the
+# first keepalive interval and never emit a frame.
+_KEEPALIVE_CMDS = frozenset({
+    "GET_VM_LIST", "GET_NODE_STATS", "GET_SYSTEM_STATS", "RUN_COMMAND",
+})
+
 # Per-agent update-recovery state dir. Separate from the hub's /var/lib/lm/state
 # and the spokes' /var/lib/lm/<spoke_id>/ so a co-located box never collides.
 # The external health-gate watchdog (lm-component-update-restart) reads the
@@ -1143,6 +1152,39 @@ class ProxmoxAgent:
         except Exception:
             pass
 
+    async def _emit_command_progress(self, websocket, corr_id: str, cmd_type: str,
+                                     interval: float = 8.0):
+        """Emit periodic AGENT_PROGRESS keepalives while a slow command runs so
+        the hosting spoke extends its send_to_agent deadline (and, in turn, the
+        hub extends request_response) instead of timing out on a busy backend —
+        e.g. GET_NODE_STATS / GET_VM_LIST against a large Proxmox cluster.
+
+        correlation_id == the command's corr_id so the spoke matches the
+        outstanding waiter. Runs as a background task; the receive loop cancels
+        it the instant the handler returns. Best-effort — a send failure just
+        stops the emitter (the command result path owns real error handling)."""
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                frame = {
+                    "header": {
+                        "message_id":   str(uuid.uuid4()),
+                        "correlation_id": corr_id,
+                        "timestamp":    time.time(),
+                        "sender_id":    self.agent_id,
+                        "destination_id": "pxmx-spoke",
+                    },
+                    "payload": {"type": "AGENT_PROGRESS",
+                                "data": {"command": cmd_type, "state": "working"}},
+                }
+                await websocket.send(encode_frame(self.signer, frame))
+                logger.debug("AGENT_PROGRESS keepalive sent for %s (%s)",
+                             cmd_type, str(corr_id)[:8])
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001 — socket closed mid-handle
+            logger.debug("progress emitter stopped for %s: %s", cmd_type, e)
+
     async def send_cs_event(self, event_type: str, data: Dict[str, Any]):
         """Emit a Client-Simulation event (CS_WATCHDOG_EVENT / CS_HW_RESET_EVENT /
         CS_PROGRESS / CS_COMMAND_RESULT / CS_TOKEN_RESULT / CS_TELEMETRY / CS_LOG)
@@ -2034,6 +2076,15 @@ class ProxmoxAgent:
                     logger.debug(f"Command: {cmd_type}")
                     result = {"status": "ERROR", "message": "Unknown command"}
 
+                    # Keepalive: for potentially-slow commands, emit periodic
+                    # AGENT_PROGRESS frames while the handler runs so the spoke
+                    # (and hub) extend their response deadlines instead of timing
+                    # out on a busy backend. Cancelled just before the ack below.
+                    _prog_task = None
+                    if cmd_type in _KEEPALIVE_CMDS and corr_id:
+                        _prog_task = asyncio.create_task(
+                            self._emit_command_progress(websocket, corr_id, cmd_type))
+
                     if cmd_type == "UPDATE_CONFIG":
                         old_cs = bool((self.config.get("client_simulation") or {}).get("enabled"))
                         # Deep-merge, don't wholesale-replace: partial pushes from
@@ -2637,6 +2688,8 @@ class ProxmoxAgent:
                         },
                         "payload": {"type": "AGENT_RESPONSE", "data": result},
                     }
+                    if _prog_task is not None:
+                        _prog_task.cancel()
                     await websocket.send(encode_frame(self.signer, resp))
 
             finally:
