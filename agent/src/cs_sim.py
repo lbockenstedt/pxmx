@@ -39,7 +39,7 @@ logger = logging.getLogger("PxmxAgent")
 
 # Actions handled here (the accepted+progress pattern), not in cs_commands.
 LONG_ACTIONS = frozenset({
-    "delete_vm", "reclone_vm", "proxmox_reclone_all", "clone_lxc",
+    "delete_vm", "delete_vms", "reclone_vm", "proxmox_reclone_all", "clone_lxc",
     "provision_unassigned", "backup", "reseed", "update_agent",
     "quarantine_dongle_and_destroy",
 })
@@ -251,12 +251,14 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
 # ── per-action handlers ────────────────────────────────────────────────────
 
 
-async def _delete_vm(agent, data, cs_cmd_id) -> None:
-    vmid = data.get("vmid") or data.get("vm_id")
-    prot = _protected(agent)
-    vid = assert_sim_vm(vmid, prot)  # raises → run_long_op emits terminal failed
+async def _destroy_sim_vm(agent, vid: int, prot) -> Dict[str, Any]:
+    """Shared single-VM teardown for both ``delete_vm`` (single) and
+    ``delete_vms`` (batch): per-vmid lock + idempotent ``destroy_vm`` (bus-
+    excluded) + reset of the dongle strike/guest-blind ladder. Returns
+    ``destroy_vm``'s result dict; the CALLER emits progress/terminal so the two
+    entry points can shape their own events. Kept as one helper so the single
+    and batch paths can never drift on the teardown semantics."""
     async with _vm_lock(agent, vid):
-        await _progress(agent, cs_cmd_id, "delete_vm", "running", "stopping", 10, vmid=vid)
         # Admin delete bus-excludes the dongle (anti-churn: don't immediately
         # re-provision a just-deleted dongle). The exclusion is TIME-LIMITED — the
         # provision loop auto-returns the bus after usb_exclude_cooldown (default
@@ -270,6 +272,15 @@ async def _delete_vm(agent, data, cs_cmd_id) -> None:
         # and never escalates to QT; it only stops an instant auto-reprovision so
         # the delete sticks.
         usb_provision.clear_recovery_state(r.get("bus"))
+    return r
+
+
+async def _delete_vm(agent, data, cs_cmd_id) -> None:
+    vmid = data.get("vmid") or data.get("vm_id")
+    prot = _protected(agent)
+    vid = assert_sim_vm(vmid, prot)  # raises → run_long_op emits terminal failed
+    await _progress(agent, cs_cmd_id, "delete_vm", "running", "stopping", 10, vmid=vid)
+    r = await _destroy_sim_vm(agent, vid, prot)
     if r["ok"]:
         await _terminal(agent, cs_cmd_id, "delete_vm", "completed",
                         f"VM {vid} destroyed", vmid=vid, kind=r["kind"])
@@ -279,6 +290,101 @@ async def _delete_vm(agent, data, cs_cmd_id) -> None:
                f"VM {vid} destroy failed (attempt {r.get('fails')}/3)")
         await _terminal(agent, cs_cmd_id, "delete_vm", "failed", msg,
                         vmid=vid, orphaned=r["orphaned"])
+
+
+async def _delete_vms(agent, data, cs_cmd_id) -> None:
+    """Batch teardown — destroy a LIST of sim VMs in ONE long-op.
+
+    This is the server-side batch the mass-delete UI addresses: instead of one
+    ``delete_vm`` command per VM (N hub→spoke→agent relays, each competing for
+    the agent's ACCEPT within the relay window while the host is saturated —
+    the drops that made "delete all" only remove some VMs), the spoke coalesces
+    a multi-VM delete into a single ``delete_vms`` carrying every vmid for that
+    host. It runs OUTSIDE the global ``_LONG_OP_SEM`` (see ``_BATCH_LONG_OPS``)
+    and paces itself at 2 concurrent destroys with its OWN semaphore, so it
+    never floods the event loop yet never head-of-line-blocks a single op.
+
+    Emits a per-VM ``CS_PROGRESS`` (``vmid`` + ``result``) as each VM is torn
+    down so the UI can drop that row the instant it's gone, then ONE terminal
+    ``CS_COMMAND_RESULT`` summarizing the batch. ``destroy_vm`` is idempotent
+    (already-gone → ok), so a requeued/re-spawned batch re-runs safely."""
+    args = data.get("args") if isinstance(data.get("args"), dict) else data
+    raw = []
+    if isinstance(args, dict):
+        raw = args.get("vmids") or args.get("vm_ids") or []
+    if not raw:
+        raw = data.get("vmids") or []
+    prot = _protected(agent)
+    # Validate up front: a per-VM guard failure (protected / out-of-sim-range)
+    # is recorded as that VM's failure — it must never abort the whole batch.
+    targets: list = []
+    invalid: list = []
+    seen_ids: set = set()
+    for x in raw:
+        try:
+            vid = assert_sim_vm(x, prot)
+        except GuardError as e:
+            invalid.append((x, str(e)))
+            continue
+        if vid in seen_ids:
+            continue  # de-dupe a vmid listed twice
+        seen_ids.add(vid)
+        targets.append(vid)
+    total = len(targets) + len(invalid)
+    if not total:
+        await _terminal(agent, cs_cmd_id, "delete_vms", "completed",
+                        "no VMs specified", deleted=0, failed=0, total=0)
+        return
+
+    await _progress(agent, cs_cmd_id, "delete_vms", "running", "starting", 0,
+                    total=total)
+    for x, msg in invalid:
+        await _progress(agent, cs_cmd_id, "delete_vms", "running", "failed", None,
+                        vmid=x, result="failed", error=msg)
+
+    ok_ids: list = []
+    fail_ids: list = []
+    sem = asyncio.Semaphore(2)
+    counter_lock = asyncio.Lock()
+    done = len(invalid)
+
+    async def _one(vid: int) -> None:
+        nonlocal done
+        async with sem:
+            try:
+                r = await _destroy_sim_vm(agent, vid, prot)
+                ok = bool(r.get("ok"))
+                err = None if ok else (
+                    "declared orphan (bus released)" if r.get("orphaned")
+                    else f"destroy failed (attempt {r.get('fails')}/3)")
+            except GuardError as e:
+                ok, err = False, str(e)
+            except Exception as e:  # noqa: BLE001 — one VM must not sink the batch
+                logger.exception("delete_vms: VM %s teardown error", vid)
+                ok, err = False, str(e)
+        async with counter_lock:
+            done += 1
+            (ok_ids if ok else fail_ids).append(vid)
+            pct = int(100 * done / total)
+        await _progress(agent, cs_cmd_id, "delete_vms", "running",
+                        "deleted" if ok else "failed", pct,
+                        vmid=vid, result="completed" if ok else "failed",
+                        error=err)
+
+    await asyncio.gather(*[_one(v) for v in targets], return_exceptions=True)
+
+    fail_ct = len(fail_ids) + len(invalid)
+    # Terminal status mirrors _reclone_all: the command RAN, so it's "completed"
+    # unless EVERY VM failed. The per-VM progress already told the UI which
+    # individual VMs failed; this is only the queue-ack disposition.
+    status = "failed" if (ok_ids == [] and fail_ct) else "completed"
+    msg = f"deleted {len(ok_ids)}/{total} VM(s)"
+    if fail_ct:
+        msg += f", {fail_ct} failed"
+    await _terminal(agent, cs_cmd_id, "delete_vms", status, msg,
+                    deleted=len(ok_ids), failed=fail_ct, total=total,
+                    deleted_vmids=ok_ids,
+                    failed_vmids=fail_ids + [x for x, _ in invalid])
 
 
 async def _quarantine_dongle_and_destroy(agent, data, cs_cmd_id) -> None:
@@ -826,6 +932,7 @@ def request_reclone_stop() -> bool:
 
 _HANDLERS = {
     "delete_vm": _delete_vm,
+    "delete_vms": _delete_vms,
     "reclone_vm": _reclone_vm,
     "proxmox_reclone_all": _reclone_all,
     "clone_lxc": _clone_lxc,
@@ -850,7 +957,7 @@ _LONG_OP_SEM = asyncio.Semaphore(2)
 # with their OWN internal Semaphore (e.g. _reclone_all's `sem`), so letting one
 # occupy a global _LONG_OP_SEM slot for its whole lifetime head-of-line-blocks a
 # single delete_vm/reclone_vm behind it. These run OUTSIDE the global sem.
-_BATCH_LONG_OPS = {"proxmox_reclone_all"}
+_BATCH_LONG_OPS = {"proxmox_reclone_all", "delete_vms"}
 
 
 async def run_long_op(agent, action: str, data: Dict[str, Any],
