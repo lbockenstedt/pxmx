@@ -192,6 +192,47 @@ logger = logging.getLogger("PxmxAgent")
 _KEEPALIVE_CMDS = frozenset({
     "GET_VM_LIST", "GET_NODE_STATS", "GET_SYSTEM_STATS", "RUN_COMMAND",
 })
+# 50 MB circular-log cap for the standalone Proxmox agent. This box runs OFF the
+# hub (no lm/core on path), so it uses the inline configure_logging fallback
+# above and does NOT inherit core's log-cap watchdog — replicate it here so
+# /var/log/lm/pxmx-agent.log can't grow unbounded and fill the Proxmox host.
+# Truncate-in-place (open(path,"w")) at the cap: both the FileHandler fd and
+# systemd's StandardError=append: fd resume at offset 0 after the truncate, so
+# the file stays a single circular file with NO backups to maintain. Daemon
+# thread, best-effort (never crashes the agent). LM_LOG_MAX_BYTES=0 disables.
+def _start_pxmx_log_cap_watchdog(log_file, interval=30.0):
+    import threading
+    try:
+        max_bytes = int((os.environ.get("LM_LOG_MAX_BYTES") or "").strip())
+    except (TypeError, ValueError):
+        max_bytes = 50 * 1024 * 1024
+    if max_bytes <= 0:
+        return
+    log_dir = os.path.dirname(log_file) or "/var/log/lm"
+
+    def _loop():
+        while True:
+            try:
+                for _name in os.listdir(log_dir):
+                    if not _name.endswith(".log"):
+                        continue
+                    _p = os.path.join(log_dir, _name)
+                    try:
+                        if os.path.isfile(_p) and os.path.getsize(_p) > max_bytes:
+                            with open(_p, "w"):
+                                pass  # O_TRUNC in place — same inode, no backups
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, name="pxmx-log-cap-watchdog",
+                     daemon=True).start()
+
+
+_start_pxmx_log_cap_watchdog(_log_path)
+
 
 # Per-agent update-recovery state dir. Separate from the hub's /var/lib/lm/state
 # and the spokes' /var/lib/lm/<spoke_id>/ so a co-located box never collides.
