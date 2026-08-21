@@ -283,6 +283,22 @@ def _host_t1_excluded(agent) -> bool:
     return False
 
 
+def _host_t3_excluded(agent) -> bool:
+    """Per-host T3 opt-out, mirroring ``_host_t1_excluded`` for
+    ``usb_config.t3_exclude_hosts``. Same case-insensitive exact-or-prefix match;
+    empty list = every host with a matching controller runs T3 (the default)."""
+    hn = (getattr(agent, "hostname", "") or "").strip().lower()
+    if not hn:
+        return False
+    raw = _usb_cfg(agent).get("t3_exclude_hosts")
+    items = raw if isinstance(raw, list) else str(raw or "").replace(",", " ").split()
+    for h in items:
+        entry = str(h or "").strip().lower()
+        if entry and (hn == entry or hn.startswith(entry)):
+            return True
+    return False
+
+
 # Cache the per-VM tier map — passthrough rarely changes, and resolving PCI
 # (qm config + lspci) for every VM on each ~60s telemetry tick is wasteful.
 _vm_tier_cache: Dict[str, Any] = {"ts": 0.0, "tiers": {}}
@@ -3239,7 +3255,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                         getattr(agent, "hostname", "?"))
         else:
             pci_provisioned += await _provision_pci_tier(agent, "t1", _t1_pci_vidpids(agent), _pci_tpl, start, end)
-        pci_provisioned += await _provision_pci_tier(agent, "t3", _t3_pci_vidpids(agent), _pci_tpl, start, end)
+        # Per-host T3 opt-out, same rationale as T1 above.
+        if _host_t3_excluded(agent):
+            logger.info("auto-provision: host %s in t3_exclude_hosts — skipping T3 (hub "
+                        "mode: dongles pass through as T2/USB instead of PCI)",
+                        getattr(agent, "hostname", "?"))
+        else:
+            pci_provisioned += await _provision_pci_tier(agent, "t3", _t3_pci_vidpids(agent), _pci_tpl, start, end)
         if pci_provisioned:
             logger.info("auto-provision: provisioned %d T1/T3 PCI VM(s) this tick", pci_provisioned)
 
