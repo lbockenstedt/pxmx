@@ -43,6 +43,7 @@ bash install_agent.sh --spoke-ip <SPOKE_IP>
 ## ⚙️ Configuration
 - **Port**: With `--spoke-ip`, the installer probes the current agent-listener endpoints and pins the working `/ws/agent` URL (typically `wss://<spoke>:443/ws/agent`; legacy fallback `ws://<spoke>:8766/ws/agent`).
 - **Authentication**: `--secret` sets a pre-shared secret; otherwise an existing `.env` secret is preserved, or the agent connects unauthenticated and waits for WebUI approval.
+- **Zero-admin-click onboarding**: `--onboarding-psk <psk> --tenant-hint <tenant>` presents a tenant-scoped onboarding key (minted in the LM WebUI → My Devices → Onboarding Keys) on the zero-touch connect. The hub validates it and, on a match, auto-approves the agent and binds it to that tenant immediately — no admin approval click needed. Ignored once the agent already holds a provisioned `--secret`.
 - **Systemd**: Installed as `lm-pxmx-agent.service`.
 
 ## 📊 Collected Data
