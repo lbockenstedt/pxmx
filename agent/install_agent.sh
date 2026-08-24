@@ -25,6 +25,14 @@ SPOKE_URL_PINNED=0
 AGENT_ID=""
 AGENT_ID_PINNED=0
 AGENT_SECRET=""
+# Onboarding PSK + tenant hint: an OPTIONAL tenant-scoped credential (minted by
+# a tenant-admin in the LM WebUI → My Devices → Onboarding Keys, the SAME PSK
+# store used for hub-direct spoke onboarding). When both are given, the agent
+# presents them on its zero-touch connect and the hub auto-approves + binds it
+# to that tenant immediately — no admin click needed. Without them the agent
+# still connects zero-touch and just waits for a manual approval, unchanged.
+ONBOARDING_PSK=""
+TENANT_HINT=""
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
@@ -35,6 +43,8 @@ while [[ "$#" -gt 0 ]]; do
         --spoke-url) SPOKE_URL="$2"; SPOKE_URL_PINNED=1; shift ;;
         --id) AGENT_ID="$2"; AGENT_ID_PINNED=1; shift ;;
         --secret) AGENT_SECRET="$2"; shift ;;
+        --onboarding-psk) ONBOARDING_PSK="$2"; shift ;;
+        --tenant-hint)     TENANT_HINT="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
@@ -237,9 +247,27 @@ if [ -f "$INSTALL_DIR/.env" ]; then
 fi
 FINAL_SECRET="${AGENT_SECRET:-$EXISTING_SECRET}"
 
+# ── Preserve existing onboarding PSK / tenant hint across reinstalls ──────────
+# Same precedence as AGENT_SECRET above: arg > existing .env value > empty.
+EXISTING_PSK=""
+EXISTING_TENANT_HINT=""
+if [ -f "$INSTALL_DIR/.env" ]; then
+    EXISTING_PSK=$(grep "^ONBOARDING_PSK=" "$INSTALL_DIR/.env" 2>/dev/null \
+                  | cut -d= -f2- | tr -d '\r\n' || true)
+    EXISTING_TENANT_HINT=$(grep "^TENANT_HINT=" "$INSTALL_DIR/.env" 2>/dev/null \
+                           | cut -d= -f2- | tr -d '\r\n' || true)
+fi
+FINAL_PSK="${ONBOARDING_PSK:-$EXISTING_PSK}"
+FINAL_TENANT_HINT="${TENANT_HINT:-$EXISTING_TENANT_HINT}"
+
 if [ -z "$AGENT_SECRET" ] && [ -z "$EXISTING_SECRET" ]; then
-    echo "ℹ️  No pre-shared secret. Agent will connect unauthenticated and await admin approval."
-    echo "   Approve it in the LM WebUI (Setup → Spokes & Agents → Agents tile) to complete provisioning."
+    if [ -n "$FINAL_PSK" ] && [ -n "$FINAL_TENANT_HINT" ]; then
+        echo "ℹ️  No pre-shared secret. Agent will present its onboarding key for tenant"
+        echo "   '$FINAL_TENANT_HINT' and should auto-approve without an admin click."
+    else
+        echo "ℹ️  No pre-shared secret. Agent will connect unauthenticated and await admin approval."
+        echo "   Approve it in the LM WebUI (Setup → Spokes & Agents → Agents tile) to complete provisioning."
+    fi
 elif [ -z "$AGENT_SECRET" ] && [ -n "$EXISTING_SECRET" ]; then
     echo "🔑 Preserved existing agent secret."
 fi
@@ -348,6 +376,8 @@ SPOKE_IP=$SPOKE_IP
 SPOKE_URL=$SPOKE_URL
 ${AGENT_ID_LINE}
 AGENT_SECRET=$FINAL_SECRET
+ONBOARDING_PSK=$FINAL_PSK
+TENANT_HINT=$FINAL_TENANT_HINT
 EOF
 
 # ── Systemd service ───────────────────────────────────────────────────────────

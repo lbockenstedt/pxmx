@@ -451,6 +451,13 @@ class ProxmoxAgent:
         self.agent_id = agent_id
         self.secret = secret or self._load_secret()
         # No secret is OK — we will connect without one and wait for approval.
+        # Optional tenant-scoped onboarding key (installer's --onboarding-psk /
+        # --tenant-hint, persisted to .env like the secret). Presented on the
+        # zero-touch handshake only — see _connect_once — so the hub can
+        # auto-approve + bind this agent to the hinted tenant without an admin
+        # click, mirroring how a hub-direct spoke self-provisions with a PSK.
+        self.onboarding_psk = self._load_env_field("ONBOARDING_PSK")
+        self.tenant_hint = self._load_env_field("TENANT_HINT")
 
         self.websocket = None
         # Seed from the last hub-pushed config so a restart (esp. a self-update)
@@ -543,6 +550,26 @@ class ProxmoxAgent:
                               datefmt='%Y-%m-%d %H:%M:%S'))
         logging.getLogger().addHandler(self._ws_log_handler)
         self._install_uncaught_exception_relay()
+
+    def _load_env_field(self, key: str) -> Optional[str]:
+        """Read a single ``KEY=value`` line from the installer-written .env —
+        same file + parsing convention as ``_load_secret``. Used for fields
+        that, like the agent secret, are only ever pinned via .env (written by
+        install_agent.sh at install time) and never baked into the systemd
+        unit's ExecStart args, so they don't show up in `ps`/the unit file."""
+        env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+        env_path = os.path.abspath(env_path)
+        try:
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    for line in f:
+                        if line.startswith(f"{key}="):
+                            val = line.split("=", 1)[1].strip()
+                            if val:
+                                return val
+        except Exception:
+            pass
+        return None
 
     def _load_secret(self) -> Optional[str]:
         # 1. Prefer the hub-provisioned secret persisted to .env. This is the
@@ -2022,6 +2049,12 @@ class ProxmoxAgent:
             handshake: Dict[str, Any] = {"agent_id": self.agent_id}
             if self.secret:
                 handshake["secret"] = self.secret
+            elif self.onboarding_psk and self.tenant_hint:
+                # Zero-touch onboarding key: relayed by the spoke to the hub for
+                # tenant-scoped validation. Only relevant pre-approval — once
+                # provisioned, self.secret takes over and this stops being sent.
+                handshake["onboarding_psk"] = self.onboarding_psk
+                handshake["tenant_hint"] = self.tenant_hint
             # install_uuid + hostname let the hub detect a clone-and-rename of this
             # node and carry over the agent's config/approval. Empty install_uuid =
             # .env unwritable → hub skips correlation (agent treated as before).
