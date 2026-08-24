@@ -97,14 +97,19 @@ else
     echo "       apt-get install -y uhubctl"
 fi
 
-# ── Host power-management kernel parameters ────────────────────────────────
+# ── Host power-management + PCIe passthrough kernel parameters ─────────────
 # Aggressive PCIe/USB power management is what makes dongles vanish from lsusb
 # with NO kernel error — the silent multi-day decay that only a reboot or a
 # physical replug recovers (the in-guest usb_reset rung cannot help:
 # /sys/bus/usb/devices/<bus>/authorized stops existing once the device is gone).
 #
+# pcie_acs_override=downstream additionally splits the PCIe ACS/IOMMU groups so
+# individual devices behind a shared root port can be passed through to separate
+# VMs (VFIO passthrough) instead of the whole group having to move together —
+# the standard Proxmox hypervisor passthrough enabler, paired with intel_iommu=on.
+#
 # Target line on every pxmx CS agent host:
-#   GRUB_CMDLINE_LINUX_DEFAULT="quiet pcie_aspm=off intel_iommu=on pcie_power_pm=off usbcore.autosuspend=-1"
+#   GRUB_CMDLINE_LINUX_DEFAULT="quiet pcie_aspm=off intel_iommu=on pcie_acs_override=downstream pcie_power_pm=off usbcore.autosuspend=-1"
 #
 # NOTE the sign on autosuspend. It is a DELAY IN SECONDS, not a boolean:
 #   =2   kernel default (suspend after 2s idle)
@@ -117,7 +122,7 @@ fi
 # reboot — that is the operator's call on a hypervisor running VMs. The runtime
 # fallback below takes effect immediately for already-attached devices.
 # Skip with LM_SKIP_KERNEL_PARAMS=1.
-LM_KERNEL_PARAMS="pcie_aspm=off intel_iommu=on pcie_power_pm=off usbcore.autosuspend=-1"
+LM_KERNEL_PARAMS="pcie_aspm=off intel_iommu=on pcie_acs_override=downstream pcie_power_pm=off usbcore.autosuspend=-1"
 
 _lm_apply_cmdline() {
     # $1 = file, $2 = "grub" | "cmdline". Ensures every key=value in
