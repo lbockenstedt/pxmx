@@ -22,7 +22,10 @@ set -u
 STATE_DIR="/var/lib/pxmx"
 NET_FAIL_FILE="${STATE_DIR}/net-fail-since"
 LOG_FILE="/var/log/lm-pxmx-net-watchdog.log"
-NET_DOWN_REBOOT_SECS="${NET_DOWN_REBOOT_SECS:-3600}"   # 60 min default
+NET_DOWN_REBOOT_SECS="${NET_DOWN_REBOOT_SECS:-1800}"   # 30 min default — ride out a
+                                                       # temporary outage; only a
+                                                       # sustained 30-min gateway
+                                                       # loss triggers the reboot.
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"; }
