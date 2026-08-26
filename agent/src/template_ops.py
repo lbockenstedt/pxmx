@@ -364,6 +364,12 @@ async def do_template_refresh(agent, data: Dict[str, Any]) -> None:
     template_vmid = int(data.get("template_vmid"))
     url = str(data.get("download_url") or "")
     token = str(data.get("refresh_token") or "")
+    # Optional destination storage (Proxmox storage id) for the restored disks.
+    # Blank keeps qmrestore's default (each disk goes back to the storage recorded
+    # in the backup) — but that storage may not exist on a DIFFERENT target host,
+    # which made cross-host restores fail. When set, qmrestore --storage places
+    # every restored disk on this storage instead.
+    storage = str(data.get("storage") or "").strip()
     progress_url = url.rsplit("/download", 1)[0] + "/refresh-progress"
     headers = {"x-refresh-token": token}
 
@@ -448,10 +454,17 @@ async def do_template_refresh(agent, data: Dict[str, Any]) -> None:
 
         # 3. Restore to the target template VMID (--force overwrites the old
         # template) and re-mark it a template so clones/auto-prov are unchanged.
-        _report("restoring", f"{host}: qmrestore → VM {template_vmid}")
+        # --storage (when supplied) redirects every restored disk onto a storage
+        # that exists on THIS host, so a seed backed up from a host whose storage
+        # id differs still restores here.
+        dest = f" (storage {storage})" if storage else ""
+        _report("restoring", f"{host}: qmrestore → VM {template_vmid}{dest}")
         qmrestore = shutil.which("qmrestore") or "/usr/sbin/qmrestore"
+        qmrestore_args = [qmrestore, archive, str(template_vmid), "--force"]
+        if storage:
+            qmrestore_args += ["--storage", storage]
         proc = await asyncio.create_subprocess_exec(
-            qmrestore, archive, str(template_vmid), "--force",
+            *qmrestore_args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         out, err = await proc.communicate()
         if proc.returncode != 0:
