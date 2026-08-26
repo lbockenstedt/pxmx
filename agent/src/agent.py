@@ -497,6 +497,18 @@ class ProxmoxAgent:
         self._cluster_resources_ts: float = 0.0
         self._cluster_resources_ttl: float = 5.0
 
+        # Longer (120s) TTL memo for the local node's image-capable storages,
+        # shipped in the CS telemetry ``node`` summary so the hub WebUI's fleet
+        # template-refresh modal can offer a "Destination storage" dropdown from
+        # cached telemetry (no live per-open round-trip, which fails when there
+        # is no dedicated hypervisor spoke). Storages change rarely, so a 120s
+        # TTL keeps this off the ~60s hot loop's pvesh budget while staying fresh
+        # enough. Last-known value survives a transient pvesh miss.
+        self._cs_storages_cache: Optional[list] = None
+        self._cs_storages_ts: float = 0.0
+        self._cs_storages_ttl: float = 120.0
+        self._last_storages: list = []
+
         # Prime psutil's non-blocking CPU sampler. cpu_percent(interval=None)
         # measures since the PREVIOUS call, so the first post-prime reading in
         # collect_metrics reflects usage since this prime (startup→first tick).
@@ -1075,6 +1087,22 @@ class ProxmoxAgent:
         self._cluster_resources_cache = resources
         self._cluster_resources_ts = now
         return resources
+
+    async def _local_node_storages(self) -> list:
+        """The local node's image-capable storages with a 120s TTL memo, for the
+        CS telemetry ``node`` summary (hub fleet-refresh "Destination storage"
+        dropdown). Returns ``[{storage, type, avail, total, shared}]``; ``[]`` on
+        failure. The TTL keeps this off the per-tick pvesh budget (storages
+        rarely change) while a hit avoids a round-trip every ~60s frame."""
+        now = time.time()
+        if (self._cs_storages_cache is not None
+                and (now - self._cs_storages_ts) < self._cs_storages_ttl):
+            return self._cs_storages_cache
+        node = str(getattr(self, "_local_node", "") or self.hostname or "").strip()
+        storages = await self.list_node_storages(node, "images") if node else []
+        self._cs_storages_cache = storages
+        self._cs_storages_ts = now
+        return storages
 
     async def get_node_stats(self) -> Dict[str, Any]:
         """Per-node stats via local pvesh — no API credentials required.
@@ -3027,6 +3055,20 @@ class ProxmoxAgent:
                         except Exception as _pe:  # noqa: BLE001
                             logger.debug(f"cs_pci_telemetry failed: {_pe}")
                             self._last_pci = getattr(self, "_last_pci", None) or {"t1_pci_devices": [], "t3_pci_devices": []}
+                        # Local node's image-capable storages for the hub fleet
+                        # refresh "Destination storage" dropdown. 120s TTL memo +
+                        # bounded like PCI/tiers so a slow pvesh can't stall the
+                        # loop; on timeout keep the last-known list.
+                        try:
+                            self._last_storages = await asyncio.wait_for(
+                                self._local_node_storages(), timeout=_PCI_DEADLINE_S)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "local_node_storages exceeded %.0fs (busy host) — "
+                                "shipping telemetry with the last-known storage list",
+                                _PCI_DEADLINE_S)
+                        except Exception as _se:  # noqa: BLE001
+                            logger.debug(f"local_node_storages failed: {_se}")
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         # Bounded like the AGENT_TELEMETRY send above. An
                         # unbounded send stalls the WHOLE loop behind a
@@ -3201,6 +3243,11 @@ class ProxmoxAgent:
             "mem_used_kb":   int(mem_used / 1024) if mem_used else 0,
             "mem_total_kb":  int(mem_total / 1024) if mem_total else 0,
             "proxmox_version": first.get("proxmox_version", ""),
+            # Image-capable storages on this host (qmrestore --storage targets),
+            # so the hub fleet template-refresh modal can offer a destination-
+            # storage dropdown from cached telemetry. Refreshed on a 120s TTL in
+            # the telemetry loop; [] until the first successful scan.
+            "storages":      list(getattr(self, "_last_storages", []) or []),
         }
 
         def _is_template(v: Dict[str, Any]) -> bool:
