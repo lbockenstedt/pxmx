@@ -269,3 +269,47 @@ def test_tempdir_mode_back_compat(monkeypatch):
     assert not any("--storage" in a for a in vzdump_calls), vzdump_calls
     assert rmtree_calls == [tmpdir], rmtree_calls      # tempdir cleaned
     assert removed == [], removed                       # no explicit os.remove (rmtree handles it)
+
+# ── _proxmox_vzdump_name: qmrestore-parseable archive naming ─────────────────
+# Regression: the refresh downloaded the archive under a neutral name
+# (image/template.vma.zst) that does NOT match Proxmox's vzdump naming, so
+# qmrestore died "couldn't determine archive info from '...'" — the archive was
+# valid but never restored (and thus never re-marked a template). The agent now
+# renames it to vzdump-qemu-<vmid>-<ts>.<ext> with the compression sniffed from
+# the file's magic bytes.
+import re as _re
+
+
+def _write(tmp_path, name, data: bytes):
+    p = tmp_path / name
+    p.write_bytes(data)
+    return str(p)
+
+
+def test_vzdump_name_zstd_magic(tmp_path):
+    path = _write(tmp_path, "download.tmp", b"\x28\xb5\x2f\xfd" + b"\x00" * 32)
+    name = _template_ops._proxmox_vzdump_name(100, path, "image.vma.zst")
+    assert _re.match(r"^vzdump-qemu-100-\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}\.vma\.zst$", name), name
+
+
+def test_vzdump_name_gzip_magic(tmp_path):
+    path = _write(tmp_path, "download.tmp", b"\x1f\x8b" + b"\x00" * 32)
+    name = _template_ops._proxmox_vzdump_name(200, path, "")
+    assert name.endswith(".vma.gz")
+    assert name.startswith("vzdump-qemu-200-")
+
+
+def test_vzdump_name_uncompressed_vma(tmp_path):
+    path = _write(tmp_path, "download.tmp", b"VMA\x00" + b"\x00" * 32)
+    name = _template_ops._proxmox_vzdump_name(300, path, "image.vma")
+    # Uncompressed VMA → no compression suffix.
+    assert name.endswith("-300-" + name.split("-300-")[1]) and name.endswith(".vma")
+    assert ".vma.zst" not in name
+
+
+def test_vzdump_name_falls_back_to_hint_then_zstd(tmp_path):
+    # Unrecognized magic → use the hub filename hint's extension.
+    path = _write(tmp_path, "download.tmp", b"\x00\x01\x02\x03" + b"\x00" * 8)
+    assert _template_ops._proxmox_vzdump_name(1, path, "image.vma.lzo").endswith(".vma.lzo")
+    # No hint either → default zstd (the backup flow always uses --compress zstd).
+    assert _template_ops._proxmox_vzdump_name(1, path, "").endswith(".vma.zst")

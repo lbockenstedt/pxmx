@@ -313,8 +313,49 @@ def download_refresh_archive(url: str, token: str, dest: str,
     return total
 
 
+def _proxmox_vzdump_name(vmid, archive_path: str, hint_name: str = "") -> str:
+    """Build a Proxmox-valid ``vzdump`` archive filename for ``archive_path``.
+
+    ``qmrestore`` parses the archive *basename* against the vzdump naming
+    convention (``vzdump-<type>-<vmid>-<YYYY_MM_DD-HH_MM_SS>.<ext>``) to
+    determine the guest type + compression. A name that doesn't match dies with
+    ``couldn't determine archive info from '<file>'`` — which is exactly what a
+    neutral hub name (``image.vma.zst`` / ``template.vma.zst``) produced, so a
+    perfectly valid archive failed to restore. Rename to a conforming name first.
+
+    Compression is sniffed from the file's magic bytes (zstd / gzip / lzop /
+    uncompressed VMA), falling back to the hub-provided original filename's
+    extension, then to zstd (the backup flow always uses ``--compress zstd``).
+    The container is VMA (qemu): these are qemu VM templates and VMA is
+    qemu-only.
+    """
+    import re
+    import time as _time
+    detected = None
+    try:
+        with open(archive_path, "rb") as fh:
+            magic = fh.read(4)
+        if magic[:4] == b"\x28\xb5\x2f\xfd":
+            detected = "zst"
+        elif magic[:2] == b"\x1f\x8b":
+            detected = "gz"
+        elif magic[:4] == b"\x89\x4c\x5a\x4f":
+            detected = "lzo"
+        elif magic[:4] == b"VMA\x00":
+            detected = ""  # uncompressed VMA
+    except OSError:
+        detected = None
+    if detected is None:
+        m = re.search(r"\.(zst|gz|lzo)$", str(hint_name or ""))
+        detected = m.group(1) if m else "zst"
+    ext = "vma" + (("." + detected) if detected else "")
+    stamp = _time.strftime("%Y_%m_%d-%H_%M_%S")
+    return "vzdump-qemu-%d-%s.%s" % (int(vmid), stamp, ext)
+
+
 async def do_template_refresh(agent, data: Dict[str, Any]) -> None:
     import os
+    import re
     import shutil
     import tempfile
     from . import cs_sim, usb_provision
@@ -373,7 +414,7 @@ async def do_template_refresh(agent, data: Dict[str, Any]) -> None:
         # WAN stream instead of hanging forever.
         host = getattr(agent, "hostname", "") or ""
         _report("downloading", f"{host}: pulling backup from the hub")
-        archive = os.path.join(tmpdir, "template.vma.zst")
+        archive = os.path.join(tmpdir, "download.tmp")
 
         def _on_prog(done, total):
             mb = done // (1024 * 1024)
@@ -393,6 +434,17 @@ async def do_template_refresh(agent, data: Dict[str, Any]) -> None:
             got = os.path.getsize(archive)
             if got != total:
                 raise RuntimeError(f"download truncated: got {got} of {total} bytes")
+        # qmrestore parses the archive *basename* against the vzdump naming
+        # convention to determine the guest type + compression; the hub serves
+        # the archive under a neutral name (image/template.vma.zst) which makes
+        # qmrestore die "couldn't determine archive info from '<file>'" even for
+        # a valid archive. Rename to a conforming vzdump-<type>-<vmid>-<ts>.<ext>
+        # (compression sniffed from the file, hub filename as a hint) first.
+        restore_name = _proxmox_vzdump_name(
+            template_vmid, archive, str(data.get("archive_name") or ""))
+        restore_path = os.path.join(tmpdir, restore_name)
+        os.rename(archive, restore_path)
+        archive = restore_path
 
         # 3. Restore to the target template VMID (--force overwrites the old
         # template) and re-mark it a template so clones/auto-prov are unchanged.
@@ -405,18 +457,30 @@ async def do_template_refresh(agent, data: Dict[str, Any]) -> None:
         if proc.returncode != 0:
             raise RuntimeError(f"qmrestore failed: {(err.decode() or out.decode())[:300]}")
         qm = shutil.which("qm") or "/usr/sbin/qm"
+        _report("templating", f"{host}: marking VM {template_vmid} as a template")
         tproc = await asyncio.create_subprocess_exec(
             qm, "template", str(template_vmid),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         _tout, terr = await tproc.communicate()
-        if tproc.returncode != 0:
-            # Non-fatal: the disk is restored but not flagged a template.
-            logger.warning("REFRESH_TEMPLATE: qm template %s rc=%s: %s",
-                           template_vmid, tproc.returncode, (terr.decode() or "")[:200])
+        # Verify the flag actually stuck (`qm config` reports `template: 1`) —
+        # a restored-but-not-templated VM was the reported symptom, and the
+        # conversion was previously swallowed as non-fatal so the refresh still
+        # reported "complete". A VM that restored but did NOT become a template
+        # is a FAILED refresh (clones/auto-prov depend on it), so surface it.
+        cproc = await asyncio.create_subprocess_exec(
+            qm, "config", str(template_vmid),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        cout, _cerr = await cproc.communicate()
+        is_template = bool(re.search(r"(?mi)^template:\s*1\b", cout.decode() or ""))
+        if not is_template:
+            detail = (terr.decode() or _cerr.decode() or "").strip()[:200]
+            raise RuntimeError(
+                f"restored VM {template_vmid} but 'qm template' did not take "
+                f"(rc={tproc.returncode}): {detail or 'template flag not set'}")
         _report("resuming", "re-enabling auto-provisioning")
         ok = True
-        logger.info("REFRESH_TEMPLATE: template %s restored on %s", template_vmid,
-                    getattr(agent, "hostname", ""))
+        logger.info("REFRESH_TEMPLATE: template %s restored + re-marked on %s",
+                    template_vmid, getattr(agent, "hostname", ""))
     except Exception as e:  # noqa: BLE001
         logger.warning("REFRESH_TEMPLATE failed: %s", e)
         _report("failed", error=str(e)[:300])
