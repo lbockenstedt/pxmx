@@ -4259,16 +4259,16 @@ async def _resolve_template_vmid(configured: Any) -> Optional[int]:
         # Distinguish "nowhere" from "only on other nodes" for an actionable log.
         other_nodes = sorted({node for vid, name, node in cluster_vms if name == raw})
         if other_nodes:
-            logger.error(f"provision loop: clone-source template {raw!r} is not on "
+            logger.warning(f"provision loop: clone-source template {raw!r} is not on "
                         f"this node ({local_node}) — it exists on {other_nodes}. A "
                         f"clone runs locally; put a copy named {raw!r} on this node "
                         "or use the VMID. Clones will fail.")
         else:
-            logger.error(f"provision loop: configured clone-source template name "
+            logger.warning(f"provision loop: configured clone-source template name "
                         f"{raw!r} not found on this node ({local_node}) — clones "
                         "will fail (check the VM name / use the VMID instead)")
         return None
-    logger.error(f"provision loop: configured clone-source template name "
+    logger.warning(f"provision loop: configured clone-source template name "
                 f"{raw!r} matches multiple vmids {sorted(local_matches)} on this "
                 f"node ({local_node}) — refusing to pick; clones will fail (make "
                 "the template name unique or use the VMID)")
