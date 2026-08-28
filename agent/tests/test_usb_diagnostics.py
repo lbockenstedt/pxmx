@@ -53,6 +53,12 @@ def _setup(tmp_path):
     _ud.USB_PRESENCE_FILE = f"{lib}/usb_presence.json"
     _ud.USB_BOOT_FILE = f"{lib}/usb_boot_baseline.json"
     _ud.USB_KERNEL_FILE = f"{lib}/usb_kernel_events.json"
+    # usb_device_controller memoizes positive lookups in a process-wide dict.
+    # The module object is shared by every test here, so without this a test
+    # that resolves bus "3-1" pins that answer for every later test using the
+    # same bus — which made the unresolvable-path test pass alone and fail in
+    # the full suite. Give each test a clean cache alongside its clean tmp dir.
+    _ud._CTRL_CACHE.clear()
     return _ud
 
 

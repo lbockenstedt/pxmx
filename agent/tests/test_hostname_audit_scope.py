@@ -51,7 +51,15 @@ def harness(monkeypatch):
         return False          # QGA "down" → audit stops there; we only assert SCOPE
     fake.qm_agent_ping = _ping
     monkeypatch.setattr(up, "pve_cmds", fake, raising=False)
-    sys.modules.setdefault("src.pve_cmds", fake)
+    # setitem, NOT sys.modules.setdefault: the audit does a per-function
+    # ``from . import pve_cmds``, so it reads sys.modules/the package attribute
+    # rather than up.pve_cmds. setdefault silently did nothing once ANY earlier
+    # test module had imported the real src.pve_cmds, and the audit then shelled
+    # out to a nonexistent `qm` — passing alone, failing in the full suite.
+    # monkeypatch also restores both bindings afterwards, so this no longer
+    # leaks a fake into other modules the way the setdefault version did.
+    monkeypatch.setitem(sys.modules, "src.pve_cmds", fake)
+    monkeypatch.setattr(sys.modules["src"], "pve_cmds", fake, raising=False)
     return probed, state
 
 
