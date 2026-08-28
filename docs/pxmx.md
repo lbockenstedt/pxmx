@@ -1,3 +1,8 @@
+---
+summary: "Proxmox bridge spoke + per-host agent. Repo: pxmx. moduletype = 'hypervisor'."
+keywords: [agent, behaviors, cs, install_agent, install_all, install_pxmx, lm, pxmx, usb_auto_provision, vnc_start]
+---
+
 # pxmx — Proxmox (hypervisor)
 
 Proxmox bridge spoke + per-host agent. Repo: `pxmx`. `module_type = "hypervisor"`. See [architecture-topology.md](architecture-topology.md).

@@ -1,3 +1,8 @@
+---
+summary: "This is the shared backbone page for the Lab Manager (LM) system."
+keywords: [architecture, cs, hub, install_agent, install_all, install_pxmx, lm, mesh, module_type, overview, pxmx, recovery, spoke, topology]
+---
+
 # Architecture & Topology
 
 This is the shared backbone page for the Lab Manager (LM) system. It describes the hub/spoke/agent mesh, the WebSocket + TLS scheme, discovery, message signing, onboarding, log relay, self-update, and state/tenancy. Every module page cross-references this one. The canonical copy lives in `lm/docs/`; each repo carries a verbatim copy in its own `docs/`.
