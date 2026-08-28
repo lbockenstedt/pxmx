@@ -1,0 +1,99 @@
+name: promote
+
+# Promotion pipeline: dev -> qa -> main.
+#
+# Pushing to dev prepares a PR into qa; landing on qa prepares a PR into main.
+# The PR is raised against a prepared `promote/<src>-to-<tgt>` branch rather
+# than against `dev`/`qa` directly, for two reasons:
+#
+#   1. VERSION is BRANCH-OWNED. Each branch advances its own counter (see
+#      version-bump.yml). A straight merge would drag the source branch's
+#      VERSION into the target -- so if someone set dev to 10.00, qa would
+#      inherit it instead of going 1.45 -> 1.46. This job pins every tracked
+#      VERSION file back to the target's value, so promotion carries CODE ONLY.
+#   2. Pinning VERSION here also RESOLVES what would otherwise be a recurring
+#      merge conflict on that file, which would stall every promotion PR.
+#
+# Any OTHER conflict is left unresolved on purpose: the job fails loudly so a
+# human resolves it, rather than a bot guessing at real code.
+
+on:
+  push:
+    branches: [dev, qa]
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Source branch to promote from'
+        required: true
+        default: dev
+        type: choice
+        options: [dev, qa]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: promote-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve source and target
+        id: route
+        run: |
+          src="${{ github.event.inputs.source || github.ref_name }}"
+          case "$src" in
+            dev) tgt=qa ;;
+            qa)  tgt=main ;;
+            *)   echo "::error::$src is not a promotable branch"; exit 1 ;;
+          esac
+          echo "src=$src" >> "$GITHUB_OUTPUT"
+          echo "tgt=$tgt" >> "$GITHUB_OUTPUT"
+          echo "branch=promote/$src-to-$tgt" >> "$GITHUB_OUTPUT"
+          echo "Promoting $src -> $tgt"
+
+      - name: Build promotion branch (code only, VERSION pinned to target)
+        id: build
+        env:
+          SRC: ${{ steps.route.outputs.src }}
+          TGT: ${{ steps.route.outputs.tgt }}
+          BR: ${{ steps.route.outputs.branch }}
+        run: |
+          git config user.name  "promote-bot[bot]"
+          git config user.email "promote-bot@users.noreply.github.com"
+          bash .github/scripts/promote.sh
+
+      - name: Push promotion branch
+        if: steps.build.outputs.changed == 'true'
+        run: git push -f -q origin "${{ steps.route.outputs.branch }}"
+
+      - name: Open or update the promotion PR
+        if: steps.build.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC: ${{ steps.route.outputs.src }}
+          TGT: ${{ steps.route.outputs.tgt }}
+          BR: ${{ steps.route.outputs.branch }}
+        run: |
+          set -e
+          existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already open for $BR (force-pushed with the latest $SRC)."
+            exit 0
+          fi
+          {
+            printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
+            printf 'Carries **code only** - every tracked `VERSION` file is pinned to\n'
+            printf '`%s`'"'"'s own sequence and advanced one step here.\n' "$TGT"
+            printf 'A version set on `%s` never leaks across.\n' "$SRC"
+          } > /tmp/promote-body.md
+          gh pr create --base "$TGT" --head "$BR" \
+            --title "promote: $SRC -> $TGT" \
+            --body-file /tmp/promote-body.md

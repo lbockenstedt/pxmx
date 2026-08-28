@@ -1,0 +1,41 @@
+name: CI
+
+# Gates the dev -> qa -> main promotion flow. `qa` and `main` require a PR, so
+# without a status check those gates would verify nothing. This job is that
+# check. `dev` also runs on direct push, which contributors are allowed to make.
+
+on:
+  push:
+    branches: [ dev ]
+  pull_request:
+    branches: [ main, qa, dev ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # This repo inherits BaseSpoke from the LM core repo (imported as
+      # `base_spoke` / `core.src.base_spoke`). In dev that resolves via the
+      # sibling lm checkout; alone in CI it fails with
+      # ModuleNotFoundError: No module named 'core', so reproduce the layout.
+      - name: Check out LM core (BaseSpoke dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: lbockenstedt/lm
+          path: _lm
+          sparse-checkout: core
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          # Non-fatal: the suite runs against stubs and must not be blocked by a
+          # transient index failure. A genuinely missing import still fails the
+          # test step below, which is what gates the merge.
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+      - name: Run tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/_lm:${{ github.workspace }}/_lm/core/src
+        run: pytest -q agent/tests tests
