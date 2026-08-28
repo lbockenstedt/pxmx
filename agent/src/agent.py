@@ -75,7 +75,7 @@ class _AuthError(Exception):
 
 class WebSocketLogHandler(logging.Handler):
     """Relays agent log records (INFO+, own loggers only) to the hub via
-    AGENT_LOG — so Setup → Agent Logs shows them AND the BugFixer module can
+    AGENT_LOG — so Setup → Agent Logs shows them AND the AppBuilder module can
     read agent errors without anyone touching the box's CLI. This is a hard
     requirement: once the agent is connected, the hub must see its logs.
 
@@ -548,7 +548,7 @@ class ProxmoxAgent:
         # Hub log relay — installed ONCE here (not per-connection) so records
         # from the very first startup line onward are captured; buffered while
         # the socket is down and flushed on each connect. Requirement: the hub
-        # must have every agent's logs (Setup → Agent Logs + BugFixer) without
+        # must have every agent's logs (Setup → Agent Logs + AppBuilder) without
         # needing the box's CLI.
         self._ws_log_handler = WebSocketLogHandler(self)
         # Match the canonical format/datefmt used by configure_logging (see
@@ -686,7 +686,7 @@ class ProxmoxAgent:
     def _install_uncaught_exception_relay(self) -> None:
         """Route uncaught *synchronous* exceptions through the PxmxAgent logger
         (which relays to the hub) before the interpreter's default handler runs,
-        so a crash's traceback reaches Setup → Agent Logs + BugFixer, not only
+        so a crash's traceback reaches Setup → Agent Logs + AppBuilder, not only
         the local file via systemd stderr capture. The asyncio-task counterpart
         is installed in run() once the loop exists."""
         _prev = sys.excepthook
@@ -1229,7 +1229,7 @@ class ProxmoxAgent:
         return await vm_inventory.get_vm_list(self)
 
     async def send_log(self, message: str, level: str):
-        """Send an AGENT_LOG message upstream (relayed to BugFixer by the Hub)."""
+        """Send an AGENT_LOG message upstream (relayed to AppBuilder by the Hub)."""
         try:
             log_msg = {
                 "header": {
@@ -1389,7 +1389,7 @@ class ProxmoxAgent:
         if remote_hash and installed_hash == remote_hash:
             return  # installed tree already matches the remote commit
         # Commit hash is the authoritative "did anything actually change"
-        # signal — matches bugfixer/lm's self-update, and unlike VERSION
+        # signal — matches ab/lm's self-update, and unlike VERSION
         # (bumped by a SEPARATE CI job on push) it can never silently stop
         # advancing. The old `new_ver == current` gate depended on that CI
         # job keeping VERSION in lockstep with every real commit; the moment
@@ -1901,7 +1901,7 @@ class ProxmoxAgent:
         """
         import websockets
         # Route uncaught asyncio-task exceptions through the PxmxAgent logger so
-        # their tracebacks relay to the hub (Setup → Agent Logs + BugFixer),
+        # their tracebacks relay to the hub (Setup → Agent Logs + AppBuilder),
         # not just the local file. Set here because the loop is now running.
         try:
             asyncio.get_running_loop().set_exception_handler(self._asyncio_exception_relay)
