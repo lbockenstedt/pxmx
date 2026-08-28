@@ -64,3 +64,7 @@ done < <(version_files)
 git commit -q -m "promote: $SRC -> $TGT" \
   -m "Code-only promotion. VERSION stays on ${TGT}'s own sequence, advanced one step here."
 echo "changed=true" >> "$out"
+# The approve step must wait for the run belonging to THIS commit; approving
+# whichever parked run happens to exist first races with the run GitHub is
+# still creating for the new head.
+echo "sha=$(git rev-parse HEAD)" >> "$out"
