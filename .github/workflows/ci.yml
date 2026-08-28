@@ -31,10 +31,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest
-          # Non-fatal: the suite runs against stubs and must not be blocked by a
-          # transient index failure. A genuinely missing import still fails the
-          # test step below, which is what gates the merge.
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          # Requirements are NOT always at the repo root -- several repos declare
+          # them per component (lm-spoke/, agent/, core/ ...). Installing only a
+          # root requirements.txt silently left fastapi/httpx/websockets missing
+          # and every test module failed to import. Install all of them.
+          # Non-fatal: a transient index failure must not gate the merge; a
+          # genuinely missing import still fails the test step below.
+          while IFS= read -r req; do
+            echo "installing $req"
+            pip install -r "$req" || true
+          done < <(find . -name 'requirements*.txt' \
+                     -not -path './_lm/*' -not -path '*/venv/*' \
+                     -not -path '*/node_modules/*' | sort)
       - name: Run tests
         env:
           PYTHONPATH: ${{ github.workspace }}/_lm:${{ github.workspace }}/_lm/core/src
