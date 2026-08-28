@@ -1340,15 +1340,32 @@ class ProxmoxAgent:
 
     # ── Self-update ───────────────────────────────────────────────────────────
 
+    def _repo_branch(self, repo_dir: str) -> str:
+        """Branch this agent checkout is on, defaulting to ``main``.
+
+        The agent self-updates by pulling its own checkout, so pinning "main"
+        here would drag a dev/qa host back onto main on the next update sweep.
+        Detached HEAD (or any git failure) falls back to main."""
+        import subprocess
+        try:
+            out = subprocess.check_output(
+                ["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+                timeout=10, stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            return out if out and out != "HEAD" else "main"
+        except Exception:
+            return "main"
+
     def _git_behind_count(self, repo_dir: str) -> int:
-        """Return number of commits the local repo is behind origin/main."""
+        """Return number of commits the local repo is behind its remote branch."""
         import subprocess
         subprocess.check_call(
             ["git", "-C", repo_dir, "fetch", "--quiet"],
             timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        branch = self._repo_branch(repo_dir)
         out = subprocess.check_output(
-            ["git", "-C", repo_dir, "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "-C", repo_dir, "rev-list", "--count", f"HEAD..origin/{branch}"],
             timeout=10,
         )
         return int(out.decode().strip())
@@ -1371,13 +1388,14 @@ class ProxmoxAgent:
         from . import update_recovery as ur
         current = get_version()
         marker_path = pathlib.Path(install_dir) / ".pxmx_deployed_sha"
+        _branch = self._repo_branch(repo_dir)
         try:
             subprocess.check_call(
-                ["git", "-C", repo_dir, "fetch", "--quiet", "origin", "main"],
+                ["git", "-C", repo_dir, "fetch", "--quiet", "origin", _branch],
                 timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             remote_hash = subprocess.check_output(
-                ["git", "-C", repo_dir, "rev-parse", "origin/main"], timeout=10
+                ["git", "-C", repo_dir, "rev-parse", f"origin/{_branch}"], timeout=10
             ).decode().strip()
         except Exception:
             remote_hash = ""
