@@ -4,8 +4,13 @@ this host; multiple/no matches log an error and return None (no silent fallback
 to a random template). The numeric path keeps its existing
 fallback-to-lowest-template behavior when the vmid doesn't exist.
 
+Name lookup is scoped to the LOCAL node: on a cluster every node carries its
+own same-named template at a different vmid, and a clone runs locally, so only
+this node's copy is a valid source.
+
 No real ``qm``: a fake ``pve_cmds`` module (with ``qm_config`` /
-``list_qemu_vms`` / ``list_qemu_vmids`` stubs) is injected into the synthetic
+``list_qemu_vms_cluster`` / ``list_qemu_vmids`` / ``local_node_name`` stubs)
+is injected into the synthetic
 package namespace so ``_resolve_template_vmid``'s ``from . import pve_cmds``
 picks up the stubs directly. Mirrors the synthetic-package pattern in
 ``test_template_backup_storage.py``.
@@ -64,11 +69,16 @@ _usb_provision = _load("usb_provision", "usb_provision.py")
 _resolve = _usb_provision._resolve_template_vmid
 
 
-def _install(qm_config, list_qemu_vms, list_qemu_vmids):
+def _install(qm_config, list_qemu_vms_cluster, list_qemu_vmids, node="pve1"):
     """Point the fake pve_cmds at per-test async stubs."""
     _fake_pve.qm_config = qm_config
-    _fake_pve.list_qemu_vms = list_qemu_vms
+    _fake_pve.list_qemu_vms_cluster = list_qemu_vms_cluster
     _fake_pve.list_qemu_vmids = list_qemu_vmids
+
+    async def _local_node_name():
+        return node
+
+    _fake_pve.local_node_name = _local_node_name
 
 
 # ── stub builders ────────────────────────────────────────────────────────────
@@ -82,8 +92,10 @@ async def _qm_config_missing(_vid):
 
 
 async def _list_vms_dupname():
-    # (vmid, name); 100 and 300 share the name "debian-12".
-    return [(100, "debian-12"), (200, "win11"), (300, "debian-12")]
+    # (vmid, name, node); 100 and 300 share the name "debian-12" on pve1.
+    # 400 is a same-named template owned by ANOTHER node — never a valid source.
+    return [(100, "debian-12", "pve1"), (200, "win11", "pve1"),
+            (300, "debian-12", "pve1"), (400, "rocky-9", "pve2")]
 
 
 async def _list_vmids_dupname():
@@ -135,10 +147,28 @@ async def test_name_not_found_returns_none_no_fallback():
 
 
 @pytest.mark.asyncio
-async def test_name_multiple_matches_returns_none():
-    # "debian-12" matches vmid 100 AND 300 → ambiguous → refuse.
+async def test_name_multiple_matches_on_this_node_returns_none():
+    # "debian-12" matches vmid 100 AND 300 on pve1 → ambiguous → refuse.
     _install(_qm_config_missing, _list_vms_dupname, _list_vmids_dupname)
     assert await _resolve("debian-12") is None
+
+
+@pytest.mark.asyncio
+async def test_name_only_on_another_node_returns_none():
+    # "rocky-9" exists, but only on pve2. A clone runs locally, so cloning from
+    # another node's vmid would clone the wrong (or no) image → refuse.
+    _install(_qm_config_missing, _list_vms_dupname, _list_vmids_dupname)
+    assert await _resolve("rocky-9") is None
+
+
+@pytest.mark.asyncio
+async def test_same_name_on_two_nodes_resolves_to_the_local_one():
+    # Both nodes carry "debian-12" at different vmids; only the local copy wins.
+    async def list_cluster():
+        return [(100, "debian-12", "pve1"), (900, "debian-12", "pve2")]
+
+    _install(_qm_config_missing, list_cluster, _list_vmids_dupname, node="pve2")
+    assert await _resolve("debian-12") == 900
 
 
 # ── empty / None ─────────────────────────────────────────────────────────────

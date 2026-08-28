@@ -56,7 +56,12 @@ _local_node_storages = _load_method()
 
 
 def _run(fake):
-    return asyncio.get_event_loop().run_until_complete(_local_node_storages(fake))
+    # asyncio.run, NOT get_event_loop().run_until_complete: once another test
+    # module has run under pytest-asyncio there is no current event loop left in
+    # the main thread, so get_event_loop() raises and these tests failed only
+    # when the full suite ran (they passed in isolation). asyncio.run makes and
+    # disposes of its own loop, so the result no longer depends on test order.
+    return asyncio.run(_local_node_storages(fake))
 
 
 def test_returns_local_node_storages():

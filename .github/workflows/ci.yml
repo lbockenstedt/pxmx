@@ -13,6 +13,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       # This repo inherits BaseSpoke from the LM core repo (imported as
@@ -30,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          pip install pytest pytest-timeout
           # Requirements are NOT always at the repo root -- several repos declare
           # them per component (lm-spoke/, agent/, core/ ...). Installing only a
           # root requirements.txt silently left fastapi/httpx/websockets missing
@@ -46,4 +47,4 @@ jobs:
       - name: Run tests
         env:
           PYTHONPATH: ${{ github.workspace }}/_lm:${{ github.workspace }}/_lm/core/src
-        run: pytest -q agent/tests tests
+        run: pytest --timeout=300 --timeout-method=thread -q agent/tests tests
