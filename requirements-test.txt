@@ -1,0 +1,11 @@
+# Test-only dependencies. CI installs every requirements*.txt it finds, so this
+# file is picked up automatically; it is deliberately NOT part of requirements.txt
+# because the agent/spoke runtime does not need any of it.
+#
+# pytest-asyncio: the agent's provisioning seams (_resolve_template_vmid,
+# list_backup_storages, ...) are async, and their tests are marked
+# @pytest.mark.asyncio. Without the plugin pytest does not run an async test —
+# it FAILS it with "async def functions are not natively supported", which is
+# how ~10 tests were red in CI while passing locally, where the plugin happened
+# to be installed globally.
+pytest-asyncio

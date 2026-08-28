@@ -13,28 +13,47 @@ suffix must resolve to a fully-qualified wss://host:443/ws/agent (or preserve
 whatever piece WAS explicitly given), since websockets.connect() dials the
 URL verbatim with no rewriting of its own.
 """
-import re
+import ast
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 
 AGENT = Path(__file__).resolve().parent.parent / "src" / "agent.py"
 
+_CONSTS = ("_AGENT_WS_PATH", "_AGENT_DEFAULT_SCHEME", "_AGENT_DEFAULT_PORT")
+
 
 def _load_normalize_spoke_url():
     """Extract _normalize_spoke_url (+ its constants) from the real agent.py
     source and exec it in an isolated namespace, so this test exercises the
-    actual shipped function body rather than a hand-copied duplicate."""
-    src = AGENT.read_text()
-    m = re.search(
-        r"_AGENT_WS_PATH = .*?\n_AGENT_DEFAULT_SCHEME = .*?\n"
-        r"_AGENT_DEFAULT_PORT = .*?\n\n\n"
-        r"def _normalize_spoke_url\(.*?\n(?:    .*\n|\n)*",
-        src,
-    )
-    assert m, "could not locate _normalize_spoke_url in agent.py — source shape changed?"
+    actual shipped function body rather than a hand-copied duplicate.
+
+    Selected via ``ast`` rather than a source regex. The previous regex
+    required the three constants to sit immediately above the function; when
+    unrelated module constants were added between them it stopped matching and
+    the module raised at import time, which took the WHOLE pxmx suite down with
+    a collection error. Picking nodes out of the parsed tree does not care how
+    the file is laid out.
+    """
+    tree = ast.parse(AGENT.read_text())
+    consts, fn = [], None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id in _CONSTS for t in node.targets
+        ):
+            consts.append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                node.name == "_normalize_spoke_url":
+            fn = node
+    assert fn is not None, "no _normalize_spoke_url in agent.py — was it renamed?"
+    missing = set(_CONSTS) - {
+        t.id for n in consts for t in n.targets if isinstance(t, ast.Name)
+    }
+    assert not missing, f"missing constants in agent.py: {sorted(missing)}"
+
     ns = {"urlsplit": urlsplit, "urlunsplit": urlunsplit, "Optional": Optional}
-    exec(compile(m.group(0), str(AGENT), "exec"), ns)
+    module = ast.Module(body=consts + [fn], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(AGENT), "exec"), ns)
     return ns["_normalize_spoke_url"]
 
 
