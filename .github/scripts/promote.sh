@@ -55,7 +55,11 @@ if git ls-files -u | grep -q .; then
 fi
 
 if git diff --cached --quiet && git diff --quiet; then
-  echo "Nothing to carry: $TGT already contains $SRC (ignoring VERSION)."
+  # Phrase the no-op with $LABEL: "Nothing to promote" is the string every
+  # repo's promotion_selftest.sh matches on, so the forward direction must keep
+  # saying exactly that, while the reverse direction still reads correctly
+  # ("Nothing to backmerge"). Changing this to a fixed phrase broke nw's CI.
+  echo "Nothing to $LABEL: $TGT already contains $SRC (ignoring VERSION)."
   echo "changed=false" >> "$out"
   exit 0
 fi
