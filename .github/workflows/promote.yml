@@ -16,10 +16,20 @@ name: promote
 #
 # Any OTHER conflict is left unresolved on purpose: the job fails loudly so a
 # human resolves it, rather than a bot guessing at real code.
+#
+# PROMOTION IS DELIBERATE, NOT AUTOMATIC. This previously ran `on: push` to dev
+# and qa, so every single commit to dev immediately raised (or force-pushed) a
+# PR into qa, and merging that PR was itself a push to qa, which immediately
+# raised the next PR into main. Unfinished work was therefore permanently in
+# flight toward production and neither gate ever batched anything. Promotion is
+# now started by hand: run this workflow with `source: dev` when dev is actually
+# ready, then again with `source: qa` to move qa into main. Each hop becomes one
+# intentional PR covering everything that has accumulated since the last one.
+#
+# CI is unaffected -- ci.yml still runs on every dev push and on every PR, so
+# day-to-day feedback stays automatic. Only the decision to promote is manual.
 
 on:
-  push:
-    branches: [dev, qa]
   workflow_dispatch:
     inputs:
       source:
@@ -35,7 +45,10 @@ permissions:
   actions: write   # to release the promotion PR's own CI run (see last step)
 
 concurrency:
-  group: promote-${{ github.ref_name }}
+  # Keyed off the branch being promoted, not the ref the run was dispatched
+  # from -- a manual run is always dispatched from the default branch, so
+  # github.ref_name would collapse dev->qa and qa->main into one queue.
+  group: promote-${{ github.event.inputs.source || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
