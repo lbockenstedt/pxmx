@@ -18,10 +18,12 @@ name: backmerge
 # confusing diff full of changes that are "already on main".
 #
 # WHAT IT DOES
-# On every push to main, opens a PR main -> qa and a PR main -> dev. It does
-# NOT merge and does NOT push to qa or dev: those branches take changes by pull
-# request like everything else, so a conflicting back-merge surfaces for a human
-# instead of being force-resolved by a bot.
+# On every push to main, opens a PR main -> qa and a PR main -> dev, and merges
+# each one as soon as its required checks pass (natively via auto-merge on qa,
+# which is check-gated; after waiting for the checks to go green on dev, which
+# is not). It never pushes to qa or dev directly: those branches take changes by
+# pull request like everything else, so a conflicting or failing back-merge
+# surfaces for a human instead of being force-resolved by a bot.
 #
 # NO LOOP: the only trigger is a push to main, and nothing here writes to main.
 # Merging a back-merge PR pushes to qa or dev, which triggers nothing.
@@ -87,6 +89,7 @@ jobs:
         run: git push -f -q origin "backmerge/main-to-${{ matrix.target }}"
 
       - name: Open or update the back-merge PR
+        id: pr
         if: steps.build.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -97,6 +100,7 @@ jobs:
           existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
           if [ -n "$existing" ]; then
             echo "PR #$existing already open for $BR (force-pushed with the latest main)."
+            echo "number=$existing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           {
@@ -107,11 +111,15 @@ jobs:
             printf 'promotion diff fills up with changes that are already on main.\n\n'
             printf 'Carries **code only** -- every tracked `VERSION` file is pinned to\n'
             printf '`%s`'"'"'s own sequence, so main'"'"'s version does not leak backwards.\n\n' "$TGT"
-            printf 'Nothing was merged or pushed to `%s`; merge this PR to close the gap.\n' "$TGT"
+            printf 'This PR merges itself once its required checks pass. If it cannot\n'
+            printf '(a conflict, or a failing check) it stays open for a human -- nothing\n'
+            printf 'is force-resolved and nothing is pushed to `%s` directly.\n' "$TGT"
           } > /tmp/backmerge-body.md
           gh pr create --base "$TGT" --head "$BR" \
             --title "backmerge: main -> $TGT" \
             --body-file /tmp/backmerge-body.md
+          num=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
+          echo "number=$num" >> "$GITHUB_OUTPUT"
 
       # A PR opened with GITHUB_TOKEN does not start its checks automatically --
       # GitHub parks the run as `action_required`. qa requires check-direction,
@@ -138,3 +146,62 @@ jobs:
             sleep 5
           done
           echo "::notice::no parked run found for $BR @ $SHA"
+
+      # Merge it. The gap only actually closes when the PR lands, and a queue
+      # of stale back-merge PRs waiting on a human is the same divergence this
+      # workflow exists to prevent -- just with extra steps.
+      #
+      # Two paths, because the targets are protected differently:
+      #   * qa requires `test` + `check-direction`, so the PR is BLOCKED on
+      #     open. GitHub's native auto-merge is exactly right: it lands the PR
+      #     if and when those checks pass, and never if they fail.
+      #   * dev has no required checks, so the PR is mergeable immediately and
+      #     GitHub REFUSES to arm auto-merge ("Pull request is in clean
+      #     status"). Falling straight through to a merge would land it while
+      #     its checks were still running, so wait for them first and merge
+      #     only on a green (or genuinely check-free) result.
+      #
+      # Neither path can force a conflicted merge: `gh pr merge` fails on a
+      # dirty PR and it stays open for a human, which is the whole point.
+      #
+      # Still no loop: this pushes to qa/dev, and nothing back-merges from
+      # those branches.
+      - name: Merge the back-merge PR
+        if: steps.build.outputs.changed == 'true' && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUM: ${{ steps.pr.outputs.number }}
+          TGT: ${{ matrix.target }}
+        run: |
+          if gh pr merge "$NUM" --auto --merge --delete-branch 2>/tmp/automerge.err; then
+            echo "::notice::auto-merge armed on #$NUM; it will land when its checks pass"
+            exit 0
+          fi
+          echo "auto-merge not armed: $(cat /tmp/automerge.err)"
+
+          # Wait for the checks to settle before merging by hand.
+          for _ in $(seq 1 60); do
+            state=$(gh pr view "$NUM" --json state -q .state)
+            if [ "$state" = "MERGED" ]; then
+              echo "::notice::#$NUM already merged"; exit 0
+            fi
+            if [ "$state" = "CLOSED" ]; then
+              echo "::warning::#$NUM was closed without merging"; exit 0
+            fi
+            rollup=$(gh pr view "$NUM" --json statusCheckRollup \
+                       -q '[.statusCheckRollup[]? | .conclusion // .status] | join(",")')
+            case "$rollup" in
+              *IN_PROGRESS*|*QUEUED*|*PENDING*|*WAITING*|*REQUESTED*)
+                sleep 10; continue ;;
+              *FAILURE*|*TIMED_OUT*|*CANCELLED*|*ACTION_REQUIRED*)
+                echo "::warning::#$NUM has failing checks ($rollup); leaving it open for a human"
+                exit 0 ;;
+            esac
+            break
+          done
+
+          if gh pr merge "$NUM" --merge --delete-branch; then
+            echo "::notice::merged #$NUM into $TGT"
+          else
+            echo "::warning::could not merge #$NUM (conflict?); it stays open for a human"
+          fi
