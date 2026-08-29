@@ -1,0 +1,61 @@
+name: branch-flow
+
+# Enforces the promotion order: dev -> qa -> main.
+#
+# Work is developed on dev, promoted to qa when the dev cycle is done, and
+# promoted to main when qa signs off. Nothing skips a step: a PR straight from
+# a feature branch (or from dev) into main would put unvalidated work into
+# production and silently strand qa behind main.
+#
+# Promotion PRs are raised from a prepared `promote/<src>-to-<tgt>` branch
+# rather than from dev/qa directly (see promote.yml), so those two names are
+# accepted as equivalent to their source branch.
+#
+# This is a REQUIRED CHECK on qa and main. It deliberately does not run on PRs
+# into dev -- dev is where work lands from anywhere, and that is the point.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+    branches: [qa, main]
+
+permissions:
+  contents: read
+
+jobs:
+  check-direction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify the PR follows dev -> qa -> main
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+
+          case "$BASE" in
+            qa)   allowed="dev promote/dev-to-qa" ;;
+            main) allowed="qa promote/qa-to-main" ;;
+            *)
+              echo "No direction rule for base '$BASE'; nothing to enforce."
+              exit 0
+              ;;
+          esac
+
+          for ok in $allowed; do
+            if [ "$HEAD" = "$ok" ]; then
+              echo "OK: $HEAD -> $BASE follows the promotion order."
+              exit 0
+            fi
+          done
+
+          echo "::error title=Wrong promotion direction::'$HEAD' -> '$BASE' skips a step."
+          echo ""
+          echo "  The promotion order is dev -> qa -> main."
+          echo "  PRs into '$BASE' may only come from: $allowed"
+          echo ""
+          echo "  Land this work on dev first, then promote it:"
+          echo "    gh workflow run promote.yml -f source=dev   # dev -> qa"
+          echo "    gh workflow run promote.yml -f source=qa    # qa  -> main"
+          exit 1
