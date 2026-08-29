@@ -17,3 +17,8 @@ secrets.json
 
 # Claude Code local worktrees/config
 .claude/
+
+# mTLS material and runtime secrets issued by the hub — never commit these
+certs/
+.env.lock
+*.crt
