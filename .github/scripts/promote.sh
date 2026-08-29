@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# Build a promotion branch carrying CODE ONLY from $SRC into $TGT.
+# Build a branch carrying CODE ONLY from $SRC into $TGT.
+#
+# Used for BOTH directions of the flow:
+#   forward  (promote.yml)   dev -> qa -> main, plus the dev -> main override
+#   backward (backmerge.yml) main -> qa and main -> dev, so a commit made
+#                            directly on main does not leave the lower branches
+#                            permanently behind.
+# One script for both on purpose: the VERSION pinning and conflict handling
+# below are the fiddly part, and a second copy of them would drift.
 #
 # VERSION is branch-owned: every tracked VERSION file is pinned to $TGT's value
 # and then advanced one step, so a version set on the source branch NEVER leaks
@@ -7,10 +15,12 @@
 # Pinning also resolves the VERSION merge conflict that would otherwise stall
 # every promotion PR. Any other conflict is left for a human.
 #
-# Env: SRC, TGT, BR. Writes changed=true/false to $GITHUB_OUTPUT if set.
+# Env: SRC, TGT, BR, and optional LABEL (wording only -- "promote"/"backmerge").
+# Writes changed=true/false to $GITHUB_OUTPUT if set.
 set -euo pipefail
 
 : "${SRC:?}" "${TGT:?}" "${BR:?}"
+LABEL="${LABEL:-promote}"
 out="${GITHUB_OUTPUT:-/dev/null}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -45,7 +55,7 @@ if git ls-files -u | grep -q .; then
 fi
 
 if git diff --cached --quiet && git diff --quiet; then
-  echo "Nothing to promote: $TGT already contains $SRC (ignoring VERSION)."
+  echo "Nothing to carry: $TGT already contains $SRC (ignoring VERSION)."
   echo "changed=false" >> "$out"
   exit 0
 fi
@@ -61,8 +71,8 @@ while IFS= read -r f; do
   git add "$f"
 done < <(version_files)
 
-git commit -q -m "promote: $SRC -> $TGT" \
-  -m "Code-only promotion. VERSION stays on ${TGT}'s own sequence, advanced one step here."
+git commit -q -m "$LABEL: $SRC -> $TGT" \
+  -m "Code-only $LABEL. VERSION stays on ${TGT}'s own sequence, advanced one step here."
 echo "changed=true" >> "$out"
 # The approve step must wait for the run belonging to THIS commit; approving
 # whichever parked run happens to exist first races with the run GitHub is

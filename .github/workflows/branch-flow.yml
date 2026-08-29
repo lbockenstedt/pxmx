@@ -11,6 +11,27 @@ name: branch-flow
 # rather than from dev/qa directly (see promote.yml), so those two names are
 # accepted as equivalent to their source branch.
 #
+# `promote/dev-to-main` is the ONE deliberate exception to "nothing skips a
+# step". It is an override, not a hole:
+#
+#   * It is a single, well-known, promote.yml-generated branch NAME, not a
+#     pattern. `dev` itself, and any feature branch, are still rejected into
+#     main -- so the only way to produce a passing head is to run promote.yml
+#     with target=main, which logs a warning and records who dispatched it.
+#   * It still only OPENS a PR. Nothing in the promotion path merges, so a
+#     human still reviews and merges every change that reaches main.
+#
+# Do not widen this list further, and do not turn it into a prefix/glob match
+# (`promote/*` would let any hand-made branch called promote/anything into
+# main, which is exactly the bypass this file exists to prevent).
+#
+# `backmerge/main-to-qa` is allowed into qa (see backmerge.yml). That is the
+# REVERSE direction and so cannot skip a step -- it carries main back down to
+# qa, closing the gap left by a direct commit to main or by a promotion's own
+# merge commit. Note there is no equivalent entry for main: nothing is ever
+# back-merged INTO main, and `backmerge/main-to-dev` needs no entry because
+# PRs into dev are not gated at all.
+#
 # This is a REQUIRED CHECK on qa and main. It deliberately does not run on PRs
 # into dev -- dev is where work lands from anywhere, and that is the point.
 
@@ -35,8 +56,8 @@ jobs:
           set -euo pipefail
 
           case "$BASE" in
-            qa)   allowed="dev promote/dev-to-qa" ;;
-            main) allowed="qa promote/qa-to-main" ;;
+            qa)   allowed="dev promote/dev-to-qa backmerge/main-to-qa" ;;
+            main) allowed="qa promote/qa-to-main promote/dev-to-main" ;;
             *)
               echo "No direction rule for base '$BASE'; nothing to enforce."
               exit 0
@@ -58,4 +79,8 @@ jobs:
           echo "  Land this work on dev first, then promote it:"
           echo "    gh workflow run promote.yml -f source=dev   # dev -> qa"
           echo "    gh workflow run promote.yml -f source=qa    # qa  -> main"
+          echo ""
+          echo "  If this genuinely cannot wait for qa, use the override --"
+          echo "  it opens a dev -> main PR (it does not merge):"
+          echo "    gh workflow run promote.yml -f source=dev -f target=main"
           exit 1
