@@ -1,0 +1,140 @@
+name: backmerge
+
+# Keeps qa and dev from falling permanently behind main.
+#
+# WHY THIS EXISTS
+# The promotion flow is one-way: dev -> qa -> main. Anything that lands on main
+# without travelling that path therefore leaves the lower branches behind, and
+# the gap never closes on its own. Two things routinely do exactly that:
+#
+#   * the repo owner committing directly to main (the one path allowed to skip
+#     the flow -- see branch-flow.yml), and
+#   * the promotion merge commits themselves. `promote/qa-to-main` is merged
+#     INTO main, so main gains a merge commit plus its VERSION bump that qa
+#     never sees. This is not hypothetical: ab's main was 4 commits ahead of qa
+#     from promotions alone before this workflow existed.
+#
+# Left alone the divergence compounds, and the next promotion PR carries a
+# confusing diff full of changes that are "already on main".
+#
+# WHAT IT DOES
+# On every push to main, opens a PR main -> qa and a PR main -> dev. It does
+# NOT merge and does NOT push to qa or dev: those branches take changes by pull
+# request like everything else, so a conflicting back-merge surfaces for a human
+# instead of being force-resolved by a bot.
+#
+# NO LOOP: the only trigger is a push to main, and nothing here writes to main.
+# Merging a back-merge PR pushes to qa or dev, which triggers nothing.
+#
+# VERSION is handled by the same .github/scripts/promote.sh used by promote.yml
+# -- shared deliberately, because the VERSION pinning and conflict handling are
+# the fiddly part and a second copy would drift. qa/dev keep their own version
+# lineage; main's version never leaks backwards.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write   # to release the back-merge PR's own parked CI run
+
+jobs:
+  backmerge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Job-level, not workflow-level: workflow `concurrency` is evaluated before
+    # the matrix expands, so `matrix.target` is empty there and both targets
+    # would collapse into one queue (the qa run cancelling the dev run).
+    concurrency:
+      group: backmerge-main-to-${{ matrix.target }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false   # dev must still be offered the change if qa conflicts
+      matrix:
+        target: [qa, dev]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip if the target branch does not exist
+        id: exists
+        run: |
+          if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no '${{ matrix.target }}' branch in this repo; nothing to back-merge"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build back-merge branch (code only, VERSION pinned to target)
+        id: build
+        if: steps.exists.outputs.ok == 'true'
+        env:
+          SRC: main
+          TGT: ${{ matrix.target }}
+          BR: backmerge/main-to-${{ matrix.target }}
+          LABEL: backmerge
+        run: |
+          git config user.name  "promote-bot[bot]"
+          git config user.email "promote-bot@users.noreply.github.com"
+          bash .github/scripts/promote.sh
+
+      - name: Push back-merge branch
+        if: steps.build.outputs.changed == 'true'
+        run: git push -f -q origin "backmerge/main-to-${{ matrix.target }}"
+
+      - name: Open or update the back-merge PR
+        if: steps.build.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TGT: ${{ matrix.target }}
+          BR: backmerge/main-to-${{ matrix.target }}
+        run: |
+          set -e
+          existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already open for $BR (force-pushed with the latest main)."
+            exit 0
+          fi
+          {
+            printf 'Automated back-merge of `main` into `%s`.\n\n' "$TGT"
+            printf 'Opened because `main` moved without coming through the promotion\n'
+            printf 'flow -- a direct commit, or the merge commit from a promotion PR.\n'
+            printf 'Without this, `%s` falls permanently behind and the next\n' "$TGT"
+            printf 'promotion diff fills up with changes that are already on main.\n\n'
+            printf 'Carries **code only** -- every tracked `VERSION` file is pinned to\n'
+            printf '`%s`'"'"'s own sequence, so main'"'"'s version does not leak backwards.\n\n' "$TGT"
+            printf 'Nothing was merged or pushed to `%s`; merge this PR to close the gap.\n' "$TGT"
+          } > /tmp/backmerge-body.md
+          gh pr create --base "$TGT" --head "$BR" \
+            --title "backmerge: main -> $TGT" \
+            --body-file /tmp/backmerge-body.md
+
+      # A PR opened with GITHUB_TOKEN does not start its checks automatically --
+      # GitHub parks the run as `action_required`. qa requires check-direction,
+      # so without this the back-merge PR sits BLOCKED forever. Same reasoning
+      # and same fix as promote.yml's final step.
+      - name: Release the back-merge PR's CI run
+        if: steps.build.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BR: backmerge/main-to-${{ matrix.target }}
+          SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          for _ in $(seq 1 24); do
+            ids=$(gh api "repos/${{ github.repository }}/actions/runs?branch=$BR&status=action_required" \
+                    --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .id" 2>/dev/null || true)
+            if [ -n "$ids" ]; then
+              for id in $ids; do
+                echo "approving parked run $id"
+                gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve" || \
+                  echo "::warning::could not approve run $id -- approve it by hand to unblock this PR"
+              done
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::notice::no parked run found for $BR @ $SHA"
