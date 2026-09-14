@@ -40,6 +40,19 @@ except ImportError:
 logger = logging.getLogger("ProxmoxSpoke")
 
 
+def _vm_destroy_cmd(vmid, kind: str) -> str:
+    """``qm``/``pct destroy <vmid> --purge``, preferring the shared builder.
+
+    The spoke and the vendored ``lm/core`` module deploy independently, so a
+    spoke that self-updates before the hub still has to work: fall back to
+    building the string here when the installed ``pve_cmd_builder`` predates
+    ``vm_destroy_cmd``. Identical output either way."""
+    fn = getattr(pve_cmd_builder, "vm_destroy_cmd", None)
+    if callable(fn):
+        return fn(vmid, kind)
+    return f"{'pct' if kind == 'lxc' else 'qm'} destroy {int(vmid)} --purge"
+
+
 def _norm_mac(raw: str) -> str:
     """Normalize a MAC to lower-colon form (aa:bb:cc:dd:ee:ff) to match the
     hub-normalized query. Tolerates dash/colon/space separators and trailing
@@ -885,6 +898,24 @@ class ProxmoxSpoke(BaseSpoke):
                 return {"ok": True, "vmid": vid, "action": "backup",
                         "storage": storage, "mode": mode, "keep": keep,
                         "kind": kind, "started": True}
+            if act in ("destroy", "delete"):
+                # Irreversible delete — the RUN_COMMAND twin of the Agent's typed
+                # destroy handler (agent/src/pve_cmds.py). The #4 migration moved
+                # every action here but DROPPED destroy, so the Hypervisors view's
+                # Delete button (single and bulk) failed for every VM with
+                # "unknown vm action: destroy" and no VM was ever removed.
+                # `qm/pct destroy` FAILS on a running guest, so stop FIRST
+                # (best-effort — a "not running" error on an already-stopped
+                # guest is expected and ignored), then destroy --purge so the
+                # disks and backup-job membership go too, not just the config.
+                # Authorized + delete-protection-checked at the hub.
+                await _send(pve_cmd_builder.vm_action_cmd(vid, "stop", kind),
+                            timeout=60.0)
+                r = await _send(_vm_destroy_cmd(vid, kind), timeout=120.0)
+                if not pve_cmd_builder.runner_ok(r):
+                    raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
+                return {"ok": True, "vmid": vid, "action": "destroy",
+                        "kind": kind, "purged": True}
             raise pve_cmd_builder.PveCmdError(f"unknown vm action: {action}")
         except pve_cmd_builder.PveCmdError as e:
             return {"vmid": vmid, "ok": False, "error": str(e)}
