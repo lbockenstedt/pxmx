@@ -108,8 +108,17 @@ fi
 # VMs (VFIO passthrough) instead of the whole group having to move together —
 # the standard Proxmox hypervisor passthrough enabler, paired with intel_iommu=on.
 #
+# nvme_core.default_ps_max_latency_us=0 disables NVMe APST (Autonomous Power
+# State Transition) — the same class of failure as the USB/PCIe settings above,
+# one layer down. Many consumer/OEM NVMe SSDs advertise deep low-power states
+# they cannot reliably wake from; the drive stops answering and the kernel logs
+# "controller is down ... resetting" / "I/O timeout" or drops to read-only, which
+# on a hypervisor takes every VM on that datastore with it. 0 means "no power
+# state whose exit latency exceeds 0µs is allowed", i.e. stay in the fully-on
+# state. Costs idle watts, buys a datastore that does not disappear.
+#
 # Target line on every pxmx CS agent host:
-#   GRUB_CMDLINE_LINUX_DEFAULT="quiet pcie_aspm=off intel_iommu=on pcie_acs_override=downstream pcie_power_pm=off usbcore.autosuspend=-1"
+#   GRUB_CMDLINE_LINUX_DEFAULT="quiet pcie_aspm=off intel_iommu=on pcie_acs_override=downstream pcie_power_pm=off usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0"
 #
 # NOTE the sign on autosuspend. It is a DELAY IN SECONDS, not a boolean:
 #   =2   kernel default (suspend after 2s idle)
@@ -122,7 +131,7 @@ fi
 # reboot — that is the operator's call on a hypervisor running VMs. The runtime
 # fallback below takes effect immediately for already-attached devices.
 # Skip with LM_SKIP_KERNEL_PARAMS=1.
-LM_KERNEL_PARAMS="pcie_aspm=off intel_iommu=on pcie_acs_override=downstream pcie_power_pm=off usbcore.autosuspend=-1"
+LM_KERNEL_PARAMS="pcie_aspm=off intel_iommu=on pcie_acs_override=downstream pcie_power_pm=off usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0"
 
 _lm_apply_cmdline() {
     # $1 = file, $2 = "grub" | "cmdline". Ensures every key=value in
