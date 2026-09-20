@@ -117,6 +117,7 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
         )
 
         if proc.returncode == 0 and proc.stdout.strip():
+            # Format: [h:b:t:l] type vendor model rev /dev/sgN /dev/sdX
             for line in proc.stdout.strip().splitlines():
                 if not line.strip():
                     continue
@@ -156,6 +157,7 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
         try:
             for dev in sorted(os.listdir("/sys/block")):
                 if dev.startswith(("sd", "nvme", "vd")):
+                    # Skip partition nodes (e.g. sda1, nvme0n1p1)
                     if re.search(r"\d+$", dev) and not dev.startswith("nvme"):
                         continue
                     if dev.startswith("nvme") and not re.search(r"nvme\d+n\d+$", dev):
@@ -216,14 +218,15 @@ def parse_smartctl_wear(stdout: str) -> Optional[int]:
         return 100 - int(m.group(1))
 
     # 5. Standard smartctl attribute table format:
+    # ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE
     table_m = re.search(
         r"(?:Wear_Leveling_Count|Used_RBV_Wear_Leveling|Media_Wearout_Indicator)\s+"
         r"0x[0-9a-fA-F]+\s+(\d+)\s+\d+\s+\d+\s+\S+\s+\S+\s+\S+\s+(\d+)",
         stdout, re.IGNORECASE
     )
     if table_m:
-        val = int(table_m.group(1))
-        raw = int(table_m.group(2))
+        val = int(table_m.group(1))  # normalized value (e.g. 85 = 85% life left)
+        raw = int(table_m.group(2))  # raw value (e.g. 15 = 15% wear or cycle count)
         if raw <= 100 and abs((100 - val) - raw) <= 2:
             return raw
         return 100 - val if val <= 100 else raw
@@ -416,6 +419,7 @@ def save_history(drive_health: Dict[str, Any]) -> bool:
 
         history["snapshots"].append(snapshot)
 
+        # Keep only last 100 snapshots
         if len(history["snapshots"]) > 100:
             history["snapshots"] = history["snapshots"][-100:]
 
