@@ -670,7 +670,7 @@ async def test_nvme_tools_installed_and_diagnostics(monkeypatch):
 class TestCcissDiscovery:
     def test_discover_hpe_cciss_physical_drives_success(self):
         succ_mock = MagicMock(returncode=0, stdout="Vendor: HP\nDevice Model: HP SSD\nSerial Number: 12345\nSAS", stderr="")
-        fail_mock = MagicMock(returncode=1, stdout="", stderr="")
+        fail_mock = MagicMock(returncode=1, stdout="device open failed", stderr="")
         with patch("subprocess.run", side_effect=[succ_mock, fail_mock, fail_mock, fail_mock, fail_mock]):
             drives = drive_health.discover_hpe_cciss_physical_drives("/dev/sda")
             assert len(drives) == 1
@@ -681,7 +681,7 @@ class TestCcissDiscovery:
             assert drives[0]["interface"] == "sas"
 
     def test_discover_hpe_cciss_early_break(self):
-        fail_mock = MagicMock(returncode=1, stdout="", stderr="")
+        fail_mock = MagicMock(returncode=1, stdout="device open failed", stderr="")
         with patch("subprocess.run", return_value=fail_mock) as mock_run:
             drives = drive_health.discover_hpe_cciss_physical_drives("/dev/sda")
             assert len(drives) == 0
@@ -694,6 +694,20 @@ class TestCcissDiscovery:
             assert len(drives) == 1
             # 1 success + 4 fails = 5 calls
             assert mock_run.call_count == 5
+
+    def test_discover_hpe_cciss_nonzero_returncode_not_vacant(self):
+        err_mock = MagicMock(returncode=1, stdout="", stderr="syntax error: unknown option")
+        with patch("subprocess.run", return_value=err_mock) as mock_run:
+            drives = drive_health.discover_hpe_cciss_physical_drives("/dev/sda")
+            assert drives == []
+            assert mock_run.call_count == 16
+
+        succ_mock = MagicMock(returncode=0, stdout="Vendor: HP\nProduct: HP SSD\n", stderr="")
+        with patch("subprocess.run", side_effect=[succ_mock] + [err_mock] * 15) as mock_run:
+            drives = drive_health.discover_hpe_cciss_physical_drives("/dev/sda")
+            assert len(drives) == 1
+            # Non-vacant errors do not increment miss_count, preventing premature break
+            assert mock_run.call_count == 16
 
     @pytest.mark.asyncio
     async def test_get_scsi_devices_replaces_logical_volume(self):
@@ -794,10 +808,6 @@ class TestCcissDiscovery:
 
     @pytest.mark.asyncio
     async def test_get_drive_health_vendor_precedence(self):
-        mock_devices = [
-            {"block_device": "/dev/sda", "index": 0, "vendor": "Crucial", "model": "CT500MX500SSD1", "serial": "S1", "interface": "sata"},
-            {"block_device": "/dev/sdb", "index": 1, "vendor": "", "model": "Unknown", "serial": "S2", "interface": "sata"}
-        ]
         info_samsung = {
             "success": True,
             "vendor": "Samsung",
@@ -808,12 +818,54 @@ class TestCcissDiscovery:
             "interface": "sata"
         }
 
+        # 1. When device["vendor"] == "ATA", smartctl vendor overrides ATA placeholder
+        with patch.object(drive_health, "get_scsi_devices", return_value=[{"block_device": "/dev/sda", "index": 0, "vendor": "ATA", "model": "SSD", "serial": "S1", "interface": "sata"}]), \
+             patch.object(drive_health, "get_smartctl_info", return_value=info_samsung):
+            res_ata = await drive_health.get_drive_health()
+            assert res_ata["drives"][0]["vendor"] == "Samsung"
+
+        # 2. When device["vendor"] == "Crucial", explicit real vendor is preserved
+        with patch.object(drive_health, "get_scsi_devices", return_value=[{"block_device": "/dev/sda", "index": 0, "vendor": "Crucial", "model": "SSD", "serial": "S1", "interface": "sata"}]), \
+             patch.object(drive_health, "get_smartctl_info", return_value=info_samsung):
+            res_crucial = await drive_health.get_drive_health()
+            assert res_crucial["drives"][0]["vendor"] == "Crucial"
+
+        # 3. When device["vendor"] == "", fall back to smartctl vendor
+        with patch.object(drive_health, "get_scsi_devices", return_value=[{"block_device": "/dev/sda", "index": 0, "vendor": "", "model": "SSD", "serial": "S1", "interface": "sata"}]), \
+             patch.object(drive_health, "get_smartctl_info", return_value=info_samsung):
+            res_empty = await drive_health.get_drive_health()
+            assert res_empty["drives"][0]["vendor"] == "Samsung"
+
+        # Multi-device list check
+        mock_devices = [
+            {"block_device": "/dev/sda", "index": 0, "vendor": "ATA", "model": "SSD", "serial": "S0", "interface": "sata"},
+            {"block_device": "/dev/sdb", "index": 1, "vendor": "Crucial", "model": "CT500MX500SSD1", "serial": "S1", "interface": "sata"},
+            {"block_device": "/dev/sdc", "index": 2, "vendor": "", "model": "Unknown", "serial": "S2", "interface": "sata"}
+        ]
         with patch.object(drive_health, "get_scsi_devices", return_value=mock_devices), \
              patch.object(drive_health, "get_smartctl_info", return_value=info_samsung):
             result = await drive_health.get_drive_health()
-            assert len(result["drives"]) == 2
-            # Explicit device vendor is preserved over smartctl-derived vendor
-            assert result["drives"][0]["vendor"] == "Crucial"
-            # When device vendor is empty, fall back to smartctl vendor
-            assert result["drives"][1]["vendor"] == "Samsung"
+            assert len(result["drives"]) == 3
+            assert result["drives"][0]["vendor"] == "Samsung"
+            assert result["drives"][1]["vendor"] == "Crucial"
+            assert result["drives"][2]["vendor"] == "Samsung"
+
+    @pytest.mark.asyncio
+    async def test_smartctl_vendor_extraction_from_family_and_model(self):
+        cases = [
+            ("Model Family:     Crucial/Micron RealSSD m4\nDevice Model:     CT128M4SSD2", "Crucial"),
+            ("Model Family:     Western Digital Blue\nDevice Model:     WDC WD10EZEX", "Western Digital"),
+            ("Model Family:     Intel 530 Series SSDs\nDevice Model:     INTEL SSDSC2BW240A4", "Intel"),
+            ("Device Model:     KINGSTON SA400S37240G", "Kingston"),
+            ("Device Model:     SanDisk Ultra II 480GB", "SanDisk"),
+            ("Model Family:     KIOXIA EXCERIA PLUS G2 SSD\nDevice Model:     KIOXIA SSD", "Kioxia"),
+            ("Vendor:           HITACHI\nProduct:          HUS156060VLS600", "HITACHI"),
+        ]
+        with patch.object(drive_health, "check_smartctl_installed", return_value=True):
+            for output, expected_vendor in cases:
+                mock_proc = MagicMock(returncode=0, stdout=output, stderr="")
+                with patch("subprocess.run", return_value=mock_proc):
+                    info = await drive_health.get_smartctl_info("/dev/sda")
+                    assert info["vendor"] == expected_vendor
+
             
