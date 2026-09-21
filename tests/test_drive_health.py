@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,10 +18,10 @@ if SRC_DIR not in sys.path:
 if AGENT_SRC_DIR not in sys.path:
     sys.path.insert(0, AGENT_SRC_DIR)
 
-# Fix for core import
-CORE_SRC_DIR = "/Users/lbockenstedt/vscode/lm/core/src"
-if CORE_SRC_DIR not in sys.path:
-    sys.path.insert(0, CORE_SRC_DIR)
+# Optional sibling import for local multi-repo development
+_sibling_core = os.path.normpath(os.path.join(PXMX_DIR, "..", "lm", "core", "src"))
+if os.path.isdir(_sibling_core) and _sibling_core not in sys.path:
+    sys.path.insert(0, _sibling_core)
 
 import drive_health
 from drive_health import has_hpe_raid_controller, is_hpe_server
@@ -723,4 +724,96 @@ class TestCcissDiscovery:
             args = mock_run.call_args[0][0]
             assert "-d" in args
             assert "cciss,2" in args
+
+    def test_discover_hpe_cciss_gap_indices(self):
+        succ0 = MagicMock(returncode=0, stdout="Vendor: HP\nDevice Model: HP SSD 0\nSerial Number: S0\nSAS", stderr="")
+        fail1 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+        fail2 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+        succ3 = MagicMock(returncode=0, stdout="Vendor: HP\nDevice Model: HP SSD 3\nSerial Number: S3\nSAS", stderr="")
+        fail4 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+        fail5 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+        fail6 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+        fail7 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+
+        with patch("subprocess.run", side_effect=[succ0, fail1, fail2, succ3, fail4, fail5, fail6, fail7]):
+            drives = drive_health.discover_hpe_cciss_physical_drives("/dev/sda")
+            assert len(drives) == 2
+            assert drives[0]["cciss_index"] == 0
+            assert drives[0]["model"] == "HP SSD 0"
+            assert drives[1]["cciss_index"] == 3
+            assert drives[1]["model"] == "HP SSD 3"
+
+    def test_discover_hpe_cciss_timeout_resilience(self):
+        succ0 = MagicMock(returncode=0, stdout="Vendor: HP\nDevice Model: HP SSD 0\nSerial Number: S0\nSATA", stderr="")
+        timeout1 = subprocess.TimeoutExpired(cmd="smartctl", timeout=10)
+        succ2 = MagicMock(returncode=0, stdout="Vendor: HP\nDevice Model: HP SSD 2\nSerial Number: S2\nSATA", stderr="")
+        fail3 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+        fail4 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+        fail5 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+        fail6 = MagicMock(returncode=1, stdout="device open failed", stderr="")
+
+        with patch("subprocess.run", side_effect=[succ0, timeout1, succ2, fail3, fail4, fail5, fail6]):
+            drives = drive_health.discover_hpe_cciss_physical_drives("/dev/sda")
+            assert len(drives) == 2
+            assert drives[0]["cciss_index"] == 0
+            assert drives[1]["cciss_index"] == 2
+
+    @pytest.mark.asyncio
+    async def test_get_scsi_devices_logical_volume_fallback_flagged(self):
+        def mock_exists(p):
+            if p.startswith("/sys/block"):
+                return True
+            return False
+
+        def mock_open(p, *args, **kwargs):
+            import io
+            if p.endswith("/device/vendor"):
+                return io.StringIO("HP")
+            if p.endswith("/device/model"):
+                return io.StringIO("LOGICAL VOLUME")
+            if p.endswith("/removable"):
+                return io.StringIO("0")
+            if p.endswith("/size"):
+                return io.StringIO("1000000")
+            return io.StringIO("")
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")), \
+             patch("os.path.exists", side_effect=mock_exists), \
+             patch("os.listdir", return_value=["sda"]), \
+             patch("builtins.open", side_effect=mock_open), \
+             patch("drive_health.discover_hpe_cciss_physical_drives", return_value=[]):
+            
+            devices = await drive_health.get_scsi_devices()
+            assert len(devices) == 1
+            assert devices[0]["block_device"] == "/dev/sda"
+            assert devices[0]["device_path"] == "/dev/sda"
+            assert devices[0]["vendor"] == "HP"
+            assert devices[0]["model"] == "LOGICAL VOLUME"
+            assert devices[0]["is_raid_logical"] is True
+            assert devices[0]["interface"] == "raid_logical"
+
+    @pytest.mark.asyncio
+    async def test_get_drive_health_vendor_precedence(self):
+        mock_devices = [
+            {"block_device": "/dev/sda", "index": 0, "vendor": "Crucial", "model": "CT500MX500SSD1", "serial": "S1", "interface": "sata"},
+            {"block_device": "/dev/sdb", "index": 1, "vendor": "", "model": "Unknown", "serial": "S2", "interface": "sata"}
+        ]
+        info_samsung = {
+            "success": True,
+            "vendor": "Samsung",
+            "model": "Samsung SSD 860",
+            "serial": "S123",
+            "wear_leveling_count": 15,
+            "health_status": "healthy",
+            "interface": "sata"
+        }
+
+        with patch.object(drive_health, "get_scsi_devices", return_value=mock_devices), \
+             patch.object(drive_health, "get_smartctl_info", return_value=info_samsung):
+            result = await drive_health.get_drive_health()
+            assert len(result["drives"]) == 2
+            # Explicit device vendor is preserved over smartctl-derived vendor
+            assert result["drives"][0]["vendor"] == "Crucial"
+            # When device vendor is empty, fall back to smartctl vendor
+            assert result["drives"][1]["vendor"] == "Samsung"
             
