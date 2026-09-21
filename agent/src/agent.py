@@ -2597,22 +2597,34 @@ class ProxmoxAgent:
                         # Drive health monitoring: query SSD wear levels via smartctl
                         # with multi-vendor support and cciss/auto fallback.
                         try:
-                            import drive_health
+                            try:
+                                from . import drive_health
+                            except (ImportError, ValueError):
+                                import drive_health
                             result = await drive_health.get_drive_health_for_ui()
                             result["status"] = "SUCCESS"
                         except Exception as e:
                             logger.exception("PXMX_DRIVE_HEALTH failed")
-                            result = {"status": "ERROR", "message": str(e), "drives": []}
+                            result = {"status": "ERROR", "message": str(e), "drives": [],
+                                      "summary": {"total_drives": 0, "healthy": 0, "warning": 0, "critical": 0, "unknown": 0}}
+                        result["node"] = result.get("node") or self.hostname
+                        result["cluster"] = result.get("cluster") or self.cluster_name
+                        result["agent_version"] = getattr(self, "version", "unknown")
 
                     elif cmd_type == "PXMX_INSTALL_SSACLI":
                         # Install HPE SSA CLI tools if not present.
                         try:
-                            import drive_health
+                            try:
+                                from . import drive_health
+                            except (ImportError, ValueError):
+                                import drive_health
                             result = await asyncio.to_thread(drive_health.install_ssacli_if_needed)
                             result["status"] = "SUCCESS" if result.get("installed") else "ERROR"
+                            result["node"] = self.hostname
                         except Exception as e:
                             logger.exception("PXMX_INSTALL_SSACLI failed")
                             result = {"status": "ERROR", "message": str(e), "installed": False}
+
 
                     elif cmd_type == "PXMX_CREATE_VM":
                         # Create a new qemu VM from an ISO (build-your-own-VM). The
