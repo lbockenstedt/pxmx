@@ -338,6 +338,44 @@ class ProxmoxSpoke(BaseSpoke):
             return {"status": "SUCCESS", "storages": storages,
                     "node": node, "cluster": cluster}
 
+        if cmd == "PXMX_DRIVE_HEALTH":
+            agent_id = data.get("agent_id")
+            if not agent_id:
+                agent_id = self._agent_for_node(data.get("node", ""))
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for node"}
+            cluster = ((self.control_plane.connected_agents or {})
+                          .get(agent_id, {}).get("cluster_name", agent_id))
+            try:
+                r = await self.control_plane.send_to_agent(
+                      "PXMX_DRIVE_HEALTH", {}, agent_id=agent_id, timeout=30.0)
+                result = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
+                if isinstance(result, dict):
+                    result["cluster"] = cluster
+                return result
+            except Exception as e:
+                logger.debug("drive_health agent %s failed: %s", agent_id, e)
+                return {"status": "ERROR", "message": str(e), "drives": [], "cluster": cluster}
+
+        if cmd == "PXMX_INSTALL_SSACLI":
+            agent_id = data.get("agent_id")
+            if not agent_id:
+                agent_id = self._agent_for_node(data.get("node", ""))
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for node"}
+            cluster = ((self.control_plane.connected_agents or {})
+                          .get(agent_id, {}).get("cluster_name", agent_id))
+            try:
+                r = await self.control_plane.send_to_agent(
+                      "PXMX_INSTALL_SSACLI", {}, agent_id=agent_id, timeout=120.0)
+                result = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
+                if isinstance(result, dict):
+                    result["cluster"] = cluster
+                return result
+            except Exception as e:
+                logger.debug("install_ssacli agent %s failed: %s", agent_id, e)
+                return {"status": "ERROR", "message": str(e), "installed": False, "cluster": cluster}
+
         # Create a new qemu VM from an ISO. Routed to the target node's agent
         # (agent_id from the hub, or resolved from the node). pvesh create is
         # cluster-wide so any agent in the cluster can create on any node.
