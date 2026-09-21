@@ -137,7 +137,7 @@ class TestSmartctlExecution:
                 assert info["serial"] == "S2L9NY0M123456"
 
     async def test_critical_wear_threshold(self):
-        with patch.object(drive_health, "check_smartctl_installed", return_value=True), patch.object(drive_health, "has_hpe_raid_controller", return_value=True), patch.object(drive_health, "WEAR_CRITICAL_THRESHOLD", 80), patch.object(drive_health, "WEAR_WARNING_THRESHOLD", 60):
+        with patch.object(drive_health, "check_smartctl_installed", return_value=True), patch.object(drive_health, "is_hpe_server", return_value=True), patch.object(drive_health, "has_hpe_raid_controller", return_value=True):
             succ_mock = MagicMock(returncode=0, stdout=CRITICAL_WEAR_OUTPUT, stderr="")
             with patch("subprocess.run", return_value=succ_mock):
                 info = await drive_health.get_smartctl_info("/dev/sda")
@@ -146,13 +146,23 @@ class TestSmartctlExecution:
                 assert info["health_status"] == "critical"
 
     async def test_warning_wear_threshold(self):
-        with patch.object(drive_health, "check_smartctl_installed", return_value=True), patch.object(drive_health, "has_hpe_raid_controller", return_value=True), patch.object(drive_health, "WEAR_CRITICAL_THRESHOLD", 80), patch.object(drive_health, "WEAR_WARNING_THRESHOLD", 60):
+        with patch.object(drive_health, "check_smartctl_installed", return_value=True), patch.object(drive_health, "is_hpe_server", return_value=True), patch.object(drive_health, "has_hpe_raid_controller", return_value=True):
             succ_mock = MagicMock(returncode=0, stdout=WARNING_WEAR_OUTPUT, stderr="")
             with patch("subprocess.run", return_value=succ_mock):
                 info = await drive_health.get_smartctl_info("/dev/sda")
                 assert info["success"] is True
                 assert info["wear_leveling_count"] == 72
                 assert info["health_status"] == "warning"
+
+    async def test_spinning_disk_passed_without_wear_reports_healthy(self):
+        output = "SMART overall-health self-assessment test result: PASSED\nTemperature: 35 Celsius\n"
+        with patch.object(drive_health, "check_smartctl_installed", return_value=True), patch.object(drive_health, "is_hpe_server", return_value=True), patch.object(drive_health, "has_hpe_raid_controller", return_value=True):
+            succ_mock = MagicMock(returncode=0, stdout=output, stderr="")
+            with patch("subprocess.run", return_value=succ_mock):
+                info = await drive_health.get_smartctl_info("/dev/sda")
+                assert info["success"] is True
+                assert info["wear_leveling_count"] is None
+                assert info["health_status"] == "healthy"
 
 
 @pytest.mark.asyncio
@@ -181,6 +191,31 @@ class TestDeviceDiscovery:
             assert "/dev/sda1" not in block_devs
             assert "/dev/loop0" not in block_devs
 
+    async def test_get_drive_health_propagates_interface_and_telemetry(self):
+        mock_devices = [
+            {"block_device": "/dev/sda", "index": 0, "vendor": "Samsung", "model": "860", "serial": "S1", "interface": "sata"},
+        ]
+        info_healthy = {
+            "success": True, 
+            "wear_leveling_count": 10, 
+            "health_status": "healthy", 
+            "model": "860", 
+            "serial": "S1", 
+            "error": None,
+            "interface": "sas",
+            "temperature": 45,
+            "critical_warning": 0
+        }
+
+        with patch.object(drive_health, "get_scsi_devices", return_value=mock_devices), \
+             patch.object(drive_health, "get_smartctl_info", return_value=info_healthy):
+            result = await drive_health.get_drive_health()
+            assert len(result["drives"]) == 1
+            drive = result["drives"][0]
+            assert drive["interface"] == "sas"
+            assert drive["temperature"] == 45
+            assert drive["critical_warning"] == 0
+
 
 @pytest.mark.asyncio
 class TestUIOutputAndAlerts:
@@ -198,9 +233,7 @@ class TestUIOutputAndAlerts:
 
         with patch.object(drive_health, "get_scsi_devices", return_value=mock_devices), \
              patch.object(drive_health, "get_smartctl_info", side_effect=[info_healthy, info_warning, info_critical]), \
-             patch.object(drive_health, "get_historical_trends", return_value={"drives": {}}), \
-             patch.object(drive_health, "WEAR_CRITICAL_THRESHOLD", 80), \
-             patch.object(drive_health, "WEAR_WARNING_THRESHOLD", 60):
+             patch.object(drive_health, "get_historical_trends", return_value={"drives": {}}):
             ui_data = await drive_health.get_drive_health_for_ui()
             assert len(ui_data["drives"]) == 3
             summary = ui_data["summary"]
@@ -581,6 +614,7 @@ async def test_nvme_bypasses_cciss(monkeypatch):
     monkeypatch.setattr(drive_health, "check_smartctl_installed", lambda: True)
     monkeypatch.setattr(drive_health, "find_smartctl_path", lambda: "/usr/bin/smartctl")
     monkeypatch.setattr(drive_health, "has_hpe_raid_controller", lambda: True)
+    monkeypatch.setattr(drive_health, "is_hpe_server", lambda: True)
     
     cmds_run = []
     import subprocess
