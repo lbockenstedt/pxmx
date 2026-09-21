@@ -67,7 +67,7 @@ fi
 
 echo "📦 Installing system dependencies..."
 apt-get update
-apt-get install -y python3-pip python3-venv git curl jq lldpd
+apt-get install -y python3-pip python3-venv git curl jq lldpd smartmontools
 
 # lldpd — LLDP neighbor discovery (which physical switch/port each host NIC is
 # connected to). A required dependency, not best-effort like uhubctl below: the
