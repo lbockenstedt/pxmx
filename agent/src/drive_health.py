@@ -336,7 +336,6 @@ def discover_hpe_cciss_physical_drives(ctrl_dev: str = "/dev/sda", max_probes: i
                     or "no such device" in out_text
                     or "inquiry failed" in out_text
                     or "device not found" in out_text
-                    or proc.returncode in (1, 2)
                 )
                 if is_vacant:
                     miss_count += 1
@@ -786,8 +785,15 @@ async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None
             vendor_match = re.search(r"Vendor:\s*(.+)", proc.stdout, re.IGNORECASE)
             if vendor_match:
                 result["vendor"] = vendor_match.group(1).strip()
-            elif re.search(r"Model Family:\s*.*Samsung", proc.stdout, re.IGNORECASE) or "samsung" in (result["model"] or "").lower():
-                result["vendor"] = "Samsung"
+            else:
+                # Extract recognized manufacturers from Model Family or model string
+                mf_match = re.search(r"Model Family:\s*(.+)", proc.stdout, re.IGNORECASE)
+                mf_str = mf_match.group(1) if mf_match else ""
+                search_corpus = f"{mf_str} {result.get('model') or ''}".lower()
+                for v_name in ("Samsung", "Intel", "Crucial", "Micron", "Western Digital", "WD", "Seagate", "Toshiba", "Kioxia", "Kingston", "SanDisk", "SK hynix", "Solidigm"):
+                    if v_name.lower() in search_corpus:
+                        result["vendor"] = v_name
+                        break
 
             # Interface
             if is_nvme:
@@ -847,13 +853,19 @@ async def get_drive_health() -> Dict[str, Any]:
         cciss_index = device.get("cciss_index")
         health_info = await get_smartctl_info(raw_device_path, is_hpe_raid=is_hpe_raid, cciss_index=cciss_index)
 
+        dev_vendor = (device.get("vendor") or "").strip()
+        if dev_vendor.upper() in ("", "ATA", "UNKNOWN"):
+            vendor = health_info.get("vendor") or dev_vendor
+        else:
+            vendor = dev_vendor or health_info.get("vendor") or ""
+
         drive_info = {
             "physical_index": device.get("index", 0),
             "scsi_path": device.get("scsi_path", ""),
             "block_device": device.get("block_device") or raw_device_path,
             "device_path": raw_device_path,
             "cciss_index": device.get("cciss_index"),
-            "vendor": device.get("vendor") or health_info.get("vendor") or "",
+            "vendor": vendor,
             "model": health_info.get("model") or device.get("model", ""),
             "serial": health_info.get("serial") or device.get("serial", "unknown"),
             "wear_level": health_info.get("wear_leveling_count"),
