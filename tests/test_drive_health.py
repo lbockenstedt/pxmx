@@ -17,6 +17,11 @@ if SRC_DIR not in sys.path:
 if AGENT_SRC_DIR not in sys.path:
     sys.path.insert(0, AGENT_SRC_DIR)
 
+# Fix for core import
+CORE_SRC_DIR = "/Users/lbockenstedt/vscode/lm/core/src"
+if CORE_SRC_DIR not in sys.path:
+    sys.path.insert(0, CORE_SRC_DIR)
+
 import drive_health
 from drive_health import has_hpe_raid_controller, is_hpe_server
 
@@ -659,3 +664,63 @@ async def test_nvme_tools_installed_and_diagnostics(monkeypatch):
     assert diag["drive_counts"]["nvme"] == 1
     assert diag["drive_counts"]["sata"] == 1
 
+
+
+class TestCcissDiscovery:
+    def test_discover_hpe_cciss_physical_drives_success(self):
+        succ_mock = MagicMock(returncode=0, stdout="Vendor: HP\nDevice Model: HP SSD\nSerial Number: 12345\nSAS", stderr="")
+        fail_mock = MagicMock(returncode=1, stdout="", stderr="")
+        with patch("subprocess.run", side_effect=[succ_mock, fail_mock, fail_mock, fail_mock, fail_mock]):
+            drives = drive_health.discover_hpe_cciss_physical_drives("/dev/sda")
+            assert len(drives) == 1
+            assert drives[0]["cciss_index"] == 0
+            assert drives[0]["vendor"] == "HP"
+            assert drives[0]["model"] == "HP SSD"
+            assert drives[0]["serial"] == "12345"
+            assert drives[0]["interface"] == "sas"
+
+    def test_discover_hpe_cciss_early_break(self):
+        fail_mock = MagicMock(returncode=1, stdout="", stderr="")
+        with patch("subprocess.run", return_value=fail_mock) as mock_run:
+            drives = drive_health.discover_hpe_cciss_physical_drives("/dev/sda")
+            assert len(drives) == 0
+            # Since no drives found, it runs max_probes (16)
+            assert mock_run.call_count == 16
+            
+        succ_mock = MagicMock(returncode=0, stdout="Vendor: HP\nProduct: HP SSD\n", stderr="")
+        with patch("subprocess.run", side_effect=[succ_mock, fail_mock, fail_mock, fail_mock, fail_mock]) as mock_run:
+            drives = drive_health.discover_hpe_cciss_physical_drives("/dev/sda")
+            assert len(drives) == 1
+            # 1 success + 4 fails = 5 calls
+            assert mock_run.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_get_scsi_devices_replaces_logical_volume(self):
+        proc_mock = MagicMock(returncode=0, stdout="[0:0:0:0]    disk    HP       LOGICAL VOLUME   5.04  /dev/sda   /dev/sg0", stderr="")
+        with patch("subprocess.run", return_value=proc_mock), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.listdir", return_value=["sda"]), \
+             patch("drive_health.discover_hpe_cciss_physical_drives", return_value=[{"cciss_index": 0, "vendor": "HP", "model": "PHYS", "serial": "123", "interface": "sas"}]):
+            
+            devices = await drive_health.get_scsi_devices()
+            assert len(devices) == 1
+            assert devices[0]["block_device"] == "/dev/sda [cciss,0]"
+            assert devices[0]["device_path"] == "/dev/sda"
+            assert devices[0]["cciss_index"] == 0
+            assert devices[0]["model"] == "PHYS"
+
+    @pytest.mark.asyncio
+    async def test_get_smartctl_info_uses_cciss_index(self):
+        with patch("subprocess.run") as mock_run, \
+             patch("drive_health.check_smartctl_installed", return_value=True), \
+             patch("drive_health.is_hpe_server", return_value=True), \
+             patch("drive_health.has_hpe_raid_controller", return_value=True):
+            
+            mock_run.return_value = MagicMock(returncode=0, stdout="Wear_Leveling_Count = 10", stderr="")
+            info = await drive_health.get_smartctl_info("/dev/sda", cciss_index=2)
+            assert info["success"] is True
+            assert mock_run.call_count == 1
+            args = mock_run.call_args[0][0]
+            assert "-d" in args
+            assert "cciss,2" in args
+            
