@@ -25,6 +25,20 @@ logger = logging.getLogger("DriveHealth")
 SSACLI_PATH = "/usr/sbin/ssacli"
 SMARTCTL_PATH = "/usr/bin/smartctl"
 
+def find_nvme_path() -> Optional[str]:
+    """Locate nvme CLI executable across system paths."""
+    found = shutil.which("nvme")
+    if found and os.access(found, os.X_OK):
+        return found
+    for p in ("/usr/sbin/nvme", "/usr/bin/nvme", "/sbin/nvme", "/usr/local/sbin/nvme"):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+def check_nvme_installed() -> bool:
+    """Check if nvme-cli is installed."""
+    return find_nvme_path() is not None
+
 def find_smartctl_path() -> Optional[str]:
     """Locate smartctl executable across system paths."""
     found = shutil.which("smartctl")
@@ -279,14 +293,12 @@ def install_ssacli_if_needed() -> Dict[str, Any]:
 
 async def get_scsi_devices() -> List[Dict[str, Any]]:
     """
-    Get list of SCSI/SATA/NVMe devices using lsscsi with /sys/block fallback.
-
-    Returns:
-        List of device info dicts with index, device path, model, serial, etc.
+    Get all storage devices (SATA, SAS, NVMe) connected to the host.
     """
     devices = []
-
+    
     # 1. Try lsscsi -g first
+    lsscsi_map = {}
     try:
         proc = subprocess.run(
             ["lsscsi", "-g"],
@@ -294,76 +306,182 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
             text=True,
             timeout=10
         )
-
         if proc.returncode == 0 and proc.stdout.strip():
-            # Format: [h:b:t:l] type vendor model rev /dev/sgN /dev/sdX
             for line in proc.stdout.strip().splitlines():
                 if not line.strip():
                     continue
                 parts = line.split()
                 if len(parts) >= 4:
                     host_part = parts[0].replace("[", "").replace("]", "")
-                    idx = int(host_part.split(":")[0]) if ":" in host_part and host_part.split(":")[0].isdigit() else len(devices)
                     blk_dev = ""
                     scsi_path = ""
                     for p in parts:
-                        if p.startswith("/dev/sd") or p.startswith("/dev/nvme") or p.startswith("/dev/vd"):
+                        if p.startswith("/dev/sd") or p.startswith("/dev/vd"):
                             blk_dev = p
                         elif p.startswith("/dev/sg"):
                             scsi_path = p
                     if not blk_dev and len(parts) >= 3 and parts[2].startswith("/dev/"):
                         blk_dev = parts[2]
-
+                        
                     vendor = parts[2] if len(parts) > 2 and not parts[2].startswith("/") else ""
                     model = parts[3] if len(parts) > 3 and not parts[3].startswith("/") else ""
-
-                    device_info = {
-                        "host": host_part,
-                        "scsi_path": scsi_path,
-                        "block_device": blk_dev,
-                        "vendor": vendor,
-                        "model": model,
-                        "serial": "unknown",
-                        "index": idx
-                    }
+                    
                     if blk_dev:
-                        devices.append(device_info)
+                        lsscsi_map[os.path.basename(blk_dev)] = {
+                            "host": host_part,
+                            "scsi_path": scsi_path,
+                            "vendor": vendor,
+                            "model": model,
+                        }
     except Exception as e:
         logger.debug("lsscsi check failed: %s", e)
 
-    # 2. Fallback to /sys/block if lsscsi returned nothing or failed
-    if not devices and os.path.exists("/sys/block"):
+    if not os.path.exists("/sys/block"):
+        return devices
+
+    discovered = []
+    for dev in sorted(os.listdir("/sys/block")):
+        if not dev.startswith(("sd", "nvme", "vd")):
+            continue
+            
+        if re.match(r"^(?:sd[a-z]+\d+|nvme\d+n\d+p\d+|vd[a-z]+\d+)$", dev):
+            continue
+
+        sys_block_path = f"/sys/block/{dev}"
+        
+        # Skip removable USB
         try:
-            for dev in sorted(os.listdir("/sys/block")):
-                if dev.startswith(("sd", "nvme", "vd")):
-                    # Skip partition nodes (e.g. sda1, nvme0n1p1)
-                    if re.search(r"\d+$", dev) and not dev.startswith("nvme"):
-                        continue
-                    if dev.startswith("nvme") and not re.search(r"nvme\d+n\d+$", dev):
-                        continue
-                    dev_path = f"/dev/{dev}"
-                    model = ""
-                    model_path = f"/sys/block/{dev}/device/model"
-                    if os.path.exists(model_path):
-                        try:
-                            with open(model_path) as f:
-                                model = f.read().strip()
-                        except Exception:
-                            pass
-                    devices.append({
-                        "host": "0",
-                        "scsi_path": "",
-                        "block_device": dev_path,
-                        "vendor": "",
-                        "model": model,
-                        "serial": "unknown",
-                        "index": len(devices)
-                    })
-        except Exception as e:
-            logger.debug("/sys/block scan failed: %s", e)
+            removable_path = os.path.join(sys_block_path, "removable")
+            if os.path.exists(removable_path):
+                with open(removable_path, "r") as f:
+                    if f.read().strip() == "1":
+                        real_path = os.path.realpath(sys_block_path)
+                        device_real_path = os.path.realpath(os.path.join(sys_block_path, "device")) if os.path.exists(os.path.join(sys_block_path, "device")) else ""
+                        if "usb" in real_path or "usb" in device_real_path:
+                            continue
+        except Exception:
+            pass
 
+        # Skip zero-size
+        try:
+            size_path = os.path.join(sys_block_path, "size")
+            if os.path.exists(size_path):
+                with open(size_path, "r") as f:
+                    if f.read().strip() == "0":
+                        continue
+        except Exception:
+            pass
+
+        dev_path = f"/dev/{dev}"
+        
+        if dev.startswith(("sd", "vd")):
+            if dev in lsscsi_map:
+                info = lsscsi_map[dev]
+                vendor = info["vendor"]
+                model = info["model"]
+                host = info["host"]
+                scsi_path = info["scsi_path"]
+            else:
+                vendor = ""
+                model = ""
+                host = "0"
+                scsi_path = ""
+                
+                vendor_path = os.path.join(sys_block_path, "device", "vendor")
+                if os.path.exists(vendor_path):
+                    try:
+                        with open(vendor_path, "r") as f:
+                            vendor = f.read().strip()
+                    except Exception:
+                        pass
+                
+                model_path = os.path.join(sys_block_path, "device", "model")
+                if os.path.exists(model_path):
+                    try:
+                        with open(model_path, "r") as f:
+                            model = f.read().strip()
+                    except Exception:
+                        pass
+            
+            interface = "sas" if "sas" in vendor.lower() or "sas" in model.lower() else "sata"
+            
+            discovered.append({
+                "host": host,
+                "scsi_path": scsi_path,
+                "block_device": dev_path,
+                "vendor": vendor,
+                "model": model,
+                "serial": "unknown",
+                "interface": interface
+            })
+            
+        elif dev.startswith("nvme"):
+            model = ""
+            serial = ""
+            vendor = "NVMe"
+            host = ""
+            
+            # Find NVMe controller
+            ctrl = re.match(r"^(nvme\d+)", dev)
+            ctrl_name = ctrl.group(1) if ctrl else ""
+            
+            model_paths = [
+                os.path.join(sys_block_path, "device", "model"),
+                f"/sys/class/nvme/{ctrl_name}/model" if ctrl_name else ""
+            ]
+            for p in model_paths:
+                if p and os.path.exists(p):
+                    try:
+                        with open(p, "r") as f:
+                            model = f.read().strip()
+                            break
+                    except Exception:
+                        pass
+                        
+            serial_paths = [
+                os.path.join(sys_block_path, "device", "serial"),
+                f"/sys/class/nvme/{ctrl_name}/serial" if ctrl_name else ""
+            ]
+            for p in serial_paths:
+                if p and os.path.exists(p):
+                    try:
+                        with open(p, "r") as f:
+                            serial = f.read().strip()
+                            break
+                    except Exception:
+                        pass
+            
+            vendor_path = f"/sys/class/nvme/{ctrl_name}/vendor" if ctrl_name else ""
+            if vendor_path and os.path.exists(vendor_path):
+                try:
+                    with open(vendor_path, "r") as f:
+                        vendor_val = f.read().strip()
+                        if vendor_val:
+                            vendor = vendor_val
+                except Exception:
+                    pass
+            
+            if ctrl_name:
+                host_match = re.search(r"nvme(\d+)", ctrl_name)
+                if host_match:
+                    host = host_match.group(1)
+            
+            discovered.append({
+                "host": host,
+                "scsi_path": "",
+                "block_device": dev_path,
+                "vendor": vendor,
+                "model": model,
+                "serial": serial,
+                "interface": "nvme"
+            })
+            
+    discovered.sort(key=lambda x: (not x['block_device'].startswith('/dev/sd'), x['block_device']))
+    for i, d in enumerate(discovered):
+        d["index"] = i
+        devices.append(d)
+        
     return devices
-
 
 def parse_smartctl_wear(stdout: str) -> Optional[int]:
     """
@@ -418,12 +536,13 @@ def parse_smartctl_wear(stdout: str) -> Optional[int]:
     return None
 
 
-async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
+async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None) -> Dict[str, Any]:
     """
     Get SMART information for a device using smartctl with cciss fallback.
 
     Args:
         device_path: Device path like /dev/sda
+        is_hpe_raid: Optional pre-computed boolean for HPE RAID controller presence.
 
     Returns:
         Dict with SMART data including wear level if available.
@@ -436,6 +555,10 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
         "model": None,
         "serial": None,
         "health_status": "unknown",
+        "interface": "unknown",
+        "temperature": None,
+        "data_units_written": None,
+        "critical_warning": None,
         "raw_output": ""
     }
 
@@ -443,21 +566,44 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
         result["error"] = "smartctl not installed"
         return result
 
+    if is_hpe_raid is None:
+        is_hpe_raid = is_hpe_server() and has_hpe_raid_controller()
+
     try:
         smartctl_bin = find_smartctl_path() or SMARTCTL_PATH
-        # Try cciss interface first (for HPE/LSI controllers)
-        proc = subprocess.run(
-            [smartctl_bin, "-d", "cciss", "-x", device_path],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-
-        # If cciss mode fails, fall back to standard auto-probe (-x)
-        if proc.returncode != 0:
-            cmd = [smartctl_bin, "-x", device_path]
+        is_nvme = "nvme" in os.path.basename(device_path)
+        
+        proc = None
+        
+        # Intelligent routing
+        if is_nvme:
+            # NEVER execute -d cciss for nvme
             proc = subprocess.run(
-                cmd,
+                [smartctl_bin, "-x", device_path],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+        elif is_hpe_raid:
+            # Try cciss interface first
+            proc = subprocess.run(
+                [smartctl_bin, "-d", "cciss", "-x", device_path],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            # If cciss fails, fallback
+            if proc.returncode != 0:
+                proc = subprocess.run(
+                    [smartctl_bin, "-x", device_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+        else:
+            # Direct SATA/SAS on non-HPE
+            proc = subprocess.run(
+                [smartctl_bin, "-x", device_path],
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -469,17 +615,47 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
             result["success"] = True
 
             wear_level = parse_smartctl_wear(proc.stdout)
-
+            
+            # Parse additional fields
+            crit_warn_m = re.search(r"Critical Warning:\s*(0x[0-9a-fA-F]+|\d+)", proc.stdout)
+            if crit_warn_m:
+                val_str = crit_warn_m.group(1)
+                result["critical_warning"] = int(val_str, 16) if val_str.startswith("0x") else int(val_str)
+                
+            overall_health_m = re.search(r"SMART overall-health self-assessment test result:\s*(\w+)", proc.stdout)
+            health_status_m = re.search(r"SMART Health Status:\s*(\w+)", proc.stdout)
+            overall_health = None
+            if overall_health_m:
+                overall_health = overall_health_m.group(1).upper()
+            elif health_status_m:
+                overall_health = health_status_m.group(1).upper()
+                
+            temp_m = re.search(r"(?:Current\s+Drive\s+Temperature:\s*|Temperature:\s*)(\d+)\s*(?:Celsius|C)?\b", proc.stdout, re.I)
+            if temp_m:
+                result["temperature"] = int(temp_m.group(1))
+                
+            duw_m = re.search(r"Data Units Written:\s*([0-9,]+(?:\s*\[[^\]]+\])?)", proc.stdout)
+            if duw_m:
+                result["data_units_written"] = duw_m.group(1).strip()
+                
             if wear_level is not None:
                 wear_level = max(0, min(100, wear_level))
                 result["wear_leveling_count"] = wear_level
 
+            # Health Status evaluation
+            if overall_health in ("FAILED", "BAD") or (result["critical_warning"] is not None and result["critical_warning"] > 0):
+                result["health_status"] = "critical"
+            elif wear_level is not None:
                 if wear_level >= WEAR_CRITICAL_THRESHOLD:
                     result["health_status"] = "critical"
                 elif wear_level >= WEAR_WARNING_THRESHOLD:
                     result["health_status"] = "warning"
                 else:
                     result["health_status"] = "healthy"
+            elif overall_health in ("PASSED", "OK"):
+                result["health_status"] = "healthy"
+            else:
+                result["health_status"] = "unknown"
 
             # Parse model
             model_match = re.search(
@@ -498,6 +674,14 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
             )
             if serial_match:
                 result["serial"] = serial_match.group(1).strip()
+                
+            # Interface
+            if is_nvme:
+                result["interface"] = "nvme"
+            elif "SAS" in proc.stdout:
+                result["interface"] = "sas"
+            else:
+                result["interface"] = "sata"
 
         else:
             result["error"] = proc.stderr or "smartctl failed"
@@ -508,7 +692,6 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
         result["error"] = f"smartctl error: {str(e)}"
 
     return result
-
 
 async def get_drive_health() -> Dict[str, Any]:
     """
@@ -540,12 +723,14 @@ async def get_drive_health() -> Dict[str, Any]:
 
     result["summary"]["total_drives"] = len(devices)
 
+    is_hpe_raid = is_hpe_server() and has_hpe_raid_controller()
+
     for device in devices:
         device_path = device.get("block_device", "")
         if not device_path:
             continue
 
-        health_info = await get_smartctl_info(device_path)
+        health_info = await get_smartctl_info(device_path, is_hpe_raid=is_hpe_raid)
 
         drive_info = {
             "physical_index": device.get("index", 0),
@@ -557,7 +742,10 @@ async def get_drive_health() -> Dict[str, Any]:
             "wear_level": health_info.get("wear_leveling_count"),
             "health_status": health_info.get("health_status", "unknown"),
             "success": health_info.get("success", False),
-            "error": health_info.get("error")
+            "error": health_info.get("error"),
+            "interface": health_info.get("interface") or device.get("interface", "sata"),
+            "temperature": health_info.get("temperature"),
+            "critical_warning": health_info.get("critical_warning")
         }
 
         result["drives"].append(drive_info)
@@ -731,24 +919,56 @@ async def get_drive_health_for_ui() -> Dict[str, Any]:
 
     trends = get_historical_trends()
 
+    is_hpe = is_hpe_server()
+    has_raid = has_hpe_raid_controller() if is_hpe else False
+    
+    drives = health.get("drives", [])
+    drive_counts = {"total": len(drives), "nvme": 0, "sata": 0, "sas": 0, "other": 0}
+    for d in drives:
+        # try to get interface from block device
+        dev = d.get("block_device", "")
+        if "nvme" in dev:
+            drive_counts["nvme"] += 1
+        elif d.get("interface"):
+            if d["interface"] == "sata":
+                drive_counts["sata"] += 1
+            elif d["interface"] == "sas":
+                drive_counts["sas"] += 1
+            else:
+                drive_counts["other"] += 1
+        else:
+            drive_counts["other"] += 1
+
+    if has_raid and drive_counts["nvme"] > 0:
+        controller_type = "mixed"
+    elif has_raid:
+        controller_type = "hpe_smartarray"
+    elif len(drives) > 0:
+        controller_type = "direct_attached"
+    else:
+        controller_type = "none"
+
     diagnostics = {
         "smartctl_installed": check_smartctl_installed(),
         "smartctl_path": find_smartctl_path(),
         "ssacli_installed": check_ssacli_installed(),
         "ssacli_path": find_ssacli_path(),
-        "is_hpe": is_hpe_server(),
-        "has_raid": has_hpe_raid_controller(),
+        "nvme_tools_installed": check_nvme_installed(),
+        "nvme_tools_path": find_nvme_path(),
+        "is_hpe": is_hpe,
+        "has_raid": has_raid,
+        "controller_type": controller_type,
+        "drive_counts": drive_counts,
     }
 
     return {
-        "drives": health.get("drives", []),
+        "drives": drives,
         "summary": health.get("summary", {}),
         "alerts": alerts,
         "historical_trends": trends,
         "diagnostics": diagnostics,
-        "timestamp": time.time()
+        "timestamp": health.get("timestamp", time.time())
     }
-
 
 async def run_periodic_drive_health_check(agent_instance=None) -> Dict[str, Any]:
     """
