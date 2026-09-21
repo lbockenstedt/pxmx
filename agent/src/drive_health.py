@@ -51,6 +51,141 @@ def check_smartctl_installed() -> bool:
     return os.path.exists(SMARTCTL_PATH) and os.access(SMARTCTL_PATH, os.X_OK)
 
 
+_HPE_VENDOR_STRINGS = frozenset({
+    "hpe",
+    "hp",
+    "hewlett-packard",
+    "hewlett packard enterprise",
+    "proliant",
+})
+_HPE_PCI_VENDOR_IDS = frozenset({"103c", "1590"})
+_STORAGE_CLASS_PREFIXES = ("0104", "0100")
+_HPE_RAID_DRIVER_NAMES = ("smartpqi", "hpsa", "cciss")
+_SSACLI_PACKAGE = "hpssacli"
+
+
+def _read_sysfs_vendor() -> str:
+    path = "/sys/class/dmi/id/sys_vendor"
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _read_sysfs_product_name() -> str:
+    path = "/sys/class/dmi/id/product_name"
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _read_dmidecode_vendor() -> str:
+    try:
+        proc = subprocess.run(
+            ["dmidecode", "-s", "system-manufacturer"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _matches_hpe_vendor(val: str) -> bool:
+    if not val:
+        return False
+    val_lower = val.lower()
+    return any(v in val_lower for v in _HPE_VENDOR_STRINGS)
+
+
+def is_hpe_server() -> bool:
+    if _matches_hpe_vendor(_read_sysfs_vendor()):
+        return True
+    if _matches_hpe_vendor(_read_sysfs_product_name()):
+        return True
+    if _matches_hpe_vendor(_read_dmidecode_vendor()):
+        return True
+    return False
+
+
+def _has_active_raid_driver() -> bool:
+    for driver in _HPE_RAID_DRIVER_NAMES:
+        driver_path = f"/sys/bus/pci/drivers/{driver}"
+        if os.path.isdir(driver_path):
+            try:
+                for entry in os.listdir(driver_path):
+                    if re.match(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$", entry):
+                        return True
+            except Exception:
+                pass
+    return False
+
+
+def _has_raid_in_proc_scsi() -> bool:
+    path = "/proc/scsi/scsi"
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                content = f.read()
+                if "Smart Array" in content or "SmartRAID" in content:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _read_pci_attr(dev_path: str, attr: str) -> str:
+    path = os.path.join(dev_path, attr)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _has_hpe_pci_storage_device() -> bool:
+    pci_dir = "/sys/bus/pci/devices/"
+    if not os.path.isdir(pci_dir):
+        return False
+    try:
+        for dev in os.listdir(pci_dir):
+            dev_path = os.path.join(pci_dir, dev)
+            vendor = _read_pci_attr(dev_path, "vendor")
+            if vendor.startswith("0x"):
+                vendor = vendor[2:]
+            if vendor.lower() in _HPE_PCI_VENDOR_IDS:
+                cls = _read_pci_attr(dev_path, "class")
+                if cls.startswith("0x"):
+                    cls = cls[2:]
+                if any(cls.startswith(prefix) for prefix in _STORAGE_CLASS_PREFIXES):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def has_hpe_raid_controller() -> bool:
+    if _has_active_raid_driver():
+        return True
+    if _has_raid_in_proc_scsi():
+        return True
+    if _has_hpe_pci_storage_device():
+        return True
+    return False
+
+
 def install_ssacli_if_needed() -> Dict[str, Any]:
     """
     Check and install HPE SSA CLI tools if not present.
@@ -58,22 +193,48 @@ def install_ssacli_if_needed() -> Dict[str, Any]:
     Returns:
         Dict with installation status and any errors.
     """
+    is_hpe = is_hpe_server()
+    has_raid = has_hpe_raid_controller() if is_hpe else False
+
+    if not (is_hpe and has_raid):
+        return {
+            "installed": False,
+            "already_installed": False,
+            "skipped": True,
+            "is_hpe": is_hpe,
+            "has_raid": has_raid,
+            "reason": "Not an HPE server" if not is_hpe else "No HPE Smart Array/RAID controller detected",
+            "error": None,
+            "output": "",
+        }
+
+    if check_ssacli_installed():
+        return {
+            "installed": True,
+            "already_installed": True,
+            "skipped": False,
+            "is_hpe": True,
+            "has_raid": True,
+            "reason": None,
+            "error": None,
+            "output": ""
+        }
+
     result = {
         "installed": False,
         "already_installed": False,
+        "skipped": False,
+        "is_hpe": True,
+        "has_raid": True,
+        "reason": None,
         "error": None,
         "output": ""
     }
 
-    if check_ssacli_installed():
-        result["already_installed"] = True
-        result["installed"] = True
-        return result
-
     try:
         cmd = [
             "apt-get", "update", "-y",
-            "&&", "apt-get", "install", "-y", "smartmontools", "hpssacli"
+            "&&", "apt-get", "install", "-y", "smartmontools", _SSACLI_PACKAGE
         ]
 
         proc = subprocess.run(
