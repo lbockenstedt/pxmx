@@ -123,7 +123,7 @@ class TestSmartctlExecution:
             assert info["error"] == "smartctl not installed"
 
     async def test_cciss_fallback_to_auto(self):
-        with patch.object(drive_health, "check_smartctl_installed", return_value=True):
+        with patch.object(drive_health, "check_smartctl_installed", return_value=True), patch.object(drive_health, "has_hpe_raid_controller", return_value=True):
             # First call (-d cciss) fails, second call (-a) succeeds
             fail_mock = MagicMock(returncode=1, stdout="", stderr="invalid device type cciss")
             succ_mock = MagicMock(returncode=0, stdout=SAMSUNG_SMARTCTL_OUTPUT, stderr="")
@@ -137,7 +137,7 @@ class TestSmartctlExecution:
                 assert info["serial"] == "S2L9NY0M123456"
 
     async def test_critical_wear_threshold(self):
-        with patch.object(drive_health, "check_smartctl_installed", return_value=True):
+        with patch.object(drive_health, "check_smartctl_installed", return_value=True), patch.object(drive_health, "has_hpe_raid_controller", return_value=True), patch.object(drive_health, "WEAR_CRITICAL_THRESHOLD", 80), patch.object(drive_health, "WEAR_WARNING_THRESHOLD", 60):
             succ_mock = MagicMock(returncode=0, stdout=CRITICAL_WEAR_OUTPUT, stderr="")
             with patch("subprocess.run", return_value=succ_mock):
                 info = await drive_health.get_smartctl_info("/dev/sda")
@@ -146,7 +146,7 @@ class TestSmartctlExecution:
                 assert info["health_status"] == "critical"
 
     async def test_warning_wear_threshold(self):
-        with patch.object(drive_health, "check_smartctl_installed", return_value=True):
+        with patch.object(drive_health, "check_smartctl_installed", return_value=True), patch.object(drive_health, "has_hpe_raid_controller", return_value=True), patch.object(drive_health, "WEAR_CRITICAL_THRESHOLD", 80), patch.object(drive_health, "WEAR_WARNING_THRESHOLD", 60):
             succ_mock = MagicMock(returncode=0, stdout=WARNING_WEAR_OUTPUT, stderr="")
             with patch("subprocess.run", return_value=succ_mock):
                 info = await drive_health.get_smartctl_info("/dev/sda")
@@ -161,7 +161,7 @@ class TestDeviceDiscovery:
 
     async def test_lsscsi_discovery(self):
         proc_mock = MagicMock(returncode=0, stdout=LSSCSI_SAMPLE_OUTPUT, stderr="")
-        with patch("subprocess.run", return_value=proc_mock):
+        with patch("subprocess.run", return_value=proc_mock), patch("os.path.exists", return_value=True), patch("os.listdir", return_value=["sda", "sdb", "nvme0n1"]):
             devices = await drive_health.get_scsi_devices()
             assert len(devices) == 3
             assert devices[0]["block_device"] == "/dev/sda"
@@ -172,7 +172,7 @@ class TestDeviceDiscovery:
         fail_mock = MagicMock(returncode=1, stdout="", stderr="lsscsi: not found")
         with patch("subprocess.run", return_value=fail_mock), \
              patch("os.path.exists", return_value=True), \
-             patch("os.listdir", return_value=["sda", "sda1", "sdb", "nvme0n1", "loop0", "ram0"]):
+             patch("os.listdir", return_value=["sda", "sda1", "sdb", "nvme0n1", "loop0", "ram0"]), patch("builtins.open", side_effect=FileNotFoundError):
             devices = await drive_health.get_scsi_devices()
             block_devs = [d["block_device"] for d in devices]
             assert "/dev/sda" in block_devs
@@ -198,7 +198,9 @@ class TestUIOutputAndAlerts:
 
         with patch.object(drive_health, "get_scsi_devices", return_value=mock_devices), \
              patch.object(drive_health, "get_smartctl_info", side_effect=[info_healthy, info_warning, info_critical]), \
-             patch.object(drive_health, "get_historical_trends", return_value={"drives": {}}):
+             patch.object(drive_health, "get_historical_trends", return_value={"drives": {}}), \
+             patch.object(drive_health, "WEAR_CRITICAL_THRESHOLD", 80), \
+             patch.object(drive_health, "WEAR_WARNING_THRESHOLD", 60):
             ui_data = await drive_health.get_drive_health_for_ui()
             assert len(ui_data["drives"]) == 3
             summary = ui_data["summary"]
@@ -472,3 +474,154 @@ async def test_get_drive_health_for_ui_diagnostics():
         assert diag["ssacli_path"] is None
         assert diag["is_hpe"] is True
         assert diag["has_raid"] is False
+
+@pytest.mark.asyncio
+async def test_get_scsi_devices_direct_attached_and_nvme(monkeypatch):
+    """Mocks /sys/block containing sda and nvme0n1, asserts both discovered with sequential indexes."""
+    monkeypatch.setattr("os.path.exists", lambda p: True if p == "/sys/block" else False)
+    monkeypatch.setattr("os.listdir", lambda p: ["sda", "nvme0n1"] if p == "/sys/block" else [])
+    
+    # Mock subprocess.run for lsscsi
+    import subprocess
+    original_run = subprocess.run
+    def mock_run(*args, **kwargs):
+        if "lsscsi" in args[0]:
+            class Ret:
+                returncode = 1
+                stdout = ""
+            return Ret()
+        return original_run(*args, **kwargs)
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    # Mock os.path.realpath
+    monkeypatch.setattr("os.path.realpath", lambda p: p)
+
+    devices = await drive_health.get_scsi_devices()
+    assert len(devices) == 2
+    assert devices[0]["block_device"] == "/dev/sda"
+    assert devices[0]["index"] == 0
+    assert devices[1]["block_device"] == "/dev/nvme0n1"
+    assert devices[1]["index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_scsi_devices_excludes_removable_usb(monkeypatch, tmp_path):
+    """Mocks /sys/block/sdb/removable = '1' with USB device path, asserts sdb is excluded."""
+    sys_block = tmp_path / "sys" / "block"
+    sdb = sys_block / "sdb"
+    sdb.mkdir(parents=True)
+    (sdb / "removable").write_text("1")
+    sdb_device = sdb / "device"
+    sdb_device.mkdir()
+    
+    def mock_exists(p):
+        if p == "/sys/block": return True
+        if p == "/sys/block/sdb/removable": return True
+        if p == "/sys/block/sdb/device": return True
+        return False
+        
+    def mock_realpath(p):
+        if p == "/sys/block/sdb/device":
+            return "/sys/devices/pci0000:00/0000:00:14.0/usb2/2-1/2-1:1.0/host0/target0:0:0/0:0:0:0"
+        return p
+
+    import builtins
+    original_open = builtins.open
+    def mock_open(p, *args, **kwargs):
+        if p == "/sys/block/sdb/removable":
+            import io
+            return io.StringIO("1")
+        return original_open(p, *args, **kwargs)
+
+    monkeypatch.setattr("os.path.exists", mock_exists)
+    monkeypatch.setattr("os.listdir", lambda p: ["sdb"] if p == "/sys/block" else [])
+    monkeypatch.setattr("os.path.realpath", mock_realpath)
+    monkeypatch.setattr("builtins.open", mock_open)
+    
+    import subprocess
+    original_run = subprocess.run
+    def mock_run_lsscsi(*args, **kwargs):
+        if "lsscsi" in args[0]:
+            class Ret:
+                returncode = 1
+                stdout = ""
+            return Ret()
+        return original_run(*args, **kwargs)
+    monkeypatch.setattr("subprocess.run", mock_run_lsscsi)
+
+    devices = await drive_health.get_scsi_devices()
+    assert len(devices) == 0
+
+
+@pytest.mark.asyncio
+async def test_nvme_critical_warning_escalation(monkeypatch):
+    """Mocks NVMe output with Critical Warning: 0x08 and wear 5%, asserts health_status == critical."""
+    monkeypatch.setattr(drive_health, "check_smartctl_installed", lambda: True)
+    monkeypatch.setattr(drive_health, "find_smartctl_path", lambda: "/usr/bin/smartctl")
+    
+    import subprocess
+    def mock_run(*args, **kwargs):
+        class Ret:
+            returncode = 0
+            stdout = "Percentage Used: 5%\nCritical Warning: 0x08\n"
+            stderr = ""
+        return Ret()
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    result = await drive_health.get_smartctl_info("/dev/nvme0n1")
+    assert result["success"] is True
+    assert result["critical_warning"] == 8
+    assert result["wear_leveling_count"] == 5
+    assert result["health_status"] == "critical"
+
+
+@pytest.mark.asyncio
+async def test_nvme_bypasses_cciss(monkeypatch):
+    """Asserts smartctl execution for /dev/nvme0n1 never passes -d cciss."""
+    monkeypatch.setattr(drive_health, "check_smartctl_installed", lambda: True)
+    monkeypatch.setattr(drive_health, "find_smartctl_path", lambda: "/usr/bin/smartctl")
+    monkeypatch.setattr(drive_health, "has_hpe_raid_controller", lambda: True)
+    
+    cmds_run = []
+    import subprocess
+    def mock_run(*args, **kwargs):
+        cmds_run.append(args[0])
+        class Ret:
+            returncode = 0
+            stdout = "Percentage Used: 5%\n"
+            stderr = ""
+        return Ret()
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    await drive_health.get_smartctl_info("/dev/nvme0n1")
+    assert len(cmds_run) == 1
+    assert "cciss" not in cmds_run[0]
+    assert cmds_run[0] == ["/usr/bin/smartctl", "-x", "/dev/nvme0n1"]
+
+
+@pytest.mark.asyncio
+async def test_nvme_tools_installed_and_diagnostics(monkeypatch):
+    """Tests check_nvme_installed, controller_type, and drive_counts."""
+    monkeypatch.setattr(drive_health, "check_nvme_installed", lambda: True)
+    monkeypatch.setattr(drive_health, "is_hpe_server", lambda: True)
+    monkeypatch.setattr(drive_health, "has_hpe_raid_controller", lambda: True)
+    
+    async def mock_get_drive_health():
+        return {
+            "drives": [
+                {"physical_index": 0, "block_device": "/dev/nvme0n1", "wear_level": 5, "interface": "nvme"},
+                {"physical_index": 1, "block_device": "/dev/sda", "wear_level": 10, "interface": "sata"}
+            ],
+            "summary": {}
+        }
+    monkeypatch.setattr(drive_health, "get_drive_health", mock_get_drive_health)
+    
+    result = await drive_health.get_drive_health_for_ui()
+    diag = result["diagnostics"]
+    assert diag["nvme_tools_installed"] is True
+    assert diag["has_raid"] is True
+    assert diag["controller_type"] == "mixed"
+    assert diag["drive_counts"]["total"] == 2
+    assert diag["drive_counts"]["nvme"] == 1
+    assert diag["drive_counts"]["sata"] == 1
+
