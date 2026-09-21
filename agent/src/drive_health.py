@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,6 +24,35 @@ logger = logging.getLogger("DriveHealth")
 # Path to HPE SSA CLI tools (if installed)
 SSACLI_PATH = "/usr/sbin/ssacli"
 SMARTCTL_PATH = "/usr/bin/smartctl"
+
+def find_smartctl_path() -> Optional[str]:
+    """Locate smartctl executable across system paths."""
+    found = shutil.which("smartctl")
+    if found and os.access(found, os.X_OK):
+        return found
+    for p in ("/usr/sbin/smartctl", "/usr/bin/smartctl", "/sbin/smartctl", "/usr/local/sbin/smartctl"):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+def find_ssacli_path() -> Optional[str]:
+    """Locate ssacli or hpssacli executable across system paths."""
+    for name in ("ssacli", "hpssacli"):
+        found = shutil.which(name)
+        if found and os.access(found, os.X_OK):
+            return found
+    for p in ("/usr/sbin/ssacli", "/usr/sbin/hpssacli", "/usr/bin/ssacli", "/opt/hp/hpssacli/bld/hpssacli"):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+def check_ssacli_installed() -> bool:
+    """Check if HPE SSA CLI tools are installed."""
+    return find_ssacli_path() is not None
+
+def check_smartctl_installed() -> bool:
+    """Check if smartctl is installed."""
+    return find_smartctl_path() is not None
 
 # Wear level thresholds
 WEAR_WARNING_THRESHOLD = 60  # Start warning at 60%
@@ -40,15 +70,6 @@ class DriveHealthError(Exception):
     """Drive health monitoring error."""
     pass
 
-
-def check_ssacli_installed() -> bool:
-    """Check if HPE SSA CLI tools are installed."""
-    return os.path.exists(SSACLI_PATH) and os.access(SSACLI_PATH, os.X_OK)
-
-
-def check_smartctl_installed() -> bool:
-    """Check if smartctl is installed."""
-    return os.path.exists(SMARTCTL_PATH) and os.access(SMARTCTL_PATH, os.X_OK)
 
 
 _HPE_VENDOR_STRINGS = frozenset({
@@ -232,13 +253,10 @@ def install_ssacli_if_needed() -> Dict[str, Any]:
     }
 
     try:
-        cmd = [
-            "apt-get", "update", "-y",
-            "&&", "apt-get", "install", "-y", "smartmontools", _SSACLI_PACKAGE
-        ]
+        cmd = "apt-get update -y && apt-get install -y smartmontools && (apt-get install -y " + _SSACLI_PACKAGE + " || apt-get install -y ssacli || true)"
 
         proc = subprocess.run(
-            " ".join(cmd),
+            cmd,
             shell=True,
             capture_output=True,
             text=True,
@@ -426,18 +444,20 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
         return result
 
     try:
+        smartctl_bin = find_smartctl_path() or SMARTCTL_PATH
         # Try cciss interface first (for HPE/LSI controllers)
         proc = subprocess.run(
-            [SMARTCTL_PATH, "-d", "cciss", "-a", device_path],
+            [smartctl_bin, "-d", "cciss", "-x", device_path],
             capture_output=True,
             text=True,
             timeout=30
         )
 
-        # If cciss mode fails, fall back to standard auto-probe (-a)
+        # If cciss mode fails, fall back to standard auto-probe (-x)
         if proc.returncode != 0:
+            cmd = [smartctl_bin, "-x", device_path]
             proc = subprocess.run(
-                [SMARTCTL_PATH, "-a", device_path],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -711,11 +731,21 @@ async def get_drive_health_for_ui() -> Dict[str, Any]:
 
     trends = get_historical_trends()
 
+    diagnostics = {
+        "smartctl_installed": check_smartctl_installed(),
+        "smartctl_path": find_smartctl_path(),
+        "ssacli_installed": check_ssacli_installed(),
+        "ssacli_path": find_ssacli_path(),
+        "is_hpe": is_hpe_server(),
+        "has_raid": has_hpe_raid_controller(),
+    }
+
     return {
         "drives": health.get("drives", []),
         "summary": health.get("summary", {}),
         "alerts": alerts,
         "historical_trends": trends,
+        "diagnostics": diagnostics,
         "timestamp": time.time()
     }
 

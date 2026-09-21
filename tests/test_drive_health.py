@@ -405,3 +405,70 @@ class TestHasHpeRaidController:
              patch("drive_health._has_hpe_pci_storage_device", return_value=True):
             assert has_hpe_raid_controller() is True
 
+class TestDiagnostics:
+    @patch("shutil.which")
+    @patch("os.access")
+    def test_find_smartctl_path(self, mock_access, mock_which):
+        # Test finding smartctl via shutil.which
+        mock_which.return_value = "/custom/bin/smartctl"
+        mock_access.return_value = True
+        assert drive_health.find_smartctl_path() == "/custom/bin/smartctl"
+        
+        # Test finding smartctl via fallback paths
+        mock_which.return_value = None
+        with patch("os.path.exists") as mock_exists:
+            mock_exists.side_effect = lambda p: p == "/usr/sbin/smartctl"
+            assert drive_health.find_smartctl_path() == "/usr/sbin/smartctl"
+            
+    @patch("shutil.which")
+    @patch("os.access")
+    def test_find_ssacli_path(self, mock_access, mock_which):
+        # Test finding ssacli via shutil.which
+        mock_which.side_effect = lambda name: "/custom/bin/ssacli" if name == "ssacli" else None
+        mock_access.return_value = True
+        assert drive_health.find_ssacli_path() == "/custom/bin/ssacli"
+        
+        # Test finding ssacli via fallback paths
+        mock_which.side_effect = None
+        mock_which.return_value = None
+        with patch("os.path.exists") as mock_exists:
+            mock_exists.side_effect = lambda p: p == "/usr/sbin/ssacli"
+            assert drive_health.find_ssacli_path() == "/usr/sbin/ssacli"
+
+    @patch("drive_health.find_smartctl_path")
+    def test_check_smartctl_installed(self, mock_find):
+        mock_find.return_value = "/usr/sbin/smartctl"
+        assert drive_health.check_smartctl_installed() is True
+        mock_find.return_value = None
+        assert drive_health.check_smartctl_installed() is False
+
+    @patch("drive_health.find_ssacli_path")
+    def test_check_ssacli_installed(self, mock_find):
+        mock_find.return_value = "/usr/sbin/ssacli"
+        assert drive_health.check_ssacli_installed() is True
+        mock_find.return_value = None
+        assert drive_health.check_ssacli_installed() is False
+
+@pytest.mark.asyncio
+async def test_get_drive_health_for_ui_diagnostics():
+    with patch("drive_health.get_drive_health") as mock_get_health, \
+         patch("drive_health.get_historical_trends") as mock_trends, \
+         patch("drive_health.check_smartctl_installed", return_value=True), \
+         patch("drive_health.find_smartctl_path", return_value="/usr/sbin/smartctl"), \
+         patch("drive_health.check_ssacli_installed", return_value=False), \
+         patch("drive_health.find_ssacli_path", return_value=None), \
+         patch("drive_health.is_hpe_server", return_value=True), \
+         patch("drive_health.has_hpe_raid_controller", return_value=False):
+        
+        mock_get_health.return_value = {"drives": [], "summary": {}}
+        mock_trends.return_value = []
+        
+        result = await drive_health.get_drive_health_for_ui()
+        assert "diagnostics" in result
+        diag = result["diagnostics"]
+        assert diag["smartctl_installed"] is True
+        assert diag["smartctl_path"] == "/usr/sbin/smartctl"
+        assert diag["ssacli_installed"] is False
+        assert diag["ssacli_path"] is None
+        assert diag["is_hpe"] is True
+        assert diag["has_raid"] is False
