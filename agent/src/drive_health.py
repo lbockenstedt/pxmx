@@ -536,12 +536,13 @@ def parse_smartctl_wear(stdout: str) -> Optional[int]:
     return None
 
 
-async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
+async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None) -> Dict[str, Any]:
     """
     Get SMART information for a device using smartctl with cciss fallback.
 
     Args:
         device_path: Device path like /dev/sda
+        is_hpe_raid: Optional pre-computed boolean for HPE RAID controller presence.
 
     Returns:
         Dict with SMART data including wear level if available.
@@ -565,6 +566,9 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
         result["error"] = "smartctl not installed"
         return result
 
+    if is_hpe_raid is None:
+        is_hpe_raid = is_hpe_server() and has_hpe_raid_controller()
+
     try:
         smartctl_bin = find_smartctl_path() or SMARTCTL_PATH
         is_nvme = "nvme" in os.path.basename(device_path)
@@ -580,7 +584,7 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
                 text=True,
                 timeout=30
             )
-        elif has_hpe_raid_controller():
+        elif is_hpe_raid:
             # Try cciss interface first
             proc = subprocess.run(
                 [smartctl_bin, "-d", "cciss", "-x", device_path],
@@ -626,7 +630,7 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
             elif health_status_m:
                 overall_health = health_status_m.group(1).upper()
                 
-            temp_m = re.search(r"Temperature:\s*(\d+)", proc.stdout)
+            temp_m = re.search(r"(?:Current\s+Drive\s+Temperature:\s*|Temperature:\s*)(\d+)\s*(?:Celsius|C)?\b", proc.stdout, re.I)
             if temp_m:
                 result["temperature"] = int(temp_m.group(1))
                 
@@ -641,14 +645,17 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
             # Health Status evaluation
             if overall_health in ("FAILED", "BAD") or (result["critical_warning"] is not None and result["critical_warning"] > 0):
                 result["health_status"] = "critical"
-            elif wear_level is None and overall_health not in ("PASSED", "OK"):
-                result["health_status"] = "unknown"
-            elif wear_level is not None and wear_level >= WEAR_CRITICAL_THRESHOLD:
-                result["health_status"] = "critical"
-            elif wear_level is not None and wear_level >= WEAR_WARNING_THRESHOLD:
-                result["health_status"] = "warning"
-            else:
+            elif wear_level is not None:
+                if wear_level >= WEAR_CRITICAL_THRESHOLD:
+                    result["health_status"] = "critical"
+                elif wear_level >= WEAR_WARNING_THRESHOLD:
+                    result["health_status"] = "warning"
+                else:
+                    result["health_status"] = "healthy"
+            elif overall_health in ("PASSED", "OK"):
                 result["health_status"] = "healthy"
+            else:
+                result["health_status"] = "unknown"
 
             # Parse model
             model_match = re.search(
@@ -716,12 +723,14 @@ async def get_drive_health() -> Dict[str, Any]:
 
     result["summary"]["total_drives"] = len(devices)
 
+    is_hpe_raid = is_hpe_server() and has_hpe_raid_controller()
+
     for device in devices:
         device_path = device.get("block_device", "")
         if not device_path:
             continue
 
-        health_info = await get_smartctl_info(device_path)
+        health_info = await get_smartctl_info(device_path, is_hpe_raid=is_hpe_raid)
 
         drive_info = {
             "physical_index": device.get("index", 0),
@@ -734,7 +743,9 @@ async def get_drive_health() -> Dict[str, Any]:
             "health_status": health_info.get("health_status", "unknown"),
             "success": health_info.get("success", False),
             "error": health_info.get("error"),
-            "interface": health_info.get("interface", "unknown")
+            "interface": health_info.get("interface") or device.get("interface", "sata"),
+            "temperature": health_info.get("temperature"),
+            "critical_warning": health_info.get("critical_warning")
         }
 
         result["drives"].append(drive_info)
