@@ -329,16 +329,31 @@ def discover_hpe_cciss_physical_drives(ctrl_dev: str = "/dev/sda", max_probes: i
                     })
                     miss_count = 0
             else:
-                miss_count += 1
+                # Non-zero returncode: check if this is a clean vacant slot
+                out_text = f"{proc.stdout} {proc.stderr}".lower()
+                is_vacant = (
+                    "device open failed" in out_text
+                    or "no such device" in out_text
+                    or "inquiry failed" in out_text
+                    or "device not found" in out_text
+                    or proc.returncode in (1, 2)
+                )
+                if is_vacant:
+                    miss_count += 1
+                else:
+                    logger.debug("smartctl cciss probe index %d non-zero exit %d: %s", i, proc.returncode, proc.stderr)
                 
             if len(discovered) > 0 and miss_count >= 4:
                 break
                 
-        except Exception:
-            miss_count += 1
-            if len(discovered) > 0 and miss_count >= 4:
-                break
-                
+        except subprocess.TimeoutExpired:
+            logger.debug("smartctl cciss probe index %d timed out; continuing probe", i)
+            # Do NOT increment miss_count on timeout so transient stalls do not trigger early break
+            continue
+        except Exception as e:
+            logger.debug("smartctl cciss probe index %d error: %s", i, e)
+            continue
+            
     return discovered
 
 async def get_scsi_devices() -> List[Dict[str, Any]]:
@@ -454,7 +469,7 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
                     except Exception:
                         pass
             
-            if vendor.upper() == "HP" and "LOGICAL" in model.upper():
+            if vendor.upper() in ("HP", "HPE") and "LOGICAL" in model.upper():
                 cciss_drives = discover_hpe_cciss_physical_drives(dev_path)
                 if cciss_drives:
                     for c_drv in cciss_drives:
@@ -467,9 +482,25 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
                             "vendor": c_drv["vendor"],
                             "model": c_drv["model"],
                             "serial": c_drv["serial"],
-                            "interface": c_drv["interface"]
+                            "interface": c_drv["interface"],
+                            "is_raid_logical": False,
                         })
                     continue
+                # If cciss probing yielded no member physical drives, preserve the container
+                # but explicitly flag it as a logical container so downstream consumers and UI
+                # know it is a RAID virtual volume rather than a bare physical drive.
+                discovered.append({
+                    "host": host,
+                    "scsi_path": scsi_path,
+                    "block_device": dev_path,
+                    "device_path": dev_path,
+                    "vendor": vendor,
+                    "model": model,
+                    "serial": "unknown",
+                    "interface": "raid_logical",
+                    "is_raid_logical": True,
+                })
+                continue
 
             interface = "sas" if "sas" in vendor.lower() or "sas" in model.lower() else "sata"
             
@@ -480,7 +511,8 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
                 "vendor": vendor,
                 "model": model,
                 "serial": "unknown",
-                "interface": interface
+                "interface": interface,
+                "is_raid_logical": False,
             })
             
         elif dev.startswith("nvme"):
@@ -751,10 +783,10 @@ async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None
                 result["serial"] = serial_match.group(1).strip()
                 
             # Parse vendor
-            vendor_match = re.search(r"(?:Model Family|Vendor):\s*(.+)", proc.stdout, re.IGNORECASE)
+            vendor_match = re.search(r"Vendor:\s*(.+)", proc.stdout, re.IGNORECASE)
             if vendor_match:
                 result["vendor"] = vendor_match.group(1).strip()
-            elif "samsung" in (result["model"] or "").lower():
+            elif re.search(r"Model Family:\s*.*Samsung", proc.stdout, re.IGNORECASE) or "samsung" in (result["model"] or "").lower():
                 result["vendor"] = "Samsung"
 
             # Interface
@@ -821,16 +853,17 @@ async def get_drive_health() -> Dict[str, Any]:
             "block_device": device.get("block_device") or raw_device_path,
             "device_path": raw_device_path,
             "cciss_index": device.get("cciss_index"),
-            "vendor": health_info.get("vendor") or device.get("vendor", ""),
+            "vendor": device.get("vendor") or health_info.get("vendor") or "",
             "model": health_info.get("model") or device.get("model", ""),
             "serial": health_info.get("serial") or device.get("serial", "unknown"),
             "wear_level": health_info.get("wear_leveling_count"),
             "health_status": health_info.get("health_status", "unknown"),
             "success": health_info.get("success", False),
             "error": health_info.get("error"),
-            "interface": health_info.get("interface") or device.get("interface", "sata"),
+            "interface": device.get("interface") if device.get("is_raid_logical") else (health_info.get("interface") or device.get("interface", "sata")),
             "temperature": health_info.get("temperature"),
-            "critical_warning": health_info.get("critical_warning")
+            "critical_warning": health_info.get("critical_warning"),
+            "is_raid_logical": device.get("is_raid_logical", False),
         }
 
         result["drives"].append(drive_info)
