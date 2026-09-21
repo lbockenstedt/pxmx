@@ -18,7 +18,7 @@ if AGENT_SRC_DIR not in sys.path:
     sys.path.insert(0, AGENT_SRC_DIR)
 
 import drive_health
-
+from drive_health import has_hpe_raid_controller, is_hpe_server
 
 SAMSUNG_SMARTCTL_OUTPUT = """
 smartctl 7.2 2020-12-30 r5155 [x86_64-linux-5.15.0-46-generic]
@@ -292,3 +292,116 @@ class TestSpokeRouting:
             fake_cp.send_to_agent.assert_awaited_once_with(
                 "PXMX_INSTALL_SSACLI", {}, agent_id="agent-node1", timeout=120.0
             )
+
+
+class TestHpeHardwareDetection:
+    def test_non_hpe_server_skipped(self):
+        with patch("drive_health.is_hpe_server", return_value=False):
+            res = drive_health.install_ssacli_if_needed()
+            assert res["installed"] is False
+            assert res["skipped"] is True
+            assert res["is_hpe"] is False
+            assert res["has_raid"] is False
+            assert res["reason"] == "Not an HPE server"
+
+    def test_hpe_server_without_raid_skipped(self):
+        with patch("drive_health.is_hpe_server", return_value=True), \
+             patch("drive_health.has_hpe_raid_controller", return_value=False):
+            res = drive_health.install_ssacli_if_needed()
+            assert res["installed"] is False
+            assert res["skipped"] is True
+            assert res["is_hpe"] is True
+            assert res["has_raid"] is False
+            assert res["reason"] == "No HPE Smart Array/RAID controller detected"
+
+    def test_hpe_server_with_raid_proceeds(self):
+        with patch("drive_health.is_hpe_server", return_value=True), \
+             patch("drive_health.has_hpe_raid_controller", return_value=True), \
+             patch("drive_health.check_ssacli_installed", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="installed", stderr="")):
+            res = drive_health.install_ssacli_if_needed()
+            assert res["installed"] is True
+            assert res["skipped"] is False
+            assert res["is_hpe"] is True
+            assert res["has_raid"] is True
+            assert res["output"] == "installed"
+
+    def test_already_installed_returns_true(self):
+        with patch("drive_health.is_hpe_server", return_value=True), \
+             patch("drive_health.has_hpe_raid_controller", return_value=True), \
+             patch("drive_health.check_ssacli_installed", return_value=True):
+            res = drive_health.install_ssacli_if_needed()
+            assert res["installed"] is True
+            assert res["already_installed"] is True
+            assert res["skipped"] is False
+            assert res["is_hpe"] is True
+            assert res["has_raid"] is True
+
+    def test_install_failure_reported(self):
+        with patch("drive_health.is_hpe_server", return_value=True), \
+             patch("drive_health.has_hpe_raid_controller", return_value=True), \
+             patch("drive_health.check_ssacli_installed", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="failed")):
+            res = drive_health.install_ssacli_if_needed()
+            assert res["installed"] is False
+            assert res["skipped"] is False
+            assert res["error"] == "failed"
+
+    def test_raid_check_short_circuits_on_non_hpe(self):
+        with patch("drive_health.is_hpe_server", return_value=False), \
+             patch("drive_health.has_hpe_raid_controller") as mock_has_raid:
+            drive_health.install_ssacli_if_needed()
+            mock_has_raid.assert_not_called()
+
+
+class TestIsHpeServer:
+    def test_vendor_string_match(self):
+        with patch("drive_health._read_sysfs_vendor", return_value="Hewlett Packard Enterprise"):
+            assert is_hpe_server() is True
+
+    def test_product_name_match(self):
+        with patch("drive_health._read_sysfs_vendor", return_value=""), \
+             patch("drive_health._read_sysfs_product_name", return_value="ProLiant DL380 Gen10"):
+            assert is_hpe_server() is True
+
+    def test_dmidecode_fallback(self):
+        with patch("drive_health._read_sysfs_vendor", return_value=""), \
+             patch("drive_health._read_sysfs_product_name", return_value=""), \
+             patch("drive_health._read_dmidecode_vendor", return_value="HP"):
+            assert is_hpe_server() is True
+
+    def test_dell_returns_false(self):
+        with patch("drive_health._read_sysfs_vendor", return_value="Dell Inc."), \
+             patch("drive_health._read_sysfs_product_name", return_value="PowerEdge R740"), \
+             patch("drive_health._read_dmidecode_vendor", return_value="Dell Inc."):
+            assert is_hpe_server() is False
+
+    def test_unreadable_returns_false(self):
+        with patch("drive_health._read_sysfs_vendor", return_value=""), \
+             patch("drive_health._read_sysfs_product_name", return_value=""), \
+             patch("drive_health._read_dmidecode_vendor", return_value=""):
+            assert is_hpe_server() is False
+
+
+class TestHasHpeRaidController:
+    def test_no_raid_detected(self):
+        with patch("drive_health._has_active_raid_driver", return_value=False), \
+             patch("drive_health._has_raid_in_proc_scsi", return_value=False), \
+             patch("drive_health._has_hpe_pci_storage_device", return_value=False):
+            assert has_hpe_raid_controller() is False
+
+    def test_active_driver_detected(self):
+        with patch("drive_health._has_active_raid_driver", return_value=True):
+            assert has_hpe_raid_controller() is True
+
+    def test_proc_scsi_detected(self):
+        with patch("drive_health._has_active_raid_driver", return_value=False), \
+             patch("drive_health._has_raid_in_proc_scsi", return_value=True):
+            assert has_hpe_raid_controller() is True
+
+    def test_pci_device_detected(self):
+        with patch("drive_health._has_active_raid_driver", return_value=False), \
+             patch("drive_health._has_raid_in_proc_scsi", return_value=False), \
+             patch("drive_health._has_hpe_pci_storage_device", return_value=True):
+            assert has_hpe_raid_controller() is True
+
