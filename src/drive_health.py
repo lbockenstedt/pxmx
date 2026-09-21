@@ -69,8 +69,8 @@ def check_smartctl_installed() -> bool:
     return find_smartctl_path() is not None
 
 # Wear level thresholds
-WEAR_WARNING_THRESHOLD = 80  # Start warning at 60%
-WEAR_CRITICAL_THRESHOLD = 90  # Critical at 80%+
+WEAR_WARNING_THRESHOLD = 60  # Start warning at 60%
+WEAR_CRITICAL_THRESHOLD = 80  # Critical at 80%+
 
 # Historical data storage
 HISTORY_FILE = "/var/lib/pxmx/drive_health_history.json"
@@ -580,7 +580,7 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
                 text=True,
                 timeout=30
             )
-        elif has_hpe_raid_controller() and not is_nvme:
+        elif has_hpe_raid_controller():
             # Try cciss interface first
             proc = subprocess.run(
                 [smartctl_bin, "-d", "cciss", "-x", device_path],
@@ -641,11 +641,11 @@ async def get_smartctl_info(device_path: str) -> Dict[str, Any]:
             # Health Status evaluation
             if overall_health in ("FAILED", "BAD") or (result["critical_warning"] is not None and result["critical_warning"] > 0):
                 result["health_status"] = "critical"
-            elif wear_level is None:
+            elif wear_level is None and overall_health not in ("PASSED", "OK"):
                 result["health_status"] = "unknown"
-            elif wear_level >= WEAR_CRITICAL_THRESHOLD:
+            elif wear_level is not None and wear_level >= WEAR_CRITICAL_THRESHOLD:
                 result["health_status"] = "critical"
-            elif wear_level >= WEAR_WARNING_THRESHOLD:
+            elif wear_level is not None and wear_level >= WEAR_WARNING_THRESHOLD:
                 result["health_status"] = "warning"
             else:
                 result["health_status"] = "healthy"
@@ -733,7 +733,8 @@ async def get_drive_health() -> Dict[str, Any]:
             "wear_level": health_info.get("wear_leveling_count"),
             "health_status": health_info.get("health_status", "unknown"),
             "success": health_info.get("success", False),
-            "error": health_info.get("error")
+            "error": health_info.get("error"),
+            "interface": health_info.get("interface", "unknown")
         }
 
         result["drives"].append(drive_info)
