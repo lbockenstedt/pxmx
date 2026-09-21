@@ -291,7 +291,58 @@ def install_ssacli_if_needed() -> Dict[str, Any]:
     return result
 
 
+
+def discover_hpe_cciss_physical_drives(ctrl_dev: str = "/dev/sda", max_probes: int = 16) -> List[Dict[str, Any]]:
+    """Discover physical drives behind an HPE Smart Array logical volume."""
+    discovered = []
+    miss_count = 0
+    smartctl_bin = find_smartctl_path() or SMARTCTL_PATH
+    
+    for i in range(max_probes):
+        try:
+            proc = subprocess.run(
+                [smartctl_bin, "-d", f"cciss,{i}", "-i", ctrl_dev],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if proc.returncode == 0:
+                vendor_m = re.search(r"Vendor:\s*(.+)", proc.stdout, re.IGNORECASE)
+                model_m = re.search(r"(?:Device Model|Model Number|Product):\s*(.+)", proc.stdout, re.IGNORECASE)
+                serial_m = re.search(r"Serial [Nn]umber:\s*(.+)", proc.stdout, re.IGNORECASE)
+                
+                vendor = vendor_m.group(1).strip() if vendor_m else ""
+                model = model_m.group(1).strip() if model_m else ""
+                serial = serial_m.group(1).strip() if serial_m else "unknown"
+                
+                if not vendor and not model:
+                    miss_count += 1
+                else:
+                    interface = "sas" if ("SAS" in proc.stdout or "sas" in model.lower() or "sas" in vendor.lower()) else "sata"
+                    discovered.append({
+                        "cciss_index": i,
+                        "vendor": vendor,
+                        "model": model,
+                        "serial": serial,
+                        "interface": interface
+                    })
+                    miss_count = 0
+            else:
+                miss_count += 1
+                
+            if len(discovered) > 0 and miss_count >= 4:
+                break
+                
+        except Exception:
+            miss_count += 1
+            if len(discovered) > 0 and miss_count >= 4:
+                break
+                
+    return discovered
+
 async def get_scsi_devices() -> List[Dict[str, Any]]:
+
     """
     Get all storage devices (SATA, SAS, NVMe) connected to the host.
     """
@@ -403,6 +454,23 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
                     except Exception:
                         pass
             
+            if vendor.upper() == "HP" and "LOGICAL" in model.upper():
+                cciss_drives = discover_hpe_cciss_physical_drives(dev_path)
+                if cciss_drives:
+                    for c_drv in cciss_drives:
+                        discovered.append({
+                            "host": host,
+                            "scsi_path": scsi_path,
+                            "block_device": f"{dev_path} [cciss,{c_drv['cciss_index']}]",
+                            "device_path": dev_path,
+                            "cciss_index": c_drv["cciss_index"],
+                            "vendor": c_drv["vendor"],
+                            "model": c_drv["model"],
+                            "serial": c_drv["serial"],
+                            "interface": c_drv["interface"]
+                        })
+                    continue
+
             interface = "sas" if "sas" in vendor.lower() or "sas" in model.lower() else "sata"
             
             discovered.append({
@@ -536,7 +604,7 @@ def parse_smartctl_wear(stdout: str) -> Optional[int]:
     return None
 
 
-async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None) -> Dict[str, Any]:
+async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None, cciss_index: Optional[int] = None) -> Dict[str, Any]:
     """
     Get SMART information for a device using smartctl with cciss fallback.
 
@@ -576,7 +644,14 @@ async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None
         proc = None
         
         # Intelligent routing
-        if is_nvme:
+        if cciss_index is not None:
+            proc = subprocess.run(
+                [smartctl_bin, "-d", f"cciss,{cciss_index}", "-x", device_path],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+        elif is_nvme:
             # NEVER execute -d cciss for nvme
             proc = subprocess.run(
                 [smartctl_bin, "-x", device_path],
@@ -675,6 +750,13 @@ async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None
             if serial_match:
                 result["serial"] = serial_match.group(1).strip()
                 
+            # Parse vendor
+            vendor_match = re.search(r"(?:Model Family|Vendor):\s*(.+)", proc.stdout, re.IGNORECASE)
+            if vendor_match:
+                result["vendor"] = vendor_match.group(1).strip()
+            elif "samsung" in (result["model"] or "").lower():
+                result["vendor"] = "Samsung"
+
             # Interface
             if is_nvme:
                 result["interface"] = "nvme"
@@ -726,17 +808,20 @@ async def get_drive_health() -> Dict[str, Any]:
     is_hpe_raid = is_hpe_server() and has_hpe_raid_controller()
 
     for device in devices:
-        device_path = device.get("block_device", "")
-        if not device_path:
+        raw_device_path = device.get("device_path") or device.get("block_device", "")
+        if not raw_device_path:
             continue
 
-        health_info = await get_smartctl_info(device_path, is_hpe_raid=is_hpe_raid)
+        cciss_index = device.get("cciss_index")
+        health_info = await get_smartctl_info(raw_device_path, is_hpe_raid=is_hpe_raid, cciss_index=cciss_index)
 
         drive_info = {
             "physical_index": device.get("index", 0),
             "scsi_path": device.get("scsi_path", ""),
-            "block_device": device_path,
-            "vendor": device.get("vendor", ""),
+            "block_device": device.get("block_device") or raw_device_path,
+            "device_path": raw_device_path,
+            "cciss_index": device.get("cciss_index"),
+            "vendor": health_info.get("vendor") or device.get("vendor", ""),
             "model": health_info.get("model") or device.get("model", ""),
             "serial": health_info.get("serial") or device.get("serial", "unknown"),
             "wear_level": health_info.get("wear_leveling_count"),
