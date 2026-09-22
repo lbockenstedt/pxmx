@@ -412,7 +412,12 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
         for blk_name, info in lsscsi_map.items():
             vendor = info["vendor"]
             model = info["model"]
-            interface = "sas" if "sas" in vendor.lower() or "sas" in model.lower() else "sata"
+            if vendor.upper() in ("HP", "HPE") and "LOGICAL" in model.upper():
+                interface = "raid_logical"
+                is_raid_logical = True
+            else:
+                interface = "sas" if "sas" in vendor.lower() or "sas" in model.lower() else "sata"
+                is_raid_logical = False
             devices.append({
                 "host": info["host"],
                 "scsi_path": info["scsi_path"],
@@ -421,7 +426,7 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
                 "model": model,
                 "serial": "unknown",
                 "interface": interface,
-                "is_raid_logical": False,
+                "is_raid_logical": is_raid_logical,
             })
         devices.sort(key=lambda x: (not x['block_device'].startswith('/dev/sd'), x['block_device']))
         for i, d in enumerate(devices):

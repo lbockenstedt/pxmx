@@ -213,6 +213,11 @@ class TestDeviceDiscovery:
             assert len(devices) == 2
             assert "/dev/sda" in block_devs
             assert "/dev/sdb" in block_devs
+            dev_by_blk = {d["block_device"]: d for d in devices}
+            assert dev_by_blk["/dev/sda"]["is_raid_logical"] is True
+            assert dev_by_blk["/dev/sda"]["interface"] == "raid_logical"
+            assert dev_by_blk["/dev/sdb"]["is_raid_logical"] is False
+            assert dev_by_blk["/dev/sdb"]["interface"] == "sata"
             # every entry got a sequential index despite the sysfs-less path
             assert [d["index"] for d in devices] == list(range(len(devices)))
 
