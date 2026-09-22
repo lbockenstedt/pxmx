@@ -17,7 +17,7 @@ import re
 import shutil
 import subprocess
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("DriveHealth")
 
@@ -405,6 +405,8 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
         return devices
 
     discovered = []
+    seen_cciss_serials: Set[str] = set()
+    seen_cciss_indices: Set[int] = set()
     for dev in sorted(os.listdir("/sys/block")):
         if not dev.startswith(("sd", "nvme", "vd")):
             continue
@@ -472,12 +474,22 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
                 cciss_drives = discover_hpe_cciss_physical_drives(dev_path)
                 if cciss_drives:
                     for c_drv in cciss_drives:
+                        s = (c_drv.get("serial") or "").strip()
+                        idx = c_drv.get("cciss_index")
+                        if s and s != "unknown" and s in seen_cciss_serials:
+                            continue
+                        if idx is not None and idx in seen_cciss_indices and (not s or s == "unknown"):
+                            continue
+                        if s and s != "unknown":
+                            seen_cciss_serials.add(s)
+                        if idx is not None:
+                            seen_cciss_indices.add(idx)
                         discovered.append({
                             "host": host,
                             "scsi_path": scsi_path,
-                            "block_device": f"{dev_path} [cciss,{c_drv['cciss_index']}]",
+                            "block_device": f"{dev_path} [cciss,{idx}]",
                             "device_path": dev_path,
-                            "cciss_index": c_drv["cciss_index"],
+                            "cciss_index": idx,
                             "vendor": c_drv["vendor"],
                             "model": c_drv["model"],
                             "serial": c_drv["serial"],
@@ -575,6 +587,17 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
                 "interface": "nvme"
             })
             
+    deduped = []
+    seen_serials = set()
+    for d in discovered:
+        s = (d.get("serial") or "").strip()
+        if s and s != "unknown":
+            if s in seen_serials:
+                continue
+            seen_serials.add(s)
+        deduped.append(d)
+    discovered = deduped
+
     discovered.sort(key=lambda x: (not x['block_device'].startswith('/dev/sd'), x['block_device']))
     for i, d in enumerate(discovered):
         d["index"] = i
@@ -654,7 +677,7 @@ async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None
         "model": None,
         "serial": None,
         "health_status": "unknown",
-        "interface": "unknown",
+        "interface": None,
         "temperature": None,
         "data_units_written": None,
         "critical_warning": None,
@@ -677,7 +700,7 @@ async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None
         # Intelligent routing
         if cciss_index is not None:
             proc = subprocess.run(
-                [smartctl_bin, "-d", f"cciss,{cciss_index}", "-x", device_path],
+                [smartctl_bin, "-d", f"cciss,{cciss_index}", "-a", device_path],
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -717,8 +740,21 @@ async def get_smartctl_info(device_path: str, is_hpe_raid: Optional[bool] = None
 
         result["raw_output"] = proc.stdout
 
-        if proc.returncode == 0:
+        has_smart_data = bool(
+            proc.stdout
+            and (
+                "=== START OF" in proc.stdout
+                or "SMART Attributes Data Structure" in proc.stdout
+                or "Wear_Leveling_Count" in proc.stdout
+                or "SMART overall-health" in proc.stdout
+                or "SMART Health Status" in proc.stdout
+                or "Device Model" in proc.stdout
+                or "Model Number" in proc.stdout
+            )
+        )
+        if proc.returncode == 0 or has_smart_data:
             result["success"] = True
+            result["error"] = None
 
             wear_level = parse_smartctl_wear(proc.stdout)
             
@@ -859,6 +895,11 @@ async def get_drive_health() -> Dict[str, Any]:
         else:
             vendor = dev_vendor or health_info.get("vendor") or ""
 
+        raw_iface = device.get("interface") if device.get("is_raid_logical") else health_info.get("interface")
+        if not raw_iface or raw_iface == "unknown":
+            dev_iface = device.get("interface")
+            raw_iface = dev_iface if dev_iface and dev_iface != "unknown" else "sata"
+
         drive_info = {
             "physical_index": device.get("index", 0),
             "scsi_path": device.get("scsi_path", ""),
@@ -872,7 +913,7 @@ async def get_drive_health() -> Dict[str, Any]:
             "health_status": health_info.get("health_status", "unknown"),
             "success": health_info.get("success", False),
             "error": health_info.get("error"),
-            "interface": device.get("interface") if device.get("is_raid_logical") else (health_info.get("interface") or device.get("interface", "sata")),
+            "interface": raw_iface,
             "temperature": health_info.get("temperature"),
             "critical_warning": health_info.get("critical_warning"),
             "is_raid_logical": device.get("is_raid_logical", False),
