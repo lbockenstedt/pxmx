@@ -868,4 +868,111 @@ class TestCcissDiscovery:
                     info = await drive_health.get_smartctl_info("/dev/sda")
                     assert info["vendor"] == expected_vendor
 
+    @pytest.mark.asyncio
+    async def test_get_scsi_devices_deduplicates_cciss_across_logical_volumes(self):
+        def mock_exists(p):
+            if p.startswith("/sys/block"):
+                return True
+            return False
+
+        def mock_open(p, *args, **kwargs):
+            import io
+            if p.endswith("/device/vendor"):
+                return io.StringIO("HP")
+            if p.endswith("/device/model"):
+                return io.StringIO("LOGICAL VOLUME")
+            if p.endswith("/removable"):
+                return io.StringIO("0")
+            if p.endswith("/size"):
+                return io.StringIO("1000000")
+            return io.StringIO("")
+
+        mock_physical_drives = [
+            {"cciss_index": 0, "vendor": "Samsung", "model": "SSD 860 EVO 2TB", "serial": "S3YUNB0M303896A", "interface": "sata"},
+            {"cciss_index": 1, "vendor": "Samsung", "model": "SSD 860 EVO 2TB", "serial": "S3YUNB0M303896B", "interface": "sata"},
+            {"cciss_index": 2, "vendor": "Samsung", "model": "SSD 860 EVO 2TB", "serial": "S3YUNB0M303896C", "interface": "sata"},
+            {"cciss_index": 3, "vendor": "Samsung", "model": "SSD 860 EVO 2TB", "serial": "S3YUNB0M303896D", "interface": "sata"},
+        ]
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")), \
+             patch("os.path.exists", side_effect=mock_exists), \
+             patch("os.listdir", return_value=["sda", "sdb"]), \
+             patch("builtins.open", side_effect=mock_open), \
+             patch("drive_health.discover_hpe_cciss_physical_drives", return_value=mock_physical_drives):
+            
+            devices = await drive_health.get_scsi_devices()
+            assert len(devices) == 4
+            assert [d["index"] for d in devices] == [0, 1, 2, 3]
+            assert [d["cciss_index"] for d in devices] == [0, 1, 2, 3]
+            assert [d["serial"] for d in devices] == [
+                "S3YUNB0M303896A", "S3YUNB0M303896B", "S3YUNB0M303896C", "S3YUNB0M303896D"
+            ]
+
+    @pytest.mark.asyncio
+    async def test_get_smartctl_info_cciss_nonzero_returncode_with_smart_data(self):
+        stdout = (
+            "smartctl 7.2 2020-12-30 r5155 [x86_64-linux-5.15.0-46-generic]\n"
+            "=== START OF INFORMATION SECTION ===\n"
+            "Device Model: Samsung SSD 860 EVO 2TB\n"
+            "Serial Number: S3YUNB0M303896J\n"
+            "Firmware Version: RVT04B6Q\n"
+            "User Capacity: 2,000,398,934,016 bytes [2.00 TB]\n"
+            "=== START OF READ SMART DATA SECTION ===\n"
+            "SMART overall-health self-assessment test result: PASSED\n\n"
+            "SMART Attributes Data Structure revision number: 1\n"
+            "177 Wear_Leveling_Count 0x0013 082 082 000 Pre-fail Always - 267\n"
+        )
+        mock_proc = MagicMock(returncode=4, stdout=stdout, stderr="")
+        with patch.object(drive_health, "check_smartctl_installed", return_value=True), \
+             patch("subprocess.run", return_value=mock_proc) as mock_run:
+            result = await drive_health.get_smartctl_info("/dev/sda", cciss_index=0)
+            assert result["success"] is True
+            assert result["wear_leveling_count"] == 18
+            assert result["health_status"] == "healthy"
+            assert result["interface"] == "sata"
+            assert result["vendor"] == "Samsung"
+            # Verify smartctl was invoked with -a instead of -x
+            args = mock_run.call_args[0][0]
+            assert "-a" in args
+            assert "-x" not in args
+            assert "-d" in args
+            assert "cciss,0" in args
+
+    @pytest.mark.asyncio
+    async def test_get_drive_health_interface_fallback(self):
+        # Case 1: health_info returns interface="unknown", device has interface="sas"
+        mock_dev1 = [{"block_device": "/dev/sda", "device_path": "/dev/sda", "index": 0, "interface": "sas"}]
+        health_unknown = {
+            "success": True,
+            "interface": "unknown",
+            "wear_leveling_count": 10,
+            "health_status": "healthy",
+        }
+        with patch.object(drive_health, "get_scsi_devices", return_value=mock_dev1), \
+             patch.object(drive_health, "get_smartctl_info", return_value=health_unknown):
+            res = await drive_health.get_drive_health()
+            assert res["drives"][0]["interface"] == "sas"
+
+        # Case 2: health_info returns interface=None, device has interface=None -> falls back to "sata"
+        mock_dev2 = [{"block_device": "/dev/sdb", "device_path": "/dev/sdb", "index": 0}]
+        health_none = {
+            "success": True,
+            "interface": None,
+            "wear_leveling_count": 10,
+            "health_status": "healthy",
+        }
+        with patch.object(drive_health, "get_scsi_devices", return_value=mock_dev2), \
+             patch.object(drive_health, "get_smartctl_info", return_value=health_none):
+            res = await drive_health.get_drive_health()
+            assert res["drives"][0]["interface"] == "sata"
+
+        # Case 3: health_info returns interface="unknown", device has interface="unknown" -> falls back to "sata"
+        mock_dev3 = [{"block_device": "/dev/sdc", "device_path": "/dev/sdc", "index": 0, "interface": "unknown"}]
+        with patch.object(drive_health, "get_scsi_devices", return_value=mock_dev3), \
+             patch.object(drive_health, "get_smartctl_info", return_value=health_unknown):
+            res = await drive_health.get_drive_health()
+            assert res["drives"][0]["interface"] == "sata"
+            assert res["drives"][0]["interface"] != "unknown"
+
+
             
