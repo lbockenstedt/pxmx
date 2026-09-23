@@ -100,6 +100,7 @@ _SSACLI_PACKAGE = "hpssacli"
 
 
 def _read_sysfs_vendor() -> str:
+    """Read system hardware vendor string from sysfs DMI table."""
     path = "/sys/class/dmi/id/sys_vendor"
     if os.path.exists(path):
         try:
@@ -111,6 +112,7 @@ def _read_sysfs_vendor() -> str:
 
 
 def _read_sysfs_product_name() -> str:
+    """Read system product name string from sysfs DMI table."""
     path = "/sys/class/dmi/id/product_name"
     if os.path.exists(path):
         try:
@@ -122,6 +124,7 @@ def _read_sysfs_product_name() -> str:
 
 
 def _read_dmidecode_vendor() -> str:
+    """Read system manufacturer string using dmidecode command."""
     try:
         proc = subprocess.run(
             ["dmidecode", "-s", "system-manufacturer"],
@@ -137,6 +140,7 @@ def _read_dmidecode_vendor() -> str:
 
 
 def _matches_hpe_vendor(val: str) -> bool:
+    """Check if string matches known HPE vendor identifiers."""
     if not val:
         return False
     val_lower = val.lower()
@@ -144,6 +148,7 @@ def _matches_hpe_vendor(val: str) -> bool:
 
 
 def is_hpe_server() -> bool:
+    """Determine if the host machine is an HPE server platform."""
     if _matches_hpe_vendor(_read_sysfs_vendor()):
         return True
     if _matches_hpe_vendor(_read_sysfs_product_name()):
@@ -154,6 +159,7 @@ def is_hpe_server() -> bool:
 
 
 def _has_active_raid_driver() -> bool:
+    """Check if an HPE RAID driver is currently loaded in sysfs."""
     for driver in _HPE_RAID_DRIVER_NAMES:
         driver_path = f"/sys/bus/pci/drivers/{driver}"
         if os.path.isdir(driver_path):
@@ -167,6 +173,7 @@ def _has_active_raid_driver() -> bool:
 
 
 def _has_raid_in_proc_scsi() -> bool:
+    """Check if Smart Array controllers are reported in /proc/scsi/scsi."""
     path = "/proc/scsi/scsi"
     if os.path.exists(path):
         try:
@@ -180,6 +187,7 @@ def _has_raid_in_proc_scsi() -> bool:
 
 
 def _read_pci_attr(dev_path: str, attr: str) -> str:
+    """Read attribute string for a given PCI device path."""
     path = os.path.join(dev_path, attr)
     if os.path.exists(path):
         try:
@@ -191,6 +199,7 @@ def _read_pci_attr(dev_path: str, attr: str) -> str:
 
 
 def _has_hpe_pci_storage_device() -> bool:
+    """Check PCI bus for HPE storage controllers."""
     pci_dir = "/sys/bus/pci/devices/"
     if not os.path.isdir(pci_dir):
         return False
@@ -212,6 +221,7 @@ def _has_hpe_pci_storage_device() -> bool:
 
 
 def has_hpe_raid_controller() -> bool:
+    """Detect presence of HPE Smart Array / SmartRAID controller."""
     if _has_active_raid_driver():
         return True
     if _has_raid_in_proc_scsi():
