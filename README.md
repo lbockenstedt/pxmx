@@ -1,147 +1,211 @@
-# pxmx — Proxmox Manager (LM module)
+# pxmx — Proxmox VE Spoke (Lab Manager Module)
 
-`pxmx` is the Lab Manager module for Proxmox VE. It has two cooperating parts: a
-**host agent** that runs on a Proxmox node and does the actual VM work (clone,
-destroy, USB provisioning, watchdogs), and a **spoke** that bridges multiple
-agents into the LM Hub control plane. The agent is where the Client-Sim (cs)
-auto-provisioning "brain" lives.
+`pxmx` is the Lab Manager module for Proxmox VE hypervisors. It connects Proxmox VE clusters and standalone nodes to the Lab Manager (LM) unified control plane, enabling complete hypervisor telemetry, virtual machine and LXC container lifecycle operations, direct-attached drive health monitoring, and client-simulation automation without opening the native Proxmox web interface.
 
-For the topology and where the brain lives, see [ARCHITECTURE.md](ARCHITECTURE.md).
+---
 
-<!-- INSTALLERS:START -->
-## Installation
+## Architecture
 
-Every installer in this repo, with every flag and environment variable it accepts.
-Installers are idempotent — re-running one updates code and preserves credentials.
+`pxmx` operates on a two-tier coordinator and agent topology:
 
-### Proxmox spoke — `install_pxmx.sh`
+```
+┌─────────────────┐             WebSocket / TLS (:443)             ┌─────────────────┐
+│     LM Hub      │ ◄────────────────────────────────────────────► │   pxmx Spoke    │
+│  Control Plane  │                                                │  (Coordinator)  │
+└─────────────────┘                                                └────────┬────────┘
+                                                                            │
+                                                WebSocket / TLS (:443 / :8443)
+                                                                            │
+                                                       ┌────────────────────┴────────────────────┐
+                                                       ▼                                         ▼
+                                            ┌─────────────────────┐                   ┌─────────────────────┐
+                                            │  pxmx Host Agent    │                   │  pxmx Host Agent    │
+                                            │   (Proxmox Node 1)  │                   │   (Proxmox Node 2)  │
+                                            └──────────┬──────────┘                   └──────────┬──────────┘
+                                                       │                                         │
+                                            ┌──────────┴──────────┐                   ┌──────────┴──────────┐
+                                            │ Direct Drive Health │                   │ Direct Drive Health │
+                                            │ (smartctl / ssacli) │                   │ (smartctl / ssacli) │
+                                            └─────────────────────┘                   └─────────────────────┘
+```
+
+1. **Spoke Coordinator (`src/proxmox_spoke.py`, `src/control_plane.py`):**
+   - Establishes an outbound TLS WebSocket dial to the LM Hub control plane (`/ws/spoke` on port 443).
+   - Serves as the agent listener (`/ws/agent`), fanning out commands and aggregating telemetry across multiple physical Proxmox VE hosts.
+   - Manages canonical VM addressing using `<cluster_name>/<node>/<vmid>`.
+   - Manages console sessions (VNC and interactive host shells) between browser clients and node agents.
+
+2. **Node-Agent Communication (`agent/src/agent.py`):**
+   - Runs as a systemd service (`lm-pxmx-agent.service`) directly on each Proxmox VE host as root.
+   - Dials the Spoke coordinator over an authenticated WebSocket link (`/ws/agent`), using HMAC message signing (`agent/src/security_utils.py`).
+   - Executes hypervisor-native CLI operations (`qm`, `pct`, `pvesh`, `vzdump`, `pvenode`).
+   - Runs background watchdogs, guest agent monitors, and client-simulation auto-provisioning pipelines.
+
+3. **Direct-Attached Drive Health Pipeline (`src/drive_health.py`, `agent/src/drive_health.py`):**
+   - Automatically probes local storage devices across SATA, SAS, and NVMe interfaces using `smartctl`.
+   - Detects HPE ProLiant platforms and Smart Array RAID controllers via DMI/sysfs inspection (`/sys/class/dmi/id/sys_vendor`, `/sys/bus/pci/drivers/smartpqi`, `/sys/bus/pci/drivers/hpsa`), supporting dynamic installation of `hpssacli`/`ssacli`.
+   - Collects critical drive health indicators: SSD wear leveling percentage, NVMe endurance / spare block depletion, reallocated sectors, power-on hours, and operating temperatures.
+   - Normalizes telemetry into structured status assessments (`healthy`, `warning`, `critical`) with alert thresholds.
+
+---
+
+## Features
+
+- **Node Telemetry & Metrics:** Real-time collection of CPU utilization (1m, 5m, 15m load averages), total and allocated memory, swap pressure, storage pool capacities, kernel versions, and PVE platform versions.
+- **VM & Container Lifecycle:** Full lifecycle management for QEMU virtual machines and LXC containers: start, stop, reboot, snapshot create/rollback/delete, clone, destroy, and cross-tenant re-tagging.
+- **Bulk Lifecycle Operations:** Concurrent execution of power and snapshot commands across multiple VMs per node with semaphore concurrency limits.
+- **Storage Pool Visibility:** Real-time visibility into local and shared storage pools (`local`, `local-lvm`, `local-zfs`, NFS, Ceph), backup-capable destinations, and ISO repositories.
+- **Drive Health Monitoring:** Host-level disk telemetry covering SMART data, wear-leveling percentages, NVMe percentage used, HPE Smart Array logical/physical drives, and proactive threshold alerts.
+- **Remote Web Consoles:** Interactive noVNC graphical displays and web-based terminal PTY shells routed through the spoke-agent relay with ticket authentication.
+- **Certificate Distribution:** Unattended distribution and application of Let's Encrypt TLS certificates issued by the LM Hub directly to `pveproxy` via `pvenode cert set`.
+- **Client-Simulation Automation:** Built-in auto-provisioning brain managing USB dongle tracking, multi-tier resource gates, template unlocking, and automated VM provisioning.
+
+---
+
+## Spoke Commands Reference Table
+
+Commands routed and processed by `src/proxmox_spoke.py`:
+
+| Command | Direction / Scope | Description |
+| :--- | :--- | :--- |
+| `GET_VERSION` | Hub → Spoke | Returns spoke module version and local git commit SHA. |
+| `UPDATE_CONFIG` | Hub → Spoke / Agents | Updates spoke configuration and broadcasts new settings to connected agents. |
+| `PXMX_RETAG_TENANT` | Hub → Spoke → Agents | Cross-tenant migration: re-tags VMs with `old_tag` to `new_tag` across all nodes. |
+| `SET_AGENT_CONFIG` | Hub → Spoke → Agent | Pushes and persists configuration for a designated agent. |
+| `GET_AGENTS` | Hub → Spoke | Returns registry of connected and pending agents with node/VM summary counts. |
+| `SPOKE_RELAY` | Hub → Spoke → Agent | Relays control commands (`APPROVAL_SUCCESS`, `REVOKE_AGENT`, generic commands) to target agent. |
+| `GET_NODE_STATS` | Hub → Spoke → Agents | Aggregates CPU, memory, and storage metrics across specified or all connected nodes. |
+| `PXMX_LIST_VMS` | Hub → Spoke → Agents | Aggregates full virtual machine and container inventory from all connected agents. |
+| `GET_VM_LIST` / `AGENT_GET_VM_LIST` | Hub → Spoke → Agents | Aliases for `PXMX_LIST_VMS`. |
+| `SEARCH_VMS` | Hub → Spoke | Searches VMs across clusters by name, VMID, IP, or MAC with tenant-scoping enforcement. |
+| `GET_VM_INFO` | Hub → Spoke → Agent | Fetches detailed configuration and runtime status for a specific VM. |
+| `PXMX_VM_ACTION` | Hub → Spoke → Agent | Executes single VM action (`start`, `stop`, `reboot`, `snapshot`, `backup`) via agent. |
+| `PXMX_VM_ACTION_BULK` | Hub → Spoke → Agents | Groups and executes lifecycle actions across multiple VMs in parallel per agent. |
+| `PXMX_CLONE_VM` | Hub → Spoke → Agent | Clones a template VM to a new VMID with name, resource pool, and tenant tags. |
+| `PXMX_LIST_POOLS` | Hub → Spoke → Agents | Aggregates Proxmox resource pools across all connected agents. |
+| `PXMX_LIST_ISOS` | Hub → Spoke → Agent | Lists ISO images present across storage volumes on a given node. |
+| `PXMX_LIST_STORAGES` | Hub → Spoke → Agent | Queries storage volumes on a target node accepting specified content types. |
+| `PXMX_DRIVE_HEALTH` | Hub → Spoke → Agent | Queries physical drive telemetry, wear-leveling, and SMART health for a node. |
+| `PXMX_INSTALL_SSACLI` | Hub → Spoke → Agent | Triggers automated HPE SSACLI package installation on an HPE server node. |
+| `PXMX_CREATE_VM` | Hub → Spoke → Agent | Creates and configures a new QEMU virtual machine from an ISO image. |
+| `INSTALL_CERT` | Hub → Spoke → Agent | Relays TLS certificate and private key to agent for local `pveproxy` installation. |
+| `VNC_START` | Hub → Spoke → Agent | Establishes authenticated noVNC console session, returning VNC ticket. |
+| `VNC_FRAME_DOWN` | Hub → Spoke → Agent | Relays browser input frames to node VNC session. |
+| `VNC_DISCONNECT` | Hub → Spoke → Agent | Tears down active VNC console session. |
+| `SHELL_START` | Hub → Spoke → Agent | Spawns interactive administrative PTY shell session on target node. |
+| `SHELL_IN` / `SHELL_RESIZE` | Hub → Spoke → Agent | Streams terminal input and window resize events to the active PTY shell. |
+| `SHELL_DISCONNECT` | Hub → Spoke → Agent | Closes active host shell session. |
+
+---
+
+## Agent Commands Reference Table
+
+Commands handled by `agent/src/agent.py` on the Proxmox host:
+
+| Command | Handler / Subsystem | Description |
+| :--- | :--- | :--- |
+| `UPDATE_CONFIG` | `agent.py` / `managed_crontab` | Updates agent runtime settings, reconciles crontabs, and toggles CS loops. |
+| `GET_VM_LIST` | `agent.py:get_vm_list` | Queries local `qm` and `pct` for all configured guest domains and containers. |
+| `GET_NODE_STATS` | `agent.py:get_node_stats` | Queries local PVE node stats (CPU, RAM, swap, storage). |
+| `GET_SYSTEM_STATS` | `agent.py:collect_metrics` | Collects system hardware and performance telemetry. |
+| `SET_LOG_LEVEL` | `agent.py:set_log_level` | Adjusts runtime logging verbosity dynamically. |
+| `RUN_COMMAND` | `command_runner.py` | Runs signed local system commands with timeouts and buffer truncation limits. |
+| `CS_COMMAND` | `cs_commands.py` / `cs_sim.py` | Dispatches Client-Sim commands (fast sync actions or async background jobs). |
+| `CS_CREATE_PROXMOX_TOKEN` | `agent.py:_provision_proxmox_token` | Provisions an administrative API token via local `pvesh` for hub integration. |
+| `PXMX_VM_ACTION` | `pve_cmds.py:vm_action_any` | Executes start, stop, reboot, snapshot, or vzdump backup on a guest. |
+| `PXMX_VM_ACTION_BULK` | `pve_cmds.py` (concurrency sem) | Executes lifecycle actions across a batch of VMs on this host. |
+| `PXMX_LIST_STORAGE` | `pve_cmds.py:list_backup_storages` | Identifies storage destinations supporting backup archives. |
+| `PXMX_RETAG_TENANT` | `pve_cmds.py:retag_tenant` | Replaces tenant tags on all local guest configs matching the target tag. |
+| `OS_UPDATE_CHECK` | `os_update.py:check_updates` | Checks for pending Debian/PVE package updates via apt. |
+| `OS_UPDATE_APPLY` | `os_update.py:apply_updates` | Performs unattended dist-upgrade (guarded against active provisioning). |
+| `PXMX_GET_IDENTITY` | `agent.py` | Reports agent ID, hostname, and active spoke connection coordinates. |
+| `PXMX_POOL_ADD_VMS` | `pve_cmds.py:pool_add_vms` | Adds designated simulation VMs into a Proxmox resource pool. |
+| `PXMX_APPLY_SIM_TAGS` | `pve_cmds.py:apply_sim_tags` | Asynchronously writes client-simulation metadata tags to local guests. |
+| `PXMX_CLONE_VM` | `pve_cmds.py:clone_vm_any` | Clones template guest, sets network and tenant labels, assigns resource pool. |
+| `PXMX_LIST_POOLS` | `agent.py:list_pools` | Queries cluster resource pools configured on this host. |
+| `PXMX_LIST_ISOS` | `agent.py:list_node_isos` | Inspects node storages for ISO installation images. |
+| `PXMX_LIST_STORAGES` | `agent.py:list_node_storages` | Queries node storage configurations for image/disk allocations. |
+| `PXMX_DRIVE_HEALTH` | `drive_health.py` | Executes `smartctl` and `ssacli` drive audits and returns wear/alerting telemetry. |
+| `PXMX_INSTALL_SSACLI` | `drive_health.py:install_ssacli_if_needed` | Installs HPE Smart Storage Administrator tools on HPE hardware. |
+| `PXMX_CREATE_VM` | `agent.py` (`pvesh create`) | Creates a new QEMU VM from ISO with specified disk, memory, CPU, and network. |
+| `VNC_START` | `agent.py:_start_vnc_session` | Spawns `vncproxy` via `pvesh`, connects local WebSocket, and returns ticket. |
+| `VNC_FRAME_DOWN` | `agent.py` (Queue drain) | Relays incoming RFB frames from browser to the Proxmox VNC socket. |
+| `VNC_DISCONNECT` | `agent.py:_vnc_teardown` | Closes VNC socket connection and releases session structures. |
+| `SHELL_START` | `agent.py:_start_shell_session` | Forks local PTY with interactive bash shell for web terminal access. |
+| `SHELL_IN` | `agent.py:_shell_write` | Forwards user keystrokes into the active PTY master file descriptor. |
+| `SHELL_RESIZE` | `agent.py:_shell_resize` | Sets terminal window size via `TIOCSWINSZ` ioctl call. |
+| `SHELL_DISCONNECT` | `agent.py:_shell_teardown` | Terminates shell child process and releases master PTY file descriptor. |
+| `INSTALL_CERT` | `agent.py:install_cert` | Deploys TLS certificates to `pveproxy` using `pvenode cert set`. |
+| `START_BACKUP` | `template_ops.py` | Triggers background vzdump backup and streams archive to repository. |
+| `REFRESH_TEMPLATE` | `template_ops.py` | Restores base template from archive after purging sim VMs. |
+
+---
+
+## Installation & Environment Configuration
+
+Installers are idempotent — re-running updates code while preserving configuration and credentials.
+
+### 1. Spoke Coordinator Installation (`install_pxmx.sh`)
+
+Run in the dedicated spoke container or VM:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/install_pxmx.sh \
-  | sudo bash -s -- --hub lm-hub.lrbtechnologies.com
+  | sudo bash -s -- --hub wss://lm-hub.example.com:443
 ```
 
-Run this in the **spoke container**. The host agent below is a separate install.
-
-| Flag | Purpose |
+| Flag | Description |
 | :--- | :--- |
-| `--hub URL` | Hub WebSocket URL. A bare host is fine — `lm-hub.example.com` becomes `wss://lm-hub.example.com:443`, `host:port` gets a `wss://` prefix, and an explicit `ws://`/`wss://` is left alone. Omit it to auto-discover the hub (DNS `lm-hub.<suffix>`, then mDNS `_lm-hub._tcp.local.`). |
-| `--id`, `--name` | Pin the spoke id. Omitted, the id derives from the hostname, so a renamed clone reconnects under its new name. |
-| `--secret` | Pre-shared spoke secret. |
-| `--hub-secret` | Hub PSK for auto-approval. Without it the spoke lands in *pending approval* in the WebUI. |
-| `--all-prereqs` | Accepted and ignored — kept so the hub's install-module call doesn't abort. |
-| `--tls-verify` | Verify the hub's TLS certificate. Requires `--tls-ca-cert`. |
-| `--tls-ca-cert PATH` | CA certificate used for that verification. |
-| `--loopback` | Spoke and agent are on the same box — talk over loopback. |
-| `--infra-only` | Host-level infrastructure only — no spoke runtime. |
+| `--hub URL` | LM Hub WebSocket URL (`wss://<host>:443`). Bare host is automatically normalized. |
+| `--id`, `--name` | Spoke identifier (defaults to `<hostname>-spoke`). |
+| `--secret` | Pre-shared key for authenticating with the hub. |
+| `--hub-secret` | Hub PSK for automated auto-approval. |
+| `--tls-verify` | Enables strict TLS certificate validation. |
+| `--tls-ca-cert PATH` | Path to custom CA certificate for TLS verification. |
+| `--loopback` | Enables loopback mode for co-located (all-in-one) hub/spoke installations. |
+| `--infra-only` | Installs host-level prerequisites without starting spoke daemon. |
 
-**Environment overrides:** `HUB_URL` (same normalization as `--hub`), `SPOKE_ID`., `HUB_SECRET`, `LM_COMP_UPDATE_GUARD`
+**Spoke Environment Variables (`/opt/lm/pxmx/.env`):**
+- `HUB_URL`: Target LM Hub WebSocket endpoint.
+- `SPOKE_ID`: Unique identifier for this spoke coordinator.
+- `SPOKE_SECRET`: Pre-shared authentication secret.
+- `HUB_SECRET`: Hub auto-approval secret.
+- `LM_PXMX_AGENT_PORT`: Agent listener port (default `443` standalone, `8443` loopback).
+- `LM_TLS_CERT`, `LM_TLS_KEY`: Paths to TLS certificates for the agent listener.
+- `LM_HUB_TLS_VERIFY`, `LM_HUB_CA_CERT`: Hub certificate validation settings.
 
-### Proxmox host agent — `agent/install_agent.sh`
+### 2. Host Agent Installation (`agent/install_agent.sh`)
 
-Run this **on the Proxmox host** (not in a container). This is where the
-Client-Sim auto-provisioning brain runs.
+Run directly **on each Proxmox VE host** as root:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/pxmx/main/agent/install_agent.sh \
+  | sudo bash -s -- --spoke-ip <spoke-ip>
 ```
 
-| Flag | Purpose |
+| Flag | Description |
 | :--- | :--- |
-| `--spoke-ip IP` | Spoke address. Omit it and the installer auto-detects a co-located LM spoke LXC. |
-| `--spoke-url URL` | Full spoke URL, pinned — takes precedence over `--spoke-ip`. |
-| `--id` | Pin the agent id. Omitted, it derives from the hostname at startup, so a cloned and renamed node reconnects under its new name (the hub correlates it to the old one by install UUID). |
-| `--secret` | Pre-shared agent secret. |
+| `--spoke-ip IP` | IP address of the pxmx spoke. Automatically negotiates scheme, port, and `/ws/agent` path. |
+| `--spoke-url URL` | Explicit full WebSocket URL to the spoke agent listener. |
+| `--id` | Unique agent identifier (defaults to host hostname). |
+| `--secret` | Agent pre-shared key matching spoke configuration. |
 
-**Environment overrides:** `SPOKE_IP`, `SPOKE_URL`, `AGENT_SECRET`,
-`LM_COMP_UPDATE_GUARD`.
-<!-- INSTALLERS:END -->
+**Agent Environment Variables (`/etc/lm-agent/config.json` or systemd unit):**
+- `SPOKE_URL`: Pinned WebSocket endpoint for the parent spoke coordinator.
+- `AGENT_ID`: Unique identity for this host agent.
+- `AGENT_SECRET`: HMAC authentication secret.
+- `LM_HUB_TLS_VERIFY`, `LM_HUB_CA_CERT`: Certificate verification configuration.
 
-## Operators
+---
 
-### What it does
-- **VM lifecycle** — start/stop/reboot/snapshot/clone/destroy QEMU and LXC
-  containers via `qm`/`pct` (`agent/src/pve_cmds.py`).
-- **Client-Sim (cs) control** — fast (<15s) cs commands plus long-running
-  operations (fleet reclone, update-all) dispatched in the background
-  (`agent/src/cs_commands.py`, `agent/src/cs_sim.py`).
-- **USB auto-provisioning** — the cs "brain": toggle gate, 1h resource
-  thresholds, delete-gate + 300s cooldown, `provision_halt`, `prov_run`,
-  VMID-gap audit, slot cap (`agent/src/usb_provision.py:run_provision_loop`).
-- **Watchdogs** — hardware + guest-agent watchdogs ported from the legacy cs
-  bash agent (`agent/src/watchdogs.py`).
-- **Self-update** — pulls new code from GitHub and restarts itself.
+## Testing & Verification
 
-### Install
+Execute the test suites from the repository root:
+
 ```bash
-sudo ./install_pxmx.sh --hub wss://<hub-host>:443/ws/spoke [--id <spoke-id>] [--secret <psk>]
+# Run spoke tests
+pytest tests
+
+# Run agent tests
+pytest agent/tests
 ```
-- The hub serves the spoke WebSocket on the unified `:443` uvicorn (`/ws/spoke`,
-  wss when a cert is configured). Omit `--hub` to auto-discover via mDNS/DNS.
-- Without `--secret`, the spoke connects unauthenticated and awaits admin
-  approval in the LM WebUI. IDs default to `<hostname>-spoke`.
-- Installs to `/opt/lm/pxmx`, creates the `lm-pxmx.service` systemd unit, and
-  starts it.
-
-### Ports
-- LM Hub control plane: **443** wss (`/ws/spoke` — the spoke connects to this).
-- pxmx agent listener: **443** wss **standalone (default)** — the spoke (on its own box) serves `wss://0.0.0.0:443` and a Proxmox agent dials `wss://<spoke>:443/ws/agent` directly (**agent → spoke → hub**; agent pinned via `--spoke-ip` — just the spoke's IP; the agent auto-determines the scheme/port/`/ws/agent` path by probing; a standalone spoke does not broadcast `_lm-hub` mDNS). **8443** loopback (co-located all-in-one, `--loopback`/`install_all.sh` only — `agent → hub → spoke`, hub `/ws/agent` byte-proxies to it). **8766** is the legacy no-cert plaintext fallback. See [docs/pxmx.md](docs/pxmx.md).
-
-### Notable fix
-A recurring **agent-blackout** bug (the agent-server task died and the spoke
-stopped relaying to agents) was fixed — the agent-server task is now kept alive
-and self-heals on exit, and the spoke guarantees the agent-listener port is
-released before a new instance starts. Current version: see `VERSION`.
-
-## Developers
-
-### Repo layout
-| Path | Role |
-|------|------|
-| `agent/src/agent.py` | `ProxmoxAgent` — the host agent: telemetry, cs event relay, USB provision loop. |
-| `agent/src/usb_provision.py` | The auto-provisioning brain + host-side USB state machine. |
-| `agent/src/cs_commands.py` | Fast cs command dispatcher. |
-| `agent/src/cs_sim.py` | Long-op implementations (Phase E). |
-| `agent/src/cs_guard.py` | Execution-layer sim-VM guard (90000 floor + `PROTECTED_VMIDS`). |
-| `agent/src/pve_cmds.py` | Async `qm`/`pct` wrappers. |
-| `agent/src/watchdogs.py` | Hardware + guest-agent watchdogs. |
-| `agent/src/security_utils.py` | HMAC message signing. |
-| `src/control_plane.py` | `PxmxControlPlane` — Hub-side: runs the agent listener (`run_agent_server` — `:443` wss standalone default, `:8443` loopback via `LM_PXMX_AGENT_LOOPBACK=1`/`--loopback`, `:8766` no-cert fallback), runs self-update. |
-| `src/proxmox_spoke.py` | `ProxmoxSpoke` — the multi-agent bridge spoke (Hub ↔ agents). |
-| `install_pxmx.sh` | Installer (systemd service + prereqs). |
-| `pxmx.Dockerfile` | Container build. |
-
-### Where the auto-provisioning brain lives
-Only the **agent** has Proxmox clone/destroy, so the brain runs in
-`agent/src/usb_provision.py:run_provision_loop` — **not** in the LM Hub and
-**not** in the LM cs spoke (which is relay-only). The toggle arrives under two
-key names — `usb_auto_provision` (webui-spoke 6-key blob) or `auto_provision`
-(lm-spoke full payload) — so readers take the union. Same for
-`usb_missing_timeout`/`missing_timeout` and `usb_max_slots`/`max_slots`. See
-[ARCHITECTURE.md](ARCHITECTURE.md).
-
-Every clone (first-clone + reclone) also schedules a **+15-min post-clone
-settle reboot** (`post_prov_reboot[vmid]` in `usb_state.json`, swept by
-`_run_post_prov_reboot_queue`; env `POST_PROV_REBOOT_DELAY_S`, default 900)
-so the box restarts after settling + pulling engine config + running
-`update.sh`. Two reboots are intentional — the immediate post-clone reboot
-only sets hostname/first-boot bits. See `lm/docs/pxmx.md` → *Post-clone
-settle reboot*.
-
-### Conventions
-The agent code follows a **"Phase X port of legacy `cs/proxmox/proxmox-agent.sh`…"**
-docstring convention with line-range cross-references to the solutions-hpe cs
-source. When porting more cs logic, mirror that: cite the legacy file + line
-range and the Phase milestone.
-
-### Build & test
-```bash
-pip install -r requirements.txt
-python3 -m py_compile agent/src/*.py src/*.py   # syntax check (no node/runtime needed for docs)
-```
-The cs spokes do **not** self-update — they are manually redeployed. pxmx
-self-updates from GitHub on a Hub `SPOKE_UPDATE`.
-
-### Related
-- LM Hub repo: `vscode/lm` — see `lm/docs/architecture-topology.md`, `lm/docs/pxmx.md`, and `lm/docs/README.md` for the full canonical doc set.
-- cs source: `github.com/solutions-hpe`.
