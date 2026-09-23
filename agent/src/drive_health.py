@@ -440,10 +440,7 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
     discovered = []
     seen_cciss_serials: Set[str] = set()
     seen_cciss_indices: Set[int] = set()
-    try:
-        sys_blocks = sorted(os.listdir("/sys/block"))
-    except Exception:
-        sys_blocks = []
+    sys_blocks = sorted(os.listdir("/sys/block"))
     for dev in sys_blocks:
         if not dev.startswith(("sd", "nvme", "vd")):
             continue
@@ -634,9 +631,6 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
             seen_serials.add(s)
         deduped.append(d)
     discovered = deduped
-
-    if not discovered and lsscsi_map:
-        return _build_from_lsscsi()
 
     discovered.sort(key=lambda x: (not x['block_device'].startswith('/dev/sd'), x['block_device']))
     for i, d in enumerate(discovered):
