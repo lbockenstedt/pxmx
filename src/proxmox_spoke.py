@@ -85,6 +85,7 @@ class ProxmoxSpoke(BaseSpoke):
     """
 
     def __init__(self, spoke_id: str, config: Dict[str, Any], control_plane=None):
+        """Initialize ProxmoxSpoke instance and session caches."""
         super().__init__(spoke_id, config)
         self.control_plane = control_plane
         # Per-agent telemetry cache: agent_id → latest telemetry data blob
@@ -543,6 +544,7 @@ class ProxmoxSpoke(BaseSpoke):
     # ── Agent registry ────────────────────────────────────────────────────────
 
     def _get_agents(self) -> Dict[str, Any]:
+        """Return connected and pending Proxmox agents with node and VM summaries."""
         if not self.control_plane:
             return {"status": "SUCCESS", "agents": [], "pending_agents": []}
         agents = []
@@ -577,25 +579,32 @@ class ProxmoxSpoke(BaseSpoke):
     # keep working unchanged.
 
     async def _node_stats_from_agent(self, agent_id: str) -> Dict[str, Any]:
+        """Fetch node metrics and telemetry from a specific agent."""
         return await _pxmx_agg._node_stats_from_agent(self.control_plane, agent_id)
 
     async def _get_node_stats(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Aggregate node statistics across specified or connected agents."""
         return await _pxmx_agg.get_node_stats(self.control_plane, data)
 
     async def _vms_from_agent(self, agent_id: str) -> Dict[str, Any]:
+        """Fetch VM and container inventory from a specific agent."""
         return await _pxmx_agg._vms_from_agent(self.control_plane, agent_id)
 
     async def _pool_map_from_agent(self, agent_id: str, _send, probe) -> Dict[Any, str]:
+        """Retrieve resource pool mapping from an agent."""
         return await _pxmx_agg._pool_map_from_agent(self.control_plane, agent_id, _send, probe)
 
     async def _annotate_vm_interfaces(self, agent_id: str, vms: List[Dict[str, Any]],
                                       _send) -> None:
+        """Annotate VM inventory entries with network interface details."""
         return await _pxmx_agg._annotate_vm_interfaces(vms, _send)
 
     async def _vm_interfaces(self, _send, v: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Query guest or config network interfaces for a VM."""
         return await _pxmx_agg._vm_interfaces(_send, v)
 
     async def _list_vms(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Aggregate and filter VM list across all connected agents."""
         return await _pxmx_agg.list_vms(self.control_plane, data)
 
     # ── VM search ─────────────────────────────────────────────────────────────
