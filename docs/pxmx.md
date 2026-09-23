@@ -53,9 +53,9 @@ The pxmx spoke's agent listener has two modes. **Which mode is deployed determin
 
 ## Key commands / handlers
 
-- **`ProxmoxSpoke.handle_command`** (`src/proxmox_spoke.py`): `GET_VERSION`, `UPDATE_CONFIG`, `PXMX_RETAG_TENANT`, `SET_AGENT_CONFIG`, `GET_AGENTS`, `SPOKE_RELAY` (`APPROVAL_SUCCESS`/`REVOKE_AGENT`/forward), `GET_NODE_STATS`, `PXMX_LIST_VMS`/`GET_VM_LIST`/`AGENT_GET_VM_LIST`, `SEARCH_VMS`, `GET_VM_INFO`, `PXMX_VM_ACTION`, `PXMX_VM_ACTION_BULK`, `PXMX_CLONE_VM`, `PXMX_LIST_POOLS`, `PXMX_LIST_ISOS`, `PXMX_LIST_STORAGES`, `PXMX_CREATE_VM`, `INSTALL_CERT`, `VNC_START`, `VNC_FRAME_DOWN`, `VNC_DISCONNECT`, `SHELL_START`, `SHELL_IN`, `SHELL_RESIZE`, `SHELL_DISCONNECT`. VM identity key: `<cluster_name>/<node>/<vmid>`.
+- **`ProxmoxSpoke.handle_command`** (`src/proxmox_spoke.py`): `GET_VERSION`, `UPDATE_CONFIG`, `PXMX_RETAG_TENANT`, `SET_AGENT_CONFIG`, `GET_AGENTS`, `SPOKE_RELAY` (`APPROVAL_SUCCESS`/`REVOKE_AGENT`/forward), `GET_NODE_STATS`, `PXMX_LIST_VMS`/`GET_VM_LIST`/`AGENT_GET_VM_LIST`, `SEARCH_VMS`, `GET_VM_INFO`, `PXMX_VM_ACTION`, `PXMX_VM_ACTION_BULK`, `PXMX_CLONE_VM`, `PXMX_LIST_POOLS`, `PXMX_LIST_ISOS`, `PXMX_LIST_STORAGES`, `PXMX_DRIVE_HEALTH`, `PXMX_INSTALL_SSACLI`, `PXMX_CREATE_VM`, `INSTALL_CERT`, `VNC_START`, `VNC_FRAME_DOWN`, `VNC_DISCONNECT`, `SHELL_START`, `SHELL_IN`, `SHELL_RESIZE`, `SHELL_DISCONNECT`. VM identity key: `<cluster_name>/<node>/<vmid>`.
 - **`PxmxControlPlane._agent_handler`** relayed frame types (wrapped in `AGENT_RELAY_UP`): `AGENT_HEARTBEAT`, `AGENT_TELEMETRY`, `AGENT_RESPONSE`, `AGENT_LOG`, `CS_*` (`CS_TELEMETRY`/`CS_LOG`/`CS_WATCHDOG_EVENT`/`CS_HW_RESET_EVENT`/`CS_PROGRESS`/`CS_COMMAND_RESULT`/`CS_TOKEN_RESULT`), `VNC_*` (`VNC_FRAME_UP`/`VNC_READY`/`VNC_ERROR`/`VNC_DISCONNECT`). `SET_LOG_LEVEL`/`SPOKE_SET_LOG_LEVEL` broadcast down to all agents.
-- **Agent dispatch** (`agent/src/agent.py`): `UPDATE_CONFIG`, `GET_VM_LIST`, `GET_NODE_STATS`, `GET_SYSTEM_STATS`, `SET_LOG_LEVEL`, `RUN_COMMAND`, `CS_COMMAND` (→ `cs_commands.handle_cs_command`), `CS_CREATE_PROXMOX_TOKEN`, `PXMX_VM_ACTION`, `PXMX_VM_ACTION_BULK`, `PXMX_LIST_STORAGE`, `PXMX_RETAG_TENANT`, `OS_UPDATE_CHECK`, `OS_UPDATE_APPLY`, `PXMX_GET_IDENTITY`, `PXMX_POOL_ADD_VMS`, `PXMX_APPLY_SIM_TAGS`, `PXMX_CLONE_VM`, `PXMX_LIST_POOLS`, `PXMX_LIST_ISOS`, `PXMX_LIST_STORAGES`, `PXMX_CREATE_VM`, `VNC_START`, `VNC_FRAME_DOWN`, `VNC_DISCONNECT`, `SHELL_START`, `SHELL_IN`, `SHELL_RESIZE`, `SHELL_DISCONNECT`, `INSTALL_CERT`, `START_BACKUP`, `REFRESH_TEMPLATE`.
+- **Agent dispatch** (`agent/src/agent.py`): `UPDATE_CONFIG`, `GET_VM_LIST`, `GET_NODE_STATS`, `GET_SYSTEM_STATS`, `SET_LOG_LEVEL`, `RUN_COMMAND`, `CS_COMMAND` (→ `cs_commands.handle_cs_command`), `CS_CREATE_PROXMOX_TOKEN`, `PXMX_VM_ACTION`, `PXMX_VM_ACTION_BULK`, `PXMX_LIST_STORAGE`, `PXMX_RETAG_TENANT`, `OS_UPDATE_CHECK`, `OS_UPDATE_APPLY`, `PXMX_GET_IDENTITY`, `PXMX_POOL_ADD_VMS`, `PXMX_APPLY_SIM_TAGS`, `PXMX_CLONE_VM`, `PXMX_LIST_POOLS`, `PXMX_LIST_ISOS`, `PXMX_LIST_STORAGES`, `PXMX_DRIVE_HEALTH`, `PXMX_INSTALL_SSACLI`, `PXMX_CREATE_VM`, `VNC_START`, `VNC_FRAME_DOWN`, `VNC_DISCONNECT`, `SHELL_START`, `SHELL_IN`, `SHELL_RESIZE`, `SHELL_DISCONNECT`, `INSTALL_CERT`, `START_BACKUP`, `REFRESH_TEMPLATE`.
 - **`cs_commands.handle_cs_command`** fast actions: `proxmox_reclone_clear`, `proxmox_reclone_stop`, `start_vm`, `stop_vm`, `reboot_vm`, `snapshot_vm`, `start_vms`, `stop_vms`, `snapshot_vms`, `unlock_template`, `clear_provision_lock`, `usb_probe`, `clear_usb_quarantine`, `clear_usb_history`, `clear_usb_exclusions`. Long ops (accepted + `CS_PROGRESS` + terminal `CS_COMMAND_RESULT`) in `agent/src/cs_sim.py::LONG_ACTIONS`: `delete_vm`, `reclone_vm`, `proxmox_reclone_all`, `clone_lxc`, `provision_unassigned`, `backup`, `reseed`, `update_agent`, `quarantine_dongle_and_destroy`.
 
 ## Key files
@@ -123,6 +123,19 @@ The pxmx spoke's agent listener has two modes. **Which mode is deployed determin
 2. Per-agent `client_simulation.enabled` flag (pushed to the specific pxmx agent).
 
 You also need at least one certified USB vid:pid configured and at least one clone-source template ID (`image1_template_id`/`image2_template_id`) set — without these the brain logs a gate reason (`no dongle_vidpids configured` / `no template ids configured`) and does nothing, by design.
+
+## Drive health & storage monitoring
+
+`pxmx` includes a comprehensive direct-attached drive health monitoring pipeline (`agent/src/drive_health.py` and `src/drive_health.py`):
+- **Telemetry & Inspection:** Inspects local physical disks via `smartctl` with multi-vendor fallbacks (SATA/SAS/NVMe) and HPE Smart Storage Administrator CLI (`ssacli` / `hpssacli`) for HPE Smart Array RAID controllers.
+- **Wear-leveling & Endurance:** Extracts wear-level percentage, NVMe percentage used, spare block depletion, reallocated sectors, power-on hours, and device temperature.
+- **Dynamic SSACLI Provisioning:** Auto-detects HPE ProLiant hardware platforms via DMI and PCI sysfs (`/sys/class/dmi/id/sys_vendor`, `/sys/bus/pci/drivers`) and dynamically triggers unattended package installation (`PXMX_INSTALL_SSACLI`) on the host node.
+- **Threshold Alerting & Summaries:** Categorizes drives as `healthy`, `warning`, or `critical` according to wear endurance thresholds (>=80% warning, >=90% critical) and SMART overall health assessments, returning structured summaries (`PXMX_DRIVE_HEALTH`) to the LM WebUI.
+
+## Node-level metrics & telemetry
+
+- **Hardware & Host Metrics:** Periodically aggregates CPU load averages (1m/5m/15m), total/used RAM, swap pressure, root filesystem and local storage utilization, and kernel/Proxmox PVE versions via `GET_NODE_STATS` and `GET_SYSTEM_STATS`.
+- **Storage Pools:** Ingests PVE storage allocations (`PXMX_LIST_STORAGES`) including `local`, `local-lvm`, `local-zfs`, and shared NFS/Ceph targets, tracking active image and ISO repositories (`PXMX_LIST_ISOS`).
 
 ## Troubleshooting / common questions
 
