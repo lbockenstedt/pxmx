@@ -197,6 +197,31 @@ class TestDeviceDiscovery:
             assert "/dev/sda1" not in block_devs
             assert "/dev/loop0" not in block_devs
 
+    async def test_missing_sys_block_falls_back_to_lsscsi(self):
+        """pxmx#99: a host where /sys/block isn't mounted (container/chroot,
+        restricted namespace) used to discard every lsscsi-discovered drive
+        outright and report zero devices, even though lsscsi -g succeeded.
+        Those drives must still be reported, built straight from lsscsi.
+        (NVMe entries aren't recoverable this way — lsscsi's own block-device
+        column extraction only recognizes /dev/sd*/vd* — so this fixture only
+        has the two SAS/SATA drives lsscsi_map can actually capture.)"""
+        proc_mock = MagicMock(returncode=0, stdout=LSSCSI_SAMPLE_OUTPUT, stderr="")
+        with patch("subprocess.run", return_value=proc_mock), \
+             patch("os.path.exists", return_value=False):
+            devices = await drive_health.get_scsi_devices()
+            block_devs = [d["block_device"] for d in devices]
+            assert len(devices) == 2
+            assert "/dev/sda" in block_devs
+            assert "/dev/sdb" in block_devs
+            dev_by_blk = {d["block_device"]: d for d in devices}
+            assert dev_by_blk["/dev/sda"]["is_raid_logical"] is True
+            assert dev_by_blk["/dev/sda"]["interface"] == "raid_logical"
+            assert dev_by_blk["/dev/sdb"]["is_raid_logical"] is False
+            assert dev_by_blk["/dev/sdb"]["interface"] == "sata"
+            # every entry got a sequential index despite the sysfs-less path
+            assert [d["index"] for d in devices] == list(range(len(devices)))
+
+
     async def test_get_drive_health_propagates_interface_and_telemetry(self):
         mock_devices = [
             {"block_device": "/dev/sda", "index": 0, "vendor": "Samsung", "model": "860", "serial": "S1", "interface": "sata"},
