@@ -411,13 +411,47 @@ async def get_scsi_devices() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.debug("lsscsi check failed: %s", e)
 
+    def _build_from_lsscsi() -> List[Dict[str, Any]]:
+        lsscsi_devices = []
+        for blk_name, info in lsscsi_map.items():
+            vendor = info["vendor"]
+            model = info["model"]
+            if vendor.upper() in ("HP", "HPE") and "LOGICAL" in model.upper():
+                interface = "raid_logical"
+                is_raid_logical = True
+            else:
+                interface = "sas" if "sas" in vendor.lower() or "sas" in model.lower() else "sata"
+                is_raid_logical = False
+            lsscsi_devices.append({
+                "host": info["host"],
+                "scsi_path": info["scsi_path"],
+                "block_device": f"/dev/{blk_name}",
+                "vendor": vendor,
+                "model": model,
+                "serial": "unknown",
+                "interface": interface,
+                "is_raid_logical": is_raid_logical,
+            })
+        lsscsi_devices.sort(key=lambda x: (not x['block_device'].startswith('/dev/sd'), x['block_device']))
+        for i, d in enumerate(lsscsi_devices):
+            d["index"] = i
+        return lsscsi_devices
+
     if not os.path.exists("/sys/block"):
-        return devices
+        # /sys/block is unavailable (containerized/chrooted host, restricted
+        # mount namespace) but lsscsi -g above may still have succeeded — that
+        # was previously discarded outright, silently reporting zero drives on
+        # any host where /sys/block isn't mounted even though lsscsi saw them
+        # all. Build best-effort entries straight from the lsscsi output
+        # instead; per-device sysfs details (removable/zero-size filtering,
+        # cciss physical-drive expansion, NVMe) simply aren't available here.
+        return _build_from_lsscsi()
 
     discovered = []
     seen_cciss_serials: Set[str] = set()
     seen_cciss_indices: Set[int] = set()
-    for dev in sorted(os.listdir("/sys/block")):
+    sys_blocks = sorted(os.listdir("/sys/block"))
+    for dev in sys_blocks:
         if not dev.startswith(("sd", "nvme", "vd")):
             continue
             
