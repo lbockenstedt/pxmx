@@ -16,7 +16,11 @@ from pathlib import Path
 
 _PXMX = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PXMX / "src"))
-sys.path.insert(0, str(Path("/Users/lbockenstedt/vscode/lm/core/src")))
+# base_spoke lives in the sibling lm repo's core/src (see proxmox_spoke.py's
+# import fallback). Assumes the usual sibling checkout layout (pxmx and lm
+# side by side under the same parent directory) rather than one developer's
+# absolute home path, and LM_CORE_SRC lets CI/other layouts override it.
+sys.path.insert(0, os.environ.get("LM_CORE_SRC") or str(_PXMX.parent / "lm" / "core" / "src"))
 
 import asyncio  # noqa: E402
 
