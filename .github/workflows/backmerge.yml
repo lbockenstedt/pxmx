@@ -42,9 +42,10 @@ name: backmerge
 #   * The back-merge graph is strictly DOWNWARD -- main -> {qa,dev}, qa -> dev.
 #     dev is never a source, so it is a terminal node. The longest possible
 #     chain is main -> qa -> dev and then it stops.
-#   * In practice even that chain does not fire: a merge performed with
-#     GITHUB_TOKEN does not spawn new workflow runs, and main -> dev is opened
-#     in parallel anyway, so qa -> dev has nothing left to carry.
+#   * In practice even that chain does not fire for pushes to main: a merge
+#     performed with GITHUB_TOKEN does not spawn new workflow runs, and
+#     main -> dev is opened in parallel anyway. For pushes directly to qa
+#     (e.g. fixes during promotion), qa -> dev carries the changes back.
 # Do not add dev as a source, and do not add main as a target.
 #
 # VERSION is handled by the same .github/scripts/promote.sh used by promote.yml
@@ -79,10 +80,9 @@ jobs:
       # upward edges this workflow must never take.
       #
       # Only the pairs whose source is the branch that was just pushed actually
-      # do anything -- the rest exit at the first step. They are not filtered
-      # out with a job-level `if` because the `matrix` context is NOT available
-      # there (GitHub evaluates it before the matrix expands), so the filter has
-      # to be a step.
+      # do anything. They are not filtered out with a job-level `if` because the
+      # `matrix` context is NOT available there (GitHub evaluates it before the
+      # matrix expands), so the filter is placed on the steps.
       matrix:
         include:
           - source: main
@@ -93,16 +93,15 @@ jobs:
             target: dev
     steps:
       - uses: actions/checkout@v4
+        if: matrix.source == github.ref_name
         with:
           fetch-depth: 0
 
       - name: Skip pairs that do not apply to this push, or a missing target
         id: exists
+        if: matrix.source == github.ref_name
         run: |
-          if [ "${{ matrix.source }}" != "${{ github.ref_name }}" ]; then
-            echo "::notice::push was to '${{ github.ref_name }}'; the ${{ matrix.source }} -> ${{ matrix.target }} back-merge does not apply"
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          elif git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
+          if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::no '${{ matrix.target }}' branch in this repo; nothing to back-merge"
