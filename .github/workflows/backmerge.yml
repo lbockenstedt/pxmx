@@ -64,6 +64,7 @@ permissions:
 
 jobs:
   backmerge:
+    if: matrix.source == github.ref_name
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Job-level, not workflow-level: workflow `concurrency` is evaluated before
@@ -79,10 +80,8 @@ jobs:
       # legal pairs: the cross product would also produce qa -> qa and the
       # upward edges this workflow must never take.
       #
-      # Only the pairs whose source is the branch that was just pushed actually
-      # do anything. They are not filtered out with a job-level `if` because the
-      # `matrix` context is NOT available there (GitHub evaluates it before the
-      # matrix expands), so the filter is placed on the steps.
+      # Only the pairs whose source is the branch that was just pushed run;
+      # the job-level `if` skips unneeded pairs before allocating a runner.
       matrix:
         include:
           - source: main
@@ -93,13 +92,11 @@ jobs:
             target: dev
     steps:
       - uses: actions/checkout@v4
-        if: matrix.source == github.ref_name
         with:
           fetch-depth: 0
 
       - name: Skip pairs that do not apply to this push, or a missing target
         id: exists
-        if: matrix.source == github.ref_name
         run: |
           if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
