@@ -1,41 +1,60 @@
 name: backmerge
 
-# Keeps qa and dev from falling permanently behind main.
+# Keeps qa and dev from falling permanently behind the branches above them.
 #
 # WHY THIS EXISTS
-# The promotion flow is one-way: dev -> qa -> main. Anything that lands on main
-# without travelling that path therefore leaves the lower branches behind, and
-# the gap never closes on its own. Two things routinely do exactly that:
+# The promotion flow is one-way: dev -> qa -> main. Anything that lands on an
+# UPPER branch without travelling that path therefore leaves the lower ones
+# behind, and the gap never closes on its own. Three things routinely do
+# exactly that:
 #
 #   * the repo owner committing directly to main (the one path allowed to skip
-#     the flow -- see branch-flow.yml), and
+#     the flow -- see branch-flow.yml),
 #   * the promotion merge commits themselves. `promote/qa-to-main` is merged
 #     INTO main, so main gains a merge commit plus its VERSION bump that qa
 #     never sees. This is not hypothetical: ab's main was 4 commits ahead of qa
-#     from promotions alone before this workflow existed.
+#     from promotions alone before this workflow existed, and
+#   * FIXES MADE DURING A PROMOTION. A promotion PR is a real PR: it gets
+#     reviewed, and when the panel (or a human) finds something, the repair is
+#     committed onto the promotion branch -- `promote/dev-to-qa` for a qa
+#     promotion, `promote/qa-to-main` for a main one. That repair therefore
+#     exists ONLY on the branch being promoted into. The `promote/qa-to-main`
+#     case is carried back by main -> dev below; the `promote/dev-to-qa` case
+#     lands on qa, and before qa was made a source here NOTHING carried it back
+#     to dev. dev would then re-promote the unfixed code and the same defect
+#     would be found again, every cycle, forever.
 #
 # Left alone the divergence compounds, and the next promotion PR carries a
 # confusing diff full of changes that are "already on main".
 #
 # WHAT IT DOES
-# On every push to main, opens a PR main -> qa and a PR main -> dev, and merges
-# each one as soon as its required checks pass (natively via auto-merge on qa,
-# which is check-gated; after waiting for the checks to go green on dev, which
-# is not). It never pushes to qa or dev directly: those branches take changes by
-# pull request like everything else, so a conflicting or failing back-merge
-# surfaces for a human instead of being force-resolved by a bot.
+# On every push to main it opens main -> qa and main -> dev; on every push to
+# qa it opens qa -> dev. Each PR is merged as soon as its required checks pass
+# (natively via auto-merge on qa, which is check-gated; after waiting for the
+# checks to go green on dev, which is not). It never pushes to qa or dev
+# directly: those branches take changes by pull request like everything else,
+# so a conflicting or failing back-merge surfaces for a human instead of being
+# force-resolved by a bot.
 #
-# NO LOOP: the only trigger is a push to main, and nothing here writes to main.
-# Merging a back-merge PR pushes to qa or dev, which triggers nothing.
+# NO LOOP, and this is the property to preserve when editing:
+#   * Nothing here ever writes to main, so a push to main cannot re-trigger the
+#     workflow (pinned by test_never_writes_to_main).
+#   * The back-merge graph is strictly DOWNWARD -- main -> {qa,dev}, qa -> dev.
+#     dev is never a source, so it is a terminal node. The longest possible
+#     chain is main -> qa -> dev and then it stops.
+#   * In practice even that chain does not fire: a merge performed with
+#     GITHUB_TOKEN does not spawn new workflow runs, and main -> dev is opened
+#     in parallel anyway, so qa -> dev has nothing left to carry.
+# Do not add dev as a source, and do not add main as a target.
 #
 # VERSION is handled by the same .github/scripts/promote.sh used by promote.yml
 # -- shared deliberately, because the VERSION pinning and conflict handling are
 # the fiddly part and a second copy would drift. qa/dev keep their own version
-# lineage; main's version never leaks backwards.
+# lineage; an upper branch's version never leaks backwards.
 
 on:
   push:
-    branches: [main]
+    branches: [main, qa]
 
 permissions:
   contents: write
@@ -50,21 +69,40 @@ jobs:
     # the matrix expands, so `matrix.target` is empty there and both targets
     # would collapse into one queue (the qa run cancelling the dev run).
     concurrency:
-      group: backmerge-main-to-${{ matrix.target }}
+      group: backmerge-${{ matrix.source }}-to-${{ matrix.target }}
       cancel-in-progress: false
     strategy:
       fail-fast: false   # dev must still be offered the change if qa conflicts
+      # Every DOWNWARD edge of the promotion graph. `include` rather than two
+      # crossed lists because main -> qa, main -> dev and qa -> dev are the only
+      # legal pairs: the cross product would also produce qa -> qa and the
+      # upward edges this workflow must never take.
+      #
+      # Only the pairs whose source is the branch that was just pushed actually
+      # do anything -- the rest exit at the first step. They are not filtered
+      # out with a job-level `if` because the `matrix` context is NOT available
+      # there (GitHub evaluates it before the matrix expands), so the filter has
+      # to be a step.
       matrix:
-        target: [qa, dev]
+        include:
+          - source: main
+            target: qa
+          - source: main
+            target: dev
+          - source: qa
+            target: dev
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Skip if the target branch does not exist
+      - name: Skip pairs that do not apply to this push, or a missing target
         id: exists
         run: |
-          if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
+          if [ "${{ matrix.source }}" != "${{ github.ref_name }}" ]; then
+            echo "::notice::push was to '${{ github.ref_name }}'; the ${{ matrix.source }} -> ${{ matrix.target }} back-merge does not apply"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          elif git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::no '${{ matrix.target }}' branch in this repo; nothing to back-merge"
@@ -75,9 +113,9 @@ jobs:
         id: build
         if: steps.exists.outputs.ok == 'true'
         env:
-          SRC: main
+          SRC: ${{ matrix.source }}
           TGT: ${{ matrix.target }}
-          BR: backmerge/main-to-${{ matrix.target }}
+          BR: backmerge/${{ matrix.source }}-to-${{ matrix.target }}
           LABEL: backmerge
         run: |
           git config user.name  "promote-bot[bot]"
@@ -86,37 +124,40 @@ jobs:
 
       - name: Push back-merge branch
         if: steps.build.outputs.changed == 'true'
-        run: git push -f -q origin "backmerge/main-to-${{ matrix.target }}"
+        run: git push -f -q origin "backmerge/${{ matrix.source }}-to-${{ matrix.target }}"
 
       - name: Open or update the back-merge PR
         id: pr
         if: steps.build.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC: ${{ matrix.source }}
           TGT: ${{ matrix.target }}
-          BR: backmerge/main-to-${{ matrix.target }}
+          BR: backmerge/${{ matrix.source }}-to-${{ matrix.target }}
         run: |
           set -e
           existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
           if [ -n "$existing" ]; then
-            echo "PR #$existing already open for $BR (force-pushed with the latest main)."
+            echo "PR #$existing already open for $BR (force-pushed with the latest $SRC)."
             echo "number=$existing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           {
-            printf 'Automated back-merge of `main` into `%s`.\n\n' "$TGT"
-            printf 'Opened because `main` moved without coming through the promotion\n'
-            printf 'flow -- a direct commit, or the merge commit from a promotion PR.\n'
-            printf 'Without this, `%s` falls permanently behind and the next\n' "$TGT"
-            printf 'promotion diff fills up with changes that are already on main.\n\n'
+            printf 'Automated back-merge of `%s` into `%s`.\n\n' "$SRC" "$TGT"
+            printf 'Opened because `%s` moved without coming through the promotion\n' "$SRC"
+            printf 'flow -- a direct commit, the merge commit from a promotion PR, or a\n'
+            printf 'fix committed onto a promotion branch while that promotion was being\n'
+            printf 'reviewed. That last one only ever exists on `%s`: without this PR,\n' "$SRC"
+            printf '`%s` would re-promote the unfixed code and the same defect would be\n' "$TGT"
+            printf 'found again next cycle.\n\n'
             printf 'Carries **code only** -- every tracked `VERSION` file is pinned to\n'
-            printf '`%s`'"'"'s own sequence, so main'"'"'s version does not leak backwards.\n\n' "$TGT"
+            printf '`%s`'"'"'s own sequence, so `%s`'"'"'s version does not leak backwards.\n\n' "$TGT" "$SRC"
             printf 'This PR merges itself once its required checks pass. If it cannot\n'
             printf '(a conflict, or a failing check) it stays open for a human -- nothing\n'
             printf 'is force-resolved and nothing is pushed to `%s` directly.\n' "$TGT"
           } > /tmp/backmerge-body.md
           gh pr create --base "$TGT" --head "$BR" \
-            --title "backmerge: main -> $TGT" \
+            --title "backmerge: $SRC -> $TGT" \
             --body-file /tmp/backmerge-body.md
           num=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
           echo "number=$num" >> "$GITHUB_OUTPUT"
@@ -129,7 +170,7 @@ jobs:
         if: steps.build.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BR: backmerge/main-to-${{ matrix.target }}
+          BR: backmerge/${{ matrix.source }}-to-${{ matrix.target }}
           SHA: ${{ steps.build.outputs.sha }}
         run: |
           for _ in $(seq 1 24); do
@@ -164,8 +205,8 @@ jobs:
       # Neither path can force a conflicted merge: `gh pr merge` fails on a
       # dirty PR and it stays open for a human, which is the whole point.
       #
-      # Still no loop: this pushes to qa/dev, and nothing back-merges from
-      # those branches.
+      # Still no loop: this pushes to qa or dev. dev back-merges from nothing,
+      # and the qa -> dev edge is strictly downward, so the chain terminates.
       - name: Merge the back-merge PR
         if: steps.build.outputs.changed == 'true' && steps.pr.outputs.number != ''
         env:
