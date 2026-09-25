@@ -30,6 +30,17 @@ name: promote
 # day-to-day feedback stays automatic. Only the decision to promote is manual.
 
 on:
+  # qa advancing means the dev -> qa unit that was in flight has landed.
+  # Promotion is split one original PR at a time, so queue the next unit here.
+  # Without this the queue stalls after unit 1 and every later unit needs its
+  # own manual dispatch -- strictly worse than the old single batched PR.
+  #
+  # This does NOT reintroduce the per-commit cascade that `on: push` to dev
+  # once caused: it fires only on qa, and "Resolve source and target" pins a
+  # push-triggered run to the dev -> qa hop. A push to qa can never start
+  # anything moving toward main.
+  push:
+    branches: [qa]
   workflow_dispatch:
     inputs:
       source:
@@ -48,7 +59,11 @@ concurrency:
   # Keyed off the branch being promoted, not the ref the run was dispatched
   # from -- a manual run is always dispatched from the default branch, so
   # github.ref_name would collapse dev->qa and qa->main into one queue.
-  group: promote-${{ github.event.inputs.source || github.ref_name }}
+  # Must agree with the src that "Resolve source and target" will pick, or a
+  # push-triggered run (ref_name 'qa', but promoting dev) would land in a
+  # different queue than a manual dev run and the two would force-push the
+  # same promotion branch concurrently.
+  group: promote-${{ github.event_name == 'push' && 'dev' || github.event.inputs.source || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -63,7 +78,15 @@ jobs:
       - name: Resolve source and target
         id: route
         run: |
-          src="${{ github.event.inputs.source || github.ref_name }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Pinned, NOT taken from the ref. github.ref_name on this trigger is
+            # "qa", which would resolve to the qa -> main hop and auto-advance
+            # production every time a promotion landed. Queueing the next
+            # dev -> qa unit is the only thing this trigger may do.
+            src=dev
+          else
+            src="${{ github.event.inputs.source || github.ref_name }}"
+          fi
           case "$src" in
             dev) tgt=qa ;;
             qa)  tgt=main ;;
@@ -80,6 +103,11 @@ jobs:
           SRC: ${{ steps.route.outputs.src }}
           TGT: ${{ steps.route.outputs.tgt }}
           BR: ${{ steps.route.outputs.branch }}
+          # One ORIGINAL unit of work per promotion PR instead of everything
+          # that has accumulated. A 20-file batch is what drove the skeptical
+          # reviewers past their file budget, so they rejected on "could not
+          # verify" rather than on any real defect.
+          PROMOTE_SPLIT: '1'
         run: |
           git config user.name  "promote-bot[bot]"
           git config user.email "promote-bot@users.noreply.github.com"
@@ -96,21 +124,49 @@ jobs:
           SRC: ${{ steps.route.outputs.src }}
           TGT: ${{ steps.route.outputs.tgt }}
           BR: ${{ steps.route.outputs.branch }}
+          UNIT_PR: ${{ steps.build.outputs.unit_pr }}
+          UNIT_SUBJECT: ${{ steps.build.outputs.unit_subject }}
+          REMAINING: ${{ steps.build.outputs.remaining }}
         run: |
           set -e
-          existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
-          if [ -n "$existing" ]; then
-            echo "PR #$existing already open for $BR (force-pushed with the latest $SRC)."
-            exit 0
+          # Name the ORIGINAL work, not just the hop -- with one unit per
+          # promotion PR, "promote: dev -> qa" alone no longer identifies which
+          # change is in flight. The `promote:` prefix is load-bearing:
+          # fleet_guardrails.is_promotion matches on it.
+          title="promote: $SRC -> $TGT"
+          if [ -n "$UNIT_SUBJECT" ]; then
+            if [ -n "$UNIT_PR" ]; then
+              title="$title (#$UNIT_PR: $UNIT_SUBJECT)"
+            else
+              title="$title ($UNIT_SUBJECT)"
+            fi
           fi
           {
             printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
+            if [ -n "$UNIT_SUBJECT" ]; then
+              printf 'Carries **one unit of work**'
+              [ -n "$UNIT_PR" ] && printf ' (originally #%s)' "$UNIT_PR"
+              printf ':\n\n> %s\n\n' "$UNIT_SUBJECT"
+              if [ "${REMAINING:-0}" -gt 0 ] 2>/dev/null; then
+                printf 'Up to **%s** further unit(s) are queued behind this one and will\n' "$REMAINING"
+                printf 'be promoted once this PR merges, oldest first.\n\n' 
+              fi
+            fi
             printf 'Carries **code only** - every tracked `VERSION` file is pinned to\n'
             printf '`%s`'"'"'s own sequence and advanced one step here.\n' "$TGT"
             printf 'A version set on `%s` never leaks across.\n' "$SRC"
           } > /tmp/promote-body.md
+          existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            # The branch was force-pushed, so an existing PR's title/body can
+            # describe a unit that is no longer the one in flight. Refresh it
+            # rather than leaving a stale description on a live PR.
+            echo "PR #$existing already open for $BR -- refreshing title and body."
+            gh pr edit "$existing" --title "$title" --body-file /tmp/promote-body.md
+            exit 0
+          fi
           gh pr create --base "$TGT" --head "$BR" \
-            --title "promote: $SRC -> $TGT" \
+            --title "$title" \
             --body-file /tmp/promote-body.md
 
       # A PR opened with GITHUB_TOKEN does not start its checks automatically --

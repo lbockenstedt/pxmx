@@ -49,4 +49,77 @@ git checkout -q -B dev origin/dev; echo "feature2" > app.py; git commit -qam f2;
 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh >/dev/null
 chk "qa 1.46 -> 1.47" "$(cat VERSION)" "1.47"
 
+echo "== split promotion: one original PR per promotion PR =="
+git push -q origin promote/dev-to-qa:qa
+git fetch -q origin
+
+# Three units land on dev: a merged PR, then a VERSION-only bump, then a direct
+# push. The VERSION bump sits DELIBERATELY IN THE MIDDLE -- once VERSION is
+# pinned back to qa it is a content no-op, so if the selector could not skip it
+# the queue would deadlock on it and the direct push behind it would never be
+# promoted. A no-op unit at the END of the queue would not prove this: there,
+# "skipped it" and "nothing left to do" look identical.
+git checkout -q -B dev origin/dev
+git checkout -q -b unitA
+echo "alpha" > alpha.py; git add alpha.py; git commit -qm "add alpha"
+git checkout -q dev
+git merge -q --no-ff unitA -m "Merge pull request #7 from o/unitA" -m "feat: add the alpha module"
+echo "10.01" > VERSION; git commit -qam "chore: bump dev version"
+echo "beta" > beta.py; git add beta.py; git commit -qm "direct: add beta"
+git push -q origin dev; git fetch -q origin
+
+PROMOTE_SPLIT=1 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh >/dev/null
+chk "unit 1 carries its own change"  "$(cat alpha.py 2>/dev/null)" "alpha"
+chk "unit 1 withholds later work"    "$([ -f beta.py ] && echo present || echo absent)" "absent"
+chk "unit 1 names the original PR"   "$(git log -1 --pretty=%s)" "promote: dev -> qa (#7)"
+chk "unit 1 advances qa once"        "$(cat VERSION)" "1.48"
+git push -q origin promote/dev-to-qa:qa; git fetch -q origin
+
+# The next unit in line is the VERSION-only commit, which is a no-op. It must be
+# skipped so the direct push BEHIND it still gets promoted.
+out=$(PROMOTE_SPLIT=1 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh 2>&1)
+case "$out" in *"no content change"*) echo "  PASS no-op unit reported as skipped"; pass=$((pass+1));;
+  *) echo "  FAIL expected a skip, got: $out"; fail=$((fail+1));; esac
+chk "queue advanced past the no-op" "$(cat beta.py 2>/dev/null)" "beta"
+chk "and still has unit 1"          "$(cat alpha.py 2>/dev/null)" "alpha"
+chk "qa advanced once, not twice"   "$(cat VERSION)" "1.49"
+git push -q origin promote/dev-to-qa:qa; git fetch -q origin
+
+out=$(PROMOTE_SPLIT=1 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh 2>&1 || true)
+case "$out" in *"Nothing to promote"*) echo "  PASS queue drains when every unit is promoted"; pass=$((pass+1));;
+  *) echo "  FAIL expected a drained queue, got: $out"; fail=$((fail+1));; esac
+
+echo "== batched mode is unchanged by the split option =="
+git checkout -q -B dev origin/dev
+echo "gamma" > gamma.py; git add gamma.py; git commit -qm "add gamma"
+echo "delta" > delta.py; git add delta.py; git commit -qm "add delta"
+git push -q origin dev; git fetch -q origin
+SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh >/dev/null
+chk "batched takes every unit at once (gamma)" "$(cat gamma.py 2>/dev/null)" "gamma"
+chk "batched takes every unit at once (delta)" "$(cat delta.py 2>/dev/null)" "delta"
+
+echo "== the running script is immutable mid-promotion =="
+# stage_to checks out the TARGET branch into the working tree, which replaces
+# .github/scripts/* underneath the running script. If the run then picked its
+# tooling back up from the working tree it would be executing the TARGET's code
+# halfway through -- which is how a split promotion silently continued as the
+# target's older batched script and swept up every remaining unit at once.
+# Sabotaging the target's copy makes that hijack deterministic to detect.
+git checkout -q -B qa origin/qa
+cat > .github/scripts/bump_version.py <<'SAB'
+import sys
+open(sys.argv[1], "w").write("SABOTAGED\n")
+SAB
+git commit -qam "qa: tooling that must never run"
+git push -q origin qa
+git checkout -q -B dev origin/dev
+echo "epsilon" > epsilon.py; git add epsilon.py; git commit -qm "add epsilon"
+git push -q origin dev; git fetch -q origin
+PROMOTE_SPLIT=1 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh >/dev/null
+case "$(cat VERSION)" in
+  SABOTAGED) chk "target's tooling cannot hijack the run" "hijacked" "clean" ;;
+  *)         chk "target's tooling cannot hijack the run" "clean"    "clean" ;;
+esac
+chk "and it still promoted the oldest unit" "$(cat gamma.py 2>/dev/null)" "gamma"
+
 echo; echo "RESULT: $pass passed, $fail failed"; rm -rf "$T"; [ "$fail" -eq 0 ]
