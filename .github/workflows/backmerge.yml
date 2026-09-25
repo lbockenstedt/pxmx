@@ -79,10 +79,7 @@ jobs:
       # legal pairs: the cross product would also produce qa -> qa and the
       # upward edges this workflow must never take.
       #
-      # Only the pairs whose source is the branch that was just pushed actually
-      # do anything. They are not filtered out with a job-level `if` because the
-      # `matrix` context is NOT available there (GitHub evaluates it before the
-      # matrix expands), so the filter is placed on the steps.
+      # Only the pairs whose source is the branch that was just pushed run.
       matrix:
         include:
           - source: main
@@ -97,7 +94,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Skip pairs that do not apply to this push, or a missing target
+      - name: Check target branch exists
         id: exists
         if: matrix.source == github.ref_name
         run: |
