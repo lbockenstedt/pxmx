@@ -79,8 +79,7 @@ jobs:
       # legal pairs: the cross product would also produce qa -> qa and the
       # upward edges this workflow must never take.
       #
-      # Only the pairs whose source is the branch that was just pushed run;
-      # the `exists` step skips pairs that do not apply to this push.
+      # Only the pairs whose source is the branch that was just pushed run.
       matrix:
         include:
           - source: main
@@ -91,16 +90,14 @@ jobs:
             target: dev
     steps:
       - uses: actions/checkout@v4
+        if: matrix.source == github.ref_name
         with:
           fetch-depth: 0
 
-      - name: Skip pairs that do not apply to this push, or a missing target
+      - name: Check target branch exists
         id: exists
+        if: matrix.source == github.ref_name
         run: |
-          if [ "${{ matrix.source }}" != "${{ github.ref_name }}" ]; then
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
