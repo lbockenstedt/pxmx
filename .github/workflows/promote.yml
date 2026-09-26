@@ -75,6 +75,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # GitHub REFUSES to let the Actions GITHUB_TOKEN create or update any
+          # file under .github/workflows/, and NO `permissions:` block can grant
+          # it -- it is a platform rule, not a configurable scope. A promotion or
+          # back-merge whose unit touches a workflow file therefore died at the
+          # push step with "refusing to allow a GitHub App to create or update
+          # workflow ... without `workflows` permission". That stalled the
+          # promotion queue, and because back-merge is what keeps dev and qa
+          # converged, it also let them drift until they genuinely conflicted.
+          # WORKFLOW_TOKEN (a PAT or App token carrying `workflow` scope) is
+          # used when it exists; the push step explains the situation instead of
+          # failing opaquely when it does not.
+          token: ${{ secrets.WORKFLOW_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Resolve source and target
         id: route
@@ -116,7 +128,29 @@ jobs:
 
       - name: Push promotion branch
         if: steps.build.outputs.changed == 'true'
-        run: git push -f -q origin "${{ steps.route.outputs.branch }}"
+        env:
+          BR: ${{ steps.route.outputs.branch }}
+          TGT: ${{ steps.route.outputs.tgt }}
+          # An unset secret is the empty string, so this is 'true' only when a
+          # workflow-scoped token is actually configured.
+          HAS_WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN != '' }}
+        run: |
+          # Preflight: a push carrying a .github/workflows/ change is rejected
+          # outright unless the credential holds `workflow` scope. Detecting it
+          # here turns an opaque git failure into an instruction.
+          if wf="$(git diff --name-only "origin/$TGT...$BR" 2>/dev/null)"; then
+            if printf '%s\n' "$wf" | grep -q '^\.github/workflows/'; then
+              if [ "$HAS_WORKFLOW_TOKEN" != "true" ]; then
+                echo "::error::This promotion changes .github/workflows/, which the Actions GITHUB_TOKEN is forbidden to push. Add a repository secret WORKFLOW_TOKEN holding a token with 'workflow' scope, then re-run. No permissions: block can grant this -- it is a GitHub platform restriction."
+                printf 'Workflow files carried by this promotion:\n%s\n' \
+                  "$(printf '%s\n' "$wf" | grep '^\.github/workflows/')"
+                exit 1
+              fi
+            fi
+          else
+            echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential; attempting the push anyway"
+          fi
+          git push -f -q origin "$BR"
 
       - name: Open or update the promotion PR
         if: steps.build.outputs.changed == 'true'
