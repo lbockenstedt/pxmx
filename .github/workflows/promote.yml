@@ -160,14 +160,13 @@ jobs:
           if [ -n "$UNIT_PR" ]; then
             # Pessimistic default: only a confirmed exit 0 clears it.
             intent_state="fetch-failed"
-            unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null)"
-            if [ $? -eq 0 ]; then
+            if unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null)"; then
               if printf '%s\n' "$unit_body" \
                    | grep -qE '^#+.*Intent & Problem Statement'; then
                 intent="$(printf '%s\n' "$unit_body" | awk '
-                  /^#/ && /Intent & Problem Statement/ { f=1; next }
-                  f && /^#/ { exit }
-                  f { print }' | sed 's/<!--.*-->//' | sed '/^[[:space:]]*$/d')"
+                  /^##+[[:space:]].*Intent & Problem Statement/ { f=1; next }
+                  f && /^##+[[:space:]]/ { exit }
+                  f { print }' | perl -0777 -pe 's/<!--.*?-->//gs' | sed '/^[[:space:]]*$/d')"
                 if [ -n "$intent" ]; then
                   intent_state="ok"
                 else
@@ -182,8 +181,7 @@ jobs:
           # No `|| echo 0` here: that masks a rev-list FAILURE as a genuine count
           # of 0, so the body would claim "0 commit(s)" for a promotion that may
           # carry many. Capture the real status, then default only on failure.
-          ncommits="$(git rev-list --count --no-merges "$base..$BR" 2>/dev/null)"
-          if [ $? -eq 0 ] && [ -n "$ncommits" ]; then
+          if ncommits="$(git rev-list --count --no-merges "$base..$BR" 2>/dev/null)" && [ -n "$ncommits" ]; then
             ncommits_ok="yes"
           else
             ncommits_ok="no"
