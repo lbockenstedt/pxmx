@@ -142,24 +142,143 @@ jobs:
               title="$title ($UNIT_SUBJECT)"
             fi
           fi
-          {
-            printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
-            if [ -n "$UNIT_SUBJECT" ]; then
-              printf 'Carries **one unit of work**'
-              [ -n "$UNIT_PR" ] && printf ' (originally #%s)' "$UNIT_PR"
-              printf ':\n\n> %s\n\n' "$UNIT_SUBJECT"
-              if [ "${REMAINING:-0}" -gt 0 ] 2>/dev/null; then
-                printf 'Up to **%s** further unit(s) are queued behind this one and will\n' "$REMAINING"
-                printf 'be promoted once this PR merges, oldest first.\n\n' 
+          # The panel is told to lower confidence when a PR states no intent
+          # (AGENTS.md: Pull Request Intent & Specification Rule). A promotion
+          # PR inherits its intent from the original PR it carries, so fetch
+          # that and quote it. The old boilerplate ("carries code only") is
+          # what made every recent promotion reject with ZERO code findings --
+          # dns#65, le#22, opnsense#54, cppm#34, nw#128 all read "the
+          # description doesn't match the diff".
+          #
+          # "intent is empty" is FOUR different states and they must not print the
+          # same sentence: no originating PR at all, a fetch that FAILED (so the
+          # section was never even looked at), a PR with no section, and a PR that
+          # left the template comment unfilled. Reporting a failed fetch as "stated
+          # no intent" is simply false, and it hides a broken token or a deleted PR.
+          intent=""
+          intent_state="no-unit"
+          if [ -n "$UNIT_PR" ]; then
+            # Pessimistic default: only a confirmed exit 0 clears it.
+            intent_state="fetch-failed"
+            unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null)"
+            if [ $? -eq 0 ]; then
+              if printf '%s\n' "$unit_body" \
+                   | grep -qE '^#+.*Intent & Problem Statement'; then
+                intent="$(printf '%s\n' "$unit_body" | awk '
+                  /^#/ && /Intent & Problem Statement/ { f=1; next }
+                  f && /^#/ { exit }
+                  f { print }' | sed 's/<!--.*-->//' | sed '/^[[:space:]]*$/d')"
+                if [ -n "$intent" ]; then
+                  intent_state="ok"
+                else
+                  intent_state="unfilled"
+                fi
+              else
+                intent_state="no-section"
               fi
             fi
-            printf 'Features included in this promotion workflow:\n'
-            printf '- **Split promotion**: PRs are promoted one original unit at a time.\n'
-            printf '- **Auto-queueing**: pushes to `qa` auto-queue the next unit until drained.\n'
-            printf '- **Isolated re-exec**: CI tooling runs from a tmpdir snapshot to prevent worktree mutation.\n\n'
-            printf 'Carries **code only** - every tracked `VERSION` file is pinned to\n'
-            printf '`%s`'"'"'s own sequence and advanced one step here.\n' "$TGT"
-            printf 'A version set on `%s` never leaks across.\n' "$SRC"
+          fi
+          base="origin/$TGT"
+          # No `|| echo 0` here: that masks a rev-list FAILURE as a genuine count
+          # of 0, so the body would claim "0 commit(s)" for a promotion that may
+          # carry many. Capture the real status, then default only on failure.
+          ncommits="$(git rev-list --count --no-merges "$base..$BR" 2>/dev/null)"
+          if [ $? -eq 0 ] && [ -n "$ncommits" ]; then
+            ncommits_ok="yes"
+          else
+            ncommits_ok="no"
+            ncommits="0"
+          fi
+          commits="$(git log --no-merges --format='- `%h` %s' "$base..$BR" 2>/dev/null | head -30)"
+          # Same masking hazard as ncommits: piping into `wc -l` prints 0 when
+          # the diff itself FAILED (bad ref, no merge base), so "0 file(s)"
+          # would read as a truthful count of an empty promotion.
+          if files_list="$(git diff --name-only "$base...$BR" 2>/dev/null)"; then
+            nfiles_ok="yes"
+            nfiles="$(printf '%s\n' "$files_list" | grep -c . || true)"
+          else
+            nfiles_ok="no"
+            nfiles="0"
+          fi
+          files="$(git diff --numstat "$base...$BR" 2>/dev/null \
+                   | awk -F'\t' '{printf "- `%s` (+%s/-%s)\n", $3, $1, $2}' | head -30)"
+          automation="$(git diff --name-only "$base...$BR" 2>/dev/null \
+                        | grep -E '^\.github/|\.sh$' | sed 's/^/- `/; s/$/`/' | head -20 || true)"
+          {
+            printf '## Intent & Problem Statement\n\n'
+            if [ -n "$UNIT_SUBJECT" ]; then
+              printf 'Promotes **one unit of work** from `%s` into `%s`' "$SRC" "$TGT"
+              [ -n "$UNIT_PR" ] && printf ' (originally #%s)' "$UNIT_PR"
+              printf ':\n\n> %s\n\n' "$UNIT_SUBJECT"
+            else
+              printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
+            fi
+            case "$intent_state" in
+              ok)
+                printf 'Intent carried from #%s:\n\n' "$UNIT_PR"
+                printf '%s\n' "$intent" | sed 's/^/> /'
+                printf '\n' ;;
+              unfilled)
+                printf '_#%s has an Intent section but left it unfilled, so there is\n' "$UNIT_PR"
+                printf 'no stated intent to carry. What this PR actually carries is\n'
+                printf 'enumerated below._\n\n' ;;
+              no-section)
+                printf '_#%s stated no Intent section, so there is nothing to carry.\n' "$UNIT_PR"
+                printf 'What this PR actually carries is enumerated below._\n\n' ;;
+              fetch-failed)
+                printf '_Could not read #%s to inherit its intent (the GitHub fetch\n' "$UNIT_PR"
+                printf 'failed), so the intent below is UNKNOWN -- not absent. Review\n'
+                printf 'the enumerated changes directly._\n\n' ;;
+              *)
+                printf '_This promotion is not tied to a single originating PR, so there\n'
+                printf 'is no upstream intent to inherit. What it carries is enumerated\n'
+                printf 'below._\n\n' ;;
+            esac
+            if [ "${REMAINING:-0}" -gt 0 ] 2>/dev/null; then
+              printf 'Up to **%s** further unit(s) are queued behind this one and will\n' "$REMAINING"
+              printf 'be promoted once this PR merges, oldest first.\n\n'
+            fi
+
+            printf '## Proposed Solution & Changes\n\n'
+            if [ "$nfiles_ok" = "yes" ]; then
+              fphrase="$(printf '%s file(s)' "$nfiles")"
+            else
+              fphrase='an UNKNOWN number of files (`git diff` failed)'
+            fi
+            if [ "$ncommits_ok" = "yes" ]; then
+              printf 'This is a promotion, not new work: %s commit(s) touching %s,\n' "$ncommits" "$fphrase"
+              printf 'already reviewed and merged on the way into `%s`.\n\n' "$SRC"
+            else
+              printf 'This is a promotion, not new work, touching %s, already\n' "$fphrase"
+              printf 'reviewed and merged on the way into `%s`. The commit count could\n' "$SRC"
+              printf 'not be determined (`git rev-list` failed) -- it is UNKNOWN, not zero.\n\n'
+            fi
+            if [ -n "$commits" ]; then
+              printf '**Commits carried:**\n\n%s\n\n' "$commits"
+              [ "${ncommits:-0}" -gt 30 ] 2>/dev/null && printf '_...and %s more._\n\n' "$((ncommits - 30))"
+            fi
+            if [ -n "$files" ]; then
+              printf '**Files changed:**\n\n%s\n\n' "$files"
+              [ "${nfiles:-0}" -gt 30 ] 2>/dev/null && printf '_...and %s more._\n\n' "$((nfiles - 30))"
+            fi
+
+            printf '## Guardrails & Side-Effect Assessment\n\n'
+            printf -- '- Every tracked `VERSION` file is pinned to `%s`'"'"'s own sequence and\n' "$TGT"
+            printf '  advanced one step here; a version set on `%s` never leaks across.\n' "$SRC"
+            if [ -n "$automation" ]; then
+              printf -- '- This promotion changes **automation**, so it is not behaviour-neutral.\n'
+              printf '  Workflow/script paths touched:\n\n%s\n' "$automation"
+            else
+              printf -- '- No workflow or shell-script paths are touched.\n'
+            fi
+            printf '\n'
+
+            printf '## Verification & Parity\n\n'
+            printf -- '- Each commit was reviewed by the skeptical panel before merging into `%s`.\n' "$SRC"
+            printf -- '- Repository CI runs on this promotion PR.\n'
+            printf -- '- **Split promotion**: PRs are promoted one original unit at a time.\n'
+            printf -- '- **Auto-queueing**: pushes to `qa` auto-queue the next unit until drained.\n'
+            printf -- '- **Isolated re-exec**: CI tooling runs from a tmpdir snapshot to prevent worktree mutation.\n'
           } > /tmp/promote-body.md
           existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
           if [ -n "$existing" ]; then
