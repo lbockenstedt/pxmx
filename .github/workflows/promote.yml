@@ -10,7 +10,17 @@ name: promote
 #      version-bump.yml). A straight merge would drag the source branch's
 #      VERSION into the target -- so if someone set dev to 10.00, qa would
 #      inherit it instead of going 1.45 -> 1.46. This job pins every tracked
-#      VERSION file back to the target's value, so promotion carries CODE ONLY.
+#      VERSION file back to the target's value, so no version set on the
+#      SOURCE can ever cross the boundary: promotion carries CODE ONLY.
+#
+#      READ THIS BEFORE FLAGGING A VERSION BUMP IN A PROMOTION DIFF. "Code
+#      only" means no SOURCE version crosses -- it does NOT mean the diff
+#      leaves VERSION untouched. The job then advances the TARGET's own
+#      counter by exactly one step inside the promotion commit (see
+#      .github/scripts/promote.sh, "Advance the TARGET's own version"),
+#      because qa and main require a PR and a bot cannot push a bump straight
+#      at them. A correct promotion diff therefore shows the target's own
+#      sequence moving forward one step -- 1.35 -> 1.36, never dev's value.
 #   2. Pinning VERSION here also RESOLVES what would otherwise be a recurring
 #      merge conflict on that file, which would stall every promotion PR.
 #
@@ -124,7 +134,7 @@ jobs:
           echo "branch=promote/$src-to-$tgt" >> "$GITHUB_OUTPUT"
           echo "Promoting $src -> $tgt"
 
-      - name: Build promotion branch (code only, VERSION pinned to target)
+      - name: Build promotion branch (code only; VERSION pinned to target, then advanced one step)
         id: build
         env:
           SRC: ${{ steps.route.outputs.src }}
