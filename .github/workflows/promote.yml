@@ -189,7 +189,16 @@ jobs:
             ncommits="0"
           fi
           commits="$(git log --no-merges --format='- `%h` %s' "$base..$BR" 2>/dev/null | head -30)"
-          nfiles="$(git diff --name-only "$base...$BR" 2>/dev/null | wc -l | tr -d ' ')"
+          # Same masking hazard as ncommits: piping into `wc -l` prints 0 when
+          # the diff itself FAILED (bad ref, no merge base), so "0 file(s)"
+          # would read as a truthful count of an empty promotion.
+          if files_list="$(git diff --name-only "$base...$BR" 2>/dev/null)"; then
+            nfiles_ok="yes"
+            nfiles="$(printf '%s\n' "$files_list" | grep -c . || true)"
+          else
+            nfiles_ok="no"
+            nfiles="0"
+          fi
           files="$(git diff --numstat "$base...$BR" 2>/dev/null \
                    | awk -F'\t' '{printf "- `%s` (+%s/-%s)\n", $3, $1, $2}' | head -30)"
           automation="$(git diff --name-only "$base...$BR" 2>/dev/null \
@@ -230,11 +239,16 @@ jobs:
             fi
 
             printf '## Proposed Solution & Changes\n\n'
+            if [ "$nfiles_ok" = "yes" ]; then
+              fphrase="$(printf '%s file(s)' "$nfiles")"
+            else
+              fphrase='an UNKNOWN number of files (`git diff` failed)'
+            fi
             if [ "$ncommits_ok" = "yes" ]; then
-              printf 'This is a promotion, not new work: %s commit(s) touching %s file(s),\n' "$ncommits" "$nfiles"
+              printf 'This is a promotion, not new work: %s commit(s) touching %s,\n' "$ncommits" "$fphrase"
               printf 'already reviewed and merged on the way into `%s`.\n\n' "$SRC"
             else
-              printf 'This is a promotion, not new work, touching %s file(s), already\n' "$nfiles"
+              printf 'This is a promotion, not new work, touching %s, already\n' "$fphrase"
               printf 'reviewed and merged on the way into `%s`. The commit count could\n' "$SRC"
               printf 'not be determined (`git rev-list` failed) -- it is UNKNOWN, not zero.\n\n'
             fi
