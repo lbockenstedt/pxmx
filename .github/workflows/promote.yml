@@ -161,19 +161,35 @@ jobs:
           # Preflight: a push carrying a .github/workflows/ change is rejected
           # outright unless the credential holds `workflow` scope. Detecting it
           # here turns an opaque git failure into an instruction.
-          if wf="$(git diff --name-only "origin/$TGT...$BR" 2>/dev/null)"; then
+          has_wf=false
+          diff_err=$(mktemp)
+          if wf="$(git diff --name-only "origin/$TGT...$BR" 2>"$diff_err")"; then
             if printf '%s\n' "$wf" | grep -q '^\.github/workflows/'; then
+              has_wf=true
               if [ "$HAS_WORKFLOW_TOKEN" != "true" ]; then
                 echo "::error::This promotion changes .github/workflows/, which the Actions GITHUB_TOKEN is forbidden to push. Add a repository secret WORKFLOW_TOKEN holding a token with 'workflow' scope, then re-run. No permissions: block can grant this -- it is a GitHub platform restriction."
                 printf 'Workflow files carried by this promotion:\n%s\n' \
                   "$(printf '%s\n' "$wf" | grep '^\.github/workflows/')"
+                rm -f "$diff_err"
                 exit 1
               fi
             fi
           else
-            echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential; attempting the push anyway"
+            err_msg=$(tr '\n' ' ' < "$diff_err")
+            echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential ($err_msg); attempting the push anyway"
           fi
-          git push -f -q origin "$BR"
+          rm -f "$diff_err"
+
+          push_out=$(mktemp)
+          if ! git push -f -q origin "$BR" 2>"$push_out"; then
+            cat "$push_out" >&2
+            if [ "$has_wf" = "true" ] || grep -qiE 'workflow' "$push_out"; then
+              echo "::error::Push failed while updating .github/workflows/. Ensure WORKFLOW_TOKEN has 'workflow' scope and is not expired."
+            fi
+            rm -f "$push_out"
+            exit 1
+          fi
+          rm -f "$push_out"
 
       - name: Open or update the promotion PR
         if: steps.build.outputs.changed == 'true'
