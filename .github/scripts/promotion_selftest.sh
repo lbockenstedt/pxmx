@@ -97,6 +97,7 @@ git push -q origin dev; git fetch -q origin
 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh >/dev/null
 chk "batched takes every unit at once (gamma)" "$(cat gamma.py 2>/dev/null)" "gamma"
 chk "batched takes every unit at once (delta)" "$(cat delta.py 2>/dev/null)" "delta"
+git push -q origin promote/dev-to-qa:qa; git fetch -q origin
 
 echo "== the running script is immutable mid-promotion =="
 # stage_to checks out the TARGET branch into the working tree, which replaces
@@ -120,6 +121,6 @@ case "$(cat VERSION)" in
   SABOTAGED) chk "target's tooling cannot hijack the run" "hijacked" "clean" ;;
   *)         chk "target's tooling cannot hijack the run" "clean"    "clean" ;;
 esac
-chk "and it still promoted the oldest unit" "$(cat gamma.py 2>/dev/null)" "gamma"
+chk "and it still promoted the oldest unit" "$(cat epsilon.py 2>/dev/null)" "epsilon"
 
 echo; echo "RESULT: $pass passed, $fail failed"; rm -rf "$T"; [ "$fail" -eq 0 ]
