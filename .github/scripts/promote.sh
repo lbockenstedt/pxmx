@@ -146,6 +146,54 @@ if [ -z "$picked" ]; then
   exit 0
 fi
 
+# COALESCE SUPERSEDED UNITS.
+#
+# Splitting by unit created a deadlock the first time it met a self-correcting
+# change. Unit 1 shipped a defect; unit 2 fixed it. But unit 2 cannot be
+# promoted until unit 1 merges, and unit 1 cannot merge because the review
+# panel correctly rejects the defect that unit 2 already fixed. The fleet
+# stalled with every repo holding the same rejected unit-1 PR.
+#
+# The root mistake is promoting a file at an intermediate state that a LATER
+# unit has already corrected: that asks the panel to approve code known to be
+# superseded. So once the oldest unit is picked, extend the endpoint forward
+# over any later unit that touches a file this promotion already touches, and
+# carry them together. Units that touch nothing in common are still left
+# behind, so promotions stay small and reviewable.
+if [ "$SPLIT" = "1" ]; then
+  ext_idx="$picked_idx"
+  changed="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}" | sort -u)"
+  j=$(( picked_idx + 1 ))
+  while [ "$j" -lt "${#units[@]}" ]; do
+    # Files this one unit changed. First-parent listing means ^ is the
+    # previous unit, so this is exactly that unit's own contribution.
+    unit_files="$(git diff --name-only "${units[$j]}^...${units[$j]}" 2>/dev/null | sort -u)"
+    if [ -n "$unit_files" ] && [ -n "$changed" ] \
+       && printf '%s\n' "$unit_files" \
+          | comm -12 - <(printf '%s\n' "$changed") | grep -q .; then
+      ext_idx="$j"
+      # Everything from the target up to the new endpoint is in play now,
+      # including any unit pulled in between.
+      changed="$(git diff --name-only "origin/$TGT...${units[$j]}" | sort -u)"
+    fi
+    j=$(( j + 1 ))
+  done
+  if [ "$ext_idx" -ne "$picked_idx" ]; then
+    echo "  extending unit $picked_idx -> $ext_idx: later unit(s) modify the same" \
+         "file(s); promoting an already-superseded version would be rejected"
+    if stage_to "${units[$ext_idx]}"; then
+      picked="${units[$ext_idx]}"
+      picked_idx="$ext_idx"
+    else
+      # Cannot happen (a superset of a real change is a real change), but if
+      # it ever did, fall back to the unextended unit rather than promoting a
+      # half-staged tree.
+      echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
+      stage_to "$picked" || true
+    fi
+  fi
+fi
+
 # Identify the unit for the PR title/body. A merge commit names its PR in the
 # subject and carries the PR's own title on the first line of the body, which
 # is far more useful than "Merge pull request #123 from user/branch".
