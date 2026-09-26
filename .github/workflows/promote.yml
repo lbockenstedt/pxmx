@@ -148,16 +148,46 @@ jobs:
           # what made every recent promotion reject with ZERO code findings --
           # dns#65, le#22, opnsense#54, cppm#34, nw#128 all read "the
           # description doesn't match the diff".
+          #
+          # "intent is empty" is FOUR different states and they must not print the
+          # same sentence: no originating PR at all, a fetch that FAILED (so the
+          # section was never even looked at), a PR with no section, and a PR that
+          # left the template comment unfilled. Reporting a failed fetch as "stated
+          # no intent" is simply false, and it hides a broken token or a deleted PR.
           intent=""
+          intent_state="no-unit"
           if [ -n "$UNIT_PR" ]; then
-            unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null || true)"
-            intent="$(printf '%s\n' "$unit_body" | awk '
-              /^#/ && /Intent & Problem Statement/ { f=1; next }
-              f && /^#/ { exit }
-              f { print }' | sed 's/<!--.*-->//' | sed '/^[[:space:]]*$/d')"
+            # Pessimistic default: only a confirmed exit 0 clears it.
+            intent_state="fetch-failed"
+            unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null)"
+            if [ $? -eq 0 ]; then
+              if printf '%s\n' "$unit_body" \
+                   | grep -qE '^#+.*Intent & Problem Statement'; then
+                intent="$(printf '%s\n' "$unit_body" | awk '
+                  /^#/ && /Intent & Problem Statement/ { f=1; next }
+                  f && /^#/ { exit }
+                  f { print }' | sed 's/<!--.*-->//' | sed '/^[[:space:]]*$/d')"
+                if [ -n "$intent" ]; then
+                  intent_state="ok"
+                else
+                  intent_state="unfilled"
+                fi
+              else
+                intent_state="no-section"
+              fi
+            fi
           fi
           base="origin/$TGT"
-          ncommits="$(git rev-list --count --no-merges "$base..$BR" 2>/dev/null || echo 0)"
+          # No `|| echo 0` here: that masks a rev-list FAILURE as a genuine count
+          # of 0, so the body would claim "0 commit(s)" for a promotion that may
+          # carry many. Capture the real status, then default only on failure.
+          ncommits="$(git rev-list --count --no-merges "$base..$BR" 2>/dev/null)"
+          if [ $? -eq 0 ] && [ -n "$ncommits" ]; then
+            ncommits_ok="yes"
+          else
+            ncommits_ok="no"
+            ncommits="0"
+          fi
           commits="$(git log --no-merges --format='- `%h` %s' "$base..$BR" 2>/dev/null | head -30)"
           nfiles="$(git diff --name-only "$base...$BR" 2>/dev/null | wc -l | tr -d ' ')"
           files="$(git diff --numstat "$base...$BR" 2>/dev/null \
@@ -173,22 +203,41 @@ jobs:
             else
               printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
             fi
-            if [ -n "$intent" ]; then
-              printf 'Intent carried from #%s:\n\n' "$UNIT_PR"
-              printf '%s\n' "$intent" | sed 's/^/> /'
-              printf '\n'
-            else
-              printf '_The originating change stated no intent section. What it\n'
-              printf 'actually carries is enumerated below._\n\n'
-            fi
+            case "$intent_state" in
+              ok)
+                printf 'Intent carried from #%s:\n\n' "$UNIT_PR"
+                printf '%s\n' "$intent" | sed 's/^/> /'
+                printf '\n' ;;
+              unfilled)
+                printf '_#%s has an Intent section but left it unfilled, so there is\n' "$UNIT_PR"
+                printf 'no stated intent to carry. What this PR actually carries is\n'
+                printf 'enumerated below._\n\n' ;;
+              no-section)
+                printf '_#%s stated no Intent section, so there is nothing to carry.\n' "$UNIT_PR"
+                printf 'What this PR actually carries is enumerated below._\n\n' ;;
+              fetch-failed)
+                printf '_Could not read #%s to inherit its intent (the GitHub fetch\n' "$UNIT_PR"
+                printf 'failed), so the intent below is UNKNOWN -- not absent. Review\n'
+                printf 'the enumerated changes directly._\n\n' ;;
+              *)
+                printf '_This promotion is not tied to a single originating PR, so there\n'
+                printf 'is no upstream intent to inherit. What it carries is enumerated\n'
+                printf 'below._\n\n' ;;
+            esac
             if [ "${REMAINING:-0}" -gt 0 ] 2>/dev/null; then
               printf 'Up to **%s** further unit(s) are queued behind this one and will\n' "$REMAINING"
               printf 'be promoted once this PR merges, oldest first.\n\n'
             fi
 
             printf '## Proposed Solution & Changes\n\n'
-            printf 'This is a promotion, not new work: %s commit(s) touching %s file(s),\n' "$ncommits" "$nfiles"
-            printf 'already reviewed and merged on the way into `%s`.\n\n' "$SRC"
+            if [ "$ncommits_ok" = "yes" ]; then
+              printf 'This is a promotion, not new work: %s commit(s) touching %s file(s),\n' "$ncommits" "$nfiles"
+              printf 'already reviewed and merged on the way into `%s`.\n\n' "$SRC"
+            else
+              printf 'This is a promotion, not new work, touching %s file(s), already\n' "$nfiles"
+              printf 'reviewed and merged on the way into `%s`. The commit count could\n' "$SRC"
+              printf 'not be determined (`git rev-list` failed) -- it is UNKNOWN, not zero.\n\n'
+            fi
             if [ -n "$commits" ]; then
               printf '**Commits carried:**\n\n%s\n\n' "$commits"
               [ "${ncommits:-0}" -gt 30 ] 2>/dev/null && printf '_...and %s more._\n\n' "$((ncommits - 30))"
