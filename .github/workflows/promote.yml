@@ -27,13 +27,14 @@ name: promote
 # intentional PR covering everything that has accumulated since the last one.
 #
 # CI is unaffected -- ci.yml still runs on every dev push and on every PR, so
-# day-to-day feedback stays automatic. Only the decision to promote is manual.
+# day-to-day feedback stays automatic. Promotion hops to main remain manual;
+# split promotions dev -> qa are automatically queued on push to qa.
 
 on:
-  # qa advancing means the dev -> qa unit that was in flight has landed.
-  # Promotion is split one original PR at a time, so queue the next unit here.
-  # Without this the queue stalls after unit 1 and every later unit needs its
-  # own manual dispatch -- strictly worse than the old single batched PR.
+  # qa advancing (including hotfixes and merged promotion PRs) triggers auto-queueing
+  # of the next unpromoted dev -> qa split unit. Promotion is split one original PR
+  # at a time, so queue the next unit here. Note: this runs without a human gate on
+  # any push to qa, automatically reopening or force-pushing the dev -> qa PR.
   #
   # This does NOT reintroduce the per-commit cascade that `on: push` to dev
   # once caused: it fires only on qa, and "Resolve source and target" pins a
@@ -152,6 +153,10 @@ jobs:
                 printf 'be promoted once this PR merges, oldest first.\n\n' 
               fi
             fi
+            printf 'Features included in this promotion workflow:\n'
+            printf '- **Split promotion**: PRs are promoted one original unit at a time.\n'
+            printf '- **Auto-queueing**: pushes to `qa` auto-queue the next unit until drained.\n'
+            printf '- **Isolated re-exec**: CI tooling runs from a tmpdir snapshot to prevent worktree mutation.\n\n'
             printf 'Carries **code only** - every tracked `VERSION` file is pinned to\n'
             printf '`%s`'"'"'s own sequence and advanced one step here.\n' "$TGT"
             printf 'A version set on `%s` never leaks across.\n' "$SRC"
