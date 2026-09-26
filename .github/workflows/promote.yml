@@ -86,6 +86,20 @@ jobs:
           # WORKFLOW_TOKEN (a PAT or App token carrying `workflow` scope) is
           # used when it exists; the push step explains the situation instead of
           # failing opaquely when it does not.
+          # CREDENTIAL SCOPE, stated explicitly. actions/checkout persists this
+          # token in .git/config, so every LATER step in this job pushes with
+          # `workflow` scope rather than the narrower GITHUB_TOKEN. That is
+          # accepted, and it is bounded: this job's only network writes are the
+          # `git push -f origin "$BR"` below and the `gh` PR calls, all aimed at
+          # the single well-known promote/<src>-to-<tgt> branch. The job never
+          # merges (see the header) and never pushes to dev/qa/main.
+          #
+          # TRIGGER BEHAVIOUR. A PAT push DOES start downstream workflows, where
+          # a GITHUB_TOKEN push does not -- so this could recurse if the push
+          # target were a trigger branch. It is not: `on.push.branches` above is
+          # `[qa]` ONLY, and the branch pushed here is always promote/*, which
+          # matches no trigger in this workflow or in backmerge.yml. The loop is
+          # therefore closed by the trigger filter, not by the token's weakness.
           token: ${{ secrets.WORKFLOW_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Resolve source and target
@@ -135,6 +149,15 @@ jobs:
           # workflow-scoped token is actually configured.
           HAS_WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN != '' }}
         run: |
+          # TGT drives the preflight diff below. If it were ever empty the diff
+          # would degrade to "origin/...$BR", which FAILS -- and a failed diff
+          # takes the warn-and-push branch, silently disabling the preflight.
+          # Fail loudly instead: a missing route output is a bug, not a state to
+          # push through. (steps.route does emit tgt; this pins that it must.)
+          if [ -z "$TGT" ]; then
+            echo "::error::TGT is empty -- steps.route must emit a 'tgt' output. Refusing to push without a working workflow-file preflight."
+            exit 1
+          fi
           # Preflight: a push carrying a .github/workflows/ change is rejected
           # outright unless the credential holds `workflow` scope. Detecting it
           # here turns an opaque git failure into an instruction.

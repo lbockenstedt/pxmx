@@ -104,6 +104,13 @@ jobs:
           # WORKFLOW_TOKEN (a PAT or App token carrying `workflow` scope) is
           # used when it exists; the push step explains the situation instead of
           # failing opaquely when it does not.
+          # CREDENTIAL SCOPE / TRIGGER BEHAVIOUR -- see the same note in
+          # promote.yml. actions/checkout persists this token for every later
+          # step in the job, and a PAT push (unlike a GITHUB_TOKEN push) does
+          # start downstream workflows. Bounded the same way: `on.push.branches`
+          # above is `[main, qa]`, while every push below targets a
+          # backmerge/<src>-to-<tgt> branch, which matches no trigger here or in
+          # promote.yml. This job opens a PR and never merges.
           token: ${{ secrets.WORKFLOW_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Check target branch exists
@@ -137,6 +144,12 @@ jobs:
           TGT: ${{ matrix.target }}
           HAS_WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN != '' }}
         run: |
+          # A failed diff takes the warn-and-push branch below, so an empty TGT
+          # would silently disable the preflight. Fail loudly instead.
+          if [ -z "$TGT" ]; then
+            echo "::error::TGT is empty -- the matrix must supply a target. Refusing to push without a working workflow-file preflight."
+            exit 1
+          fi
           # Same preflight as promote.yml -- see the checkout step above.
           if wf="$(git diff --name-only "origin/$TGT...$BR" 2>/dev/null)"; then
             if printf '%s\n' "$wf" | grep -q '^\.github/workflows/'; then
