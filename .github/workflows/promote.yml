@@ -141,20 +141,77 @@ jobs:
               title="$title ($UNIT_SUBJECT)"
             fi
           fi
+          # The panel is told to lower confidence when a PR states no intent
+          # (AGENTS.md: Pull Request Intent & Specification Rule). A promotion
+          # PR inherits its intent from the original PR it carries, so fetch
+          # that and quote it. The old boilerplate ("carries code only") is
+          # what made every recent promotion reject with ZERO code findings --
+          # dns#65, le#22, opnsense#54, cppm#34, nw#128 all read "the
+          # description doesn't match the diff".
+          intent=""
+          if [ -n "$UNIT_PR" ]; then
+            unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null || true)"
+            intent="$(printf '%s\n' "$unit_body" | awk '
+              /^#/ && /Intent & Problem Statement/ { f=1; next }
+              f && /^#/ { exit }
+              f { print }' | sed 's/<!--.*-->//' | sed '/^[[:space:]]*$/d')"
+          fi
+          base="origin/$TGT"
+          ncommits="$(git rev-list --count --no-merges "$base..$BR" 2>/dev/null || echo 0)"
+          commits="$(git log --no-merges --format='- `%h` %s' "$base..$BR" 2>/dev/null | head -30)"
+          nfiles="$(git diff --name-only "$base...$BR" 2>/dev/null | wc -l | tr -d ' ')"
+          files="$(git diff --numstat "$base...$BR" 2>/dev/null \
+                   | awk -F'\t' '{printf "- `%s` (+%s/-%s)\n", $3, $1, $2}' | head -30)"
+          automation="$(git diff --name-only "$base...$BR" 2>/dev/null \
+                        | grep -E '^\.github/|\.sh$' | sed 's/^/- `/; s/$/`/' | head -20 || true)"
           {
-            printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
+            printf '## Intent & Problem Statement\n\n'
             if [ -n "$UNIT_SUBJECT" ]; then
-              printf 'Carries **one unit of work**'
+              printf 'Promotes **one unit of work** from `%s` into `%s`' "$SRC" "$TGT"
               [ -n "$UNIT_PR" ] && printf ' (originally #%s)' "$UNIT_PR"
               printf ':\n\n> %s\n\n' "$UNIT_SUBJECT"
-              if [ "${REMAINING:-0}" -gt 0 ] 2>/dev/null; then
-                printf 'Up to **%s** further unit(s) are queued behind this one and will\n' "$REMAINING"
-                printf 'be promoted once this PR merges, oldest first.\n\n' 
-              fi
+            else
+              printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
             fi
-            printf 'Carries **code only** - every tracked `VERSION` file is pinned to\n'
-            printf '`%s`'"'"'s own sequence and advanced one step here.\n' "$TGT"
-            printf 'A version set on `%s` never leaks across.\n' "$SRC"
+            if [ -n "$intent" ]; then
+              printf 'Intent carried from #%s:\n\n' "$UNIT_PR"
+              printf '%s\n' "$intent" | sed 's/^/> /'
+              printf '\n'
+            else
+              printf '_The originating change stated no intent section. What it\n'
+              printf 'actually carries is enumerated below._\n\n'
+            fi
+            if [ "${REMAINING:-0}" -gt 0 ] 2>/dev/null; then
+              printf 'Up to **%s** further unit(s) are queued behind this one and will\n' "$REMAINING"
+              printf 'be promoted once this PR merges, oldest first.\n\n'
+            fi
+
+            printf '## Proposed Solution & Changes\n\n'
+            printf 'This is a promotion, not new work: %s commit(s) touching %s file(s),\n' "$ncommits" "$nfiles"
+            printf 'already reviewed and merged on the way into `%s`.\n\n' "$SRC"
+            if [ -n "$commits" ]; then
+              printf '**Commits carried:**\n\n%s\n\n' "$commits"
+              [ "${ncommits:-0}" -gt 30 ] 2>/dev/null && printf '_...and %s more._\n\n' "$((ncommits - 30))"
+            fi
+            if [ -n "$files" ]; then
+              printf '**Files changed:**\n\n%s\n\n' "$files"
+              [ "${nfiles:-0}" -gt 30 ] 2>/dev/null && printf '_...and %s more._\n\n' "$((nfiles - 30))"
+            fi
+
+            printf '## Guardrails & Side-Effect Assessment\n\n'
+            printf -- '- Every tracked `VERSION` file is pinned to `%s`'"'"'s own sequence and\n' "$TGT"
+            printf '  advanced one step here; a version set on `%s` never leaks across.\n' "$SRC"
+            if [ -n "$automation" ]; then
+              printf -- '- This promotion changes **automation**, so it is not behaviour-neutral.\n'
+              printf '  Workflow/script paths touched:\n\n%s\n' "$automation"
+            else
+              printf -- '- No workflow or shell-script paths are touched.\n'
+            fi
+            printf '\n'
+
+            printf '## Verification & Parity\n\n'
+            printf -- '- Each commit was reviewed by the skeptical panel before merging into `%s`.\n' "$SRC"
+            printf -- '- Repository CI runs on this promotion PR.\n'
           } > /tmp/promote-body.md
           existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
           if [ -n "$existing" ]; then
