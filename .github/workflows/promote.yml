@@ -390,17 +390,39 @@ jobs:
           BR: ${{ steps.route.outputs.branch }}
           SHA: ${{ steps.build.outputs.sha }}
         run: |
+          # More than one workflow is triggered per PR (CI *and* branch-flow),
+          # and they do not enter `action_required` at the same instant. The
+          # first version of this loop returned as soon as ANY parked run was
+          # approved, so whichever workflow parked a second later stayed parked
+          # -- and if that one was `CI`, the required `test` check never
+          # reported and the PR was BLOCKED forever ("Required status check
+          # \"test\" is expected", ab#338). Keep polling and approve every run
+          # we have not already approved; only stop once the queue has been
+          # quiet for three consecutive polls.
+          approved=""
+          quiet=0
           for _ in $(seq 1 24); do
             ids=$(gh api "repos/${{ github.repository }}/actions/runs?branch=$BR&status=action_required" \
                     --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .id" 2>/dev/null || true)
-            if [ -n "$ids" ]; then
-              for id in $ids; do
-                echo "approving parked run $id"
-                gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve" || \
-                  echo "::warning::could not approve run $id -- approve it by hand to unblock this PR"
-              done
-              exit 0
+            new=""
+            for id in $ids; do
+              case " $approved " in *" $id "*) continue ;; esac
+              echo "approving parked run $id"
+              gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve" || \
+                echo "::warning::could not approve run $id -- approve it by hand to unblock this PR"
+              approved="$approved $id"
+              new="$new $id"
+            done
+            if [ -n "$approved" ] && [ -z "$new" ]; then
+              quiet=$((quiet + 1))
+              if [ "$quiet" -ge 3 ]; then break; fi
+            else
+              quiet=0
             fi
             sleep 5
           done
-          echo "::notice::no parked run found for $BR @ $SHA"
+          if [ -n "$approved" ]; then
+            echo "::notice::released parked run(s):$approved"
+          else
+            echo "::notice::no parked run found for $BR @ $SHA"
+          fi
