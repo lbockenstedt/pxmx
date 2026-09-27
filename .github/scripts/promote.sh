@@ -84,9 +84,9 @@ fi
 [ "${#units[@]}" -gt 0 ] || units=("origin/$SRC")
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
-# Returns 0 when that produced a real change, 1 when it is a content no-op, and
-# 2 when a split unit conflicts against $TGT (the caller falls back to a batched
-# merge). Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
+# Returns 0 when that produced a real change and 1 when it is a content no-op.
+# A merge conflict outside VERSION does NOT return: it exits the whole script
+# with status 1, aborting the promotion (no fallback of any kind).
 stage_to() {
   local endpoint="$1"
 
@@ -189,21 +189,12 @@ if [ "$SPLIT" = "1" ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
     else
-      # stage_to is tri-state, so 1 and 2 must not be reported alike: 2 is a real
-      # merge conflict and 1 is a genuine no-op. Collapsing them printed "content
-      # no-op" over a conflict, which sent anyone reading the CI log looking for a
-      # VERSION-only diff that was never there.
-      if [ "$ext_rc" -eq 2 ]; then
-        echo "::warning::extension to ${units[$ext_idx]} conflicts against $TGT -- keeping unit $picked_idx"
-      else
-        # Cannot happen (a superset of a real change is a real change).
-        echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
-      fi
-      # The failed extension left the worktree staged against the WRONG endpoint,
-      # so the original unit has to be restaged before anything is committed.
-      # Discarding this exit code (|| true) defeated the fallback entirely: a
-      # restage that did not reproduce a real change left a half-staged or
-      # conflicted tree, and the script committed it anyway.
+      # Only reachable as rc=1 (content no-op); a conflict exits inside stage_to.
+      echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
+      # The worktree is now staged against the extension endpoint, so the
+      # original unit must be restaged. Defensive: this should always succeed,
+      # but if it does not (e.g. origin/$TGT moved) refuse to commit rather than
+      # commit whatever happens to be staged.
       re_rc=0
       stage_to "$picked" || re_rc=$?
       if [ "$re_rc" -ne 0 ]; then
