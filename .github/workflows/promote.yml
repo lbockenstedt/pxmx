@@ -128,6 +128,8 @@ jobs:
           UNIT_PR: ${{ steps.build.outputs.unit_pr }}
           UNIT_SUBJECT: ${{ steps.build.outputs.unit_subject }}
           REMAINING: ${{ steps.build.outputs.remaining }}
+          COALESCED_COUNT: ${{ steps.build.outputs.coalesced_count }}
+          COALESCED_PRS: ${{ steps.build.outputs.coalesced_prs }}
         run: |
           set -e
           # Name the ORIGINAL work, not just the hop -- with one unit per
@@ -162,7 +164,7 @@ jobs:
             intent_state="fetch-failed"
             if unit_body="$(gh pr view "$UNIT_PR" --json body -q .body 2>/dev/null)"; then
               if printf '%s\n' "$unit_body" \
-                   | grep -qE '^#+.*Intent & Problem Statement'; then
+                   | grep -qE '^##+[[:space:]].*Intent & Problem Statement'; then
                 intent="$(printf '%s\n' "$unit_body" | awk '
                   /^##+[[:space:]].*Intent & Problem Statement/ { f=1; next }
                   f && /^##+[[:space:]]/ { exit }
@@ -232,6 +234,13 @@ jobs:
                 printf 'is no upstream intent to inherit. What it carries is enumerated\n'
                 printf 'below._\n\n' ;;
             esac
+            if [ "${COALESCED_COUNT:-1}" -gt 1 ] 2>/dev/null; then
+              printf '**Coalesced promotion:** %s units of work are carried together\n' "$COALESCED_COUNT"
+              printf 'because later unit(s) modify files the first one touches, so the\n'
+              printf 'earlier, already-superseded state is never promoted on its own.\n'
+              printf 'Originating PRs: %s. The intent quoted above covers only the last\n' "${COALESCED_PRS:-unknown}"
+              printf 'of them; the commits and files enumerated below cover them all.\n\n'
+            fi
             if [ "${REMAINING:-0}" -gt 0 ] 2>/dev/null; then
               printf 'Up to **%s** further unit(s) are queued behind this one and will\n' "$REMAINING"
               printf 'be promoted once this PR merges, oldest first.\n\n'
@@ -266,8 +275,11 @@ jobs:
             if [ -n "$automation" ]; then
               printf -- '- This promotion changes **automation**, so it is not behaviour-neutral.\n'
               printf '  Workflow/script paths touched:\n\n%s\n' "$automation"
-            else
+            elif [ "$nfiles_ok" = "yes" ]; then
               printf -- '- No workflow or shell-script paths are touched.\n'
+            else
+              printf -- '- Whether workflow or shell-script paths are touched is UNKNOWN\n'
+              printf '  (`git diff` failed) -- do not read this as "none".\n'
             fi
             printf '\n'
 
