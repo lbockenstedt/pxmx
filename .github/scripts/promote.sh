@@ -164,19 +164,25 @@ fi
 # behind, so promotions stay small and reviewable.
 if [ "$SPLIT" = "1" ]; then
   ext_idx="$picked_idx"
-  changed="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}" | sort -u)"
+  coalesced_prs=""
+  coalesced_count=1
+  changed="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}" | grep -vE '(^|/)VERSION$' | sort -u || true)"
   j=$(( picked_idx + 1 ))
   while [ "$j" -lt "${#units[@]}" ]; do
     # Files this one unit changed. First-parent listing means ^ is the
     # previous unit, so this is exactly that unit's own contribution.
-    unit_files="$(git diff --name-only "${units[$j]}^...${units[$j]}" 2>/dev/null | sort -u)"
-    if [ -n "$unit_files" ] && [ -n "$changed" ] \
-       && printf '%s\n' "$unit_files" \
-          | comm -12 - <(printf '%s\n' "$changed") | grep -q .; then
+    unit_files="$(git diff --name-only "${units[$j]}^...${units[$j]}" 2>/dev/null | grep -vE '(^|/)VERSION$' | sort -u || true)"
+    overlap=""
+    if [ -n "$unit_files" ] && [ -n "$changed" ]; then
+      # No pipe into grep here: under `set -o pipefail` an early-exiting grep
+      # can SIGPIPE comm and make the test falsely negative. Test emptiness.
+      overlap="$(comm -12 <(printf '%s\n' "$unit_files") <(printf '%s\n' "$changed") || true)"
+    fi
+    if [ -n "$overlap" ]; then
       ext_idx="$j"
       # Everything from the target up to the new endpoint is in play now,
       # including any unit pulled in between.
-      changed="$(git diff --name-only "origin/$TGT...${units[$j]}" | sort -u)"
+      changed="$(git diff --name-only "origin/$TGT...${units[$j]}" | grep -vE '(^|/)VERSION$' | sort -u || true)"
     fi
     j=$(( j + 1 ))
   done
@@ -228,6 +234,8 @@ if [ "$SPLIT" = "1" ]; then
     echo "unit_sha=$(git rev-parse "$picked")"
     echo "unit_pr=$unit_pr"
     echo "remaining=$remaining"
+    echo "coalesced_count=${coalesced_count:-1}"
+    echo "coalesced_prs=${coalesced_prs:-}"
   } >> "$out"
   # Multi-line values need the heredoc form of the step-output protocol.
   eof_delim="PROMOTE_EOF_${RANDOM}_$$"
