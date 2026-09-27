@@ -231,20 +231,37 @@ jobs:
           BR: backmerge/${{ matrix.source }}-to-${{ matrix.target }}
           SHA: ${{ steps.build.outputs.sha }}
         run: |
+          # See promote.yml's identical step: several workflows are triggered
+          # per PR and they park at slightly different instants, so returning
+          # after the first approval leaves the later one parked and the PR
+          # blocked on a required check that never reports.
+          approved=""
+          quiet=0
           for _ in $(seq 1 24); do
             ids=$(gh api "repos/${{ github.repository }}/actions/runs?branch=$BR&status=action_required" \
                     --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .id" 2>/dev/null || true)
-            if [ -n "$ids" ]; then
-              for id in $ids; do
-                echo "approving parked run $id"
-                gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve" || \
-                  echo "::warning::could not approve run $id -- approve it by hand to unblock this PR"
-              done
-              exit 0
+            new=""
+            for id in $ids; do
+              case " $approved " in *" $id "*) continue ;; esac
+              echo "approving parked run $id"
+              gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve" || \
+                echo "::warning::could not approve run $id -- approve it by hand to unblock this PR"
+              approved="$approved $id"
+              new="$new $id"
+            done
+            if [ -n "$approved" ] && [ -z "$new" ]; then
+              quiet=$((quiet + 1))
+              if [ "$quiet" -ge 3 ]; then break; fi
+            else
+              quiet=0
             fi
             sleep 5
           done
-          echo "::notice::no parked run found for $BR @ $SHA"
+          if [ -n "$approved" ]; then
+            echo "::notice::released parked run(s):$approved"
+          else
+            echo "::notice::no parked run found for $BR @ $SHA"
+          fi
 
       # Merge it. The gap only actually closes when the PR lands, and a queue
       # of stale back-merge PRs waiting on a human is the same divergence this
