@@ -84,7 +84,9 @@ fi
 [ "${#units[@]}" -gt 0 ] || units=("origin/$SRC")
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
-# Returns 0 when that produced a real change, 1 when it is a content no-op.
+# Returns 0 when that produced a real change and 1 when it is a content no-op.
+# A merge conflict outside VERSION does NOT return: it exits the whole script
+# with status 1, aborting the promotion (no fallback of any kind).
 stage_to() {
   local endpoint="$1"
 
@@ -187,27 +189,25 @@ if [ "$SPLIT" = "1" ]; then
   if [ "$ext_idx" -ne "$picked_idx" ]; then
     echo "  extending unit $picked_idx -> $ext_idx: later unit(s) modify the same" \
          "file(s); promoting an already-superseded version would be rejected"
-    if stage_to "${units[$ext_idx]}"; then
-      # Record EVERY unit carried, so the PR body can say the promotion is a
-      # coalesced one instead of presenting the last unit's intent as if it
-      # covered the whole diff.
-      k="$picked_idx"
-      while [ "$k" -le "$ext_idx" ]; do
-        p="$(git log -1 --format=%s "${units[$k]}" \
-             | sed -n -e 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p' \
-                      -e 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p' | head -1)"
-        [ -n "$p" ] && coalesced_prs="${coalesced_prs:+$coalesced_prs, }#$p"
-        k=$(( k + 1 ))
-      done
-      coalesced_count=$(( ext_idx - picked_idx + 1 ))
+    ext_rc=0
+    stage_to "${units[$ext_idx]}" || ext_rc=$?
+    if [ "$ext_rc" -eq 0 ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
     else
-      # Cannot happen (a superset of a real change is a real change), but if
-      # it ever did, fall back to the unextended unit rather than promoting a
-      # half-staged tree.
+      # Only reachable as rc=1 (content no-op); a conflict exits inside stage_to.
       echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
-      stage_to "$picked" || true
+      # The worktree is now staged against the extension endpoint, so the
+      # original unit must be restaged. Defensive: this should always succeed,
+      # but if it does not (e.g. origin/$TGT moved) refuse to commit rather than
+      # commit whatever happens to be staged.
+      re_rc=0
+      stage_to "$picked" || re_rc=$?
+      if [ "$re_rc" -ne 0 ]; then
+        echo "::error::could not restage $picked after the failed extension (exit $re_rc) --" \
+             "refusing to promote a half-staged tree"
+        exit 1
+      fi
     fi
   fi
 fi
