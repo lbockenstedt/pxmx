@@ -202,9 +202,12 @@ if [ "$SPLIT" = "1" ]; then
         [ -n "$p" ] || p="$(printf '%s' "$s" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
         printf '%s' "$p"
       }
-      coalesced_count=$(( 1 + ${#kept_units[@]} ))
+      # Merging an ancestor carries EVERY first-parent unit in
+      # (picked_idx, ext_idx], including the non-overlapping ones dragged in
+      # between. Record them all, so the PR body cannot understate the diff.
+      coalesced_count=$(( ext_idx - picked_idx + 1 ))
       coalesced_prs=""
-      for k in "$picked_idx" "${kept_units[@]}"; do
+      for k in $(seq "$picked_idx" "$ext_idx"); do
         p="$(pr_of "${units[$k]}")"
         [ -n "$p" ] && coalesced_prs="${coalesced_prs:+$coalesced_prs, }#$p"
       done
