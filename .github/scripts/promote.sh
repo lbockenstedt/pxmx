@@ -166,6 +166,7 @@ if [ "$SPLIT" = "1" ]; then
   ext_idx="$picked_idx"
   coalesced_prs=""
   coalesced_count=1
+  kept_units=()
   changed="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}" | grep -vE '(^|/)VERSION$' | sort -u || true)"
   j=$(( picked_idx + 1 ))
   while [ "$j" -lt "${#units[@]}" ]; do
@@ -180,6 +181,7 @@ if [ "$SPLIT" = "1" ]; then
     fi
     if [ -n "$overlap" ]; then
       ext_idx="$j"
+      kept_units+=("$j")
       # Everything from the target up to the new endpoint is in play now,
       # including any unit pulled in between.
       changed="$(git diff --name-only "origin/$TGT...${units[$j]}" | grep -vE '(^|/)VERSION$' | sort -u || true)"
@@ -192,11 +194,27 @@ if [ "$SPLIT" = "1" ]; then
     ext_rc=0
     stage_to "${units[$ext_idx]}" || ext_rc=$?
     if [ "$ext_rc" -eq 0 ]; then
+      # Count only once the extension is confirmed as the final endpoint.
+      pr_of() {
+        local s p
+        s="$(git log -1 --format=%s "$1")"
+        p="$(printf '%s' "$s" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
+        [ -n "$p" ] || p="$(printf '%s' "$s" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
+        printf '%s' "$p"
+      }
+      coalesced_count=$(( 1 + ${#kept_units[@]} ))
+      coalesced_prs=""
+      for k in "$picked_idx" "${kept_units[@]}"; do
+        p="$(pr_of "${units[$k]}")"
+        [ -n "$p" ] && coalesced_prs="${coalesced_prs:+$coalesced_prs, }#$p"
+      done
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
     else
       # Only reachable as rc=1 (content no-op); a conflict exits inside stage_to.
       echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
+      coalesced_count=1
+      coalesced_prs=""
       # The worktree is now staged against the extension endpoint, so the
       # original unit must be restaged. Defensive: this should always succeed,
       # but if it does not (e.g. origin/$TGT moved) refuse to commit rather than
