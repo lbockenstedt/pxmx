@@ -85,8 +85,8 @@ fi
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
 # Returns 0 when that produced a real change and 1 when it is a content no-op.
-# A merge conflict outside VERSION does NOT return: it exits the whole script
-# with status 1, aborting the promotion (no fallback of any kind).
+# A merge conflict outside VERSION returns 2; the caller decides whether that
+# is recoverable (intermediate unit) or fatal (final endpoint).
 stage_to() {
   local endpoint="$1"
 
@@ -134,9 +134,12 @@ stage_to() {
 picked=""
 picked_idx=0
 conflicted=0
+first_conflict=""
+last_rc=1
 for i in "${!units[@]}"; do
   sel_rc=0
   stage_to "${units[$i]}" || sel_rc=$?
+  last_rc="$sel_rc"
   if [ "$sel_rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
@@ -158,8 +161,11 @@ for i in "${!units[@]}"; do
     # full $SRC -> $TGT merge clean. tsa failed this way every run while
     # `git merge origin/qa` into main succeeded by hand.
     conflicted=1
-    echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
-         "batching it with the next unit"
+    [ -n "$first_conflict" ] || first_conflict="$i"
+    if [ "$i" -lt $(( ${#units[@]} - 1 )) ]; then
+      echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
+           "batching it with the next unit"
+    fi
     continue
   fi
   [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
@@ -169,7 +175,7 @@ done
 # divergence a human must reconcile -- and it must NOT fall through to the
 # "Nothing to promote" branch below, which would report success while
 # promoting nothing.
-if [ -z "$picked" ] && [ "$conflicted" -eq 1 ]; then
+if [ -z "$picked" ] && [ "$conflicted" -eq 1 ] && [ "$last_rc" -eq 2 ]; then
   echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
   exit 1
 fi
@@ -198,10 +204,32 @@ fi
 # over any later unit that touches a file this promotion already touches, and
 # carry them together. Units that touch nothing in common are still left
 # behind, so promotions stay small and reviewable.
+pr_of() {
+  local s p
+  s="$(git log -1 --format=%s "$1")"
+  p="$(printf '%s' "$s" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
+  [ -n "$p" ] || p="$(printf '%s' "$s" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
+  printf '%s' "$p"
+}
+# Skipped conflicting units are carried in by the cumulative merge, so the
+# metadata counts from the first of them.
+base_idx="${first_conflict:-$picked_idx}"
+[ "$base_idx" -le "$picked_idx" ] || base_idx="$picked_idx"
+set_meta() {
+  local k p
+  coalesced_count=$(( $2 - $1 + 1 ))
+  coalesced_prs=""
+  if [ "$coalesced_count" -gt 1 ]; then
+    for k in $(seq "$1" "$2"); do
+      p="$(pr_of "${units[$k]}")"
+      [ -n "$p" ] && coalesced_prs="${coalesced_prs:+$coalesced_prs, }#$p"
+    done
+  fi
+  return 0
+}
 if [ "$SPLIT" = "1" ]; then
   ext_idx="$picked_idx"
-  coalesced_prs=""
-  coalesced_count=1
+  set_meta "$base_idx" "$picked_idx"
   kept_units=()
   changed="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}" | grep -vE '(^|/)VERSION$' | sort -u || true)"
   j=$(( picked_idx + 1 ))
@@ -230,30 +258,20 @@ if [ "$SPLIT" = "1" ]; then
     ext_rc=0
     stage_to "${units[$ext_idx]}" || ext_rc=$?
     if [ "$ext_rc" -eq 0 ]; then
-      # Count only once the extension is confirmed as the final endpoint.
-      pr_of() {
-        local s p
-        s="$(git log -1 --format=%s "$1")"
-        p="$(printf '%s' "$s" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
-        [ -n "$p" ] || p="$(printf '%s' "$s" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
-        printf '%s' "$p"
-      }
       # Merging an ancestor carries EVERY first-parent unit in
-      # (picked_idx, ext_idx], including the non-overlapping ones dragged in
+      # [base_idx, ext_idx], including the non-overlapping ones dragged in
       # between. Record them all, so the PR body cannot understate the diff.
-      coalesced_count=$(( ext_idx - picked_idx + 1 ))
-      coalesced_prs=""
-      for k in $(seq "$picked_idx" "$ext_idx"); do
-        p="$(pr_of "${units[$k]}")"
-        [ -n "$p" ] && coalesced_prs="${coalesced_prs:+$coalesced_prs, }#$p"
-      done
+      set_meta "$base_idx" "$ext_idx"
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
     else
-      # Only reachable as rc=1 (content no-op); a conflict exits inside stage_to.
-      echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
-      coalesced_count=1
-      coalesced_prs=""
+      if [ "$ext_rc" -eq 2 ]; then
+        echo "::warning::extension to ${units[$ext_idx]} conflicts against $TGT --" \
+             "keeping unit $picked_idx (its files are superseded by later units)"
+      else
+        echo "::warning::extension to ${units[$ext_idx]} was a content no-op -- keeping unit $picked_idx"
+      fi
+      set_meta "$base_idx" "$picked_idx"
       # The worktree is now staged against the extension endpoint, so the
       # original unit must be restaged. Defensive: this should always succeed,
       # but if it does not (e.g. origin/$TGT moved) refuse to commit rather than
