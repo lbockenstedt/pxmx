@@ -10,7 +10,17 @@ name: promote
 #      version-bump.yml). A straight merge would drag the source branch's
 #      VERSION into the target -- so if someone set dev to 10.00, qa would
 #      inherit it instead of going 1.45 -> 1.46. This job pins every tracked
-#      VERSION file back to the target's value, so promotion carries CODE ONLY.
+#      VERSION file back to the target's value, so no version set on the
+#      SOURCE can ever cross the boundary: promotion carries CODE ONLY.
+#
+#      READ THIS BEFORE FLAGGING A VERSION BUMP IN A PROMOTION DIFF. "Code
+#      only" means no SOURCE version crosses -- it does NOT mean the diff
+#      leaves VERSION untouched. The job then advances the TARGET's own
+#      counter by exactly one step inside the promotion commit (see
+#      .github/scripts/promote.sh, "Advance the TARGET's own version"),
+#      because qa and main require a PR and a bot cannot push a bump straight
+#      at them. A correct promotion diff therefore shows the target's own
+#      sequence moving forward one step -- 1.35 -> 1.36, never dev's value.
 #   2. Pinning VERSION here also RESOLVES what would otherwise be a recurring
 #      merge conflict on that file, which would stall every promotion PR.
 #
@@ -75,6 +85,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # GitHub REFUSES to let the Actions GITHUB_TOKEN create or update any
+          # file under .github/workflows/, and NO `permissions:` block can grant
+          # it -- it is a platform rule, not a configurable scope. A promotion or
+          # back-merge whose unit touches a workflow file therefore died at the
+          # push step with "refusing to allow a GitHub App to create or update
+          # workflow ... without `workflows` permission". That stalled the
+          # promotion queue, and because back-merge is what keeps dev and qa
+          # converged, it also let them drift until they genuinely conflicted.
+          # WORKFLOW_TOKEN (a PAT or App token carrying `workflow` scope) is
+          # used when it exists; the push step explains the situation instead of
+          # failing opaquely when it does not.
+          # CREDENTIAL SCOPE, stated explicitly. actions/checkout persists this
+          # token in .git/config, so every LATER step in this job pushes with
+          # `workflow` scope rather than the narrower GITHUB_TOKEN. That is
+          # accepted, and it is bounded: this job's only network writes are the
+          # `git push -f origin "$BR"` below and the `gh` PR calls, all aimed at
+          # the single well-known promote/<src>-to-<tgt> branch. The job never
+          # merges (see the header) and never pushes to dev/qa/main.
+          #
+          # TRIGGER BEHAVIOUR. A PAT push DOES start downstream workflows, where
+          # a GITHUB_TOKEN push does not -- so this could recurse if the push
+          # target were a trigger branch. It is not: `on.push.branches` above is
+          # `[qa]` ONLY, and the branch pushed here is always promote/*, which
+          # matches no trigger in this workflow or in backmerge.yml. The loop is
+          # therefore closed by the trigger filter, not by the token's weakness.
+          token: ${{ secrets.WORKFLOW_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Resolve source and target
         id: route
@@ -98,7 +134,7 @@ jobs:
           echo "branch=promote/$src-to-$tgt" >> "$GITHUB_OUTPUT"
           echo "Promoting $src -> $tgt"
 
-      - name: Build promotion branch (code only, VERSION pinned to target)
+      - name: Build promotion branch (code only; VERSION pinned to target, then advanced one step)
         id: build
         env:
           SRC: ${{ steps.route.outputs.src }}
@@ -116,7 +152,54 @@ jobs:
 
       - name: Push promotion branch
         if: steps.build.outputs.changed == 'true'
-        run: git push -f -q origin "${{ steps.route.outputs.branch }}"
+        env:
+          BR: ${{ steps.route.outputs.branch }}
+          TGT: ${{ steps.route.outputs.tgt }}
+          # An unset secret is the empty string, so this is 'true' only when a
+          # workflow-scoped token is actually configured.
+          HAS_WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN != '' }}
+        run: |
+          # TGT drives the preflight diff below. If it were ever empty the diff
+          # would degrade to "origin/...$BR", which FAILS -- and a failed diff
+          # takes the warn-and-push branch, silently disabling the preflight.
+          # Fail loudly instead: a missing route output is a bug, not a state to
+          # push through. (steps.route does emit tgt; this pins that it must.)
+          if [ -z "$TGT" ]; then
+            echo "::error::TGT is empty -- steps.route must emit a 'tgt' output. Refusing to push without a working workflow-file preflight."
+            exit 1
+          fi
+          # Preflight: a push carrying a .github/workflows/ change is rejected
+          # outright unless the credential holds `workflow` scope. Detecting it
+          # here turns an opaque git failure into an instruction.
+          has_wf=false
+          diff_err=$(mktemp)
+          if wf="$(git diff --name-only "origin/$TGT...$BR" 2>"$diff_err")"; then
+            if printf '%s\n' "$wf" | grep -q '^\.github/workflows/'; then
+              has_wf=true
+              if [ "$HAS_WORKFLOW_TOKEN" != "true" ]; then
+                echo "::error::This promotion changes .github/workflows/, which the Actions GITHUB_TOKEN is forbidden to push. Add a repository secret WORKFLOW_TOKEN holding a token with 'workflow' scope, then re-run. No permissions: block can grant this -- it is a GitHub platform restriction."
+                printf 'Workflow files carried by this promotion:\n%s\n' \
+                  "$(printf '%s\n' "$wf" | grep '^\.github/workflows/')"
+                rm -f "$diff_err"
+                exit 1
+              fi
+            fi
+          else
+            err_msg=$(tr '\n' ' ' < "$diff_err")
+            echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential ($err_msg); attempting the push anyway"
+          fi
+          rm -f "$diff_err"
+
+          push_out=$(mktemp)
+          if ! git push -f -q origin "$BR" 2>"$push_out"; then
+            cat "$push_out" >&2
+            if [ "$has_wf" = "true" ] || grep -qiE 'workflow' "$push_out"; then
+              echo "::error::Push failed while updating .github/workflows/. Ensure WORKFLOW_TOKEN has 'workflow' scope and is not expired."
+            fi
+            rm -f "$push_out"
+            exit 1
+          fi
+          rm -f "$push_out"
 
       - name: Open or update the promotion PR
         if: steps.build.outputs.changed == 'true'
@@ -317,17 +400,39 @@ jobs:
           BR: ${{ steps.route.outputs.branch }}
           SHA: ${{ steps.build.outputs.sha }}
         run: |
+          # More than one workflow is triggered per PR (CI *and* branch-flow),
+          # and they do not enter `action_required` at the same instant. The
+          # first version of this loop returned as soon as ANY parked run was
+          # approved, so whichever workflow parked a second later stayed parked
+          # -- and if that one was `CI`, the required `test` check never
+          # reported and the PR was BLOCKED forever ("Required status check
+          # \"test\" is expected", ab#338). Keep polling and approve every run
+          # we have not already approved; only stop once the queue has been
+          # quiet for three consecutive polls.
+          approved=""
+          quiet=0
           for _ in $(seq 1 24); do
             ids=$(gh api "repos/${{ github.repository }}/actions/runs?branch=$BR&status=action_required" \
                     --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .id" 2>/dev/null || true)
-            if [ -n "$ids" ]; then
-              for id in $ids; do
-                echo "approving parked run $id"
-                gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve" || \
-                  echo "::warning::could not approve run $id -- approve it by hand to unblock this PR"
-              done
-              exit 0
+            new=""
+            for id in $ids; do
+              case " $approved " in *" $id "*) continue ;; esac
+              echo "approving parked run $id"
+              gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve" || \
+                echo "::warning::could not approve run $id -- approve it by hand to unblock this PR"
+              approved="$approved $id"
+              new="$new $id"
+            done
+            if [ -n "$approved" ] && [ -z "$new" ]; then
+              quiet=$((quiet + 1))
+              if [ "$quiet" -ge 3 ]; then break; fi
+            else
+              quiet=0
             fi
             sleep 5
           done
-          echo "::notice::no parked run found for $BR @ $SHA"
+          if [ -n "$approved" ]; then
+            echo "::notice::released parked run(s):$approved"
+          else
+            echo "::notice::no parked run found for $BR @ $SHA"
+          fi
