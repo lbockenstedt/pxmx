@@ -360,6 +360,51 @@ class TestSpokeRouting:
             )
 
 
+class TestAgentForNode:
+    """_agent_for_node resolves a PVE node name to the agent that reported it."""
+
+    def test_matches_dict_shaped_nodes(self):
+        """Production telemetry stores ``nodes`` as a list of dicts (one per
+        cluster member reported via /cluster/resources), e.g.
+        [{"node": "pve1", ...}] — not plain strings. Each of the cluster's
+        agents independently sees the whole cluster, so multiple agents can
+        legitimately list the same node names; _agent_for_node must extract
+        the "node" key to match rather than stringifying the whole dict
+        (which never matched and silently collapsed every node-scoped
+        request, e.g. PXMX_DRIVE_HEALTH, onto the first connected agent)."""
+        from proxmox_spoke import ProxmoxSpoke
+
+        fake_cp = MagicMock()
+        fake_cp.connected_agents = {
+            "agent-node1": {"cluster_name": "lab-cluster",
+                            "nodes": [{"node": "pve1", "status": "online"}]},
+            "agent-node2": {"cluster_name": "lab-cluster",
+                            "nodes": [{"node": "pve2", "status": "online"}]},
+            "agent-node3": {"cluster_name": "lab-cluster",
+                            "nodes": [{"node": "pve3", "status": "online"}]},
+        }
+        spoke = ProxmoxSpoke("px-1", {}, control_plane=fake_cp)
+
+        assert spoke._agent_for_node("pve1") == "agent-node1"
+        assert spoke._agent_for_node("pve2") == "agent-node2"
+        assert spoke._agent_for_node("pve3") == "agent-node3"
+        # Case-insensitive match, same as the plain-string path.
+        assert spoke._agent_for_node("PVE2") == "agent-node2"
+
+    def test_falls_back_when_unmatched(self):
+        from proxmox_spoke import ProxmoxSpoke
+
+        fake_cp = MagicMock()
+        fake_cp.connected_agents = {
+            "agent-node1": {"cluster_name": "lab-cluster",
+                            "nodes": [{"node": "pve1", "status": "online"}]},
+        }
+        spoke = ProxmoxSpoke("px-1", {}, control_plane=fake_cp)
+
+        # Unknown node name: no match anywhere → fall back to first agent.
+        assert spoke._agent_for_node("unknown-node") == "agent-node1"
+
+
 class TestHpeHardwareDetection:
     def test_non_hpe_server_skipped(self):
         with patch("drive_health.is_hpe_server", return_value=False):

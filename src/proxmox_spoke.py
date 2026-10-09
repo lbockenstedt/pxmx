@@ -853,8 +853,16 @@ class ProxmoxSpoke(BaseSpoke):
         if node:
             node_l = node.lower()
             for aid, info in agents.items():
-                nodes = [str(n).lower() for n in (info.get("nodes") or [])]
-                if node_l in nodes:
+                # ``nodes`` entries are dicts (e.g. {"node": "node01", ...}),
+                # one per cluster member as reported by /cluster/resources —
+                # not plain strings. str()-ing the dict itself never matched
+                # ``node_l``, so every lookup silently fell through to the
+                # "first connected agent" fallback below, collapsing every
+                # node-scoped request (e.g. PXMX_DRIVE_HEALTH) onto whichever
+                # agent happened to be first in the dict.
+                names = [str(n.get("node") if isinstance(n, dict) else n).lower()
+                         for n in (info.get("nodes") or [])]
+                if node_l in names:
                     return aid
         return next(iter(agents))
 
