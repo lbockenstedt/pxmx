@@ -341,22 +341,45 @@ class ProxmoxSpoke(BaseSpoke):
 
         if cmd == "PXMX_DRIVE_HEALTH":
             agent_id = data.get("agent_id")
-            if not agent_id:
-                agent_id = self._agent_for_node(data.get("node", ""))
-            if not agent_id:
+            if agent_id or data.get("node"):
+                if not agent_id:
+                    agent_id = self._agent_for_node(data.get("node", ""))
+                if not agent_id:
+                    return {"status": "ERROR", "message": "No agent resolved for node"}
+                cluster = ((self.control_plane.connected_agents or {})
+                              .get(agent_id, {}).get("cluster_name", agent_id))
+                try:
+                    r = await self.control_plane.send_to_agent(
+                          "PXMX_DRIVE_HEALTH", {}, agent_id=agent_id, timeout=30.0)
+                    result = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
+                    if isinstance(result, dict):
+                        result["cluster"] = cluster
+                    return result
+                except Exception as e:
+                    logger.debug("drive_health agent %s failed: %s", agent_id, e)
+                    return {"status": "ERROR", "message": str(e), "drives": [], "cluster": cluster}
+            # Unscoped: fan out to EVERY agent. There is one agent per server and
+            # smartctl only sees local drives; this used to go to whichever agent
+            # was first in the dict, so Diagnostics showed one server that rotated
+            # as agents reconnected.
+            agents = list(((self.control_plane.connected_agents if self.control_plane else None) or {}).items())
+            if not agents:
                 return {"status": "ERROR", "message": "No agent resolved for node"}
-            cluster = ((self.control_plane.connected_agents or {})
-                          .get(agent_id, {}).get("cluster_name", agent_id))
-            try:
-                r = await self.control_plane.send_to_agent(
-                      "PXMX_DRIVE_HEALTH", {}, agent_id=agent_id, timeout=30.0)
-                result = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
-                if isinstance(result, dict):
-                    result["cluster"] = cluster
-                return result
-            except Exception as e:
-                logger.debug("drive_health agent %s failed: %s", agent_id, e)
-                return {"status": "ERROR", "message": str(e), "drives": [], "cluster": cluster}
+            async def _one(aid, info):
+                try:
+                    r = await self.control_plane.send_to_agent(
+                        "PXMX_DRIVE_HEALTH", {}, agent_id=aid, timeout=30.0)
+                    result = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
+                    if not isinstance(result, dict):
+                        raise ValueError("invalid reply")
+                    out = dict(result)
+                    out["cluster"] = info.get("cluster_name", aid)
+                    out["node"] = result.get("node") or info.get("hostname") or aid
+                    return out
+                except Exception as e:
+                    logger.debug("drive_health agent %s failed: %s", aid, e)
+                    return {"node": info.get("hostname") or aid, "cluster": info.get("cluster_name", aid), "status": "ERROR", "message": str(e) or "invalid reply", "drives": []}
+            return {"status": "SUCCESS", "nodes": list(await asyncio.gather(*[_one(aid, info) for aid, info in agents]))}
 
         if cmd == "PXMX_INSTALL_SSACLI":
             agent_id = data.get("agent_id")
@@ -844,7 +867,12 @@ class ProxmoxSpoke(BaseSpoke):
         """Resolve the agent_id whose ``nodes`` list contains ``node``. Falls
         back to the first connected agent when none matches (single-node /
         standalone). Used by PXMX_LIST_ISOS / PXMX_LIST_STORAGES /
-        PXMX_CREATE_VM which are node-scoped but routed via agent_id."""
+        PXMX_CREATE_VM which are node-scoped but routed via agent_id.
+
+        The agent RUNNING ON ``node`` (hostname, short-name, case-insensitive)
+        wins over the membership match: every agent in a cluster lists every
+        member in ``nodes``, so node-local commands (PXMX_DRIVE_HEALTH runs
+        smartctl on its own host) would otherwise all land on one agent."""
         if not self.control_plane:
             return None
         agents = self.control_plane.connected_agents or {}
@@ -852,14 +880,16 @@ class ProxmoxSpoke(BaseSpoke):
             return None
         if node:
             node_l = node.lower()
+            short_node = node_l.split(".")[0]
+            for aid, info in agents.items():
+                if str(info.get("hostname") or "").lower().split(".")[0] == short_node:
+                    return aid
             for aid, info in agents.items():
                 # ``nodes`` entries are dicts (e.g. {"node": "node01", ...}),
                 # one per cluster member as reported by /cluster/resources —
                 # not plain strings. str()-ing the dict itself never matched
                 # ``node_l``, so every lookup silently fell through to the
-                # "first connected agent" fallback below, collapsing every
-                # node-scoped request (e.g. PXMX_DRIVE_HEALTH) onto whichever
-                # agent happened to be first in the dict.
+                # "first connected agent" fallback below.
                 names = [str(n.get("node") if isinstance(n, dict) else n).lower()
                          for n in (info.get("nodes") or [])]
                 if node_l in names:
