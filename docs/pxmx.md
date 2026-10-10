@@ -131,6 +131,7 @@ You also need at least one certified USB vid:pid configured and at least one clo
 - **Wear-leveling & Endurance:** Extracts wear-level percentage, NVMe percentage used, spare block depletion, reallocated sectors, power-on hours, and device temperature.
 - **Dynamic SSACLI Provisioning:** Auto-detects HPE ProLiant hardware platforms via DMI and PCI sysfs (`/sys/class/dmi/id/sys_vendor`, `/sys/bus/pci/drivers`) and dynamically triggers unattended package installation (`PXMX_INSTALL_SSACLI`) on the host node.
 - **Threshold Alerting & Summaries:** Categorizes drives as `healthy`, `warning`, or `critical` according to wear endurance thresholds (>=80% warning, >=90% critical) and SMART overall health assessments, returning structured summaries (`PXMX_DRIVE_HEALTH`) to the LM WebUI.
+- **Per-server routing:** smartctl only sees the drives of the host its agent runs on, so the spoke sends an unscoped `PXMX_DRIVE_HEALTH` to **every** connected agent and returns `{"status": "SUCCESS", "nodes": [...]}`, one entry per server. An unreachable agent shows up as an `ERROR` entry and does not hide the others. A request for a named `node` goes to the agent whose own hostname matches it (short name, case-insensitive) before falling back to cluster membership, because every agent in a cluster lists every member. Before this, Diagnostics showed one server at a time, rotating as agents reconnected.
 
 ## Node-level metrics & telemetry
 
