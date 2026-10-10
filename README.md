@@ -85,7 +85,7 @@ Commands routed and processed by `src/proxmox_spoke.py`:
 | `PXMX_LIST_POOLS` | Hub → Spoke → Agents | Aggregates Proxmox resource pools across all connected agents. |
 | `PXMX_LIST_ISOS` | Hub → Spoke → Agent | Lists ISO images present across storage volumes on a given node. |
 | `PXMX_LIST_STORAGES` | Hub → Spoke → Agent | Queries storage volumes on a target node accepting specified content types. |
-| `PXMX_DRIVE_HEALTH` | Hub → Spoke → Agent | Queries physical drive telemetry, wear-leveling, and SMART health for a node. |
+| `PXMX_DRIVE_HEALTH` | Hub → Spoke → Agent | Queries physical drive telemetry, wear-leveling, and SMART health for a node (routed to the agent on that host), or for every server when no node is given (fans out to all agents). |
 | `PXMX_INSTALL_SSACLI` | Hub → Spoke → Agent | Triggers automated HPE SSACLI package installation on an HPE server node. |
 | `PXMX_CREATE_VM` | Hub → Spoke → Agent | Creates and configures a new QEMU virtual machine from an ISO image. |
 | `INSTALL_CERT` | Hub → Spoke → Agent | Relays TLS certificate and private key to agent for local `pveproxy` installation. |
