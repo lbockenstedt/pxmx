@@ -481,6 +481,12 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
     async def _prog(step, pct, **extra):
         if emit_progress and cs_cmd_id:
             await _progress(agent, cs_cmd_id, "reclone_vm", "running", step, pct, vmid=vid, **extra)
+
+    def _fail(error: str, bus_: Optional[str]) -> Dict[str, Any]:
+        # Log every failure on the agent too — the per-VM error otherwise only
+        # rides CS_PROGRESS to the browser and never lands in pxmx-agent.log.
+        logger.error("reclone VM %s failed: %s", vid, error)
+        return {"ok": False, "error": error, "bus": bus_}
     # Recover the USB bus path: state first, then `qm config` usb0 host= (bash 2436-2451).
     bus = usb_provision.bus_for_vmid(vid)
     if not bus:
@@ -490,22 +496,31 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
                 bus = v.split("host=", 1)[1].split(",", 1)[0].strip()
                 break
     if not bus or not os.path.isdir(f"/sys/bus/usb/devices/{bus}"):
-        return {"ok": False, "error": f"no present USB bus for VM {vid}", "bus": bus}
+        return _fail(f"no present USB bus for VM {vid}", bus)
 
     state = usb_provision.load_usb_state()
     image_num = int(state["vmid_to_image"].get(str(vid), 1) or 1)
     usb_cfg = _usb_cfg(agent)
-    template = source_vmid or (usb_cfg.get("image1_template_id") if image_num == 1
-                               else usb_cfg.get("image2_template_id")) \
+    configured = source_vmid or (usb_cfg.get("image1_template_id") if image_num == 1
+                                 else usb_cfg.get("image2_template_id")) \
         or usb_cfg.get("image1_template_id")
+    if not configured:
+        return _fail("no template id configured", bus)
+    # Resolve the clone source BEFORE destroying, through the same resolver the
+    # provision loop uses (missing numeric vmid → fall back to a cluster
+    # template; template NAME → local vmid). Passing the raw configured value
+    # straight to `qm clone` destroyed the VM and then failed the clone whenever
+    # the configured template didn't exist on this host, leaving it gone.
+    template = await usb_provision._resolve_template_vmid(configured)
     if not template:
-        return {"ok": False, "error": "no template id configured", "bus": bus}
+        return _fail(f"clone source {configured!r} not found on this host "
+                     "and no fallback template — VM left untouched", bus)
 
     await _prog("destroying", 20)
     dr = await destroy_vm(agent, vid, bus=bus, protected=prot)
     if not dr["ok"] and not dr["orphaned"]:
-        return {"ok": False, "error": f"destroy before reclone failed (attempt {dr.get('fails')}/3)",
-                "bus": bus}
+        return _fail(f"destroy before reclone failed (attempt {dr.get('fails')}/3): "
+                     f"{dr.get('reason') or 'unknown reason'}", bus)
 
     # Resolve the deterministic username from vm_names.json (the same map the
     # initial clone uses) so a reclone lands on the human name (e.g.
@@ -515,16 +530,24 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
     # the guest hostname came up as sim-9xxxx, losing the username programmed
     # into the local map.
     vm_name = name or _reclone_vm_name(vid)
-    await _prog("cloning", 40)
-    await pve_cmds.qm_clone(template, vid, vm_name, protected=prot, timeout=600)
-    await pve_cmds.qm_set(vid, "--onboot", "1", "--startup", "order=2,up=60", protected=prot)
-    await pve_cmds.qm_set(vid, "-usb0", f"host={bus}", protected=prot)
-    vlan = usb_cfg.get("vlan_nic")
-    if vlan:
-        await pve_cmds.qm_set(vid, "-net0", f"virtio,bridge={vlan}", protected=prot)
+    phase = "cloning"
+    try:
+        await _prog("cloning", 40)
+        await pve_cmds.qm_clone(template, vid, vm_name, protected=prot, timeout=600)
+        phase = "configuring"
+        await pve_cmds.qm_set(vid, "--onboot", "1", "--startup", "order=2,up=60", protected=prot)
+        await pve_cmds.qm_set(vid, "-usb0", f"host={bus}", protected=prot)
+        vlan = usb_cfg.get("vlan_nic")
+        if vlan:
+            await pve_cmds.qm_set(vid, "-net0", f"virtio,bridge={vlan}", protected=prot)
 
-    await _prog("starting", 60)
-    await pve_cmds.qm_start(vid, prot)
+        phase = "starting"
+        await _prog("starting", 60)
+        await pve_cmds.qm_start(vid, prot)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 — report the phase + qm stderr, don't lose it
+        return _fail(f"{phase} from template {template} failed: {e}", bus)
 
     await _prog("waiting_guest_agent", 75)
     # Bash cadence: `timeout 10` ping + `sleep 5` ≈ 15s/iter, 40× ≈ 10 min
@@ -635,6 +658,7 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
                                             emit_progress=False)
                 ok = bool(r.get("ok"))
             except Exception as e:  # noqa: BLE001
+                logger.exception("fleet reclone: VM %s raised", vid)
                 ok = False
                 r = {"error": str(e)}
             usb_provision.mark_reclone_vm_done(vid, ok, vname)
