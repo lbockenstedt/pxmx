@@ -41,7 +41,7 @@
    - Executes hypervisor-native CLI operations (`qm`, `pct`, `pvesh`, `vzdump`, `pvenode`).
    - Runs background watchdogs, guest agent monitors, and client-simulation auto-provisioning pipelines.
 
-3. **Direct-Attached Drive Health Pipeline (`src/drive_health.py`, `agent/src/drive_health.py`):**
+3. **Direct-Attached Drive Health Pipeline (`agent/src/drive_health.py`):**
    - Automatically probes local storage devices across SATA, SAS, and NVMe interfaces using `smartctl`.
    - Detects HPE ProLiant platforms and Smart Array RAID controllers via DMI/sysfs inspection (`/sys/class/dmi/id/sys_vendor`, `/sys/bus/pci/drivers/smartpqi`, `/sys/bus/pci/drivers/hpsa`), supporting dynamic installation of `hpssacli`/`ssacli`.
    - Collects critical drive health indicators: SSD wear leveling percentage, NVMe endurance / spare block depletion, reallocated sectors, power-on hours, and operating temperatures.

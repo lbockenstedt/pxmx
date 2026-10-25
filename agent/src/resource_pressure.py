@@ -12,8 +12,7 @@ Principle (per design): if ANY part of the system is under load it raises a
 pressure score, and downstream pollers (clients → spoke, spoke → hub) scale
 their report/poll interval UP so the loaded tier gets fewer requests and can
 recover. Pure functions, stdlib-only, so the file vendors byte-identically into
-pxmx/agent/src, cs/lm-spoke/src, and lm/core/src — grep "resource_pressure" to
-find all copies; edit the canonical (lm/core/src) and re-copy.
+cs/lm-spoke/src (canonical) and pxmx/agent/src — edit the canonical and re-copy.
 
 NOTE: this is ONLY the back-pressure signal. The CPU/mem 1h averaging stays
 per-tier (each computes what it displays / gates on independently) — deliberately
