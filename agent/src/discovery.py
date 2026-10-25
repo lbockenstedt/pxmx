@@ -32,9 +32,9 @@ install plaintext-loopback while anything off-box uses ``wss://``.
 that port when the hub advertises TLS).
 
 This module is **standalone**: stdlib + an optional ``zeroconf`` import only — no
-intra-repo dependencies — so the same source is vendored verbatim into the pxmx
-spoke (``pxmx/src/discovery.py``) and the standalone pxmx agent
-(``pxmx/agent/src/discovery.py``). Keep the three copies in sync.
+intra-repo dependencies — so the same source is vendored verbatim into the standalone pxmx
+agent (``pxmx/agent/src/discovery.py``, also run by ``install_pxmx.sh``). Keep
+the two copies in sync.
 
 If ``zeroconf`` is not importable the mDNS branch is skipped and DNS-only is
 used, so a missing optional dep never breaks discovery (or the hub broadcast).
