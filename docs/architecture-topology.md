@@ -64,7 +64,7 @@ LM is a zero-trust hub/spoke/agent management mesh for a lab/DC lab. One **hub**
 - **DNS:** tries `lm-hub.<search-domain>`, `lm-hub.local` (Avahi), bare `lm-hub`. DNS has no TXT → always returns `ws://` (pin `--hub wss://...` for a TLS remote hub reached only by DNS).
 - **Scheme selection:** same-box → `wss://127.0.0.1:443/ws/spoke` (verify-off, loopback on the single :443 listener); remote + mDNS TXT `tls_port` → `wss://<ip>:443`; remote no TXT → `ws://<ip>:443` (no-cert hub). `agent_listener=True` reads TXT `agent_port` (advertised **443** on both deployments) → `wss://<hub>:443/ws/agent` — this is the **loopback/all-in-one** path (agent → hub → spoke). On the **standalone** path (agent → spoke → hub, the default) the pxmx spoke does NOT broadcast `_lm-hub` mDNS, so the agent cannot auto-discover it and **must be pinned** with `agent/install_agent.sh --spoke-ip <spoke>` (the installer prints this).
 - **Same-box = IP-equality, NOT mDNS receipt.** mDNS crosses the LAN (L2-scoped), so hearing the hub over mDNS does not mean same-box. `is_hub_local(hub_ip)` compares the resolved/mDNS hub IP against this box's own interface IPv4s (UDP-connect-to-`223.255.255.1` + psutil, loopback included). When same-box, the caller dials `127.0.0.1:443` on the same unified listener instead of the LAN IP.
-- **Four byte-identical vendored copies** of `hub_discovery.py` must move together: `lm/core/src/messaging/hub_discovery.py` (canonical), `pxmx/src/discovery.py`, `pxmx/agent/src/discovery.py`, `lm/generic_agent/src/hub_discovery.py`.
+- **Two byte-identical vendored copies** of `hub_discovery.py` must move together: `lm/core/src/messaging/hub_discovery.py` (canonical) and `pxmx/agent/src/discovery.py`.
 
 ## TLS trust model
 

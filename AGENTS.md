@@ -24,14 +24,14 @@ copy also lives in this repo's `docs/` — before making structural changes.
 | `src/proxmox_spoke.py`, `src/control_plane.py` | The spoke. Runs in its own container; bridges hub <-> agents (`run_agent_server`). |
 | `agent/src/agent.py` | **Host agent** — runs on the Proxmox node. VM clone/destroy, VNC, USB provisioning, watchdogs. |
 | `agent/src/usb_provision.py` | **The Client-Sim auto-provisioning brain lives here** (`run_provision_loop`) — not in the hub, not in the `cs` spoke. |
-| `src/discovery.py`, `agent/src/discovery.py` | Vendored copies of `lm/core/src/messaging/hub_discovery.py`. |
+| `agent/src/discovery.py` | Vendored copy of `lm/core/src/messaging/hub_discovery.py` (also run by `install_pxmx.sh`). |
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the agent/spoke split and where the brain lives.
 
 ## pxmx-specific gotchas
 
 - **Two listener modes.** Standalone (**default**): agent dials `wss://<spoke>:443/ws/agent`, pinned with `--spoke-ip` because a standalone spoke does not broadcast mDNS. All-in-one (`--loopback`): agent dials the hub, which byte-proxies to the spoke on loopback `:8443`.
-- **`discovery.py` is vendored twice here** and must stay byte-identical to the canonical copy in `lm/core/src/messaging/hub_discovery.py`.
+- **`agent/src/discovery.py` is vendored** and must stay byte-identical to the canonical copy in `lm/core/src/messaging/hub_discovery.py`.
 - **There is both a `test/` and a `tests/` directory.** Check which one the runner picks up (`pytest.ini`) before adding tests.
 - `pxmx.log` is a committed runtime artifact, not source.
 - Two installers: `install_pxmx.sh` (spoke container) and `agent/install_agent.sh` (Proxmox host). They are not interchangeable.

@@ -351,12 +351,12 @@ fi
 # ── Hub auto-discovery ──────────────────────────────────────────────────────
 # When --hub was not given (and no HUB_URL env), auto-locate the hub via DNS
 # (lm-hub.<dns-suffix>) then mDNS (_lm-hub._tcp.local.) using the just-installed
-# venv + the vendored src/discovery.py. If nothing is found, leave HUB_URL empty
-# — the spoke re-discovers at startup (BaseControlPlane.run sentinel) once the
-# hub is up. cwd is the pxmx repo ($INSTALL_DIR/pxmx) so `src.discovery` imports.
+# venv + the vendored agent/src/discovery.py (stdlib-only, run as a script). If
+# nothing is found, leave HUB_URL empty — the spoke re-discovers at startup
+# (BaseControlPlane.run sentinel) once the hub is up. cwd is the pxmx repo.
 if [ "$HUB_URL_PINNED" != "1" ]; then
     echo "🔎 No --hub given; auto-discovering the LM hub (DNS lm-hub.* / mDNS)…"
-    DISCOVERED=$(./venv/bin/python3 -m src.discovery --timeout 5 2>/dev/null || echo NONE)
+    DISCOVERED=$(./venv/bin/python3 agent/src/discovery.py --timeout 5 2>/dev/null || echo NONE)
     if [ -n "$DISCOVERED" ] && [ "$DISCOVERED" != "NONE" ]; then
         HUB_URL="$DISCOVERED"
         echo "✅ Discovered hub: $HUB_URL"
