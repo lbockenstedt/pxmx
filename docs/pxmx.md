@@ -60,7 +60,7 @@ The pxmx spoke's agent listener has two modes. **Which mode is deployed determin
 
 ## Key files
 
-- Spoke: `src/control_plane.py` (`PxmxControlPlane`, `run_agent_server` — self-healing agent listener; **standalone DEFAULT** `wss://0.0.0.0:443` (agent → spoke → hub); **loopback** `127.0.0.1:8443` plaintext via `LM_PXMX_AGENT_LOOPBACK=1` reached through the hub `/ws/agent` byte-proxy (agent → hub → spoke, `--loopback`/install_all only); legacy no-cert `ws://0.0.0.0:8766`), `src/proxmox_spoke.py` (`ProxmoxSpoke`), `src/discovery.py` (vendored).
+- Spoke: `src/control_plane.py` (`PxmxControlPlane`, `run_agent_server` — self-healing agent listener; **standalone DEFAULT** `wss://0.0.0.0:443` (agent → spoke → hub); **loopback** `127.0.0.1:8443` plaintext via `LM_PXMX_AGENT_LOOPBACK=1` reached through the hub `/ws/agent` byte-proxy (agent → hub → spoke, `--loopback`/install_all only); legacy no-cert `ws://0.0.0.0:8766`), `src/proxmox_spoke.py` (`ProxmoxSpoke`) (hub discovery comes from lm core; `install_pxmx.sh` runs `agent/src/discovery.py`).
 - Agent: `agent/src/agent.py` (`ProxmoxAgent`, telemetry `_cs_telemetry_body`, VNC, self-update, sd_notify watchdog), `agent/src/usb_provision.py` (7-layer auto-provision brain), `agent/src/cs_commands.py`, `agent/src/cs_sim.py`, `agent/src/cs_guard.py` (90000 VMID floor + `PROTECTED_VMIDS`), `agent/src/pve_cmds.py` (async `qm`/`pct`), `agent/src/watchdogs.py`, `agent/src/security_utils.py` (HMAC), `agent/src/update_recovery.py`, `agent/src/vm_names.json`, `agent/src/dep_guard.py`.
 
 ## Notable behaviors & gotchas
@@ -126,7 +126,7 @@ You also need at least one certified USB vid:pid configured and at least one clo
 
 ## Drive health & storage monitoring
 
-`pxmx` includes a comprehensive direct-attached drive health monitoring pipeline (`agent/src/drive_health.py` and `src/drive_health.py`):
+`pxmx` includes a comprehensive direct-attached drive health monitoring pipeline (`agent/src/drive_health.py`; the spoke fetches it from each host agent):
 - **Telemetry & Inspection:** Inspects local physical disks via `smartctl` with multi-vendor fallbacks (SATA/SAS/NVMe) and HPE Smart Storage Administrator CLI (`ssacli` / `hpssacli`) for HPE Smart Array RAID controllers.
 - **Wear-leveling & Endurance:** Extracts wear-level percentage, NVMe percentage used, spare block depletion, reallocated sectors, power-on hours, and device temperature.
 - **Dynamic SSACLI Provisioning:** Auto-detects HPE ProLiant hardware platforms via DMI and PCI sysfs (`/sys/class/dmi/id/sys_vendor`, `/sys/bus/pci/drivers`) and dynamically triggers unattended package installation (`PXMX_INSTALL_SSACLI`) on the host node.
