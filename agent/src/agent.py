@@ -2350,7 +2350,8 @@ class ProxmoxAgent:
                         except Exception as e:
                             result = {"status": "ERROR", "message": str(e)}
 
-                    elif cmd_type in ("OS_UPDATE_CHECK", "OS_UPDATE_APPLY"):
+                    elif cmd_type in ("OS_UPDATE_CHECK", "OS_UPDATE_APPLY",
+                                      "OS_UPDATE_APPLY_PACKAGES", "OS_REBOOT"):
                         # Fleet OS updates, hub-orchestrated. The agent runs ON the
                         # Proxmox HOST, so this is the one node type where an
                         # update touches the hypervisor itself — hence
@@ -2360,7 +2361,9 @@ class ProxmoxAgent:
                         #
                         # Refuses while a provision/reclone batch is running: an
                         # apt transaction that restarts pve services mid-clone is
-                        # how you get a half-created VM.
+                        # how you get a half-created VM — and a reboot is worse.
+                        # OS_UPDATE_APPLY_PACKAGES upgrades only the listed
+                        # packages; OS_REBOOT is the operator's explicit reboot.
                         try:
                             from . import os_update
                             busy = None
@@ -2374,13 +2377,20 @@ class ProxmoxAgent:
                                     busy = "VMs are being deleted"
                             except Exception:  # noqa: BLE001 — never block on a status probe
                                 busy = None
-                            if cmd_type == "OS_UPDATE_APPLY" and busy:
+                            if cmd_type != "OS_UPDATE_CHECK" and busy:
+                                verb = "reboot" if cmd_type == "OS_REBOOT" else "apply updates"
                                 result = {"status": "ERROR", "busy": True,
-                                          "message": f"refusing to apply updates: {busy}"}
+                                          "message": f"refusing to {verb}: {busy}"}
                             elif cmd_type == "OS_UPDATE_CHECK":
                                 result = await asyncio.to_thread(
                                     os_update.check_updates,
                                     bool((data or {}).get("refresh", True)))
+                            elif cmd_type == "OS_UPDATE_APPLY_PACKAGES":
+                                result = await asyncio.to_thread(
+                                    os_update.apply_updates,
+                                    list((data or {}).get("packages") or []))
+                            elif cmd_type == "OS_REBOOT":
+                                result = await asyncio.to_thread(os_update.reboot_node)
                             else:
                                 result = await asyncio.to_thread(os_update.apply_updates)
                             result.setdefault("status", "SUCCESS")
