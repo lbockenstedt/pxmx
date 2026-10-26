@@ -56,7 +56,11 @@ class _Agent:
 
 
 def _setup(monkeypatch, cfg):
-    calls = {"set": [], "assign": [], "held_during_destroy": None}
+    calls = {"set": [], "assign": [], "held_during_destroy": None, "finish": []}
+
+    async def _finish(agent, vid, name, state, **kw):
+        calls["finish"].append((vid, name, state, kw))
+        return True
 
     async def _destroy(agent, vid, **kw):
         calls["held_during_destroy"] = dict(_prov._pci_reclone_hold)
@@ -75,6 +79,7 @@ def _setup(monkeypatch, cfg):
         return 101
 
     monkeypatch.setattr(_prov, "_resolve_template_vmid", _resolve)
+    monkeypatch.setattr(_prov, "finish_clone", _finish)
     monkeypatch.setattr(_prov, "bus_for_vmid", lambda vid: None)
     monkeypatch.setattr(_prov, "load_usb_state", lambda: {"vmid_to_image": {}})
     monkeypatch.setattr(_prov, "set_assignment", lambda *a: calls["assign"].append(a))
@@ -103,7 +108,10 @@ def test_pci_vm_is_recloned_onto_the_same_controller(monkeypatch):
     assert r["ok"] is True and r["bus"] == PCI
     assert ("-hostpci0", f"{PCI},pcie=1") in calls["set"]
     assert not any(a and a[0] == "-usb0" for a in calls["set"])
-    assert calls["assign"] == []  # T1/T3 VMs keep no usb_state
+    assert calls["assign"] == []  # T1/T3 VMs keep no bus assignment
+    # ...but get the same post-clone finish as auto-provision (no USB phy).
+    assert calls["finish"] == [(VID, "kmcintyre", None,
+                                {"bus": None, "image_num": 1, "dtype": ""})]
 
 
 def test_pci_controller_is_held_during_reclone_then_released(monkeypatch):
