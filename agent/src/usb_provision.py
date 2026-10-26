@@ -3746,11 +3746,26 @@ def _pci_short(addr: str) -> str:
     return a[5:] if a.startswith("0000:") else a
 
 
+# PCI controllers held by an in-flight reclone (short addr → vmid). Between the
+# reclone's destroy and its re-attach the controller and VMID look free; the
+# T1/T3 provisioner must not hand them to a new VM in that window.
+_pci_reclone_hold: Dict[str, int] = {}
+
+
+def hold_pci_for_reclone(addr: str, vmid: int) -> None:
+    _pci_reclone_hold[_pci_short(addr)] = int(vmid)
+
+
+def release_pci_hold(addr: str) -> None:
+    _pci_reclone_hold.pop(_pci_short(addr), None)
+
+
 async def _pci_addrs_in_use(agent) -> Set[str]:
     """Short-form PCI addresses already attached to ANY VM (its ``hostpciN``
-    lines) — so the T1/T3 provisioner never double-passes a controller."""
+    lines) or held by a reclone — so the T1/T3 provisioner never double-passes
+    a controller."""
     from . import pve_cmds
-    used: Set[str] = set()
+    used: Set[str] = set(_pci_reclone_hold)
     try:
         vmids = await pve_cmds.list_all_vmids()
     except Exception:  # noqa: BLE001
@@ -3855,6 +3870,7 @@ async def _provision_pci_tier(agent, tier: str, pci_vidpids, template: int,
         in_use = set(await pve_cmds.list_all_vmids())
     except Exception:  # noqa: BLE001
         in_use = set()
+    in_use |= set(_pci_reclone_hold.values())
     provisioned = 0
     for addr, vidpid in free:
         vmid = None
