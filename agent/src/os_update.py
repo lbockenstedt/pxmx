@@ -32,6 +32,12 @@ helper with a fixed set of actions (``scripts/lm-os-update``), installed with a
 matching sudoers rule. Without it a check still works but apply is reported as
 blocked WITH the reason, rather than failing mid-run.
 
+Fixing a blocked node: ``fix_access(username, password)`` takes a root (or
+sudo-capable) login typed ONCE by whoever owns the node and uses it to install
+that helper + sudoers rule. The password only ever goes to su/sudo's prompt over
+a pty; it is never stored, logged or put on a command line. After that the node
+patches with no password, through the same narrow rule as an installer-built one.
+
 Everything here is synchronous subprocess work; callers run it via
 ``asyncio.to_thread`` so a 10-minute dist-upgrade never blocks the event loop.
 
@@ -39,11 +45,18 @@ VENDORED: ``pxmx/agent/src/os_update.py`` is a verbatim copy. Change both.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
+import pty
+import pwd
 import re
+import select
+import shlex
 import shutil
+import signal
 import subprocess
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("OsUpdate")
@@ -79,9 +92,14 @@ def _lock_flags(timeout_s: int) -> List[str]:
 
 # Capabilities this node understands beyond the original check/apply-all. The
 # hub only offers package selection / reboot for nodes that report them.
-FEATURES = ["packages", "reboot"]
+FEATURES = ["packages", "reboot", "fix_access"]
 
 HELPER = "/usr/local/bin/lm-os-update"
+HELPER_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "..", "scripts", "lm-os-update")
+SUDOERS_FILE = "/etc/sudoers.d/lm-os-update"
+FIX_ACCESS_TIMEOUT_S = 120
+_USER_RE = re.compile(r"^[a-z_][a-z0-9_.-]*$")
 # Debian package name, optionally arch-qualified. Same rule as the helper's.
 _PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.\-]*(:[a-z0-9\-]+)?$")
 
@@ -111,7 +129,8 @@ def _privilege_blocker() -> str:
     if _is_root() or os.path.exists(HELPER):
         return ""
     return ("this node runs as a non-root user and the lm-os-update helper is not "
-            "installed — re-run the node's installer to enable updates")
+            "installed — use Fix access (one-time root password) or re-run the "
+            "node's installer")
 
 
 def _run(argv: List[str], timeout: int) -> subprocess.CompletedProcess:
@@ -313,3 +332,131 @@ def reboot_node() -> Dict[str, Any]:
                            f"{(r.stderr or '').strip()[:300]}"}
     return {"status": "SUCCESS", "eligible": True,
             "message": "reboot scheduled in 1 minute"}
+
+
+def _run_with_password(argv: List[str], password: str, max_prompts: int,
+                       timeout: int) -> "tuple[int, str]":
+    """Run ``argv`` on a pty, typing ``password`` at each password prompt.
+
+    su only reads a password from a terminal, hence the pty. At most
+    ``max_prompts`` prompts are answered; one more means the password was
+    rejected, so the child is killed instead of left waiting. Returns
+    ``(returncode, output)`` with the password scrubbed from the output.
+    """
+    pid, fd = pty.fork()
+    if pid == 0:  # child
+        try:
+            os.execvp(argv[0], argv)
+        finally:
+            os._exit(127)
+    out = b""
+    answered_upto = 0
+    answers = 0
+    deadline = time.monotonic() + timeout
+    killed = False
+    try:
+        while True:
+            if time.monotonic() > deadline:
+                killed = True
+                break
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 1024)
+            except OSError:  # EIO: the child closed the terminal
+                break
+            if not chunk:
+                break
+            out += chunk
+            pending = out[answered_upto:]
+            if b"assword" in pending.lower() and pending.rstrip().endswith(b":"):
+                if answers >= max_prompts:
+                    killed = True
+                    break
+                os.write(fd, password.encode() + b"\n")
+                answers += 1
+                answered_upto = len(out)
+    finally:
+        if killed:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        os.close(fd)
+        _, status = os.waitpid(pid, 0)
+    rc = os.waitstatus_to_exitcode(status) if not killed else -1
+    text = out.decode(errors="replace").replace(password, "***")
+    return rc, text
+
+
+def _install_script(helper: bytes, svc_user: str) -> str:
+    """The root-side shell script: install the helper, then the sudoers rule.
+
+    The helper travels inside the script (base64), so root never executes a
+    file the service user could have edited. The sudoers rule is written to a
+    dotted temp name (sudo ignores those) and only moved into place once
+    ``visudo`` accepts it.
+    """
+    b64 = base64.b64encode(helper).decode()
+    rule = f"{svc_user} ALL=(ALL) NOPASSWD: {HELPER} *"
+    # The helper goes in LAST: its presence is what marks the node unblocked,
+    # so a failure earlier leaves the node blocked and "Fix access" retryable.
+    return "\n".join([
+        "set -e",
+        "umask 022",
+        "mkdir -p /etc/sudoers.d",
+        f"echo {shlex.quote(rule)} > {SUDOERS_FILE}.new",
+        f"chmod 0440 {SUDOERS_FILE}.new",
+        f"visudo -cf {SUDOERS_FILE}.new",
+        f"mv -f {SUDOERS_FILE}.new {SUDOERS_FILE}",
+        f"echo {b64} | base64 -d > {HELPER}.new",
+        f"chown root:root {HELPER}.new",
+        f"chmod 0755 {HELPER}.new",
+        f"mv -f {HELPER}.new {HELPER}",
+    ])
+
+
+def fix_access(username: str, password: str) -> Dict[str, Any]:
+    """One-time: let a non-root node patch itself from now on.
+
+    Uses an operator-typed login (``root`` via su, or a sudo-capable user via
+    su + sudo) to install the lm-os-update helper and its sudoers rule. The
+    password is used for this one call and then dropped.
+    """
+    if not _privilege_blocker():
+        return {"status": "SUCCESS", "message": "updates are already enabled on this node"}
+    username = (username or "root").strip()
+    if not _USER_RE.match(username):
+        return {"status": "ERROR", "message": "invalid username"}
+    if not password:
+        return {"status": "ERROR", "message": "a password is required"}
+    try:
+        with open(HELPER_SOURCE, "rb") as f:
+            helper = f.read()
+    except OSError:
+        return {"status": "ERROR",
+                "message": "helper script not found on this node — update LM on it first"}
+    svc_user = pwd.getpwuid(os.geteuid()).pw_name
+    command = "sh -c " + shlex.quote(_install_script(helper, svc_user))
+    if username == "root":
+        max_prompts = 1
+    else:
+        command = "sudo -S -p Password: " + command
+        max_prompts = 2
+    try:
+        rc, output = _run_with_password(["su", username, "-c", command], password,
+                                        max_prompts, FIX_ACCESS_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "ERROR", "message": f"could not run su: {exc}"}
+    if rc != 0 or _privilege_blocker():
+        tail = output.strip().splitlines()[-1:] or [""]
+        reason = "wrong password or not allowed" if rc == -1 else tail[0][:200]
+        return {"status": "ERROR", "message": f"fix failed as {username}: {reason}"}
+    check = _run(["sudo", "-n", "-l", HELPER, "update"], 30)
+    if check.returncode != 0:
+        return {"status": "ERROR",
+                "message": "helper installed but sudo still refuses it — check "
+                           f"{SUDOERS_FILE} on the node"}
+    logger.warning("os-update: helper + sudoers installed via %s", username)
+    return {"status": "SUCCESS", "message": f"updates enabled (installed via {username})"}
