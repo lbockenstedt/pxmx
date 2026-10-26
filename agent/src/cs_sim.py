@@ -464,6 +464,16 @@ async def _reclone_vm(agent, data, cs_cmd_id) -> None:
                     result={"bus": r["bus"], "image": r["image"]})
 
 
+def _pci_passthrough_addr(cfg: Dict[str, Any]) -> str:
+    """PCI address of a VM's first ``hostpciN`` passthrough (``0000:05:00.0``),
+    or '' if it has none."""
+    for k in sorted(k for k in (cfg or {}) if str(k).startswith("hostpci")):
+        addr = str(cfg[k]).split(",", 1)[0].strip()
+        if addr:
+            return addr
+    return ""
+
+
 async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
                             *, prot: Optional[set] = None,
                             cs_cmd_id: Optional[str] = None,
@@ -488,15 +498,19 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
         logger.error("reclone VM %s failed: %s", vid, error)
         return {"ok": False, "error": error, "bus": bus_}
     # Recover the USB bus path: state first, then `qm config` usb0 host= (bash 2436-2451).
+    # A T1/T3 VM has no USB bus: it passes a whole PCI controller (hostpciN) and
+    # is recloned onto that same controller.
     bus = usb_provision.bus_for_vmid(vid)
+    pci = ""
     if not bus:
         cfg = await pve_cmds.qm_config(vid)
+        pci = _pci_passthrough_addr(cfg)
         for k, v in cfg.items():
-            if k.startswith("usb") and "host=" in v:
+            if not pci and k.startswith("usb") and "host=" in v:
                 bus = v.split("host=", 1)[1].split(",", 1)[0].strip()
                 break
-    if not bus or not os.path.isdir(f"/sys/bus/usb/devices/{bus}"):
-        return _fail(f"no present USB bus for VM {vid}", bus)
+    if not pci and (not bus or not os.path.isdir(f"/sys/bus/usb/devices/{bus}")):
+        return _fail(f"no present USB bus or PCI passthrough for VM {vid}", bus)
 
     state = usb_provision.load_usb_state()
     image_num = int(state["vmid_to_image"].get(str(vid), 1) or 1)
@@ -505,7 +519,7 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
                                  else usb_cfg.get("image2_template_id")) \
         or usb_cfg.get("image1_template_id")
     if not configured:
-        return _fail("no template id configured", bus)
+        return _fail("no template id configured", bus or pci)
     # Resolve the clone source BEFORE destroying, through the same resolver the
     # provision loop uses (missing numeric vmid → fall back to a cluster
     # template; template NAME → local vmid). Passing the raw configured value
@@ -514,13 +528,29 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
     template = await usb_provision._resolve_template_vmid(configured)
     if not template:
         return _fail(f"clone source {configured!r} not found on this host "
-                     "and no fallback template — VM left untouched", bus)
+                     "and no fallback template — VM left untouched", bus or pci)
 
+    # Between destroy and re-attach the controller looks free; hold it (and the
+    # VMID) so the T1/T3 provisioner can't hand it to a new VM meanwhile.
+    if pci:
+        usb_provision.hold_pci_for_reclone(pci, vid)
+    try:
+        return await _rebuild_vm(agent, vid, template, image_num, usb_cfg, bus, pci,
+                                 prot, name, _prog, _fail)
+    finally:
+        if pci:
+            usb_provision.release_pci_hold(pci)
+
+
+async def _rebuild_vm(agent, vid, template, image_num, usb_cfg, bus, pci,
+                      prot, name, _prog, _fail) -> Dict[str, Any]:
+    """Destroy → clone → attach (USB bus or PCI controller) → start → guest
+    agent wait → hostname stamp. The second half of ``_reclone_vm_core``."""
     await _prog("destroying", 20)
     dr = await destroy_vm(agent, vid, bus=bus, protected=prot)
     if not dr["ok"] and not dr["orphaned"]:
         return _fail(f"destroy before reclone failed (attempt {dr.get('fails')}/3): "
-                     f"{dr.get('reason') or 'unknown reason'}", bus)
+                     f"{dr.get('reason') or 'unknown reason'}", bus or pci)
 
     # Resolve the deterministic username from vm_names.json (the same map the
     # initial clone uses) so a reclone lands on the human name (e.g.
@@ -536,7 +566,10 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
         await pve_cmds.qm_clone(template, vid, vm_name, protected=prot, timeout=600)
         phase = "configuring"
         await pve_cmds.qm_set(vid, "--onboot", "1", "--startup", "order=2,up=60", protected=prot)
-        await pve_cmds.qm_set(vid, "-usb0", f"host={bus}", protected=prot)
+        if pci:
+            await pve_cmds.qm_set(vid, "-hostpci0", f"{pci},pcie=1", protected=prot)
+        else:
+            await pve_cmds.qm_set(vid, "-usb0", f"host={bus}", protected=prot)
         vlan = usb_cfg.get("vlan_nic")
         if vlan:
             await pve_cmds.qm_set(vid, "-net0", f"virtio,bridge={vlan}", protected=prot)
@@ -547,7 +580,7 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 — report the phase + qm stderr, don't lose it
-        return _fail(f"{phase} from template {template} failed: {e}", bus)
+        return _fail(f"{phase} from template {template} failed: {e}", bus or pci)
 
     await _prog("waiting_guest_agent", 75)
     # Bash cadence: `timeout 10` ping + `sleep 5` ≈ 15s/iter, 40× ≈ 10 min
@@ -571,9 +604,10 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
             break
         await asyncio.sleep(3)
 
-    usb_provision.set_assignment(vid, bus, image_num)
+    if not pci:  # T1/T3 VMs keep no usb_state (see _clone_and_provision_pci)
+        usb_provision.set_assignment(vid, bus, image_num)
     usb_provision.remove_orphan_vm(vid)
-    return {"ok": True, "bus": bus, "image": image_num}
+    return {"ok": True, "bus": bus or pci, "image": image_num}
 
 
 async def _reclone_all(agent, data, cs_cmd_id) -> None:
