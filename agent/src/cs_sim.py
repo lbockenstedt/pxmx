@@ -479,8 +479,8 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
                             cs_cmd_id: Optional[str] = None,
                             name: str = "",
                             emit_progress: bool = True) -> Dict[str, Any]:
-    """The reclone steps (destroy → clone → start → guest-agent wait →
-    set_assignment), WITHOUT the terminal CS_COMMAND_RESULT. Returns
+    """The reclone steps (destroy → clone → start → the shared post-clone
+    finish), WITHOUT the terminal CS_COMMAND_RESULT. Returns
     ``{ok, bus, image, error?}``. Shared by ``_reclone_vm`` (which wraps it with
     a per-VM terminal) and ``_reclone_all`` (which runs N cores under a
     semaphore + emits ONE batch terminal). ``emit_progress`` gates the per-phase
@@ -544,8 +544,15 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
 
 async def _rebuild_vm(agent, vid, template, image_num, usb_cfg, bus, pci,
                       prot, name, _prog, _fail) -> Dict[str, Any]:
-    """Destroy → clone → attach (USB bus or PCI controller) → start → guest
-    agent wait → hostname stamp. The second half of ``_reclone_vm_core``."""
+    """Destroy → clone → attach (USB bus or PCI controller) → start → the
+    shared post-clone finish (``usb_provision.finish_clone``). The second half
+    of ``_reclone_vm_core``."""
+    # Join the sim pool like auto-provision, but only a pool verified to exist:
+    # a clone into a missing pool fails, and by then the VM is already destroyed.
+    await usb_provision._ensure_sim_pool(agent)
+    pool = usb_provision._sim_pool(agent)
+    if pool not in usb_provision._verified_sim_pools:
+        pool = None
     await _prog("destroying", 20)
     dr = await destroy_vm(agent, vid, bus=bus, protected=prot)
     if not dr["ok"] and not dr["orphaned"]:
@@ -563,7 +570,8 @@ async def _rebuild_vm(agent, vid, template, image_num, usb_cfg, bus, pci,
     phase = "cloning"
     try:
         await _prog("cloning", 40)
-        await pve_cmds.qm_clone(template, vid, vm_name, protected=prot, timeout=600)
+        await pve_cmds.qm_clone(template, vid, vm_name, protected=prot,
+                                pool=pool, timeout=600)
         phase = "configuring"
         await pve_cmds.qm_set(vid, "--onboot", "1", "--startup", "order=2,up=60", protected=prot)
         if pci:
@@ -582,32 +590,26 @@ async def _rebuild_vm(agent, vid, template, image_num, usb_cfg, bus, pci,
     except Exception as e:  # noqa: BLE001 — report the phase + qm stderr, don't lose it
         return _fail(f"{phase} from template {template} failed: {e}", bus or pci)
 
-    await _prog("waiting_guest_agent", 75)
-    # Bash cadence: `timeout 10` ping + `sleep 5` ≈ 15s/iter, 40× ≈ 10 min
-    # (proxmox-agent.sh 1999-2009). Use sleep(5), not 15, to match.
-    for _ in range(40):
-        if await pve_cmds.qm_agent_ping(vid, protected=prot):
-            break
-        usb_provision.mark_recloning(vid)  # keep the badge live through the ~10m wait
-        await asyncio.sleep(5)
-    # Set the hostname inside the guest. Write /etc/hostname + /etc/hosts +
-    # cloud-init preserve_hostname via `qm guest exec --timeout 60 -- bash -c`
-    # (bash 2025-2036) — hostnamectl is deliberately avoided: it talks D-Bus
-    # which may be unready right after boot and can hang the whole task. Retry 3×
-    # (was fire-once, return ignored): a single missed exec left the clone with
-    # the TEMPLATE hostname (sim-rpi-0000) → no client match, no sim tags. The
-    # hostname audit (hostname_audit_and_restamp) is the backstop if all 3 miss.
-    host_script = usb_provision._hostname_stamp_script(vm_name)
-    for _ in range(3):
-        if await pve_cmds.qm_guest_exec_shell(vid, host_script, exec_timeout=60,
-                                              outer_timeout=90, protected=prot):
-            break
-        await asyncio.sleep(3)
-
-    if not pci:  # T1/T3 VMs keep no usb_state (see _clone_and_provision_pci)
+    dtype = ""
+    if not pci:
         usb_provision.set_assignment(vid, bus, image_num)
-    usb_provision.remove_orphan_vm(vid)
+        dtype = _usb_device_type(agent, bus)
+    await _prog("waiting_guest_agent", 75)
+    usb_provision.mark_recloning(vid)  # finish_clone keeps it live from here
+    # Same post-clone finish as auto-provision: hostname, sim_phy (USB),
+    # settle, reboot, update.sh, +15-min settle reboot, post-prov retry.
+    await usb_provision.finish_clone(agent, vid, vm_name, None, bus=bus or None,
+                                     image_num=image_num, dtype=dtype)
     return {"ok": True, "bus": bus or pci, "image": image_num}
+
+
+def _usb_device_type(agent, bus: str) -> str:
+    """Certified type (wireless/wired/...) of the dongle on ``bus``, the same
+    lookup auto-provision uses; ``wireless`` if unknown."""
+    base = f"/sys/bus/usb/devices/{bus}"
+    vidpid = (f"{usb_provision._read_sysfs(base + '/idVendor')}:"
+              f"{usb_provision._read_sysfs(base + '/idProduct')}")
+    return usb_provision._certified_types(agent).get(vidpid, "wireless")
 
 
 async def _reclone_all(agent, data, cs_cmd_id) -> None:

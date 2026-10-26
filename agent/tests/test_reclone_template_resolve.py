@@ -82,7 +82,11 @@ def _setup(monkeypatch, *, resolved, clone_exc=None):
     async def _noop(*a, **kw):
         return True
 
+    async def _finish(*a, **kw):
+        return True
+
     monkeypatch.setattr(_prov, "_resolve_template_vmid", _resolve)
+    monkeypatch.setattr(_prov, "finish_clone", _finish)
     monkeypatch.setattr(_prov, "bus_for_vmid", lambda vid: BUS)
     monkeypatch.setattr(_prov, "load_usb_state", lambda: {"vmid_to_image": {}})
     monkeypatch.setattr(_prov, "set_assignment", lambda *a: None)

@@ -44,7 +44,7 @@ from .usb_state_store import (  # noqa: E402
     _read_orphans, _write_orphans, add_orphan_vm, remove_orphan_vm,
     get_orphan_vms, _new_usb_state, load_usb_state, save_usb_state,
     clear_assignment, clear_recovery_state, prune_ghost_vms, set_assignment,
-    reconcile_bus_map, bus_for_vmid,
+    reconcile_bus_map, bus_for_vmid, stamp_post_prov_reboot,
 )
 from .usb_quarantine import (  # noqa: E402
     USB_QUARANTINE_FILE, DESTROY_FAILS_FILE, QUARANTINE_MAX_FAILS,
@@ -425,6 +425,10 @@ _DETACH_STRIKE_WINDOW_S = float(os.environ.get("LM_PXMX_DETACH_STRIKE_WINDOW_S",
 _HEALTH_CHECK_INTERVAL_S = float(os.environ.get("LM_PXMX_HEALTH_INTERVAL_S", "300") or 300)
 _HEALTH_ATTEMPT_COOLDOWN_S = float(os.environ.get("LM_PXMX_HEALTH_COOLDOWN_S", "180") or 180)
 _HEALTH_LADDER = ["usb_reset", "reattach", "reboot", "reclone", "quarantine"]
+# Every automatic reclone is preceded by a reboot; the VM gets this long to come
+# back healthy before it is recloned.
+_REBOOT_BEFORE_RECLONE_S = float(
+    os.environ.get("LM_PXMX_REBOOT_BEFORE_RECLONE_S", "900") or 900)
 # Sub-ladder for a dongle that IS lsusb-visible in the guest but not working
 # (no driver bound / never associated / firmware crash). usb_reset + reattach
 # are pointless here — the device already enumerated — so a reboot (reload the
@@ -1577,7 +1581,9 @@ async def dongle_health_check_and_recover(agent, present) -> int:
         except Exception:  # noqa: BLE001 — never block recovery on a read error
             pass
         h = health.setdefault(bus, {"fails": 0, "last_attempt": 0.0, "stage": ""})
-        if now - float(h.get("last_attempt", 0)) < _HEALTH_ATTEMPT_COOLDOWN_S:
+        cooldown = (_REBOOT_BEFORE_RECLONE_S if h.get("stage") == "reboot"
+                    else _HEALTH_ATTEMPT_COOLDOWN_S)
+        if now - float(h.get("last_attempt", 0)) < cooldown:
             return                                     # cooling down
         stage = ladder[min(h["fails"], len(ladder) - 1)]
         h["fails"] += 1
@@ -2844,7 +2850,8 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # reboot. Fires a graceful QGA reboot once reboot_at (cloned_at + 900s) is
     # reached, then pops the entry. Persisted in usb_state.json (survives
     # agent restart). Stamped by usb_state_store.set_assignment, the choke
-    # point both clone paths (first-clone + reclone) hit.
+    # point both clone paths (first-clone + reclone) hit, and by finish_clone
+    # for every clone incl. T1/T3 PCI.
     if await _run_post_prov_reboot_queue(agent, state):
         save_usb_state(state)
 
@@ -3023,9 +3030,11 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         from . import cs_sim  # deferred — cs_sim imports usb_provision
         detached_since = state.setdefault("detached_since", {})
         detach_reclones = state.setdefault("detach_reclones", {})
+        detach_restarted = state.setdefault("detach_restarted", {})
         for bus, vmid in list(state["bus_to_vmid"].items()):
             if bus not in present or _bus_attached(bus):
                 detached_since.pop(bus, None)
+                detach_restarted.pop(bus, None)
                 # Prune the strike counter only after a full window of quiet — NOT
                 # the instant it re-attaches (a reclone briefly re-grabs the dongle
                 # before it flaps again; clearing here would reset the count every
@@ -3070,6 +3079,24 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                         continue
                 except Exception:  # noqa: BLE001 — fail OPEN: still detect faults
                     pass
+                # Reboot before reclone: a cold restart makes QEMU re-grab the
+                # dongle. Reclone only if it is still detached 15 min later.
+                restarted_at = detach_restarted.get(bus)
+                if restarted_at is None:
+                    logger.warning("provision loop: bus %s detached from RUNNING VM %s "
+                                   "— restarting the VM before any reclone", bus, vmid)
+                    detach_restarted[bus] = now
+                    detached_since.pop(bus, None)
+                    try:
+                        await pve_cmds.qm_stop_force(int(vmid))
+                        await asyncio.sleep(2)
+                        await pve_cmds.qm_start(int(vmid))
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("provision loop: restart of %s failed: %s", vmid, e)
+                    continue
+                if now - float(restarted_at) < _REBOOT_BEFORE_RECLONE_S:
+                    continue
+                detach_restarted.pop(bus, None)
                 rec = detach_reclones.get(bus)
                 if rec and (now - float(rec.get("first", now))) > _DETACH_STRIKE_WINDOW_S:
                     rec = None  # window expired → fresh episode
@@ -3254,16 +3281,17 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                         "mode: dongles pass through as T2/USB instead of PCI)",
                         getattr(agent, "hostname", "?"))
         else:
-            pci_provisioned += await _provision_pci_tier(agent, "t1", _t1_pci_vidpids(agent), _pci_tpl, start, end)
+            pci_provisioned += await _provision_pci_tier(agent, "t1", _t1_pci_vidpids(agent), _pci_tpl, start, end, state)
         # Per-host T3 opt-out, same rationale as T1 above.
         if _host_t3_excluded(agent):
             logger.info("auto-provision: host %s in t3_exclude_hosts — skipping T3 (hub "
                         "mode: dongles pass through as T2/USB instead of PCI)",
                         getattr(agent, "hostname", "?"))
         else:
-            pci_provisioned += await _provision_pci_tier(agent, "t3", _t3_pci_vidpids(agent), _pci_tpl, start, end)
+            pci_provisioned += await _provision_pci_tier(agent, "t3", _t3_pci_vidpids(agent), _pci_tpl, start, end, state)
         if pci_provisioned:
             logger.info("auto-provision: provisioned %d T1/T3 PCI VM(s) this tick", pci_provisioned)
+            save_usb_state(state)  # persist their settle-reboot / retry entries
 
     if _prov_run.get("running"):
         # Stuck-run watchdog: a prior pass that never completed (a clone/reclaim
@@ -3797,13 +3825,14 @@ async def _free_pci_controllers(agent, pci_vidpids) -> List[tuple]:
 
 
 async def _clone_and_provision_pci(agent, vmid: int, pci_addr: str, vidpid: str,
-                                   template: int, tier: str) -> bool:
+                                   template: int, tier: str,
+                                   state: Optional[Dict[str, Any]] = None) -> bool:
     """Clone ``template`` → ``vmid`` and PCI-passthrough the whole T1/T3 controller
     at ``pci_addr`` (the sim dongle plugged into it comes with the card). Mirrors
     ``_clone_and_provision`` but attaches ``-hostpci0`` instead of ``-usb0`` and
-    keeps NO usb_state — a T1/T3 VM is identified by its hostpci vidpid via
-    ``compute_vm_tiers`` and protected by the delete gate, so no bus tracking is
-    needed. NOTE: the clone-source template must be q35 + IOMMU-ready for hostpci
+    keeps NO bus assignment — a T1/T3 VM is identified by its hostpci vidpid via
+    ``compute_vm_tiers`` and protected by the delete gate. It still gets the same
+    post-clone finish (``finish_clone``), recorded in ``state``. NOTE: the clone-source template must be q35 + IOMMU-ready for hostpci
     to attach; validate on the host. Returns True if cloned + started."""
     from . import pve_cmds
     protected = _protected_vmids(agent)
@@ -3818,44 +3847,13 @@ async def _clone_and_provision_pci(agent, vmid: int, pci_addr: str, vidpid: str,
     await pve_cmds.qm_start(vmid, protected=protected)
     logger.info("provision loop: %s VM %s cloned + PCI passthrough %s (%s)",
                 tier.upper(), vmid, pci_addr, vidpid)
-    # Guest-agent wait + hostname stamp (same bounded pattern as the USB path).
-    agent_up_at = None
-    for _ in range(40):
-        if await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10):
-            agent_up_at = time.time()
-            break
-        await asyncio.sleep(5)
-    for _ in range(3):
-        if await pve_cmds.qm_guest_exec_shell(vmid, _hostname_stamp_script(name),
-                                              exec_timeout=60, outer_timeout=90, protected=protected):
-            break
-        await asyncio.sleep(5)
-    remove_orphan_vm(vmid)
-    # Settle then the first post-clone reboot + update.sh (mirrors the USB path;
-    # no +15-min settle-reboot queue since that rides usb_state, which T1/T3 skip).
-    if agent_up_at is not None:
-        remaining = _FIRST_REBOOT_SETTLE_S - (time.time() - agent_up_at)
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-    try:
-        await pve_cmds.qm_guest_exec(vmid, "reboot", protected=protected)
-    except Exception:  # noqa: BLE001
-        pass
-    deadline = time.time() + 300
-    while time.time() < deadline:
-        await asyncio.sleep(5)
-        if await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10):
-            try:
-                await pve_cmds.qm_guest_exec_shell(vmid, "bash /usr/local/scripts/update.sh",
-                                                   exec_timeout=300, outer_timeout=360, protected=protected)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("provision loop: update.sh failed on %s VM %s: %s", tier.upper(), vmid, e)
-            break
+    await finish_clone(agent, vmid, name, state)
     return True
 
 
 async def _provision_pci_tier(agent, tier: str, pci_vidpids, template: int,
-                              start: int, end: int) -> int:
+                              start: int, end: int,
+                              state: Optional[Dict[str, Any]] = None) -> int:
     """Provision one T1/T3 VM per FREE controller (the physical device count is the
     natural cap). Allocates the lowest free VMID in the guarded [start,end] block
     (above the 90000 floor, skipping PROTECTED + in-use ids). Returns the count."""
@@ -3885,7 +3883,7 @@ async def _provision_pci_tier(agent, tier: str, pci_vidpids, template: int,
                            tier.upper(), start, end, addr)
             break
         try:
-            await _clone_and_provision_pci(agent, vmid, addr, vidpid, template, tier)
+            await _clone_and_provision_pci(agent, vmid, addr, vidpid, template, tier, state)
             provisioned += 1
         except Exception as e:  # noqa: BLE001
             logger.warning("provision loop: %s clone failed for controller %s: %s",
@@ -3896,8 +3894,8 @@ async def _provision_pci_tier(agent, tier: str, pci_vidpids, template: int,
 async def _clone_and_provision(agent, vmid: int, bus: str,
                                 info: Dict[str, Any], template: int,
                                 image_num: int, state: Dict[str, Any]) -> None:
-    """Clone a template → vmid, attach the USB dongle, start, wait for the guest
-    agent, set the hostname (bash ``clone_vm_for_usb`` 1943-2098, slimmed).
+    """Clone a template → vmid, attach the USB dongle, start, then the shared
+    post-clone finish (``finish_clone``) (bash ``clone_vm_for_usb`` 1943-2098).
 
     ``state`` is the caller's in-memory usb_state (shared, not reloaded from
     disk here) — a post-prov-retry entry is written straight into it rather
@@ -3919,79 +3917,91 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
         await pve_cmds.qm_set(vmid, "-net0", f"virtio,bridge={vlan}",
                               protected=protected)
     await pve_cmds.qm_start(vmid, protected=protected)
-    # Wait for the guest agent (bounded — bash waits ~10 min via 40 pings at
-    # `timeout 10` ping + `sleep 5` ≈ 15s/iter, proxmox-agent.sh 1999-2009).
+    set_assignment(vmid, bus, image_num)
+    await finish_clone(agent, vmid, name, state, bus=bus, image_num=image_num,
+                       dtype=info.get("type", "wireless"))
+
+
+async def finish_clone(agent, vmid: int, name: str,
+                       state: Optional[Dict[str, Any]], *,
+                       bus: Optional[str] = None, image_num: int = 1,
+                       dtype: str = "") -> bool:
+    """Post-clone steps shared by EVERY clone path — USB auto-provision, T1/T3
+    PCI auto-provision and reclone — so a VM comes up the same way however it
+    was cloned (bash ``clone_vm_for_usb`` 1999-2098):
+
+      1. queue the +15-min settle reboot (``post_prov_reboot``);
+      2. wait for the guest agent (40 x 10s ping + 5s sleep, ~10 min);
+      3. stamp the hostname (3 tries) and, for a USB dongle, ``sim_phy``;
+      4. let the guest settle ``_FIRST_REBOOT_SETTLE_S`` from agent-up, then
+         reboot it so the hostname/sim_phy take effect;
+      5. once it is back, run ``update.sh``. If it doesn't come back within
+         5 min, queue it for the post-prov retry (check every 10 min,
+         reclone after 1h).
+
+    Two reboots on purpose: #4 applies the first-boot bits; the +15-min one
+    restarts the box after it has pulled its engine config.
+
+    ``state`` is the caller's in-memory usb_state, which the caller saves (a
+    separate load+save here would be overwritten by that later save). Pass None
+    when there is no such caller (reclone) and the queues are saved here.
+    ``bus`` is None for a T1/T3 (PCI) VM. Returns True if the guest came back
+    from the reboot."""
+    from . import pve_cmds
+    protected = _protected_vmids(agent)
+    # Stamped first: guest_watchdog treats the VM as freshly cloned (not hung)
+    # from this stamp on.
+    st = load_usb_state() if state is None else state
+    stamp_post_prov_reboot(st, vmid, bus, image_num)
+    if state is None:
+        save_usb_state(st)
+    # A reclone keeps its "Recloning" badge (short TTL) live through the waits.
+    recloning = int(vmid) in _recloning
+
+    def _keepalive() -> None:
+        if recloning:
+            mark_recloning(vmid)
+
     agent_up_at = None
     for _ in range(40):
+        _keepalive()
         if await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10):
             agent_up_at = time.time()
             break
         await asyncio.sleep(5)
-    # Set the hostname inside the guest — write /etc/hostname + /etc/hosts +
-    # cloud-init preserve_hostname via `qm guest exec --timeout 60 -- bash -c`
-    # (bash 2025-2036). hostnamectl is deliberately avoided (D-Bus may be
-    # unready post-boot and can hang the task). Retry up to 3× like bash.
-    dtype = info.get("type", "wireless")
+    # hostnamectl is deliberately avoided (D-Bus may be unready post-boot and
+    # can hang the task) — the script writes /etc/hostname + /etc/hosts.
     host_script = _hostname_stamp_script(name)
     for _ in range(3):
         if await pve_cmds.qm_guest_exec_shell(vmid, host_script, exec_timeout=60,
                                               outer_timeout=90, protected=protected):
             break
         await asyncio.sleep(5)
-    # Best-effort: tell the guest's startup.sh which USB phy type it's bound to
-    # (bash 2046). Best-effort — /usr/local/scripts may not exist on every image.
-    # qm_guest_exec_shell is a coroutine — missing await here meant this was
-    # created and immediately discarded, so the guest never actually received
-    # this write and startup.sh could never see which phy type it was bound to.
-    await pve_cmds.qm_guest_exec_shell(
-        vmid, f"echo 'sim_phy={dtype}' > /usr/local/scripts/usb-phy-override.conf",
-        exec_timeout=60, outer_timeout=90, protected=protected)
-    set_assignment(vmid, bus, image_num)
+    if dtype:
+        # Tell the guest's startup.sh which phy type its USB dongle is.
+        await pve_cmds.qm_guest_exec_shell(
+            vmid, f"echo 'sim_phy={dtype}' > /usr/local/scripts/usb-phy-override.conf",
+            exec_timeout=60, outer_timeout=90, protected=protected)
     remove_orphan_vm(vmid)
 
-    # Settle window before the FIRST post-clone reboot: a freshly-cloned guest
-    # can corrupt if it's yanked into a reboot too soon after first boot
-    # (filesystem / services not yet settled). Let it run at least
-    # _FIRST_REBOOT_SETTLE_S (default 60s) measured from when the guest agent
-    # first answered (agent_up_at) — the hostname/sim_phy writes above eat into
-    # that window, so we wait only the remainder. The timer starts when the
-    # agent ping came up, not at clone completion. Skipped if the agent never
-    # answered (agent_up_at is None): the reboot still fires and the 300s
-    # comeback loop + post-prov retry handle a no-show.
+    # A freshly-cloned guest can corrupt if rebooted too soon after first boot.
     if agent_up_at is not None:
         remaining = _FIRST_REBOOT_SETTLE_S - (time.time() - agent_up_at)
         if remaining > 0:
             logger.info(f"provision loop: VM {vmid} first-reboot settle — "
-                        f"waiting {int(remaining)}s before reboot "
-                        f"(settle window {_FIRST_REBOOT_SETTLE_S:.0f}s from agent-up)")
+                        f"waiting {int(remaining)}s before reboot")
             await asyncio.sleep(remaining)
-
-    # Reboot so the guest picks up the hostname/sim_phy changes, then run
-    # update.sh once it comes back — it needs the latest scripts before
-    # startup.sh runs for the first time (bash clone_vm_for_usb 2050-2097).
-    # `qm guest exec ... reboot` never replies (the guest agent dies with the
-    # reboot), so this is fire-and-forget like bash's `|| true`.
-    #
-    # This is the FIRST of two post-clone reboots, and both are intentional:
-    #   1) THIS reboot — applies hostname + sim_phy + first-boot bits, then
-    #      runs update.sh. The guest comes up too briefly to have pulled a
-    #      placement/config push from the engine yet, so this reboot is NOT
-    #      the "final" restart.
-    #   2) The +15-min SETTLE reboot — stamped by set_assignment above into
-    #      usb_state.json["post_prov_reboot"] and fired later by
-    #      _run_post_prov_reboot_queue. By then the box has settled, pulled
-    #      its engine config, and run update.sh, so this second restart brings
-    #      it back fully configured. (The reclone path does NOT do reboot #1,
-    #      so for reclone the +15-min reboot is the first/only post-clone
-    #      restart — still correct: the settle+config window is what matters.)
+    _keepalive()
+    # `qm guest exec ... reboot` never replies (the agent dies with the guest).
     try:
         await pve_cmds.qm_guest_exec(vmid, "reboot", protected=protected)
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     came_back = False
-    deadline = time.time() + 300  # bash's 5-minute reboot deadline
+    deadline = time.time() + 300
     while time.time() < deadline:
         await asyncio.sleep(5)
+        _keepalive()
         if await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10):
             came_back = True
             break
@@ -4002,18 +4012,19 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
                 exec_timeout=300, outer_timeout=360, protected=protected)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"provision loop: update.sh failed on VM {vmid} "
-                          f"(will retry on next boot): {e}")
+                           f"(will retry on next boot): {e}")
+        _keepalive()
     else:
-        # Guest didn't come back in time — queue for the post-prov retry loop
-        # instead of failing the whole provision (bash 2086-2097): check every
-        # 10 min, reclone after 1h if it never responds.
         now_ts = time.time()
-        state.setdefault("post_prov_retry", {})[str(vmid)] = {
+        st = load_usb_state() if state is None else state
+        st.setdefault("post_prov_retry", {})[str(vmid)] = {
             "start_ts": now_ts, "last_ts": now_ts, "bus": bus,
-            "image_num": image_num, "device_type": dtype,
-        }
+            "image_num": image_num, "device_type": dtype}
+        if state is None:
+            save_usb_state(st)
         logger.warning(f"provision loop: VM {vmid} did not come back after reboot "
                        "— queued for post-prov retry (10-min interval, reclone after 1h)")
+    return came_back
 
 
 async def _run_post_prov_retry_queue(agent, state: Dict[str, Any]) -> bool:
