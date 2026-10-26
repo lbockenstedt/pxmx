@@ -234,23 +234,23 @@ def set_assignment(vmid: int, bus: str, image_num: int) -> None:
     # in usb_provision) fires it when due, then pops the entry. Re-stamping on a
     # reclone overwrites the prior entry — a fresh clone resets the window.
     #
-    # Why a SECOND reboot after the clone (both intentional — see the comment
-    # at the immediate post-clone reboot in _clone_and_provision): the first
-    # reboot only applies hostname + sim_phy + first-boot bits and runs
-    # update.sh; the guest doesn't stay up long enough to have pulled a
-    # placement/config push from the engine yet. This +15-min reboot is the
-    # one that restarts the box AFTER it has settled, pulled engine config,
-    # and run update.sh — so it comes back fully configured. (Reclone does no
-    # first reboot, so this is its only post-clone restart — still correct:
-    # the settle+config window is what matters, not which reboot is "first".)
+    # Why a SECOND reboot: see usb_provision.finish_clone (every clone path,
+    # USB/PCI/reclone, runs it and re-stamps this entry there too).
+    stamp_post_prov_reboot(st, vmid, bus, image_num)
+    save_usb_state(st)
+
+
+def stamp_post_prov_reboot(st: Dict[str, Any], vmid: int, bus: Optional[str],
+                           image_num: int) -> None:
+    """Queue the +15-min post-clone settle reboot for ``vmid`` in ``st``.
+    ``bus`` is None for a T1/T3 (PCI) VM."""
     cloned_at = time.time()
-    st.setdefault("post_prov_reboot", {})[v] = {
+    st.setdefault("post_prov_reboot", {})[str(int(vmid))] = {
         "cloned_at": cloned_at,
         "reboot_at": cloned_at + _POST_PROV_REBOOT_DELAY_S,
         "bus": bus,
         "image_num": int(image_num),
     }
-    save_usb_state(st)
 
 
 def reconcile_bus_map() -> List[int]:
