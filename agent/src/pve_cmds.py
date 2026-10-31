@@ -674,6 +674,62 @@ async def local_node_name() -> str:
     return socket.gethostname().split(".")[0]
 
 
+async def _pvesh_json(path: str, timeout: int = 15) -> Any:
+    """``pvesh get <path>`` as JSON; None on any failure."""
+    try:
+        rc, out, _ = await _run(["pvesh", "get", path, "--output-format", "json"],
+                                check=False, timeout=timeout)
+        return json.loads(out.decode("utf-8", "replace") or "null") if rc == 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def cluster_info() -> Dict[str, Any]:
+    """``{name, node, nodes}`` when this host is a member of a multi-node
+    Proxmox cluster, else ``{}`` (standalone host or pvesh unavailable). Lets
+    the hub's OS-updates module put a clustered node into HA maintenance
+    before an auto-reboot."""
+    rows = await _pvesh_json("/cluster/status")
+    if not isinstance(rows, list):
+        return {}
+    cluster = next((r for r in rows if r.get("type") == "cluster"), None)
+    nodes = [r for r in rows if r.get("type") == "node"]
+    local = next((r for r in nodes if r.get("local") in (1, True)), None)
+    if not cluster or not local or len(nodes) < 2:
+        return {}
+    return {"name": str(cluster.get("name") or ""), "node": str(local.get("name") or ""),
+            "nodes": len(nodes)}
+
+
+async def node_maintenance(action: str) -> Dict[str, Any]:
+    """HA maintenance mode for THIS node: ``action`` is enable, disable or
+    status. Enabling makes the HA stack migrate this node's HA guests to the
+    other nodes (non-HA guests stay put); it survives a reboot until disabled.
+    Always answers with the current state:
+    ``{status, node, maintenance, ha_guests: ["vm:100", ...]}`` where
+    ``ha_guests`` are the HA guests still on this node (empty = safe to
+    reboot)."""
+    if action not in ("enable", "disable", "status"):
+        return {"status": "ERROR", "message": f"unknown maintenance action {action!r}"}
+    node = await local_node_name()
+    if action != "status":
+        rc, _, err = await _run(["ha-manager", "crm-command", "node-maintenance", action, node],
+                                check=False, timeout=30)
+        if rc != 0:
+            return {"status": "ERROR", "node": node,
+                    "message": f"ha-manager node-maintenance {action} failed: "
+                               f"{err.decode('utf-8', 'replace').strip()[:300]}"}
+    status = await _pvesh_json("/cluster/ha/status/manager_status")
+    ms = (status.get("manager_status") or {}) if isinstance(status, dict) else {}
+    services = ms.get("service_status") or {}
+    ha_here = sorted(sid for sid, sv in services.items()
+                     if (sv or {}).get("node") == node
+                     and (sv or {}).get("state") not in ("stopped", "disabled", "ignored", "error"))
+    return {"status": "SUCCESS", "node": node,
+            "maintenance": (ms.get("node_status") or {}).get(node) == "maintenance",
+            "ha_guests": ha_here}
+
+
 async def list_qemu_vms_cluster() -> List[Tuple[int, str, str]]:
     """Every qemu VM across the cluster as ``(vmid, name, node)`` from
     ``/cluster/resources`` (each row carries the owning ``node``). Unlike
