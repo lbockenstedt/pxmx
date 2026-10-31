@@ -194,6 +194,41 @@ def _parse_upgradable(text: str) -> List[Dict[str, str]]:
     return out
 
 
+def os_release() -> Dict[str, str]:
+    """``{"id": "debian", "codename": "trixie"}`` from /etc/os-release."""
+    info: Dict[str, str] = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                key, _, value = line.strip().partition("=")
+                info[key] = value.strip().strip('"')
+    except OSError:
+        pass
+    return {"id": info.get("ID", ""), "codename": info.get("VERSION_CODENAME", "")}
+
+
+def installed_packages() -> List[List[str]]:
+    """Installed packages for the hub's CVE lookup (``os_cve``).
+
+    Rows are ``[package, version]``, or ``[package, version, source,
+    source_version]`` when the source package differs — CVEs are tracked per
+    source package. Read-only; [] if dpkg-query fails."""
+    fmt = "${db:Status-Abbrev}\t${Package}\t${Version}\t${source:Package}\t${source:Version}\n"
+    try:
+        r = _run(["dpkg-query", "-W", "-f", fmt], CHECK_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dpkg-query failed: %s", exc)
+        return []
+    rows: List[List[str]] = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5 or not parts[0].startswith("ii"):
+            continue
+        _, pkg, ver, src, src_ver = parts
+        rows.append([pkg, ver] if (src, src_ver) == (pkg, ver) else [pkg, ver, src, src_ver])
+    return rows
+
+
 def check_updates(refresh: bool = True) -> Dict[str, Any]:
     """List pending OS package updates. Read-only — never installs anything."""
     cap = detect_capability()
@@ -230,7 +265,8 @@ def check_updates(refresh: bool = True) -> Dict[str, Any]:
             "packages": pkgs, "count": len(pkgs),
             "security_count": sec, "other_count": len(pkgs) - sec,
             "reboot_required": _reboot_required(), "warnings": warnings,
-            "features": FEATURES, "apply_blocker": blocker}
+            "features": FEATURES, "apply_blocker": blocker,
+            "os": os_release(), "installed": installed_packages()}
 
 
 def apply_updates(packages: Optional[List[str]] = None) -> Dict[str, Any]:
