@@ -2350,6 +2350,15 @@ class ProxmoxAgent:
                         except Exception as e:
                             result = {"status": "ERROR", "message": str(e)}
 
+                    elif cmd_type == "OS_MAINTENANCE":
+                        # HA maintenance mode around a hub auto-reboot of a
+                        # clustered host (see pve_cmds.node_maintenance).
+                        try:
+                            result = await pve_cmds.node_maintenance(
+                                str((data or {}).get("action") or "status"))
+                        except Exception as e:  # noqa: BLE001
+                            result = {"status": "ERROR", "message": str(e)}
+
                     elif cmd_type in ("OS_UPDATE_CHECK", "OS_UPDATE_APPLY",
                                       "OS_UPDATE_APPLY_PACKAGES", "OS_REBOOT"):
                         # Fleet OS updates, hub-orchestrated. The agent runs ON the
@@ -2357,7 +2366,9 @@ class ProxmoxAgent:
                         # update touches the hypervisor itself — hence
                         # dist-upgrade (what Proxmox documents) and NEVER an
                         # automatic reboot: the host is running the whole client
-                        # fleet. A reboot is a separate explicit operator action.
+                        # fleet. A reboot is a separate explicit action (the
+                        # operator's button, or the hub's Auto-reboot, which
+                        # first puts a clustered host into HA maintenance).
                         #
                         # Refuses while a provision/reclone batch is running: an
                         # apt transaction that restarts pve services mid-clone is
@@ -2385,6 +2396,10 @@ class ProxmoxAgent:
                                 result = await asyncio.to_thread(
                                     os_update.check_updates,
                                     bool((data or {}).get("refresh", True)))
+                                cluster = await pve_cmds.cluster_info()
+                                if cluster:
+                                    result["pve_cluster"] = cluster
+                                    result["features"] = list(result.get("features") or []) + ["maintenance"]
                             elif cmd_type == "OS_UPDATE_APPLY_PACKAGES":
                                 result = await asyncio.to_thread(
                                     os_update.apply_updates,
