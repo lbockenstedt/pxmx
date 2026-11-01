@@ -950,6 +950,24 @@ class ProxmoxSpoke(BaseSpoke):
                 if act == "snapshot":
                     row["snapshot"] = snapshot_name or pve_cmd_builder.default_snapshot_name()
                 return {"ok": True, **row}
+            if act == "list_snapshots":
+                node = str(item.get("node") or "").strip()
+                if not node:
+                    raise pve_cmd_builder.PveCmdError("list_snapshots: node is required")
+                r = await _send(pve_cmd_builder.list_snapshots_cmd(node, vid, kind), timeout=30.0)
+                if not pve_cmd_builder.runner_ok(r):
+                    raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
+                return {"ok": True, "vmid": vid, "action": act, "kind": kind,
+                        "snapshots": pve_cmd_builder.parse_snapshots(r)}
+            if act == "delete_snapshot":
+                if not snapshot_name:
+                    raise pve_cmd_builder.PveCmdError("delete_snapshot: snapshot_name is required")
+                r = await _send(pve_cmd_builder.delete_snapshot_cmd(vid, kind, snapshot_name),
+                                timeout=120.0)
+                if not pve_cmd_builder.runner_ok(r):
+                    raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
+                return {"ok": True, "vmid": vid, "action": act, "kind": kind,
+                        "snapshot": snapshot_name}
             if act in ("reboot", "restart"):
                 # Foreground (qm reset is a fast hardware reset) + rc check, so a
                 # failed reset (e.g. VM not running) surfaces as an error instead
