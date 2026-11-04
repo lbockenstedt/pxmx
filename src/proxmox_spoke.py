@@ -941,6 +941,15 @@ class ProxmoxSpoke(BaseSpoke):
                     await _send(pve_cmd_builder.detect_kind_cmd(vid), timeout=10.0))
 
             act = (action or "").lower()
+            node = str(item.get("node") or "").strip()
+            if act == "snapshot" and node:
+                # Cluster API on the VM's node: the agent may sit on another node.
+                cmd = pve_cmd_builder.snapshot_cmd(node, vid, kind, snapshot_name)
+                r = await _send(cmd, timeout=300.0)
+                if not pve_cmd_builder.runner_ok(r):
+                    raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
+                return {"ok": True, "vmid": vid, "action": act, "kind": kind,
+                        "snapshot": snapshot_name or pve_cmd_builder.default_snapshot_name()}
             if act in ("start", "stop", "snapshot"):
                 cmd = pve_cmd_builder.vm_action_cmd(vid, act, kind, snapshot_name)
                 r = await _send(cmd, timeout=30.0)
@@ -951,7 +960,6 @@ class ProxmoxSpoke(BaseSpoke):
                     row["snapshot"] = snapshot_name or pve_cmd_builder.default_snapshot_name()
                 return {"ok": True, **row}
             if act == "list_snapshots":
-                node = str(item.get("node") or "").strip()
                 if not node:
                     raise pve_cmd_builder.PveCmdError("list_snapshots: node is required")
                 r = await _send(pve_cmd_builder.list_snapshots_cmd(node, vid, kind), timeout=30.0)
@@ -962,8 +970,8 @@ class ProxmoxSpoke(BaseSpoke):
             if act == "delete_snapshot":
                 if not snapshot_name:
                     raise pve_cmd_builder.PveCmdError("delete_snapshot: snapshot_name is required")
-                r = await _send(pve_cmd_builder.delete_snapshot_cmd(vid, kind, snapshot_name),
-                                timeout=120.0)
+                r = await _send(pve_cmd_builder.delete_snapshot_cmd(vid, kind, snapshot_name, node),
+                                timeout=300.0)
                 if not pve_cmd_builder.runner_ok(r):
                     raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
                 return {"ok": True, "vmid": vid, "action": act, "kind": kind,
