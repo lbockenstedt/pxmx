@@ -35,11 +35,20 @@ def test_list_snapshots_surfaces_a_failure():
     assert res["status"] == "ERROR"
 
 
-def test_delete_snapshot_runs_delsnapshot():
+def test_delete_snapshot_uses_cluster_api_on_vm_node():
     cp = _CP(_AGENTS)
     res = _act(cp, action="delete_snapshot", snapshot_name="lm-prepatch-202611010100")
     assert res["status"] == "SUCCESS", res
-    assert cp.cmds[-1][1] == "qm delsnapshot 101 lm-prepatch-202611010100"
+    assert "pvesh delete /nodes/pve1/qemu/101/snapshot/lm-prepatch-202611010100" in cp.cmds[-1][1]
+
+
+def test_snapshot_uses_cluster_api_on_vm_node():
+    # The agent handling the VM may run on another cluster node, where a
+    # plain `qm snapshot` can't see the VM (nodes/<other>/qemu-server/N.conf).
+    cp = _CP(_AGENTS)
+    res = _act(cp, action="snapshot", snapshot_name="lm-prepatch-202611040100")
+    assert res["status"] == "SUCCESS", res
+    assert "pvesh create /nodes/pve1/qemu/101/snapshot --snapname lm-prepatch-202611040100" in cp.cmds[-1][1]
 
 
 def test_delete_snapshot_needs_a_name():
