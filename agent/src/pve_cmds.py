@@ -12,6 +12,7 @@ snapshot_vms) filtered to the sim range instead of the bash agent's
 unfiltered ``qm list | awk 'NR>1{print $1}'``.
 """
 
+# Standard library: async subprocesses, JSON, logging, regex and timing.
 import asyncio
 import json
 import logging
@@ -19,8 +20,10 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+# Guard helpers that keep mutations limited to sim VMs.
 from .cs_guard import GuardError, assert_sim_vm, is_sim_vm
 
+# Shared agent logger.
 logger = logging.getLogger("PxmxAgent")
 
 # Subprocess timeout for fast VM commands (matches the cs bash `timeout 60`).
@@ -46,7 +49,9 @@ async def _kill_and_reap(proc: "asyncio.subprocess.Process", *,
     agent._pvesh, agent._pvesh_action) so a hung clone/qm/pvesh never
     permanently stalls the provision or telemetry loop. The
     pvesh-subprocess-leak invariant: kill the child on timeout AND cancel."""
+    # Kill the process first.
     proc.kill()
+    # Then wait (bounded) for it to be reaped.
     try:
         await asyncio.wait_for(proc.wait(), timeout=reap_timeout)
     except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -65,14 +70,17 @@ async def _run(argv: List[str], *, timeout: int = FAST_CMD_TIMEOUT,
     On cancellation the child is killed+reaped before CancelledError re-raises
     (a bare wait_for orphans the qm/pct child — the leak behind fleet-wide
     pvesh slowdowns). Mirrors agent._pvesh."""
+    # Start the command with stdout and stderr captured.
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
+    # Wait for it to finish within the timeout.
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    # On timeout: kill the child and report the failure.
     except asyncio.TimeoutError:
         await _kill_and_reap(proc)
         raise PveError(f"timeout ({timeout}s): {' '.join(argv)}")
@@ -82,8 +90,10 @@ async def _run(argv: List[str], *, timeout: int = FAST_CMD_TIMEOUT,
         # child — kill+reap before re-raising.
         await _kill_and_reap(proc)
         raise
+    # With check, a non-zero exit is an error (stderr gives the reason).
     if check and proc.returncode != 0:
         raise PveError(stderr.decode().strip() or f"{' '.join(argv)} exited {proc.returncode}")
+    # Return exit code and output.
     return proc.returncode, stdout, stderr
 
 
@@ -93,15 +103,19 @@ async def detect_guest_type(vmid: int) -> str:
     Mirrors the bash dispatch sniff: ``pct status <vmid>`` succeeds only for
     containers, ``qm status`` only for qemu guests.
     """
+    # `pct status` succeeds only for containers.
     rc, _, _ = await _run(["pct", "status", str(vmid)], check=False, timeout=10)
     return "lxc" if rc == 0 else "qemu"
 
 
 async def vm_status(vmid: int) -> Dict[str, Any]:
     """Read-only status probe (no guard). Returns {vmid, kind, running, raw}."""
+    # Pick the right tool for the guest type.
     kind = await detect_guest_type(vmid)
     bin_ = "pct" if kind == "lxc" else "qm"
+    # Ask for the status; no error raised if it fails.
     rc, out, _ = await _run([bin_, "status", str(vmid)], check=False, timeout=15)
+    # Report whether the output says "running".
     text = out.decode().strip()
     return {"vmid": vmid, "kind": kind, "running": "running" in text, "raw": text}
 
@@ -114,21 +128,27 @@ async def is_template(vmid: Any, kind: Optional[str] = None) -> bool:
     delete path uses so a source image can never be destroyed. Best-effort: on
     any probe failure returns ``False`` (unknown → treat as a normal guest; the
     90000-floor + protected-set guard still applies)."""
+    # A non-numeric VMID can't be a template.
     try:
         vid = int(vmid)
     except (TypeError, ValueError):
         return False
+    # Detect the guest type if not given.
     k = (kind or "").lower()
     if k not in ("qemu", "lxc"):
         k = await detect_guest_type(vid)
+    # Read the config with the matching tool.
     bin_ = "pct" if k == "lxc" else "qm"
     rc, out, _ = await _run([bin_, "config", str(vid)], check=False, timeout=15)
+    # Unreadable config: treat as a normal guest.
     if rc != 0:
         return False
+    # Look for a "template:" line set to a true value.
     for line in out.decode(errors="replace").splitlines():
         s = line.strip().lower()
         if s.startswith("template:"):
             return s.split(":", 1)[1].strip() in ("1", "true", "yes")
+    # No template line: a normal guest.
     return False
 
 
@@ -145,6 +165,7 @@ async def list_host_pci_by_vidpid(vidpids) -> Dict[str, str]:
     of ``pci_passthrough_vidpids`` (which reads a VM's attached devices): here we
     scan the HOST so the provisioner can find T1/T3 controllers to pass through.
     Empty on any failure (best-effort, never raises)."""
+    # The wanted VID:PIDs, normalised; nothing wanted means nothing to find.
     want = {str(v).strip().lower() for v in (vidpids or ()) if v}
     out: Dict[str, str] = {}
     if not want:
@@ -153,19 +174,24 @@ async def list_host_pci_by_vidpid(vidpids) -> Dict[str, str]:
     rc, o, _ = await _run(["lspci", "-Dn"], check=False, timeout=15)
     if rc != 0:
         return out
+    # Check each lspci line.
     for line in o.decode(errors="replace").lower().splitlines():
         parts = line.split()
         if not parts:
             continue
+        # The first field is the PCI address.
         addr = parts[0]  # e.g. "0000:01:00.0"
         # The class code ("0280:") is 4hex+colon+SPACE; the vendor:device is the
         # contiguous 4hex:4hex token after it — same shape _lspci_vidpid matches.
         m = re.search(r"\b([0-9a-f]{4}:[0-9a-f]{4})\b", line[len(addr):])
+        # Keep the addresses whose device ID is wanted.
         if m and m.group(1) in want:
             out[addr] = m.group(1)
+    # Return the matches.
     return out
 
 
+# Domain-stripped PCI address -> "vvvv:pppp", filled by _build_lspci_map.
 _lspci_vidpid_cache: Dict[str, str] = {}
 
 
@@ -174,10 +200,13 @@ def _addr_key(addr: str) -> str:
     prefix (``0000:03:00.0`` → ``03:00.0``). ``lspci -Dn`` prints full-domain
     addresses while a ``hostpciN`` line or an older ``lspci -s`` may omit the
     domain, so both sides key on the domain-stripped form."""
+    # Normalise the address text.
     a = str(addr or "").strip().lower()
+    # Split into parts; three parts means the domain is present.
     parts = a.split(":")
     if len(parts) == 3:  # domain:bus:slot.func → drop the domain
         a = ":".join(parts[1:])
+    # Return the normalised address.
     return a
 
 
@@ -187,15 +216,19 @@ async def _build_lspci_map() -> None:
     a ``lspci -s`` per address AND avoids the ``-s`` selector mismatch (some lspci
     builds don't match a full-domain address given to ``-s``, returning nothing —
     which silently left every PCI VM unresolved, i.e. unclassified). Best-effort."""
+    # Scan all PCI devices once.
     rc, o, _ = await _run(["lspci", "-Dn"], check=False, timeout=15)
     if rc != 0:
         return
+    # Parse each line into address and vendor:device.
     for line in o.decode(errors="replace").lower().splitlines():
         parts = line.split()
         if not parts:
             continue
+        # The first field is the address; find the vendor:device after it.
         addr = parts[0]
         m = re.search(r"\b([0-9a-f]{4}:[0-9a-f]{4})\b", line[len(addr):])
+        # Cache the result under the normalised address.
         if m:
             _lspci_vidpid_cache[_addr_key(addr)] = m.group(1)
 
@@ -205,9 +238,11 @@ async def _lspci_vidpid(addr: str) -> Optional[str]:
     (see ``_lspci_vidpid_cache``). Resolves from a one-shot ``lspci -Dn`` map so a
     full-domain ``hostpciN`` address (``0000:03:00.0``) resolves regardless of the
     local ``lspci -s`` selector behaviour. ``None`` if the address isn't present."""
+    # Use the cache when we already know the address.
     key = _addr_key(addr)
     if key in _lspci_vidpid_cache:
         return _lspci_vidpid_cache[key]
+    # Otherwise rescan lspci and look again.
     await _build_lspci_map()
     return _lspci_vidpid_cache.get(key)
 
@@ -219,11 +254,13 @@ def _live_config_text(text: str) -> str:
     inside a snapshot is NOT attached to the running VM, so tier classification
     must ignore it (``qm config`` already returns only the live section, but the
     direct file read below sees the whole file)."""
+    # Collect lines until the first section header.
     out_lines = []
     for line in text.splitlines():
         if re.match(r"^\[[^\]]+\]\s*$", line):  # first snapshot/pending header
             break
         out_lines.append(line)
+    # Join the live lines back into text.
     return "\n".join(out_lines)
 
 
@@ -238,11 +275,14 @@ async def _vm_config_text(vid: int, kind: str) -> Optional[str]:
     (Class column read e.g. ``0 T1`` despite passed-through radios). A file read is
     ~instant. Falls back to ``qm``/``pct config`` if the file is unreadable. Returns
     only the live section (snapshots stripped). None on total failure."""
+    # Config file path for the guest type.
     path = ("/etc/pve/lxc/%d.conf" % vid) if kind == "lxc" \
         else ("/etc/pve/qemu-server/%d.conf" % vid)
+    # Read the file directly (fast) and keep only the live section.
     try:
         with open(path, "r") as fh:
             return _live_config_text(fh.read())
+    # If that fails, use the qm/pct config command instead.
     except Exception:  # noqa: BLE001 — fall back to the (slower) CLI
         rc, out, _ = await _run(["pct" if kind == "lxc" else "qm", "config", str(vid)],
                                 check=False, timeout=15)
@@ -258,30 +298,36 @@ async def pci_passthrough_vidpids(vmid: Any, kind: Optional[str] = None) -> Set[
     whatever resolves, empty on any failure; LXC (no PCI passthrough) short-circuits
     to empty. Resource-mapping passthroughs (``hostpci0: mapping=...``) are skipped
     (no raw address to resolve)."""
+    # A non-numeric VMID has no devices.
     try:
         vid = int(vmid)
     except (TypeError, ValueError):
         return set()
+    # Detect the guest type if needed; containers have no PCI passthrough.
     k = (kind or "").lower()
     if k not in ("qemu", "lxc"):
         k = await detect_guest_type(vid)
     if k == "lxc":
         return set()
+    # Read the live config; nothing to scan if it's unavailable.
     text = await _vm_config_text(vid, k)
     if not text:
         return set()
     # hostpciN: <addr>[,opt=val,...] — capture the first token (the PCI address).
     addrs: Set[str] = set()
+    # Collect each hostpci line's address.
     for m in re.finditer(r"(?mi)^hostpci\d+:\s*([^\s,]+)", text):
         tok = m.group(1).strip()
         if not tok or "=" in tok:  # skip resource-mapping form (mapping=...)
             continue
         addrs.add(tok)
+    # Resolve each address to its vendor:device ID.
     vidpids: Set[str] = set()
     for addr in addrs:
         vidpid = await _lspci_vidpid(addr)  # memoized — PCI topology is static
         if vidpid:
             vidpids.add(vidpid)
+    # Return the IDs we resolved.
     return vidpids
 
 
@@ -292,10 +338,13 @@ async def start_vm(vmid: Any, protected: Set[int],
     """Guarded start of a sim VM (qemu or lxc). Returns ``{vmid, action, kind}``.
     ``kind`` ("qemu"/"lxc") skips the detect_guest_type probe when the caller
     already knows it (e.g. the qemu-only batch path)."""
+    # Refuse anything that isn't a sim VM.
     vid = assert_sim_vm(vmid, protected)
+    # Detect the guest type if not given.
     k = (kind or "").lower()
     if k not in ("qemu", "lxc"):
         k = await detect_guest_type(vid)
+    # Start it with the matching tool.
     bin_ = "pct" if k == "lxc" else "qm"
     await _run([bin_, "start", str(vid)])
     return {"vmid": vid, "action": "start", "kind": k}
@@ -305,10 +354,13 @@ async def stop_vm(vmid: Any, protected: Set[int],
                   kind: Optional[str] = None) -> Dict[str, Any]:
     """Guarded stop of a sim VM (qemu or lxc). Returns ``{vmid, action, kind}``.
     ``kind`` skips the detect_guest_type probe when known (see start_vm)."""
+    # Refuse anything that isn't a sim VM.
     vid = assert_sim_vm(vmid, protected)
+    # Detect the guest type if not given.
     k = (kind or "").lower()
     if k not in ("qemu", "lxc"):
         k = await detect_guest_type(vid)
+    # Stop it with the matching tool.
     bin_ = "pct" if k == "lxc" else "qm"
     await _run([bin_, "stop", str(vid)])
     return {"vmid": vid, "action": "stop", "kind": k}
@@ -316,8 +368,10 @@ async def stop_vm(vmid: Any, protected: Set[int],
 
 async def reboot_vm(vmid: Any, protected: Set[int]) -> Dict[str, Any]:
     """Guarded reboot of a sim VM (qemu or lxc). Returns ``{vmid, action, kind}``."""
+    # Refuse anything that isn't a sim VM, then detect its type.
     vid = assert_sim_vm(vmid, protected)
     kind = await detect_guest_type(vid)
+    # Reboot it with the matching tool.
     bin_ = "pct" if kind == "lxc" else "qm"
     await _run([bin_, "reboot", str(vid)])
     return {"vmid": vid, "action": "reboot", "kind": kind}
@@ -328,10 +382,13 @@ async def snapshot_vm(vmid: Any, protected: Set[int],
                       kind: Optional[str] = None) -> Dict[str, Any]:
     """Guarded snapshot of a sim VM; auto-names ``auto-<YYYYmmddHHMM>`` if no name given.
     ``kind`` skips the detect_guest_type probe when known (see start_vm)."""
+    # Refuse anything that isn't a sim VM.
     vid = assert_sim_vm(vmid, protected)
+    # Detect the guest type if not given.
     k = (kind or "").lower()
     if k not in ("qemu", "lxc"):
         k = await detect_guest_type(vid)
+    # Take the snapshot, naming it by time if no name was given.
     bin_ = "pct" if k == "lxc" else "qm"
     snap = name or f"auto-{time.strftime('%Y%m%d%H%M')}"
     await _run([bin_, "snapshot", str(vid), snap, "--description", "client-sim"])
@@ -355,14 +412,18 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
     Returns ``{vmid, action, kind[, snapshot]}``. Raises ``PveError`` on failure.
     ``backup_opts`` (storage/mode/keep) is required for the ``backup`` action.
     """
+    # VMID and guest type (detected if not given).
     vid = int(vmid)
     k = (kind or "").lower()
     if k not in ("qemu", "lxc"):
         k = await detect_guest_type(vid)
+    # Tool for the guest type and the normalised action.
     bin_ = "pct" if k == "lxc" else "qm"
     act = (action or "").lower()
+    # Start.
     if act == "start":
         await _run([bin_, "start", str(vid)])
+    # Stop.
     elif act == "stop":
         await _run([bin_, "stop", str(vid)])
     elif act in ("reboot", "restart"):
@@ -383,6 +444,7 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
         await _run(reboot_argv)
         return {"vmid": vid, "action": "reboot", "kind": k,
                 "method": "reset" if k == "qemu" else "reboot", "started": True}
+    # Snapshot, named by time if no name was given.
     elif act == "snapshot":
         snap = snapshot_name or f"auto-{time.strftime('%Y%m%d%H%M')}"
         await _run([bin_, "snapshot", str(vid), snap, "--description", "lm-hub"])
@@ -395,24 +457,30 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
         # Hypervisors); mode defaults to snapshot (no downtime). keep>0 prunes to
         # keep-last=N. Validate the storage exists first so an obvious misconfig
         # fails fast with a clear message instead of a silent task-log error.
+        # Storage must be set.
         opts = backup_opts or {}
         storage = str(opts.get("storage") or "").strip()
         if not storage:
             raise PveError("backup: no storage configured — set one in Setup → Hypervisors")
+        # Check the storage exists on this host.
         rc, out, _ = await _run(["pvesm", "status", "--storage", storage],
                                 check=False, timeout=15)
         if rc != 0 or storage not in out.decode(errors="replace"):
             raise PveError(f"backup: storage '{storage}' not found on this host")
+        # Backup mode, defaulting to snapshot if not recognised.
         mode = str(opts.get("mode") or "snapshot").lower()
         if mode not in ("snapshot", "suspend", "stop"):
             mode = "snapshot"
+        # vzdump command line.
         argv = ["vzdump", str(vid), "--mode", mode, "--storage", storage, "--compress", "zstd"]
+        # Optional retention: keep only the last N backups.
         try:
             keep = int(opts.get("keep") or 0)
         except (TypeError, ValueError):
             keep = 0
         if keep > 0:
             argv += ["--prune-backups", f"keep-last={keep}"]
+        # Launch vzdump in the background without waiting.
         await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         return {"vmid": vid, "action": "backup", "storage": storage,
@@ -427,8 +495,10 @@ async def vm_action_any(vmid: Any, action: str, kind: Optional[str] = None,
         await _run([bin_, "stop", str(vid)], check=False)
         await _run([bin_, "destroy", str(vid), "--purge"])
         return {"vmid": vid, "action": "destroy", "kind": k, "purged": True}
+    # Anything else is an unknown action.
     else:
         raise PveError(f"unknown vm action: {action}")
+    # Report the action done.
     return {"vmid": vid, "action": act, "kind": k}
 
 
@@ -438,8 +508,10 @@ async def next_free_vmid() -> int:
     Falls back to max(qm list ∪ pct list)+1 when pvesh is unavailable. Used by
     the clone-from-template flow to auto-assign the new VM's id.
     """
+    # Ask Proxmox for the next free ID.
     rc, out, _ = await _run(["pvesh", "get", "/cluster/nextid"], check=False, timeout=15)
     if rc == 0:
+        # Parse the reply (JSON object, quoted string, or plain number).
         try:
             data = json.loads(out.decode())
         except ValueError:
@@ -448,12 +520,14 @@ async def next_free_vmid() -> int:
             data = data.get("data", data)
         if isinstance(data, str):
             data = data.strip().strip('"')
+        # Use it if it's a number.
         try:
             return int(data)
         except (TypeError, ValueError):
             pass
     # Fallback: max existing vmid + 1.
     used: List[int] = []
+    # Collect every VMID listed by qm and pct.
     for bin_ in ("qm", "pct"):
         rc, out, _ = await _run([bin_, "list"], check=False, timeout=20)
         if rc != 0:
@@ -462,6 +536,7 @@ async def next_free_vmid() -> int:
             parts = line.split()
             if parts and parts[0].isdigit():
                 used.append(int(parts[0]))
+    # Next number after the highest (100 if none).
     return (max(used) + 1) if used else 100
 
 
@@ -477,13 +552,16 @@ async def clone_vm_any(template_vmid: Any, new_vmid: Any, name: str, kind: str,
     ``qm clone`` and ``pct clone`` accept ``--pool``). Raises ``PveError`` on
     failure.
     """
+    # Source and target VMIDs.
     tvid = int(template_vmid)
     nvid = int(new_vmid)
+    # Containers: pct clone with a hostname (and optional pool).
     if kind == "lxc":
         flags = ["pct", "clone", str(tvid), str(nvid), "--hostname", name]
         if pool:
             flags += ["--pool", str(pool)]
         await _run(flags, timeout=timeout)
+    # VMs: qm clone, full by default (and optional pool).
     else:
         flags = ["qm", "clone", str(tvid), str(nvid), "--name", name]
         if full:
@@ -498,6 +576,7 @@ async def set_tags_any(vmid: Any, kind: str, tags: List[str]) -> None:
     strings; Proxmox stores them semicolon-separated. Overwrites the current
     tags. Used by clone-from-template to tag the new VM for the cloning tenant.
     """
+    # Join the non-empty tags with ";" and write them.
     vid = int(vmid)
     joined = ";".join(str(t).strip() for t in tags if str(t).strip())
     bin_ = "pct" if kind == "lxc" else "qm"
@@ -511,43 +590,53 @@ async def retag_tenant(old_tag: str, new_tag: str) -> Dict[str, Any]:
     tags, swaps the tag (dedup, preserving the VM's other tags), and writes it
     back via :func:`set_tags_any`. VMs without ``old_tag`` are skipped; a no-op
     or empty tag pair is a no-op. Returns the changed VMs + any per-VM errors."""
+    # Clean the tag names; nothing to do if either is missing or they're the same.
     old_tag = (old_tag or "").strip()
     new_tag = (new_tag or "").strip()
     if not old_tag or not new_tag or old_tag == new_tag:
         return {"status": "SUCCESS", "retagged": [], "count": 0,
                 "message": "no tag change requested"}
+    # Fetch every VM and its tags from the cluster.
     rc, out, err = await _run(
         ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
         check=False, timeout=30)
     if rc != 0:
         return {"status": "ERROR",
                 "message": f"cluster/resources failed: {err.decode('utf-8', 'replace')[:200]}"}
+    # Parse the JSON list.
     try:
         resources = json.loads(out.decode("utf-8", "replace") or "[]")
     except Exception as e:  # noqa: BLE001
         return {"status": "ERROR", "message": f"parse failed: {e}"}
+    # Collected results and per-VM errors.
     changed: List[Dict[str, Any]] = []
     errors: Dict[str, str] = {}
+    # Check each VM's tags.
     for r in resources:
         tags = [t for t in str(r.get("tags", "")).split(";") if t.strip()]
         if old_tag not in tags:
             continue
+        # VMID and guest type.
         vmid = r.get("vmid")
         kind = "lxc" if r.get("type") == "lxc" else "qemu"
+        # Swap the old tag for the new one (no duplicate).
         new_tags = [t for t in tags if t != old_tag]
         if new_tag not in new_tags:
             new_tags.append(new_tag)
+        # Write the new tags; record failures without stopping.
         try:
             await set_tags_any(vmid, kind, new_tags)
             changed.append({"vmid": vmid, "kind": kind, "tags": new_tags})
         except Exception as e:  # noqa: BLE001 - one VM must not abort the sweep
             errors[str(vmid)] = str(e)
+    # Report the outcome (PARTIAL if any VM failed).
     status = "SUCCESS" if not errors else "PARTIAL"
     return {"status": status, "retagged": changed, "count": len(changed), "errors": errors,
             "message": (f"re-tagged {len(changed)} VM(s) {old_tag!r}→{new_tag!r}"
                         + (f", {len(errors)} error(s)" if errors else ""))}
 
 
+# Prefix used for client-simulation tags.
 _SIM_TAG_PREFIX = "sim-"
 
 
@@ -565,40 +654,50 @@ async def apply_sim_tags(tag_map: Dict[Any, List[str]]) -> Dict[str, Any]:
     with the desired set, and write back via :func:`set_tags_any`. Idempotent
     (unchanged VMs are skipped). One VM's failure never aborts the sweep. VMs not
     present on this host are silently skipped. Best-effort — returns a summary."""
+    # Nothing to apply.
     if not tag_map:
         return {"status": "SUCCESS", "updated": [], "count": 0,
                 "message": "no tags to apply"}
+    # Read every VM and its tags from the cluster in one call.
     rc, out, err = await _run(
         ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
         check=False, timeout=30)
     if rc != 0:
         return {"status": "ERROR",
                 "message": f"cluster/resources failed: {err.decode('utf-8', 'replace')[:200]}"}
+    # Parse the JSON list.
     try:
         resources = json.loads(out.decode("utf-8", "replace") or "[]")
     except Exception as e:  # noqa: BLE001
         return {"status": "ERROR", "message": f"parse failed: {e}"}
+    # Index VMs by VMID; collect results and per-VM errors.
     by_vmid = {str(r.get("vmid")): r for r in resources if r.get("vmid") is not None}
     updated: List[Dict[str, Any]] = []
     errors: Dict[str, str] = {}
+    # Work out each VM's new tag list.
     for vmid, desired in tag_map.items():
         r = by_vmid.get(str(vmid))
         if r is None:
             continue  # VM not on this host (another node owns it) — skip
+        # Guest type and current tags.
         kind = "lxc" if r.get("type") == "lxc" else "qemu"
         current = [t.strip() for t in str(r.get("tags", "")).split(";") if t.strip()]
+        # Keep the non-sim tags and replace the sim tags with the desired set.
         non_sim = [t for t in current if not t.lower().startswith(_SIM_TAG_PREFIX)]
         desired_clean = sorted({
             str(t).strip() for t in (desired or [])
             if str(t).strip() and str(t).strip().lower().startswith(_SIM_TAG_PREFIX)})
         new_tags = non_sim + desired_clean
+        # Skip VMs whose tags are already right.
         if sorted(current) == sorted(new_tags):
             continue  # idempotent — no change for this VM
+        # Write the new tags; record failures without stopping.
         try:
             await set_tags_any(vmid, kind, new_tags)
             updated.append({"vmid": vmid, "tags": new_tags})
         except Exception as e:  # noqa: BLE001 - one VM must not abort the sweep
             errors[str(vmid)] = str(e)
+    # Report the outcome (PARTIAL if any VM failed).
     status = "SUCCESS" if not errors else "PARTIAL"
     return {"status": status, "updated": updated, "count": len(updated), "errors": errors,
             "message": (f"tagged {len(updated)} VM(s)"
@@ -610,9 +709,11 @@ async def apply_sim_tags(tag_map: Dict[Any, List[str]]) -> Dict[str, Any]:
 async def list_qemu_vmids() -> List[int]:
     """All qemu VMIDs on this host. Read-only, unguarded — the caller filters
     to the sim range via :func:`cs_guard.is_sim_vm`."""
+    # List VMs; empty on failure.
     rc, out, _ = await _run(["qm", "list"], check=False, timeout=20)
     if rc != 0:
         return []
+    # Take the numeric VMID from each row after the header.
     ids: List[int] = []
     for line in out.decode().splitlines()[1:]:
         parts = line.split()
@@ -634,19 +735,23 @@ async def list_qemu_vms() -> List[Tuple[int, str]]:
     the NAME column and would be truncated by the slice (realistic template
     names are short; flagged in the field's WebUI help). Returns ``[]`` on any
     failure (non-zero ``qm list`` or empty output)."""
+    # List VMs; empty on failure.
     rc, out, _ = await _run(["qm", "list"], check=False, timeout=20)
     if rc != 0:
         return []
+    # Parse each row after the header.
     vms: List[Tuple[int, str]] = []
     for line in out.decode().splitlines()[1:]:  # skip the header row
         if len(line) < 10:
             continue
+        # The VMID column is the first 10 characters.
         vid_s = line[:10].strip()
         if not vid_s.isdigit():
             continue
         # NAME column is [10:30]; fall back to the remainder if the line is
         # shorter than the full column set (a short name + trailing columns).
         name = line[10:30].strip() if len(line) >= 30 else line[10:].strip()
+        # Record the VM.
         vms.append((int(vid_s), name))
     return vms
 
@@ -658,6 +763,7 @@ async def local_node_name() -> str:
     clustered) host. Used to scope clone-source template resolution to THIS
     node — on a cluster every node carries its own same-named template at a
     different vmid, and a cluster-wide match would wrongly look ambiguous."""
+    # Ask the cluster which node is local; any failure falls back to the hostname.
     try:
         rc, out, _ = await _run(
             ["pvesh", "get", "/cluster/status", "--output-format", "json"],
@@ -670,12 +776,14 @@ async def local_node_name() -> str:
                         return str(name)
     except Exception:  # noqa: BLE001 — fall back to the hostname
         pass
+    # Fallback: short hostname.
     import socket
     return socket.gethostname().split(".")[0]
 
 
 async def _pvesh_json(path: str, timeout: int = 15) -> Any:
     """``pvesh get <path>`` as JSON; None on any failure."""
+    # Run pvesh and parse its JSON; None on failure.
     try:
         rc, out, _ = await _run(["pvesh", "get", path, "--output-format", "json"],
                                 check=False, timeout=timeout)
@@ -689,12 +797,15 @@ async def cluster_info() -> Dict[str, Any]:
     Proxmox cluster, else ``{}`` (standalone host or pvesh unavailable). Lets
     the hub's OS-updates module put a clustered node into HA maintenance
     before an auto-reboot."""
+    # Read the cluster status rows.
     rows = await _pvesh_json("/cluster/status")
     if not isinstance(rows, list):
         return {}
+    # Find the cluster entry, all nodes, and the local node.
     cluster = next((r for r in rows if r.get("type") == "cluster"), None)
     nodes = [r for r in rows if r.get("type") == "node"]
     local = next((r for r in nodes if r.get("local") in (1, True)), None)
+    # Only report a real multi-node cluster.
     if not cluster or not local or len(nodes) < 2:
         return {}
     return {"name": str(cluster.get("name") or ""), "node": str(local.get("name") or ""),
@@ -709,9 +820,12 @@ async def node_maintenance(action: str) -> Dict[str, Any]:
     ``{status, node, maintenance, ha_guests: ["vm:100", ...]}`` where
     ``ha_guests`` are the HA guests still on this node (empty = safe to
     reboot)."""
+    # Reject unknown actions.
     if action not in ("enable", "disable", "status"):
         return {"status": "ERROR", "message": f"unknown maintenance action {action!r}"}
+    # This node's name.
     node = await local_node_name()
+    # Enable or disable maintenance via ha-manager.
     if action != "status":
         rc, _, err = await _run(["ha-manager", "crm-command", "node-maintenance", action, node],
                                 check=False, timeout=30)
@@ -719,12 +833,15 @@ async def node_maintenance(action: str) -> Dict[str, Any]:
             return {"status": "ERROR", "node": node,
                     "message": f"ha-manager node-maintenance {action} failed: "
                                f"{err.decode('utf-8', 'replace').strip()[:300]}"}
+    # Read the HA manager state.
     status = await _pvesh_json("/cluster/ha/status/manager_status")
     ms = (status.get("manager_status") or {}) if isinstance(status, dict) else {}
     services = ms.get("service_status") or {}
+    # HA guests still running on this node.
     ha_here = sorted(sid for sid, sv in services.items()
                      if (sv or {}).get("node") == node
                      and (sv or {}).get("state") not in ("stopped", "disabled", "ignored", "error"))
+    # Report the maintenance state and remaining HA guests.
     return {"status": "SUCCESS", "node": node,
             "maintenance": (ms.get("node_status") or {}).get(node) == "maintenance",
             "ha_guests": ha_here}
@@ -736,15 +853,18 @@ async def list_qemu_vms_cluster() -> List[Tuple[int, str, str]]:
     ``list_qemu_vms`` (``qm list``, local node only) this sees peer nodes, so a
     caller can resolve a template NAME to the copy on a SPECIFIC node. Read-only.
     Returns ``[]`` on any failure."""
+    # List every VM in the cluster.
     rc, out, _ = await _run(
         ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
         check=False, timeout=20)
     if rc != 0:
         return []
+    # Parse the JSON list.
     try:
         rows = json.loads(out.decode("utf-8", "replace") or "[]")
     except Exception:  # noqa: BLE001
         return []
+    # Keep the qemu VMs as (vmid, name, node).
     out_vms: List[Tuple[int, str, str]] = []
     for r in (rows if isinstance(rows, list) else []):
         if r.get("type") != "qemu" or r.get("vmid") is None:
@@ -762,10 +882,12 @@ async def _batch(action: str, protected: Set[int]) -> Dict[str, Any]:
     ``list_qemu_vmids`` only returns qemu guests — skipping the wasted
     pct-status detect probe per VM. Returns ``{action, done, skipped}``.
     """
+    # Results, and the single-VM function for this action.
     done: List[int] = []
     skipped: List[int] = []
     fn = {"start_vms": start_vm, "stop_vms": stop_vm,
           "snapshot_vms": snapshot_vm}[action]
+    # Split the VMs into sim targets and skipped ones.
     targets: List[int] = []
     for vid in await list_qemu_vmids():
         if not is_sim_vm(vid, protected):
@@ -773,9 +895,12 @@ async def _batch(action: str, protected: Set[int]) -> Dict[str, Any]:
         else:
             targets.append(vid)
 
+    # Run at most 4 VMs at a time.
     sem = asyncio.Semaphore(4)
 
     async def _one(vid: int) -> None:
+        """Run the action on one VM, recording success or logging the failure."""
+        # Wait for a free slot.
         async with sem:
             try:
                 await fn(vid, protected, kind="qemu")
@@ -783,6 +908,7 @@ async def _batch(action: str, protected: Set[int]) -> Dict[str, Any]:
             except (PveError, GuardError) as e:
                 logger.warning(f"{action}: vmid {vid} failed: {e}")
 
+    # Run them all, then report sorted results.
     await asyncio.gather(*[_one(vid) for vid in targets])
     done.sort()
     return {"action": action, "done": done, "skipped": skipped}
@@ -790,18 +916,21 @@ async def _batch(action: str, protected: Set[int]) -> Dict[str, Any]:
 
 async def start_vms(protected: Set[int]) -> Dict[str, Any]:
     """Start every sim VM on the host (batch). Returns ``{action, started, skipped}``."""
+    # Run the batch and rename "done" to "started".
     r = await _batch("start_vms", protected)
     return {**r, "started": r.pop("done")}
 
 
 async def stop_vms(protected: Set[int]) -> Dict[str, Any]:
     """Stop every sim VM on the host (batch). Returns ``{action, stopped, skipped}``."""
+    # Run the batch and rename "done" to "stopped".
     r = await _batch("stop_vms", protected)
     return {**r, "stopped": r.pop("done")}
 
 
 async def snapshot_vms(protected: Set[int]) -> Dict[str, Any]:
     """Snapshot every sim VM on the host (batch). Returns ``{action, snapshotted, skipped}``."""
+    # Run the batch and rename "done" to "snapshotted".
     r = await _batch("snapshot_vms", protected)
     return {**r, "snapshotted": r.pop("done"),
             "snapshot": f"auto-{time.strftime('%Y%m%d%H%M')}"}
@@ -812,8 +941,10 @@ async def snapshot_vms(protected: Set[int]) -> Dict[str, Any]:
 async def unlock_template(template_ids: List[int]) -> Dict[str, Any]:
     """``qm unlock`` the given template VMIDs. Templates are the *source* images
     (typically < 90000), so the sim guard does NOT apply. Best-effort per ID."""
+    # Track which IDs were unlocked or failed.
     unlocked: List[int] = []
     failed: List[int] = []
+    # Unlock each template, logging failures.
     for tid in template_ids:
         try:
             await _run(["qm", "unlock", str(int(tid))], check=False)
@@ -821,6 +952,7 @@ async def unlock_template(template_ids: List[int]) -> Dict[str, Any]:
         except (PveError, ValueError) as e:
             logger.warning(f"unlock_template: qm unlock {tid} failed: {e}")
             failed.append(int(tid) if str(tid).lstrip('-').isdigit() else tid)
+    # Report the result.
     return {"action": "unlock_template", "unlocked": unlocked, "failed": failed}
 
 
@@ -829,6 +961,7 @@ async def clear_provision_lock() -> Dict[str, Any]:
     ``clear_provision_lock`` recovery path. Non-destructive; no vmid guard
     (unlock is safe). The cs flock/cooldown state files are owned by the USB
     provision loop (Phase E); they're removed best-effort if present."""
+    # Count of processes signalled.
     killed = 0
     # SIGTERM any stuck qm clone/list processes, then SIGKILL survivors.
     rc, out, _ = await _run(["pgrep", "-f", r"^qm (clone|list)"], check=False, timeout=10)
@@ -844,6 +977,7 @@ async def clear_provision_lock() -> Dict[str, Any]:
         await _run(["pkill", "-KILL", "-f", r"^qm (clone|list)"], check=False, timeout=5)
 
     # Unlock VMs flagged 'locked' in qm list (admin recovery — unlock is safe).
+    # IDs we unlocked.
     unlocked: List[int] = []
     rc, out, _ = await _run(["qm", "list"], check=False, timeout=20)
     if rc == 0:
@@ -859,6 +993,7 @@ async def clear_provision_lock() -> Dict[str, Any]:
 
     # Best-effort: clear cs provision-halt/cooldown markers if present (Phase E
     # owns these; harmless to touch if absent).
+    # Only needed here.
     import os
     for p in ("/var/lib/pxmx/provision.lock",
               "/var/lib/pxmx/provision_halt.cache",
@@ -869,6 +1004,7 @@ async def clear_provision_lock() -> Dict[str, Any]:
         except OSError:
             pass
 
+    # Report what was killed and unlocked.
     return {"action": "clear_provision_lock", "killed_qm_pids": killed,
             "unlocked_vmids": unlocked}
 
@@ -877,13 +1013,18 @@ async def clear_usb_quarantine(bus_path: Optional[str] = None) -> Dict[str, Any]
     """Clear USB dongle-quarantine state for a bus (or all). The quarantine
     store is populated by the USB provision loop (Phase E); until then this
     is a safe no-op that ensures the store is empty/cleared on demand."""
+    # Only needed here.
     import json as _json
     import os
+    # Quarantine store path.
     path = "/var/lib/pxmx/usb_quarantine.json"
+    # Any write failure is logged and reported.
     try:
+        # Make sure the directory exists.
         os.makedirs("/var/lib/pxmx", exist_ok=True)
         if bus_path:
             # Clear one bus entry, preserve the rest.
+            # Load the current store, treating a bad file as empty.
             data: Dict[str, Any] = {}
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 with open(path) as f:
@@ -891,6 +1032,7 @@ async def clear_usb_quarantine(bus_path: Optional[str] = None) -> Dict[str, Any]
                         data = _json.load(f) or {}
                     except _json.JSONDecodeError:
                         data = {}
+            # Drop this bus and save the rest.
             data.pop(bus_path, None)
             with open(path, "w") as f:
                 _json.dump(data, f)
@@ -914,39 +1056,47 @@ async def clear_usb_quarantine(bus_path: Optional[str] = None) -> Dict[str, Any]
 
 def _parse_kv(text: str) -> Dict[str, str]:
     """Parse ``qm config``/``pct config`` ``key: value`` output into a dict."""
+    # Split each "key: value" line on the first colon.
     out: Dict[str, str] = {}
     for line in (text or "").splitlines():
         if ":" not in line:
             continue
         k, _, v = line.partition(":")
         out[k.strip()] = v.strip()
+    # Return the parsed config.
     return out
 
 
 async def qm_config(vmid: int) -> Dict[str, str]:
     """Read-only ``qm config <vmid>`` → dict. No guard (read-only)."""
+    # Read the config; empty dict on failure.
     rc, out, _ = await _run(["qm", "config", str(vmid)], check=False, timeout=20)
     if rc != 0:
         return {}
+    # Parse the key/value lines.
     return _parse_kv(out.decode())
 
 
 async def pct_config(vmid: int) -> Dict[str, str]:
     """Read-only ``pct config <vmid>`` → dict. No guard (read-only)."""
+    # Read the config; empty dict on failure.
     rc, out, _ = await _run(["pct", "config", str(vmid)], check=False, timeout=20)
     if rc != 0:
         return {}
+    # Parse the key/value lines.
     return _parse_kv(out.decode())
 
 
 async def qm_set(vmid: int, *args: str, protected: Optional[Set[int]] = None) -> None:
     """``qm set <vmid> <args...>`` — best-effort config mutation (guarded)."""
+    # Refuse non-sim VMs, then apply the settings.
     vid = assert_sim_vm(vmid, protected or set())
     await _run(["qm", "set", str(vid), *args], check=False, timeout=30)
 
 
 async def pct_set(vmid: int, *args: str, protected: Optional[Set[int]] = None) -> None:
     """``pct set <vmid> <args...>`` — best-effort config mutation (guarded)."""
+    # Refuse non-sim VMs, then apply the settings.
     vid = assert_sim_vm(vmid, protected or set())
     await _run(["pct", "set", str(vid), *args], check=False, timeout=30)
 
@@ -960,10 +1110,13 @@ async def qm_clone(template: Any, vmid: Any, name: str, *,
     ``pool`` places the new VM in a Proxmox resource pool at CLONE time — the
     only moment it can be set in one shot (``qm set`` has no --pool; retrofitting
     an existing VM needs ``pvesh set /pools/<id>``, see :func:`pool_add_vms`)."""
+    # Refuse a non-sim target VMID.
     vid = assert_sim_vm(vmid, protected or set())
+    # Clone command, with the pool if given.
     argv = ["qm", "clone", str(int(template)), str(vid), "--name", name]
     if pool:
         argv += ["--pool", str(pool)]
+    # Run the clone.
     await _run(argv, timeout=timeout)
 
 
@@ -980,22 +1133,27 @@ async def pool_add_vms(pool: str, vmids: List[int]) -> Dict[str, Any]:
     Used to retrofit VMs that were cloned before a pool was configured. Proxmox
     errors if a VM already belongs to ANOTHER pool, so those are reported rather
     than silently skipped — moving a VM between pools is an operator decision."""
+    # Clean inputs; nothing to do without a pool and VMs.
     pool = str(pool or "").strip()
     vms = [int(v) for v in (vmids or [])]
     if not pool or not vms:
         return {"status": "SUCCESS", "added": 0, "message": "nothing to do"}
+    # Add the VMs to the pool.
     rc, out, err = await _run(
         ["pvesh", "set", f"/pools/{pool}", "--vms", ",".join(str(v) for v in vms)],
         check=False, timeout=60)
+    # Report errors with the command's output.
     if rc != 0:
         return {"status": "ERROR", "added": 0,
                 "message": (err or out or b"").decode("utf-8", "replace")[:300]}
+    # Success: report how many were added.
     return {"status": "SUCCESS", "added": len(vms)}
 
 
 async def pct_clone(source: Any, vmid: Any, hostname: str, *,
                     protected: Optional[Set[int]] = None, timeout: int = 600) -> None:
     """``pct clone <source> <vmid> --hostname <hostname>``. Source unguarded."""
+    # Refuse a non-sim target, then clone.
     vid = assert_sim_vm(vmid, protected or set())
     await _run(["pct", "clone", str(int(source)), str(vid), "--hostname", hostname],
                timeout=timeout)
@@ -1003,18 +1161,21 @@ async def pct_clone(source: Any, vmid: Any, hostname: str, *,
 
 async def qm_start(vmid: Any, protected: Optional[Set[int]] = None) -> None:
     """Guarded ``qm start <vmid>`` (qemu). Used by the provision flow to boot a freshly cloned VM."""
+    # Refuse non-sim VMs, then start it.
     vid = assert_sim_vm(vmid, protected or set())
     await _run(["qm", "start", str(vid)], timeout=60)
 
 
 async def pct_start(vmid: Any, protected: Optional[Set[int]] = None) -> None:
     """Guarded ``pct start <vmid>`` (lxc). Used by the provision flow to boot a freshly cloned CT."""
+    # Refuse non-sim VMs, then start it.
     vid = assert_sim_vm(vmid, protected or set())
     await _run(["pct", "start", str(vid)], timeout=60)
 
 
 async def _qemu_pid(vmid: int) -> Optional[int]:
     """Best-effort QEMU pid lookup (bash _destroy_guest_only 1768-1777)."""
+    # Try the pid files first.
     for p in (f"/run/qemu-server/{vmid}.pid", f"/var/run/qemu-server/{vmid}.pid"):
         try:
             with open(p) as f:
@@ -1026,11 +1187,13 @@ async def _qemu_pid(vmid: int) -> Optional[int]:
     # Fall back to pgrep. Prefer the space-bounded, precise pattern first (bash
     # 1776-1777) so vmid 100 doesn't match qemu carrying vmid 1001; only then
     # fall back to the broader `qemu.*{vmid}` match.
+    # Then try pgrep patterns.
     for pat in (rf"[[:space:]]{vmid}[[:space:]]", f"qemu.*{vmid}"):
         rc, out, _ = await _run(["pgrep", "-f", pat], check=False, timeout=10)
         for line in out.decode().split():
             if line.isdigit():
                 return int(line)
+    # Not found.
     return None
 
 
@@ -1038,9 +1201,12 @@ async def qm_stop_force(vmid: Any, protected: Optional[Set[int]] = None) -> None
     """Tiered force-stop mirroring bash _destroy_guest_only (1763-1785): timeout 5
     → forceStop 1 → timeout 1, then a QEMU pid kill + systemd kill if still
     running. Guarded target."""
+    # Refuse non-sim VMs.
     vid = assert_sim_vm(vmid, protected or set())
+    # Try progressively harder qm stop options.
     for flag in (["--timeout", "5"], ["--forceStop", "1"], ["--timeout", "1"]):
         await _run(["qm", "stop", str(vid), "--skiplock", *flag], check=False, timeout=30)
+    # Still running: kill the QEMU process (or its systemd unit) directly.
     if not await wait_stopped(vid, "qemu", 15):
         pid = await _qemu_pid(vid)
         if pid:
@@ -1049,6 +1215,7 @@ async def qm_stop_force(vmid: Any, protected: Optional[Set[int]] = None) -> None
             await _run(["systemctl", "kill", "--signal=SIGKILL",
                         f"qemu-server@{vid}.service"], check=False, timeout=10)
         await asyncio.sleep(3)
+    # Wait for it to stop.
     await wait_stopped(vid, "qemu", 20)
 
 
@@ -1062,9 +1229,12 @@ async def qm_destroy(vmid: Any, protected: Optional[Set[int]] = None,
     dropped stderr (``rc, _, _``), so a failed shed could only be reported as a
     generic "locked/busy or purge timeout" guess; now the real cause is logged +
     surfaced to the delete-gate trace on the auto-prov card."""
+    # Refuse non-sim VMs.
     vid = assert_sim_vm(vmid, protected or set())
+    # Destroy the VM, its disks and its backup-job entries.
     argv = ["qm", "destroy", str(vid), "--skiplock", "--purge",
             "--destroy-unreferenced-disks"]
+    # First attempt; keep the error text.
     rc, _, err = await _run(argv, check=False, timeout=timeout)
     reason = err.decode(errors="replace").strip()
     if rc == 0:
@@ -1091,6 +1261,7 @@ async def qm_destroy(vmid: Any, protected: Optional[Set[int]] = None,
         return True, ""
     if not await guest_exists(vid, "qemu"):
         return True, ""          # gone after the kill/retry → success
+    # Still present: log and report the error.
     msg = reason or f"`qm destroy` exited {rc}; VM {vid} config still present"
     logger.error("destroy VM %s failed: %s", vid, msg)
     return False, msg
@@ -1098,7 +1269,9 @@ async def qm_destroy(vmid: Any, protected: Optional[Set[int]] = None,
 
 async def pct_stop(vmid: Any, protected: Optional[Set[int]] = None) -> None:
     """Guarded ``pct stop`` for an lxc sim VM, escalating through ``--force`` → ``--skiplock`` → plain until stopped."""
+    # Refuse non-sim VMs.
     vid = assert_sim_vm(vmid, protected or set())
+    # Try each stop option until it stops.
     for flag in (["--force"], ["--skiplock"], []):
         await _run(["pct", "stop", str(vid), *flag], check=False, timeout=120)
         if await wait_stopped(vid, "lxc", 10):
@@ -1111,8 +1284,10 @@ async def pct_destroy(vmid: Any, protected: Optional[Set[int]] = None,
 
     Returns ``(ok, reason)`` — the last ``pct`` stderr across the flag ladder on
     failure (previously dropped), so a failed shed reports the real cause."""
+    # Refuse non-sim VMs; keep the last error text.
     vid = assert_sim_vm(vmid, protected or set())
     reason = ""
+    # Try each destroy option set in turn.
     for flag in (["--skiplock", "--purge", "--force"], ["--purge", "--force"],
                  ["--skiplock", "--purge"], ["--skiplock"], []):
         rc, _, err = await _run(["pct", "destroy", str(vid), *flag],
@@ -1124,9 +1299,11 @@ async def pct_destroy(vmid: Any, protected: Optional[Set[int]] = None,
             msg = f"`pct destroy` returned 0 but CT {vid} config still present after 360s"
             logger.error("destroy CT %s: %s", vid, msg)
             return False, msg
+        # Keep the latest error text.
         reason = err.decode(errors="replace").strip() or reason
         if not await guest_exists(vid, "lxc"):
             return True, ""          # already gone → idempotent success
+    # Every option failed.
     logger.error("destroy CT %s: all `pct destroy` variants failed: %s",
                  vid, reason or "(no stderr)")
     return False, reason or "pct destroy failed (all variants)"
@@ -1134,30 +1311,37 @@ async def pct_destroy(vmid: Any, protected: Optional[Set[int]] = None,
 
 async def wait_stopped(vmid: int, kind: str, timeout: int) -> bool:
     """Poll ``qm/pct status`` until the guest is stopped or timeout elapses."""
+    # Tool for the guest type and the deadline.
     bin_ = "pct" if kind == "lxc" else "qm"
     deadline = time.time() + timeout
+    # Check every 2 seconds until stopped.
     while time.time() < deadline:
         rc, out, _ = await _run([bin_, "status", str(vmid)], check=False, timeout=15)
         if rc == 0 and "running" not in out.decode().lower():
             return True
         await asyncio.sleep(2)
+    # Timed out.
     return False
 
 
 async def qm_guest_exec(vmid: Any, *cmd: str,
                         protected: Optional[Set[int]] = None) -> bool:
     """``qm guest exec <vmid> ...`` — best-effort (guest agent may be absent)."""
+    # Refuse non-sim VMs, then run the command in the guest.
     vid = assert_sim_vm(vmid, protected or set())
     rc, _, _ = await _run(["qm", "guest", "exec", str(vid), *cmd],
                           check=False, timeout=30)
+    # Success means the qm command worked.
     return rc == 0
 
 
 async def qm_agent_ping(vmid: Any, protected: Optional[Set[int]] = None,
                         timeout: int = 10) -> bool:
     """Return True if the qemu guest-agent on ``vmid`` responds to ``qm agent ping`` (guest is up + agent live)."""
+    # Refuse non-sim VMs, then ping the guest agent.
     vid = assert_sim_vm(vmid, protected or set())
     rc, _, _ = await _run(["qm", "agent", str(vid), "ping"], check=False, timeout=timeout)
+    # Responding means up.
     return rc == 0
 
 
@@ -1170,6 +1354,7 @@ async def guest_exists(vmid: int, kind: str) -> bool:
     Treating it as a failure was the "did NOT complete but the VM is actually
     deleted" bug: the delete gate then skipped clear_assignment and retried a
     ghost VMID every tick, racking up destroy-fails toward a bogus orphan."""
+    # Ask for the config; success means it still exists.
     bin_ = "pct" if kind == "lxc" else "qm"
     rc, _, _ = await _run([bin_, "config", str(vmid)], check=False, timeout=15)
     return rc == 0
@@ -1180,13 +1365,16 @@ async def wait_guest_gone(vmid: int, kind: str, timeout: int = 360) -> bool:
     ``_wait_guest_gone`` 1811-1814 — 360s default). ``qm/pct config`` returns
     non-zero once the VMID no longer exists, so the caller can't race a
     reclone/clone into a still-purging VMID. Read-only (no guard)."""
+    # Tool for the guest type and the deadline.
     bin_ = "pct" if kind == "lxc" else "qm"
     deadline = time.time() + timeout
+    # Check every 5 seconds until the config is gone.
     while time.time() < deadline:
         rc, _, _ = await _run([bin_, "config", str(vmid)], check=False, timeout=15)
         if rc != 0:
             return True  # config gone → disk cleanup done
         await asyncio.sleep(5)
+    # Timed out.
     return False
 
 
@@ -1201,13 +1389,17 @@ async def qm_guest_exec_shell_out(vmid: Any, script: str, *,
     None when the exec fails or the envelope cannot be parsed; callers treat that
     as "unknown", never as "empty".
     """
+    # Refuse non-sim VMs.
     vid = assert_sim_vm(vmid, protected or set())
+    # Run the script in the guest and wait for it.
     rc, out, _ = await _run(["qm", "guest", "exec", str(vid),
                              "--timeout", str(exec_timeout), "--",
                              "bash", "-c", script],
                             check=False, timeout=outer_timeout)
+    # The exec failed: unknown.
     if rc != 0 or not out:
         return None
+    # Pull the output out of the JSON envelope.
     try:
         import json as _json
         return str((_json.loads(out) or {}).get("out-data") or "")
@@ -1241,20 +1433,25 @@ async def qm_guest_exec_shell(vmid: Any, script: str, *,
     ``--timeout`` is mandatory — without it PVE defaults to async
     fire-and-forget and the caller races the next step. ``hostnamectl`` is
     deliberately avoided here (D-Bus may be unready post-boot and can hang)."""
+    # Refuse non-sim VMs.
     vid = assert_sim_vm(vmid, protected or set())
+    # Run the script in the guest and wait for it.
     rc, out, _ = await _run(["qm", "guest", "exec", str(vid),
                              "--timeout", str(exec_timeout), "--",
                              "bash", "-c", script],
                             check=False, timeout=outer_timeout)
     if rc != 0 or not out:
         return None                      # the exec itself failed → UNKNOWN
+    # Parse the JSON envelope.
     try:
         import json as _json
         env = _json.loads(out)
     except Exception:  # noqa: BLE001 — non-JSON envelope → unknown, never "ok"
         return None
+    # No exit code in the envelope: unknown.
     if not isinstance(env, dict) or env.get("exitcode") is None:
         return None
+    # True if the guest script exited 0.
     try:
         return int(env["exitcode"]) == 0
     except (TypeError, ValueError):
@@ -1265,6 +1462,7 @@ async def vzdump(vmid: Any, dumpdir: str, *, compress: str = "zstd",
                  mode: str = "snapshot", protected: Optional[Set[int]] = None,
                  timeout: int = 1800) -> None:
     """``vzdump <vmid> --compress zstd --mode snapshot --dumpdir <dir>``."""
+    # Refuse non-sim VMs, then back it up.
     vid = assert_sim_vm(vmid, protected or set())
     await _run(["vzdump", str(vid), "--compress", compress, "--mode", mode,
                 "--dumpdir", dumpdir], timeout=timeout)
@@ -1274,15 +1472,19 @@ async def qmrestore(path: str, vmid: Any, *, force: bool = True,
                     protected: Optional[Set[int]] = None,
                     timeout: int = 600) -> None:
     """``qmrestore <file> <vmid> [--force]``. Target vmid guarded."""
+    # Refuse non-sim VMs.
     vid = assert_sim_vm(vmid, protected or set())
+    # Restore command, overwriting if force is set.
     args = ["qmrestore", path, str(vid)]
     if force:
         args.append("--force")
+    # Run the restore.
     await _run(args, timeout=timeout)
 
 
 async def qm_template(vmid: Any, protected: Optional[Set[int]] = None) -> None:
     """``qm template <vmid>`` (reseed templating step)."""
+    # Refuse non-sim VMs, then convert it to a template.
     vid = assert_sim_vm(vmid, protected or set())
     await _run(["qm", "template", str(vid)], timeout=120)
 
@@ -1291,6 +1493,7 @@ async def list_backup_storages() -> Dict[str, Any]:
     """This host's Proxmox storages that can hold backups (content=backup) plus
     the node hostname — feeds the Setup → Hypervisors backup-storage dropdown.
     Read-only; best-effort (empty list if pvesm is unavailable)."""
+    # This host's name and the storage list.
     import socket
     host = socket.gethostname()
     storages: List[str] = []
@@ -1299,9 +1502,11 @@ async def list_backup_storages() -> Dict[str, Any]:
     # pushes dedup chunks, not a single streamable .vma.zst). Existing consumers
     # that only read ``storages`` (names) are unaffected.
     storage_types: Dict[str, str] = {}
+    # Ask for storages that can hold backups.
     rc, out, _ = await _run(["pvesm", "status", "--content", "backup"],
                             check=False, timeout=15)
     if rc == 0:
+        # Record each storage's name and type, once each.
         for line in out.decode(errors="replace").splitlines()[1:]:
             parts = line.split()
             if parts:
@@ -1310,6 +1515,7 @@ async def list_backup_storages() -> Dict[str, Any]:
                 if name not in storages:
                     storages.append(name)
                     storage_types[name] = stype
+    # Return them for this host.
     return {"hosts": [{"hostname": host, "storages": storages,
                        "storage_types": storage_types}]}
 
@@ -1317,13 +1523,16 @@ async def list_backup_storages() -> Dict[str, Any]:
 async def list_all_vmids() -> List[int]:
     """All qemu + lxc VMIDs present on this host (read-only). Used by the USB
     provision loop to find free slots and reconcile stale bus state."""
+    # Start with the qemu VMIDs.
     ids: List[int] = list(await list_qemu_vmids())
+    # Add the container VMIDs.
     rc, out, _ = await _run(["pct", "list"], check=False, timeout=20)
     if rc == 0:
         for line in out.decode().splitlines()[1:]:
             parts = line.split()
             if parts and parts[0].isdigit():
                 ids.append(int(parts[0]))
+    # Return them all.
     return ids
 
 
@@ -1344,11 +1553,13 @@ async def open_vnc_ws(vmid: Any, node: str, kind: str, api_token: str):
     Returns ``(px_ws, ticket, port)``. ``px_ws`` is an open websockets
     connection the caller MUST close on teardown. Raises ``PveError`` on any
     failure (the caller emits VNC_ERROR up)."""
+    # Imported here so they're only needed when a console is opened.
     import urllib.parse
     import ssl
     import websockets
     import httpx
 
+    # Guest type (default qemu), VMID, node, and the API token header.
     k = (kind or "qemu").lower()
     if k not in ("qemu", "lxc"):
         k = "qemu"
@@ -1356,18 +1567,22 @@ async def open_vnc_ws(vmid: Any, node: str, kind: str, api_token: str):
     pve_node = (node or "localhost").strip() or "localhost"
     headers = {"Authorization": f"PVEAPIToken={api_token}"}
 
+    # Ask the local API for a VNC proxy ticket.
     vncproxy_url = (
         f"https://localhost:8006/api2/json/nodes/"
         f"{urllib.parse.quote(pve_node, safe='')}/{k}/{vid}/vncproxy"
     )
     async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
         resp = await client.post(vncproxy_url, headers=headers, data={"websocket": 1})
+    # A non-200 reply is an error.
     if resp.status_code != 200:
         raise PveError(f"vncproxy returned {resp.status_code}: {resp.text[:200]}")
+    # Parse the JSON body.
     try:
         body = resp.json() or {}
     except Exception as exc:
         raise PveError(f"vncproxy bad json: {exc}")
+    # It must contain a data object with a ticket and port.
     data = body.get("data") if isinstance(body, dict) else None
     if not isinstance(data, dict):
         raise PveError("vncproxy returned no data object")
@@ -1376,9 +1591,11 @@ async def open_vnc_ws(vmid: Any, node: str, kind: str, api_token: str):
     if not ticket or port is None:
         raise PveError("vncproxy did not return ticket+port")
 
+    # TLS context that accepts the host's self-signed certificate.
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
+    # WebSocket URL with the port and ticket.
     params = urllib.parse.urlencode({"port": port, "vncticket": ticket})
     ws_url = (
         f"wss://localhost:8006/api2/json/nodes/"
@@ -1387,7 +1604,9 @@ async def open_vnc_ws(vmid: Any, node: str, kind: str, api_token: str):
 
     # websockets renamed extra_headers → additional_headers (v13+). Probe the
     # signature so this works on either the agent's pinned or a newer lib.
+    # Only needed here.
     import inspect
+    # Connection options.
     connect_kwargs: Dict[str, Any] = {
         "ssl": ssl_ctx,
         "open_timeout": 20,
@@ -1402,9 +1621,11 @@ async def open_vnc_ws(vmid: Any, node: str, kind: str, api_token: str):
         # keepalive is needed here.
         "ping_interval": None,
     }
+    # Pass the auth header under the name this websockets version uses.
     hdr_key = "additional_headers" if "additional_headers" in inspect.signature(
         websockets.connect).parameters else "extra_headers"
     connect_kwargs[hdr_key] = headers
 
+    # Open the WebSocket and return it with the ticket and port.
     px_ws = await websockets.connect(ws_url, **connect_kwargs)
     return px_ws, ticket, int(port)

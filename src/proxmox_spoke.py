@@ -9,10 +9,12 @@ connect/auth/dispatch loop. Audience: pxmx developers; see the repo
 the canonical VM identity key.
 """
 
+# asyncio queries agents in parallel; logging reports routing problems.
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
+# Import BaseSpoke from the flat deploy layout, or from the repo layout in development.
 try:
     from base_spoke import BaseSpoke
 except ImportError:
@@ -37,6 +39,7 @@ try:
 except ImportError:
     from messaging import pxmx_node_vm_aggregation as _pxmx_agg  # type: ignore  # noqa: E402
 
+# Dedicated logger for this spoke.
 logger = logging.getLogger("ProxmoxSpoke")
 
 
@@ -47,9 +50,11 @@ def _vm_destroy_cmd(vmid, kind: str) -> str:
     spoke that self-updates before the hub still has to work: fall back to
     building the string here when the installed ``pve_cmd_builder`` predates
     ``vm_destroy_cmd``. Identical output either way."""
+    # Use the shared builder if this version has it.
     fn = getattr(pve_cmd_builder, "vm_destroy_cmd", None)
     if callable(fn):
         return fn(vmid, kind)
+    # Otherwise build the same command string here.
     return f"{'pct' if kind == 'lxc' else 'qm'} destroy {int(vmid)} --purge"
 
 
@@ -57,12 +62,16 @@ def _norm_mac(raw: str) -> str:
     """Normalize a MAC to lower-colon form (aa:bb:cc:dd:ee:ff) to match the
     hub-normalized query. Tolerates dash/colon/space separators and trailing
     whitespace; returns the input lowercased if parsing is ambiguous."""
+    # Empty input stays empty.
     if not raw:
         return ""
+    # Lower-case and convert dashes/spaces/dots into colon form.
     s = str(raw).strip().lower().replace("-", ":").replace(" ", "").replace(".", "")
     parts = [p for p in s.split(":") if p]
+    # Six parts: pad each to two digits and rejoin.
     if len(parts) == 6:
         return ":".join(p.zfill(2) for p in parts)
+    # Anything else: return the cleaned string unchanged.
     return s
 
 
@@ -86,6 +95,7 @@ class ProxmoxSpoke(BaseSpoke):
 
     def __init__(self, spoke_id: str, config: Dict[str, Any], control_plane=None):
         """Initialize ProxmoxSpoke instance and session caches."""
+        # Base spoke setup, plus the control plane that talks to the agents.
         super().__init__(spoke_id, config)
         self.control_plane = control_plane
         # Per-agent telemetry cache: agent_id → latest telemetry data blob
@@ -102,12 +112,15 @@ class ProxmoxSpoke(BaseSpoke):
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Route a Hub command to the right agent or handle spoke-local (GET_VERSION/UPDATE_CONFIG)."""
+        # Commands are matched case-insensitively.
         cmd = command_type.upper()
 
+        # Report the spoke's own version and commit.
         if cmd == "GET_VERSION":
             return {"status": "SUCCESS", "version": self.get_version(),
                     "commit_sha": self.get_local_commit()}
 
+        # New config: forward it to one agent, or to all of them.
         if cmd == "UPDATE_CONFIG":
             self.config = data
             if self.control_plane:
@@ -122,18 +135,23 @@ class ProxmoxSpoke(BaseSpoke):
             # Cross-tenant migration: re-tag VMs carrying old_tag -> new_tag on
             # every managed node. Broadcast to all agents (returns a LIST of
             # {agent_id, **res}); unwrap each agent's result + aggregate counts.
+            # Needs connected agents.
             if not self.control_plane:
                 return {"status": "ERROR", "message": "no control plane / agents connected"}
             results = await self.control_plane.broadcast_to_agents("PXMX_RETAG_TENANT", data)
 
             def _agent_result(item):
+                """Unwrap one agent's broadcast result to its inner data dict."""
+                # Non-dict results contribute nothing.
                 if not isinstance(item, dict):
                     return {}
+                # Responses nest the data under payload.data.
                 p = item.get("payload")
                 if isinstance(p, dict) and isinstance(p.get("data"), dict):
                     return p["data"]
                 return item
 
+            # Add up the counts; any non-success makes the overall result PARTIAL.
             unwrapped = [_agent_result(r) for r in (results or [])]
             total = sum(int(u.get("count", 0) or 0) for u in unwrapped)
             any_err = any(u.get("status") not in ("SUCCESS", None) for u in unwrapped)
@@ -142,22 +160,27 @@ class ProxmoxSpoke(BaseSpoke):
                     "message": f"re-tagged {total} VM(s) across {len(unwrapped)} node(s)"}
 
         if cmd == "SET_AGENT_CONFIG":
+            # Push a Proxmox API config to one agent.
             agent_id = data.get("agent_id")
             cfg = data.get("config", {})
             if not agent_id:
                 return {"status": "ERROR", "message": "Missing agent_id"}
             # Persist so config is re-pushed on reconnect
             self.agent_configs[agent_id] = cfg
+            # Send it now if the control plane is available.
             if self.control_plane:
                 return await self.control_plane.send_to_agent("UPDATE_CONFIG", cfg, agent_id=agent_id)
             return {"status": "ERROR", "message": "Agent not connected"}
 
+        # List the connected agents.
         if cmd == "GET_AGENTS":
             return self._get_agents()
 
+        # Hub relay commands aimed at one agent.
         if cmd == "SPOKE_RELAY":
             target = data.get("target_agent_id")
             command = data.get("command")
+            # Approve or revoke a pending agent.
             if command == "APPROVAL_SUCCESS" and target and self.control_plane:
                 await self.control_plane.approve_pending_agent(target)
                 return {"status": "SUCCESS", "message": f"Agent {target} approved"}
@@ -174,6 +197,7 @@ class ProxmoxSpoke(BaseSpoke):
                 return await self.control_plane.send_to_agent(command, inner, agent_id=target)
             return {"status": "ERROR", "error": "Unknown relay command"}
 
+        # Per-node CPU/memory stats.
         if cmd == "GET_NODE_STATS":
             return await self._get_node_stats(data)
 
@@ -181,6 +205,7 @@ class ProxmoxSpoke(BaseSpoke):
         if cmd in ("PXMX_LIST_VMS", "GET_VM_LIST", "AGENT_GET_VM_LIST"):
             return await self._list_vms(data)
 
+        # Global VM search.
         if cmd == "SEARCH_VMS":
             # Hub sends the new global-search payload; pass through scope fields
             # so _search_vms can enforce the spoke-side scoping rule.
@@ -190,6 +215,7 @@ class ProxmoxSpoke(BaseSpoke):
                 "is_admin": bool(data.get("is_admin")),
             })
 
+        # Details for one VM.
         if cmd == "GET_VM_INFO":
             return await self._get_vm_info(data)
 
@@ -238,14 +264,18 @@ class ProxmoxSpoke(BaseSpoke):
         # old typed PXMX_LIST_POOLS handler stays as a rollback fallback (a
         # rolled-back spoke still uses the typed path; RUN_COMMAND is a generic
         # primitive present on every agent, so a new spoke works against any).
+        # Collect pools from every agent in parallel.
         if cmd == "PXMX_LIST_POOLS":
             pools: list = []
             if self.control_plane:
                 agent_items = list((self.control_plane.connected_agents or {}).items())
 
                 async def _pools_one(aid, info):
+                    """Ask one agent for its pools and tag each with that agent's cluster name."""
+                    # Cluster name for tagging (falls back to the agent id).
                     cluster = info.get("cluster_name", aid)
                     out: list = []
+                    # Run `pvesh get /pools` on the agent and parse the JSON.
                     try:
                         r = await self.control_plane.send_to_agent(
                             "RUN_COMMAND",
@@ -256,10 +286,12 @@ class ProxmoxSpoke(BaseSpoke):
                             out.append({"poolid": p.get("poolid"),
                                         "comment": p.get("comment", ""),
                                         "cluster": cluster})
+                    # A slow or failing agent just contributes no pools.
                     except Exception as e:
                         logger.debug("list_pools agent %s failed: %s", aid, e)
                     return out
 
+                # Query all agents at once and merge the results.
                 for chunk in await asyncio.gather(
                         *[_pools_one(aid, info) for aid, info in agent_items]):
                     pools.extend(chunk)
@@ -276,15 +308,18 @@ class ProxmoxSpoke(BaseSpoke):
         # executor; the spoke does the parse/flatten the Agent used to do. The
         # Agent's old typed PXMX_LIST_ISOS handler stays as a rollback fallback.
         if cmd == "PXMX_LIST_ISOS":
+            # Find the agent for this node (explicit id, else by node name).
             agent_id = data.get("agent_id")
             if not agent_id:
                 agent_id = self._agent_for_node(data.get("node", ""))
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for node"}
+            # Node and cluster name for the results.
             node = data.get("node", "") or ""
             cluster = ((self.control_plane.connected_agents or {})
                         .get(agent_id, {}).get("cluster_name", agent_id))
             isos: list = []
+            # Ask the agent for its storages and keep those that hold ISOs.
             try:
                 r = await self.control_plane.send_to_agent(
                     "RUN_COMMAND",
@@ -300,22 +335,29 @@ class ProxmoxSpoke(BaseSpoke):
                             {"command": pve_cmd_builder.list_iso_content_cmd(node, storage),
                              "allow_shell": True, "timeout": 12},
                             agent_id=agent_id, timeout=15.0)
+                        # Parse the .iso entries from this storage.
                         isos.extend(pve_cmd_builder.parse_iso_items(r2, storage))
+                    # One failing storage doesn't stop the others.
                     except Exception as e:  # noqa: BLE001 - one storage failing ≠ all
                         logger.debug("iso content %s/%s failed: %s",
                                       node, storage, e)
+            # Storage list failed: return whatever was collected (possibly nothing).
             except Exception as e:
                 logger.debug("list_isos storage-list agent %s failed: %s",
                              agent_id, e)
+            # Return the ISOs with the node and cluster.
             return {"status": "SUCCESS", "isos": isos,
                     "node": node, "cluster": cluster}
 
+        # Storage list for the create-VM UI.
         if cmd == "PXMX_LIST_STORAGES":
+            # Find the agent for this node (explicit id, else by node name).
             agent_id = data.get("agent_id")
             if not agent_id:
                 agent_id = self._agent_for_node(data.get("node", ""))
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for node"}
+            # Node, and the content type to filter on (default: VM disk images).
             node = data.get("node", "") or ""
             content_filter = data.get("content") or "images"
             # #4 migration: spoke builds `pvesh get /nodes/<node>/storage` and
@@ -324,8 +366,10 @@ class ProxmoxSpoke(BaseSpoke):
             # adds node/cluster. The Agent's old typed PXMX_LIST_STORAGES handler
             # stays as a rollback fallback. The agent's list_node_storages
             # always returns [] on failure (never raises) → SUCCESS w/ empty here.
+            # Cluster name for the results.
             cluster = ((self.control_plane.connected_agents or {})
                         .get(agent_id, {}).get("cluster_name", agent_id))
+            # Run `pvesh get /nodes/<node>/storage` on the agent and filter by content type.
             try:
                 r = await self.control_plane.send_to_agent(
                     "RUN_COMMAND",
@@ -333,21 +377,29 @@ class ProxmoxSpoke(BaseSpoke):
                      "allow_shell": True, "timeout": 18},
                     agent_id=agent_id, timeout=20.0)
                 storages = pve_cmd_builder.parse_storages(r, content_filter)
+            # Failure returns an empty list.
             except Exception as e:
                 logger.debug("list_storages agent %s failed: %s", agent_id, e)
                 storages = []
+            # Return the storages with the node and cluster.
             return {"status": "SUCCESS", "storages": storages,
                     "node": node, "cluster": cluster}
 
+        # Drive health report.
         if cmd == "PXMX_DRIVE_HEALTH":
             agent_id = data.get("agent_id")
+            # Scoped to one agent or node.
             if agent_id or data.get("node"):
+                # Resolve the agent from the node name if needed.
                 if not agent_id:
                     agent_id = self._agent_for_node(data.get("node", ""))
                 if not agent_id:
                     return {"status": "ERROR", "message": "No agent resolved for node"}
+                # Cluster name for the result.
                 cluster = ((self.control_plane.connected_agents or {})
                               .get(agent_id, {}).get("cluster_name", agent_id))
+                # Ask the agent (30s, since smartctl is slow), unwrap the reply, and tag it with the
+                # cluster.
                 try:
                     r = await self.control_plane.send_to_agent(
                           "PXMX_DRIVE_HEALTH", {}, agent_id=agent_id, timeout=30.0)
@@ -355,6 +407,7 @@ class ProxmoxSpoke(BaseSpoke):
                     if isinstance(result, dict):
                         result["cluster"] = cluster
                     return result
+                # Agent failed: return an error with no drives.
                 except Exception as e:
                     logger.debug("drive_health agent %s failed: %s", agent_id, e)
                     return {"status": "ERROR", "message": str(e), "drives": [], "cluster": cluster}
@@ -362,33 +415,45 @@ class ProxmoxSpoke(BaseSpoke):
             # smartctl only sees local drives; this used to go to whichever agent
             # was first in the dict, so Diagnostics showed one server that rotated
             # as agents reconnected.
+            # All connected agents; fail if there are none.
             agents = list(((self.control_plane.connected_agents if self.control_plane else None) or {}).items())
             if not agents:
                 return {"status": "ERROR", "message": "No agent resolved for node"}
             async def _one(aid, info):
+                """Fetch one agent's drive health report, tagged with its cluster and node."""
+                # Ask the agent and unwrap the reply.
                 try:
                     r = await self.control_plane.send_to_agent(
                         "PXMX_DRIVE_HEALTH", {}, agent_id=aid, timeout=30.0)
                     result = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
+                    # Anything other than a dict is an invalid reply.
                     if not isinstance(result, dict):
                         raise ValueError("invalid reply")
+                    # Copy the result and add the cluster and node names.
                     out = dict(result)
                     out["cluster"] = info.get("cluster_name", aid)
                     out["node"] = result.get("node") or info.get("hostname") or aid
                     return out
+                # A failing agent becomes an error entry for its node.
                 except Exception as e:
                     logger.debug("drive_health agent %s failed: %s", aid, e)
                     return {"node": info.get("hostname") or aid, "cluster": info.get("cluster_name", aid), "status": "ERROR", "message": str(e) or "invalid reply", "drives": []}
+            # Query all agents in parallel and return one entry per node.
             return {"status": "SUCCESS", "nodes": list(await asyncio.gather(*[_one(aid, info) for aid, info in agents]))}
 
+        # Install the HPE array CLI on a node.
         if cmd == "PXMX_INSTALL_SSACLI":
+            # Find the agent for this node (explicit id, else by node name).
             agent_id = data.get("agent_id")
             if not agent_id:
                 agent_id = self._agent_for_node(data.get("node", ""))
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for node"}
+            # Cluster name for the result.
             cluster = ((self.control_plane.connected_agents or {})
                           .get(agent_id, {}).get("cluster_name", agent_id))
+            # Ask the agent to install it (apt can take up to 2 minutes), then unwrap and tag the
+            # reply.
             try:
                 r = await self.control_plane.send_to_agent(
                       "PXMX_INSTALL_SSACLI", {}, agent_id=agent_id, timeout=120.0)
@@ -396,6 +461,7 @@ class ProxmoxSpoke(BaseSpoke):
                 if isinstance(result, dict):
                     result["cluster"] = cluster
                 return result
+            # Agent failed: report the error.
             except Exception as e:
                 logger.debug("install_ssacli agent %s failed: %s", agent_id, e)
                 return {"status": "ERROR", "message": str(e), "installed": False, "cluster": cluster}
@@ -408,6 +474,7 @@ class ProxmoxSpoke(BaseSpoke):
         # with the ISO/disk/memory/cores args + tenant tags. The Agent's old
         # typed PXMX_CREATE_VM handler stays as a rollback fallback.
         if cmd == "PXMX_CREATE_VM":
+            # Find the agent for the target node, then create the VM through it.
             agent_id = data.get("agent_id")
             if not agent_id:
                 agent_id = self._agent_for_node(data.get("node", ""))
@@ -427,12 +494,14 @@ class ProxmoxSpoke(BaseSpoke):
         # fingerprint on its own timeout, so a slow restart still reports SUCCESS.
         # The spoke never touches Proxmox directly.
         if cmd == "INSTALL_CERT":
+            # Find the agent from the explicit id, else from the identifier or node name.
             agent_id = data.get("agent_id")
             if not agent_id:
                 agent_id = self._agent_for_node(
                     data.get("identifier") or data.get("node") or "")
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for cert install"}
+            # Forward the cert install with the long timeout and unwrap the reply.
             r = await self.control_plane.send_to_agent(
                 "INSTALL_CERT", data, agent_id=agent_id, timeout=620.0)
             r = r.get("payload", {}).get("data", r) if isinstance(r, dict) else r
@@ -450,12 +519,15 @@ class ProxmoxSpoke(BaseSpoke):
         # unique_id. Returns fast; the agent emits VNC_FRAME_UP/READY/ERROR/
         # DISCONNECT up via AGENT_RELAY_UP.
         if cmd == "VNC_START":
+            # Find the owning agent: explicit id, a known session, or the cluster in the VM's
+            # unique_id.
             session_id = data.get("session_id") or ""
             agent_id = data.get("agent_id")
             if not agent_id and session_id:
                 agent_id = self.vnc_sessions.get(session_id)
             if not agent_id:
                 # Resolve from the unique_id's cluster prefix
+                # Match the cluster prefix of "<cluster>/<node>/<vmid>" to a connected agent.
                 unique_id = data.get("unique_id") or ""
                 if "/" in unique_id and self.control_plane:
                     cluster = unique_id.split("/")[0]
@@ -463,8 +535,10 @@ class ProxmoxSpoke(BaseSpoke):
                         if info.get("cluster_name") == cluster:
                             agent_id = aid
                             break
+            # No agent found: fail.
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for VNC_START"}
+            # Remember which agent owns this session.
             if session_id:
                 self.vnc_sessions[session_id] = agent_id
                 # Phase 2: register the per-session relay token so a co-located edge
@@ -489,6 +563,7 @@ class ProxmoxSpoke(BaseSpoke):
                 "VNC_START", data, agent_id=agent_id, timeout=25.0)
             return r
 
+        # Forward a VNC frame to the session's agent without waiting for a reply.
         if cmd == "VNC_FRAME_DOWN":
             session_id = data.get("session_id") or ""
             agent_id = self.vnc_sessions.get(session_id)
@@ -496,6 +571,7 @@ class ProxmoxSpoke(BaseSpoke):
                 await self.control_plane.send_raw_to_agent(agent_id, "VNC_FRAME_DOWN", data)
             return {"status": "OK"}
 
+        # End a VNC session: forget it, drop its relay, and tell the agent.
         if cmd == "VNC_DISCONNECT":
             session_id = data.get("session_id") or ""
             agent_id = self.vnc_sessions.pop(session_id, None)
@@ -510,11 +586,13 @@ class ProxmoxSpoke(BaseSpoke):
         # fire-and-forget (high-volume keystrokes must not block the dispatch
         # loop); the agent emits SHELL_OUT/READY/ERROR/DISCONNECT up via AGENT_RELAY_UP.
         if cmd == "SHELL_START":
+            # Find the owning agent: explicit id, a known session, the VM's cluster, or any agent.
             session_id = data.get("session_id") or ""
             agent_id = data.get("agent_id")
             if not agent_id and session_id:
                 agent_id = self.shell_sessions.get(session_id)
             if not agent_id:
+                # Match the cluster prefix of the VM's unique_id to a connected agent.
                 unique_id = data.get("unique_id") or ""
                 if "/" in unique_id and self.control_plane:
                     cluster = unique_id.split("/")[0]
@@ -522,10 +600,13 @@ class ProxmoxSpoke(BaseSpoke):
                         if info.get("cluster_name") == cluster:
                             agent_id = aid
                             break
+            # Last resort: the first connected agent.
             if not agent_id and self.control_plane and self.control_plane.connected_agents:
                 agent_id = next(iter(self.control_plane.connected_agents))
+            # No agent at all: fail.
             if not agent_id:
                 return {"status": "ERROR", "message": "No agent resolved for SHELL_START"}
+            # Remember which agent owns this session.
             if session_id:
                 self.shell_sessions[session_id] = agent_id
                 # Phase 2: register the relay token so a co-located edge proxy can
@@ -538,9 +619,11 @@ class ProxmoxSpoke(BaseSpoke):
                             session_id, relay_token, agent_id, "shell")
                     except Exception:  # noqa: BLE001
                         pass
+            # Ask the agent to start the shell and return its reply.
             return await self.control_plane.send_to_agent(
                 "SHELL_START", data, agent_id=agent_id, timeout=20.0)
 
+        # Forward keystrokes or a resize to the session's agent without waiting.
         if cmd in ("SHELL_IN", "SHELL_RESIZE"):
             session_id = data.get("session_id") or ""
             agent_id = self.shell_sessions.get(session_id)
@@ -548,6 +631,7 @@ class ProxmoxSpoke(BaseSpoke):
                 await self.control_plane.send_raw_to_agent(agent_id, cmd, data)
             return {"status": "OK"}
 
+        # End a shell session: forget it, drop its relay, and tell the agent.
         if cmd == "SHELL_DISCONNECT":
             session_id = data.get("session_id") or ""
             agent_id = self.shell_sessions.pop(session_id, None)
@@ -557,6 +641,7 @@ class ProxmoxSpoke(BaseSpoke):
                 await self.control_plane.send_raw_to_agent(agent_id, "SHELL_DISCONNECT", data)
             return {"status": "OK"}
 
+        # Everything below needs the control plane.
         if not self.control_plane:
             return {"status": "ERROR", "error": "Control plane not initialised"}
 
@@ -568,8 +653,10 @@ class ProxmoxSpoke(BaseSpoke):
 
     def _get_agents(self) -> Dict[str, Any]:
         """Return connected and pending Proxmox agents with node and VM summaries."""
+        # No control plane: no agents.
         if not self.control_plane:
             return {"status": "SUCCESS", "agents": [], "pending_agents": []}
+        # Summary of every connected agent.
         agents = []
         for aid, info in self.control_plane.connected_agents.items():
             agents.append({
@@ -583,6 +670,7 @@ class ProxmoxSpoke(BaseSpoke):
                 "version":       info.get("version", "unknown"),
                 "status":        "connected",
             })
+        # Agents waiting for approval.
         pending = [
             {"agent_id": aid, "status": "pending"}
             for aid in self.control_plane.pending_agents
@@ -603,31 +691,38 @@ class ProxmoxSpoke(BaseSpoke):
 
     async def _node_stats_from_agent(self, agent_id: str) -> Dict[str, Any]:
         """Fetch node metrics and telemetry from a specific agent."""
+        # Delegate to the shared aggregation module.
         return await _pxmx_agg._node_stats_from_agent(self.control_plane, agent_id)
 
     async def _get_node_stats(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Aggregate node statistics across specified or connected agents."""
+        # Delegate to the shared aggregation module.
         return await _pxmx_agg.get_node_stats(self.control_plane, data)
 
     async def _vms_from_agent(self, agent_id: str) -> Dict[str, Any]:
         """Fetch VM and container inventory from a specific agent."""
+        # Delegate to the shared aggregation module.
         return await _pxmx_agg._vms_from_agent(self.control_plane, agent_id)
 
     async def _pool_map_from_agent(self, agent_id: str, _send, probe) -> Dict[Any, str]:
         """Retrieve resource pool mapping from an agent."""
+        # Delegate to the shared aggregation module.
         return await _pxmx_agg._pool_map_from_agent(self.control_plane, agent_id, _send, probe)
 
     async def _annotate_vm_interfaces(self, agent_id: str, vms: List[Dict[str, Any]],
                                       _send) -> None:
         """Annotate VM inventory entries with network interface details."""
+        # Delegate to the shared aggregation module.
         return await _pxmx_agg._annotate_vm_interfaces(vms, _send)
 
     async def _vm_interfaces(self, _send, v: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Query guest or config network interfaces for a VM."""
+        # Delegate to the shared aggregation module.
         return await _pxmx_agg._vm_interfaces(_send, v)
 
     async def _list_vms(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Aggregate and filter VM list across all connected agents."""
+        # Delegate to the shared aggregation module.
         return await _pxmx_agg.list_vms(self.control_plane, data)
 
     # ── VM search ─────────────────────────────────────────────────────────────
@@ -641,20 +736,25 @@ class ProxmoxSpoke(BaseSpoke):
         - no tag + non-admin → EMPTY results (never leak another tenant's VMs)
         The hub normalizes MACs to lower-colon form; VM MACs are normalized the
         same way before comparison."""
+        # Search text (lower-case) and the caller's scope.
         q = (data.get("q") or "").strip().lower()
         tag_filter = data.get("tag_filter") or ""
         is_admin = bool(data.get("is_admin"))
         # No scope key + non-admin → fail-closed empty.
         if not tag_filter and not is_admin:
             return {"status": "SUCCESS", "results": [], "count": 0}
+        # Any failure returns an error instead of crashing the spoke.
         try:
+            # Get the VM list within the caller's scope.
             all_r = await self._list_vms({"tag_filter": tag_filter})
             if all_r.get("status") != "SUCCESS":
                 return {"status": "ERROR",
                         "message": all_r.get("message") or all_r.get("error") or "list_vms failed",
                         "results": []}
+            # Check each VM against the search text.
             results = []
             for vm in all_r.get("vms", []):
+                # Text fields to match against.
                 name = (vm.get("name") or "")
                 hostname = (vm.get("hostname") or "")
                 vmid_str = str(vm.get("vmid", ""))
@@ -663,14 +763,18 @@ class ProxmoxSpoke(BaseSpoke):
                 # Gather IPs + MACs across interfaces.
                 ips = []
                 macs = []
+                # Accept either interface field name.
                 ifaces = vm.get("interfaces") or vm.get("nics") or []
                 if isinstance(ifaces, list):
                     for iface in ifaces:
+                        # Skip malformed entries.
                         if not isinstance(iface, dict):
                             continue
+                        # Normalise each MAC so it matches the hub's format.
                         mac = iface.get("mac") or iface.get("mac_address")
                         if mac:
                             macs.append(_norm_mac(mac))
+                        # Collect the interface's IPs.
                         iface_ips = iface.get("ips") or iface.get("ip_addresses") or []
                         if isinstance(iface_ips, list):
                             ips.extend([str(ip) for ip in iface_ips if ip])
@@ -680,6 +784,7 @@ class ProxmoxSpoke(BaseSpoke):
                 if not macs and vm.get("mac"):
                     macs.append(_norm_mac(vm.get("mac")))
 
+                # Match by substring on names, IDs, IPs and MACs; the VMID must match exactly.
                 matched = (
                     q in name.lower() or
                     q in hostname.lower() or
@@ -692,8 +797,10 @@ class ProxmoxSpoke(BaseSpoke):
                 if not matched:
                     continue
                 # Pick primary/matching IP + MAC for the result contract.
+                # Show the IP/MAC that matched, or the first one.
                 first_ip = next((ip for ip in ips if q in ip.lower()), ips[0] if ips else "")
                 first_mac = next((m for m in macs if q in m), macs[0] if macs else "")
+                # Build the search result entry.
                 results.append({
                     "source":    "pxmx",
                     "type":      vm.get("type", "vm"),
@@ -710,6 +817,7 @@ class ProxmoxSpoke(BaseSpoke):
                     "tags":      vm.get("tags") or [],
                     "agent_id":  vm.get("agent_id", ""),
                 })
+            # Return the matches.
             return {"status": "SUCCESS", "results": results, "count": len(results)}
         except Exception as exc:  # never crash the spoke on a search
             return {"status": "ERROR", "message": str(exc), "results": []}
@@ -734,11 +842,13 @@ class ProxmoxSpoke(BaseSpoke):
         short-circuit pool lookup + that VM's interface annotation), not a full
         LIST_VMS — the detail/VNC-ownership path is frequent and must not annotate
         the whole fleet."""
+        # Target VM: unique id, owning agent, node and VMID.
         unique_id = data.get("unique_id") or data.get("vm_id", "")
         agent_id = data.get("agent_id")
         node = data.get("node") or ""
         vmid = data.get("vmid")
 
+        # "all" means the full fleet list.
         if unique_id == "all":
             return await self._all_vms_info()
 
@@ -755,23 +865,29 @@ class ProxmoxSpoke(BaseSpoke):
                             agent_id = aid
                             break
 
+        # Otherwise find the agent from the node, or use the first connected agent.
         if not agent_id and node:
             agent_id = self._agent_for_node(node)
         if not agent_id and self.control_plane and self.control_plane.connected_agents:
             agent_id = next(iter(self.control_plane.connected_agents))
+        # No agent: fail.
         if not agent_id:
             return {"status": "ERROR", "message": f"Cannot resolve agent for '{unique_id}'"}
 
+        # Fetch the single VM.
         return await self._single_vm_info(agent_id, node, vmid, unique_id)
 
     async def _all_vms_info(self) -> Dict[str, Any]:
         """Fleet VM list across all connected agents (``vm_id:'all'``). Concurrent
         per agent; an unreachable agent is skipped (not fatal)."""
+        # No agents: empty list.
         if not self.control_plane or not self.control_plane.connected_agents:
             return {"status": "SUCCESS", "vms": [], "cluster": ""}
+        # Fetch every agent's VMs concurrently.
         aids = list(self.control_plane.connected_agents)
         results = await asyncio.gather(
             *[self._vms_from_agent(a) for a in aids], return_exceptions=True)
+        # Merge results, skipping unreachable or failing agents.
         all_vms: List[Dict[str, Any]] = []
         cluster = ""
         for aid, res in zip(aids, results):
@@ -779,6 +895,7 @@ class ProxmoxSpoke(BaseSpoke):
                 continue
             if res.get("status") == "ERROR":
                 continue
+            # Use the first cluster name seen; tag each VM with its agent.
             cluster = cluster or res.get("cluster", "")
             for vm in res.get("vms", []):
                 all_vms.append({**vm, "agent_id": aid})
@@ -790,25 +907,34 @@ class ProxmoxSpoke(BaseSpoke):
         status, tags, cpu, mem) + a short-circuit pool lookup + that VM's
         interface annotation. Falls back to per-node /qemu+/lxc if the VM isn't
         in /cluster/resources."""
+        # This agent's cluster name.
         info = (self.control_plane.connected_agents or {}).get(agent_id, {}) \
             if self.control_plane else {}
         cluster = info.get("cluster_name", agent_id)
 
         async def _send(cmd: str, timeout: float = 12.0):
+            """Run a shell command on the agent via RUN_COMMAND and return its reply."""
+            # Wrap the command in a RUN_COMMAND request.
             return await self.control_plane.send_to_agent(
                 "RUN_COMMAND",
                 {"command": cmd, "allow_shell": True, "timeout": timeout},
                 agent_id=agent_id, timeout=15.0)
 
+        # Read the pool listing first; this also checks the agent is reachable.
         probe = await _send(pve_cmd_builder.list_pools_cmd())
         if isinstance(probe, dict) and probe.get("status") == "ERROR":
             return {"status": "ERROR",
                     "message": probe.get("message", f"agent {agent_id} unreachable")}
 
+        # Any failure is logged and returned as an error.
         try:
+            # Which pool the VM belongs to (may be empty).
             pool = await self._pool_for_vmid(agent_id, _send, probe, vmid)
 
             def _match(v):
+                """True if ``v`` is the requested VM (and on the requested node, if one was given).
+                """
+                # Compare VMIDs as strings; check the node only when specified.
                 return str(v.get("vmid")) == str(vmid) and (not node or v.get("node") == node)
 
             # Primary: /cluster/resources.
@@ -826,10 +952,12 @@ class ProxmoxSpoke(BaseSpoke):
                     if vm is not None:
                         break
 
+            # Not found anywhere: fail.
             if vm is None:
                 return {"status": "ERROR",
                         "message": f"VM {unique_id} not found on agent {agent_id}"}
 
+            # Add the pool and the network interfaces.
             if pool:
                 vm["pool"] = pool
             await self._annotate_vm_interfaces(agent_id, [vm], _send)
@@ -839,6 +967,7 @@ class ProxmoxSpoke(BaseSpoke):
             # fail-closed ownership probe (pxmx_vm.py:43).
             vm["vm_status"] = vm.pop("status")
             return {"status": "SUCCESS", **vm}
+        # Unexpected error: log and report it.
         except Exception as e:
             logger.warning("pxmx GET_VM_INFO %s failed: %s", unique_id, e)
             return {"status": "ERROR", "message": str(e)}
@@ -848,16 +977,21 @@ class ProxmoxSpoke(BaseSpoke):
         the ``/pools`` probe (no extra round-trip); fetches ``/pools/{pid}`` detail
         only for pools whose listing didn't include members inline, stopping at the
         first hit. ``""`` on any failure (best-effort — pool isn't a hard gate)."""
+        # Any failure returns "" (pool is optional).
         try:
+            # Walk the pools from the listing.
             listing = pve_cmd_builder.parse_pools_listing_for_members(probe)
             for p in listing:
+                # Fetch members only for pools whose listing didn't include them.
                 members = p.get("members")
                 if members is None:
                     detail = await _send(pve_cmd_builder.pool_detail_cmd(p["poolid"]))
                     members = pve_cmd_builder.pool_detail_members(detail)
+                # Return the first pool that contains the VM.
                 for m in (members if isinstance(members, list) else []):
                     if isinstance(m, dict) and str(m.get("vmid")) == str(vmid):
                         return p["poolid"]
+            # Not in any pool.
             return ""
         except Exception as e:  # best-effort
             logger.debug("pxmx pool-for-vmid %s unavailable: %s", agent_id, e)
@@ -873,14 +1007,18 @@ class ProxmoxSpoke(BaseSpoke):
         wins over the membership match: every agent in a cluster lists every
         member in ``nodes``, so node-local commands (PXMX_DRIVE_HEALTH runs
         smartctl on its own host) would otherwise all land on one agent."""
+        # No control plane or no agents: nothing to resolve.
         if not self.control_plane:
             return None
         agents = self.control_plane.connected_agents or {}
         if not agents:
             return None
+        # Match by node name when given.
         if node:
+            # Compare on the short hostname (before the first dot).
             node_l = node.lower()
             short_node = node_l.split(".")[0]
+            # First choice: the agent running on that host.
             for aid, info in agents.items():
                 if str(info.get("hostname") or "").lower().split(".")[0] == short_node:
                     return aid
@@ -892,14 +1030,17 @@ class ProxmoxSpoke(BaseSpoke):
                 # "first connected agent" fallback below.
                 names = [str(n.get("node") if isinstance(n, dict) else n).lower()
                          for n in (info.get("nodes") or [])]
+                # Second choice: an agent whose cluster includes that node.
                 if node_l in names:
                     return aid
+        # Fallback: the first connected agent.
         return next(iter(agents))
 
     def _resolve_agent_for_vm(self, data: Dict[str, Any]) -> Optional[str]:
         """Resolve the agent_id for a VM command: explicit ``agent_id`` → the
         ``unique_id`` cluster prefix → fall back to the first connected agent.
         Returns ``None`` when no agent is connected."""
+        # Explicit agent id, or the agent whose cluster matches the unique_id prefix.
         agent_id = data.get("agent_id")
         unique_id = data.get("unique_id", "")
         if not agent_id and "/" in unique_id and self.control_plane:
@@ -908,6 +1049,7 @@ class ProxmoxSpoke(BaseSpoke):
                 if info.get("cluster_name") == cluster:
                     agent_id = aid
                     break
+        # Otherwise use the first connected agent (None if there are none).
         if not agent_id:
             if not self.control_plane or not self.control_plane.connected_agents:
                 return None
@@ -920,16 +1062,24 @@ class ProxmoxSpoke(BaseSpoke):
         """One VM action via RUN_COMMAND. Returns a bulk-row-shaped dict:
         ``{vmid, ok: True, ...action-result}`` or ``{vmid, ok: False, error}``.
         Used by both the single PXMX_VM_ACTION (one item) and the bulk path."""
+        # Item details: VMID, guest type, and optional snapshot/backup options.
         vmid = item.get("vmid")
         kind = (item.get("type") or "").lower()
         snapshot_name = item.get("snapshot_name")
         backup_opts = item.get("backup") or {}
+        # Any failure becomes an error row for this VM.
         try:
+            # A VMID is required.
             if vmid is None:
                 raise pve_cmd_builder.PveCmdError("vmid is required")
             vid = int(vmid)
 
             async def _send(cmd: str, timeout: float = 30.0):
+                """
+                Run a shell command on the agent via RUN_COMMAND (relay timeout slightly longer than
+                the command's).
+                """
+                # Wrap the command in a RUN_COMMAND request.
                 return await self.control_plane.send_to_agent(
                     "RUN_COMMAND",
                     {"command": cmd, "allow_shell": True, "timeout": timeout},
@@ -940,6 +1090,7 @@ class ProxmoxSpoke(BaseSpoke):
                 kind = pve_cmd_builder.kind_from_probe(
                     await _send(pve_cmd_builder.detect_kind_cmd(vid), timeout=10.0))
 
+            # Normalised action name and the VM's node.
             act = (action or "").lower()
             node = str(item.get("node") or "").strip()
             if act == "snapshot" and node:
@@ -950,6 +1101,7 @@ class ProxmoxSpoke(BaseSpoke):
                     raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
                 return {"ok": True, "vmid": vid, "action": act, "kind": kind,
                         "snapshot": snapshot_name or pve_cmd_builder.default_snapshot_name()}
+            # Simple qm/pct actions: run them and check the exit code.
             if act in ("start", "stop", "snapshot"):
                 cmd = pve_cmd_builder.vm_action_cmd(vid, act, kind, snapshot_name)
                 r = await _send(cmd, timeout=30.0)
@@ -959,6 +1111,7 @@ class ProxmoxSpoke(BaseSpoke):
                 if act == "snapshot":
                     row["snapshot"] = snapshot_name or pve_cmd_builder.default_snapshot_name()
                 return {"ok": True, **row}
+            # List snapshots through the cluster API (needs the node).
             if act == "list_snapshots":
                 if not node:
                     raise pve_cmd_builder.PveCmdError("list_snapshots: node is required")
@@ -967,6 +1120,7 @@ class ProxmoxSpoke(BaseSpoke):
                     raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
                 return {"ok": True, "vmid": vid, "action": act, "kind": kind,
                         "snapshots": pve_cmd_builder.parse_snapshots(r)}
+            # Delete a named snapshot.
             if act == "delete_snapshot":
                 if not snapshot_name:
                     raise pve_cmd_builder.PveCmdError("delete_snapshot: snapshot_name is required")
@@ -989,6 +1143,7 @@ class ProxmoxSpoke(BaseSpoke):
                 return {"ok": True, "vmid": vid, "action": "reboot", "kind": kind,
                         "method": "reset" if kind == "qemu" else "reboot",
                         "started": True}
+            # Backup: needs a configured storage that exists on this host.
             if act == "backup":
                 storage = str((backup_opts or {}).get("storage") or "").strip()
                 if not storage:
@@ -998,12 +1153,14 @@ class ProxmoxSpoke(BaseSpoke):
                 if not pve_cmd_builder.storage_present(r, storage):
                     raise pve_cmd_builder.PveCmdError(
                         f"backup: storage '{storage}' not found on this host")
+                # Backup mode (default snapshot) and how many backups to keep.
                 mode = pve_cmd_builder.normalize_backup_mode(
                     (backup_opts or {}).get("mode") or "snapshot")
                 try:
                     keep = int((backup_opts or {}).get("keep") or 0)
                 except (TypeError, ValueError):
                     keep = 0
+                # Start vzdump in the background and report that it started.
                 await _send(pve_cmd_builder.vzdump_cmd(vid, storage, mode, keep),
                             timeout=15.0)
                 return {"ok": True, "vmid": vid, "action": "backup",
@@ -1027,9 +1184,12 @@ class ProxmoxSpoke(BaseSpoke):
                     raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
                 return {"ok": True, "vmid": vid, "action": "destroy",
                         "kind": kind, "purged": True}
+            # Anything else is an unknown action.
             raise pve_cmd_builder.PveCmdError(f"unknown vm action: {action}")
+        # Expected failures become a clean error row.
         except pve_cmd_builder.PveCmdError as e:
             return {"vmid": vmid, "ok": False, "error": str(e)}
+        # Unexpected failures are logged too.
         except Exception as e:  # noqa: BLE001 - one VM must not sink the bulk
             logger.warning("pxmx VM_ACTION agent %s vmid=%s: %s", agent_id, vmid, e)
             return {"vmid": vmid, "ok": False, "error": str(e)}
@@ -1038,6 +1198,7 @@ class ProxmoxSpoke(BaseSpoke):
                                    data: Dict[str, Any]) -> Dict[str, Any]:
         """Single PXMX_VM_ACTION via RUN_COMMAND. Wraps :meth:`_vm_action_one`
         and maps the row to the SUCCESS/ERROR envelope the typed handler sent."""
+        # Run the single action and convert the row to a SUCCESS/ERROR response.
         row = await self._vm_action_one(agent_id, data, data.get("action"))
         if row.get("ok"):
             return {"status": "SUCCESS", **{k: v for k, v in row.items() if k != "ok"}}
@@ -1049,16 +1210,19 @@ class ProxmoxSpoke(BaseSpoke):
         mirroring the Agent's ``_bulk_one``; send_to_agent multiplexes in-flight
         requests per agent). Merges the per-item rows; one VM's failure never
         sinks the rest."""
+        # Valid items, the action, and the connected agents.
         items = [it for it in (data.get("items") or []) if isinstance(it, dict)]
         action = data.get("action")
         agents = (self.control_plane.connected_agents if self.control_plane else None) or {}
         if not agents:
             return {"status": "ERROR", "message": "No agents connected"}
+        # Map each cluster name to its first agent.
         cluster_to_agent: Dict[str, str] = {}
         for aid, info in agents.items():
             cn = info.get("cluster_name")
             if cn and cn not in cluster_to_agent:
                 cluster_to_agent[cn] = aid
+        # Group items by owning agent (explicit id, cluster prefix, or the default agent).
         default_agent = next(iter(agents))
         groups: Dict[str, list] = {}
         for it in items:
@@ -1075,14 +1239,20 @@ class ProxmoxSpoke(BaseSpoke):
         # requests per agent). _vm_action_one returns an error row instead of
         # raising, so one VM's failure never sinks the rest.
         async def _bulk_agent(aid, grp) -> list:
+            """Run one agent's items concurrently (at most 6 at a time) and return their rows."""
+            # Per-agent concurrency limit.
             sem = asyncio.Semaphore(6)
 
             async def _run_one(it):
+                """Run one item under the agent's concurrency limit."""
+                # Wait for a free slot, then run the action.
                 async with sem:
                     return await self._vm_action_one(aid, it, action)
 
+            # Run all items for this agent.
             return list(await asyncio.gather(*[_run_one(it) for it in grp]))
 
+        # Run all agents in parallel and merge their rows.
         merged: list = []
         for rows in await asyncio.gather(
                 *[_bulk_agent(aid, grp) for aid, grp in groups.items()]):
@@ -1093,10 +1263,12 @@ class ProxmoxSpoke(BaseSpoke):
         """Next free VMID via RUN_COMMAND: atomic ``/cluster/nextid`` first; on
         any failure fall back to ``max(qm list ∪ pct list)+1`` (two round-trips).
         Mirrors the Agent's ``next_free_vmid``."""
+        # Try the atomic /cluster/nextid first.
         vid = pve_cmd_builder.parse_next_free_vmid(
             await _send(pve_cmd_builder.next_free_vmid_cmd(), timeout=15.0))
         if vid is not None:
             return vid
+        # Fallback: collect every VMID in use from qm and pct lists.
         used: list = []
         for c in (pve_cmd_builder.qm_list_cmd(), pve_cmd_builder.pct_list_cmd()):
             try:
@@ -1104,6 +1276,7 @@ class ProxmoxSpoke(BaseSpoke):
                     await _send(c, timeout=20.0)))
             except Exception as e:  # noqa: BLE001 - best-effort fallback source
                 logger.debug("pxmx nextid fallback %s: %s", c, e)
+        # Next number after the highest in use.
         return pve_cmd_builder.next_free_vmid_fallback(used)
 
     async def _clone_vm_via_agent(self, agent_id: str,
@@ -1113,16 +1286,21 @@ class ProxmoxSpoke(BaseSpoke):
         auto-assigns a free VMID (atomic /cluster/nextid), clones, inherits the
         template's tags + appends the tenant labels (best-effort), and stamps the
         new VM's tags. Mirrors the Agent's PXMX_CLONE_VM handler."""
+        # This agent's cluster name.
         cluster = ((self.control_plane.connected_agents or {}).get(agent_id, {})
                    .get("cluster_name", agent_id)) if self.control_plane else agent_id
 
         async def _send(cmd: str, timeout: float = 600.0):
+            """Run a shell command on the agent via RUN_COMMAND (default 10 minutes, for clones)."""
+            # Wrap the command in a RUN_COMMAND request.
             return await self.control_plane.send_to_agent(
                 "RUN_COMMAND",
                 {"command": cmd, "allow_shell": True, "timeout": timeout},
                 agent_id=agent_id, timeout=timeout + 5.0)
 
+        # Expected errors become ERROR responses; unexpected ones are also logged.
         try:
+            # Template node and VMID from its unique_id, or from explicit fields.
             tuid = data.get("template_unique_id") or data.get("unique_id") or ""
             if tuid and "/" in tuid:
                 parts = tuid.split("/")
@@ -1131,20 +1309,24 @@ class ProxmoxSpoke(BaseSpoke):
             else:
                 node = data.get("node") or ""
                 template_vmid = data.get("template_vmid")
+            # A template and a name are required.
             if template_vmid is None:
                 raise pve_cmd_builder.PveCmdError(
                     "template_vmid or template_unique_id required")
             name = (data.get("name") or "").strip()
             if not name:
                 raise pve_cmd_builder.PveCmdError("name is required")
+            # Detect the guest type if not given.
             kind = (data.get("type") or "").lower()
             if kind not in ("qemu", "lxc"):
                 kind = pve_cmd_builder.kind_from_probe(
                     await _send(pve_cmd_builder.detect_kind_cmd(template_vmid),
                                 timeout=10.0))
+            # Pick a free VMID if none was given.
             new_vmid = data.get("new_vmid")
             if new_vmid is None:
                 new_vmid = await self._next_free_vmid_via_agent(_send)
+            # Optional pool and the tenant tags to add.
             pool = (data.get("pool") or "").strip() or None
             ttags_in = data.get("tenant_tags") or (
                 [data.get("tenant_tag")] if data.get("tenant_tag") else [])
@@ -1166,11 +1348,13 @@ class ProxmoxSpoke(BaseSpoke):
                 tags = pve_cmd_builder.parse_config_tags(cfg)
             except Exception as e:  # noqa: BLE001
                 logger.debug("clone: template tags %s/%s: %s", node, template_vmid, e)
+            # Add each tenant tag that isn't already present (case-insensitive).
             lower_tags = {t.lower() for t in tags}
             for tt in tenant_tags:
                 if tt.lower() not in lower_tags:
                     tags.append(tt)
                     lower_tags.add(tt.lower())
+            # Write the combined tags to the new VM; failures are only logged.
             if tags:
                 try:
                     r2 = await _send(pve_cmd_builder.set_tags_cmd(
@@ -1181,6 +1365,7 @@ class ProxmoxSpoke(BaseSpoke):
                 except Exception as e:  # noqa: BLE001
                     logger.warning("clone: tag set failed for new VM %s: %s", new_vmid, e)
 
+            # Report the new VM.
             return {"status": "SUCCESS",
                     "unique_id": f"{cluster}/{node}/{new_vmid}",
                     "cluster": cluster, "node": node, "vmid": int(new_vmid),
@@ -1198,16 +1383,21 @@ class ProxmoxSpoke(BaseSpoke):
         via ``pvesh create /nodes/<node>/qemu`` (cluster-wide), auto-assigns a
         free VMID (atomic /cluster/nextid), and tags it with the acting tenant's
         labels. Mirrors the Agent's PXMX_CREATE_VM handler."""
+        # This agent's cluster name.
         cluster = ((self.control_plane.connected_agents or {}).get(agent_id, {})
                    .get("cluster_name", agent_id)) if self.control_plane else agent_id
 
         async def _send(cmd: str, timeout: float = 120.0):
+            """Run a shell command on the agent via RUN_COMMAND (default 2 minutes)."""
+            # Wrap the command in a RUN_COMMAND request.
             return await self.control_plane.send_to_agent(
                 "RUN_COMMAND",
                 {"command": cmd, "allow_shell": True, "timeout": timeout},
                 agent_id=agent_id, timeout=timeout + 5.0)
 
+        # Expected errors become ERROR responses; unexpected ones are also logged.
         try:
+            # Node, name and ISO are required.
             node = (data.get("node") or "").strip()
             if not node:
                 raise pve_cmd_builder.PveCmdError("node is required")
@@ -1217,13 +1407,16 @@ class ProxmoxSpoke(BaseSpoke):
             volid = (data.get("volid") or "").strip()
             if not volid:
                 raise pve_cmd_builder.PveCmdError("volid (ISO) is required")
+            # Pick a free VMID if none was given.
             new_vmid = data.get("new_vmid")
             if new_vmid is None:
                 new_vmid = await self._next_free_vmid_via_agent(_send)
+            # Tenant tags, as a ";"-joined string for Proxmox.
             ttags_in = data.get("tenant_tags") or (
                 [data.get("tenant_tag")] if data.get("tenant_tag") else [])
             tenant_tags = [str(t).strip() for t in ttags_in if str(t).strip()]
             tags_joined = ";".join(tenant_tags)
+            # VM sizing with defaults: 2 GiB RAM, 2 cores, 32 GB disk on local-lvm, NIC on vmbr0.
             pool = (data.get("pool") or "").strip() or None
             memory_mb = int(data.get("memory_mb") or 2048)
             cores = int(data.get("cores") or 2)
@@ -1231,19 +1424,23 @@ class ProxmoxSpoke(BaseSpoke):
             disk_gb = int(data.get("disk_gb") or 32)
             bridge = (data.get("bridge") or "vmbr0").strip() or "vmbr0"
 
+            # pvesh create arguments for a Linux VM booting from the ISO.
             args = ["--vmid", str(new_vmid), "--name", name, "--cdrom", volid,
                     "--memory", str(memory_mb), "--cores", str(cores),
                     "--scsi0", f"{disk_storage}:{disk_gb}",
                     "--net0", f"virtio,bridge={bridge}", "--ostype", "l26"]
+            # Optional pool and tags.
             if pool:
                 args += ["--pool", pool]
             if tags_joined:
                 args += ["--tags", tags_joined]
+            # Create the VM and check the result.
             r = await _send(pve_cmd_builder.pvesh_create_cmd(
                 f"/nodes/{node}/qemu", args), timeout=120.0)
             if not pve_cmd_builder.runner_ok(r):
                 raise pve_cmd_builder.PveCmdError(pve_cmd_builder.runner_err(r))
 
+            # Report the new VM.
             return {"status": "SUCCESS",
                     "unique_id": f"{cluster}/{node}/{new_vmid}",
                     "cluster": cluster, "node": node, "vmid": int(new_vmid),
@@ -1259,9 +1456,11 @@ class ProxmoxSpoke(BaseSpoke):
 
     async def get_status(self) -> Dict[str, Any]:
         """Return spoke health — agent count, total VMs across agents, and a HEALTHY/NO_AGENTS status."""
+        # Connected agents and the total VMs they report.
         agent_count = len(self.control_plane.connected_agents) if self.control_plane else 0
         total_vms   = sum(len(info.get("vms", [])) for info in
                           (self.control_plane.connected_agents.values() if self.control_plane else []))
+        # Status summary for the hub.
         return {
             "spoke_id":    self.spoke_id,
             "module":      "proxmox",
@@ -1272,7 +1471,9 @@ class ProxmoxSpoke(BaseSpoke):
 
     def get_version(self) -> str:
         """Return the pxmx spoke version from the VERSION file, or ``"unknown"``."""
+        # Path is only needed here.
         from pathlib import Path
+        # Read the VERSION file at the repo root.
         try:
             return (Path(__file__).parent.parent / "VERSION").read_text().strip()
         except Exception:
@@ -1283,11 +1484,14 @@ class ProxmoxSpoke(BaseSpoke):
         as the VERSION file in get_version()). '' if this isn't a git
         checkout or git isn't available — never raises. Process-lifetime
         cached: the commit only changes on a restart-triggering update."""
+        # Return the cached value if we already looked it up.
         cached = getattr(self, "_local_commit_cache", None)
         if cached is not None:
             return cached
+        # Only needed here.
         from pathlib import Path
         import subprocess
+        # Ask git for the current commit; any failure leaves it empty.
         sha = ""
         try:
             repo_root = Path(__file__).parent.parent
@@ -1299,5 +1503,6 @@ class ProxmoxSpoke(BaseSpoke):
                 sha = out.stdout.strip()
         except Exception:
             pass
+        # Cache and return it.
         self._local_commit_cache = sha
         return sha
