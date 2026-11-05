@@ -3,7 +3,7 @@ import hashlib
 from pathlib import Path
 
 # Same constant is pinned in lm/core/tests/test_hub_discovery_sync.py; bump both together.
-EXPECTED_SHA = "5664e2693d483f25c37f643114c7dea39a1333bacf0d7fc67d73b322914c179e"
+EXPECTED_SHA = "0093536759f550721400c5307802bc2417a5f7f3b4561e37814f61c5476b2f11"
 
 
 def test_pxmx_discovery_in_sync():

@@ -33,6 +33,7 @@ disappearance with a clean log points at VBUS/PHY (→ power-cycle territory),
 which is a materially different fix from link errors or autosuspend.
 """
 
+# Standard library: async, deep copy, file globbing, JSON, logging, OS, regex, time.
 import asyncio
 import copy as _copy
 import glob
@@ -43,6 +44,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+# Shared agent logger.
 logger = logging.getLogger("PxmxAgent")
 
 
@@ -52,10 +54,12 @@ def _text(raw) -> str:
     ``TypeError: a bytes-like object is required, not 'str'`` on the first
     ``"usb" not in line`` and took the whole collect() down, so every host
     reported an EMPTY diagnostic while the presence roster kept updating."""
+    # Decode bytes; pass strings through (None becomes "").
     if isinstance(raw, bytes):
         return raw.decode("utf-8", "replace")
     return raw or ""
 
+# State directory and the presence roster file.
 PXMLIB = "/var/lib/pxmx"
 USB_PRESENCE_FILE = f"{PXMLIB}/usb_presence.json"
 # Boot-anchored baseline: what the host could see shortly after THIS boot.
@@ -129,6 +133,7 @@ _KERNEL_BUS_RE = re.compile(r"usb (\d+-[\d.]+)")
 def boot_id() -> str:
     """Kernel boot id — changes on every reboot, stable across agent restarts.
     Anchors the baseline to a BOOT rather than to a process lifetime."""
+    # Read the kernel's boot id; empty if unavailable.
     try:
         with open("/proc/sys/kernel/random/boot_id") as f:
             return f.read().strip()
@@ -137,6 +142,8 @@ def boot_id() -> str:
 
 
 def _uptime_s() -> Optional[float]:
+    """Seconds since boot from /proc/uptime, or None if it can't be read."""
+    # First field of /proc/uptime is the uptime in seconds.
     try:
         with open("/proc/uptime") as f:
             return float(f.read().split()[0])
@@ -145,6 +152,8 @@ def _uptime_s() -> Optional[float]:
 
 
 def _load_boot_baseline() -> Dict[str, Any]:
+    """Load the saved boot baseline; empty dict if missing or unreadable."""
+    # Read and parse the file if it exists and isn't empty.
     try:
         if os.path.exists(USB_BOOT_FILE) and os.path.getsize(USB_BOOT_FILE) > 0:
             with open(USB_BOOT_FILE) as f:
@@ -169,11 +178,14 @@ def capture_boot_baseline(present_by_bus: Dict[str, Any],
     (agent installed or restarted mid-session) — it is then a mid-life sample,
     not a boot snapshot, and the UI must not present it as one.
     """
+    # Current time, boot id and any saved baseline.
     now = time.time() if now is None else now
     bid = boot_id()
     cur = _load_boot_baseline()
+    # Same boot: keep the existing baseline.
     if cur.get("boot_id") == bid and bid:
         return cur
+    # New boot: build a fresh baseline.
     up = _uptime_s()
     baseline = {
         "boot_id": bid,
@@ -192,6 +204,7 @@ def capture_boot_baseline(present_by_bus: Dict[str, Any],
                       "pci_controller": usb_device_controller(b)}
                   for b, i in (present_by_bus or {}).items()},
     }
+    # Save it atomically (temp file then rename) and log it.
     try:
         os.makedirs(PXMLIB, exist_ok=True)
         tmp = f"{USB_BOOT_FILE}.tmp"
@@ -201,6 +214,7 @@ def capture_boot_baseline(present_by_bus: Dict[str, Any],
         logger.info("usb_diagnostics: boot baseline captured — %d dongle(s), "
                     "%.0fs into boot%s", baseline["count"], up or -1,
                     "" if baseline["trusted"] else " (NOT a boot snapshot)")
+    # A write failure is only logged.
     except OSError as e:
         logger.debug("usb_diagnostics: boot baseline write failed: %s", e)
     return baseline
@@ -215,16 +229,20 @@ def lost_since_boot(baseline: Dict[str, Any], present_by_bus: Dict[str, Any],
     confused by renumbering. Entries whose controller has since been passed
     through to a VM are still excluded: those left the host on purpose.
     """
+    # Passthrough controllers, roster, and the result list.
     pt = passthrough_addrs or set()
     ros = roster or {}
     out: List[Dict[str, Any]] = []
+    # Check each bus from the baseline.
     for bus, info in ((baseline or {}).get("buses") or {}).items():
+        # Still present: not lost.
         if bus in (present_by_bus or {}):
             continue
         # Baseline's own record first — written while the dongle was present at
         # boot. The roster is a fallback for baselines predating this stamping.
         ctrl = ((info or {}).get("pci_controller")
                 or (ros.get(bus) or {}).get("pci_controller") or "")
+        # Record the lost bus.
         out.append({"bus_path": bus,
                     "vidpid": (info or {}).get("vidpid") or "",
                     "product": (info or {}).get("product") or bus,
@@ -235,12 +253,14 @@ def lost_since_boot(baseline: Dict[str, Any], present_by_bus: Dict[str, Any],
                     # a loss. Reported rather than dropped so the count stays
                     # explainable ("4 of 5 absent are passthrough").
                     "passed_through": bool(ctrl and ctrl in pt)})
+    # Sort by bus path.
     out.sort(key=lambda x: x["bus_path"])
     return out
 
 
 # ── presence roster ──────────────────────────────────────────────────────────
 
+# (file key, parsed roster) for the read cache.
 _ROSTER_CACHE: Optional[tuple] = None
 
 
@@ -256,25 +276,31 @@ def _load_roster() -> Dict[str, Any]:
     poisoned by every caller. Deep-copying ~20 small dicts is microseconds --
     still far cheaper than the file read and JSON parse it replaces.
     """
+    # Use the cache when the file hasn't changed.
     global _ROSTER_CACHE
+    # Stat the file; empty file means empty roster.
     try:
         st = os.stat(USB_PRESENCE_FILE)
         if st.st_size <= 0:
             return {}
+        # Same mtime and size: serve a copy from the cache.
         key = (st.st_mtime_ns, st.st_size)
         if _ROSTER_CACHE is not None and _ROSTER_CACHE[0] == key:
             return _copy.deepcopy(_ROSTER_CACHE[1])
+        # Otherwise parse the file and cache it.
         with open(USB_PRESENCE_FILE) as f:
             d = json.load(f)
         d = d if isinstance(d, dict) else {}
         _ROSTER_CACHE = (key, d)
         return _copy.deepcopy(d)
+    # Read errors are logged and give an empty roster.
     except (OSError, json.JSONDecodeError) as e:
         logger.debug("usb_diagnostics: roster read failed: %s", e)
     return {}
 
 
 def _save_roster(d: Dict[str, Any]) -> None:
+    """Atomically write the presence roster, invalidating the read cache first."""
     # Invalidate the read cache FIRST. _load_roster keys on (mtime_ns, size),
     # and record_presence is read-modify-write: a rewrite of the same byte
     # length inside one mtime tick is indistinguishable from no change, so the
@@ -283,12 +309,14 @@ def _save_roster(d: Dict[str, Any]) -> None:
     # the cache correct regardless of filesystem timestamp resolution.
     global _ROSTER_CACHE
     _ROSTER_CACHE = None
+    # Write to a temp file and rename it into place.
     try:
         os.makedirs(PXMLIB, exist_ok=True)
         tmp = f"{USB_PRESENCE_FILE}.tmp"
         with open(tmp, "w") as f:
             json.dump(d, f)
         os.replace(tmp, USB_PRESENCE_FILE)   # atomic: a torn write loses the history
+    # A write failure is only logged.
     except OSError as e:
         logger.debug("usb_diagnostics: roster write failed: %s", e)
 
@@ -301,15 +329,20 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
     Returns the updated roster. A bus that reappears clears its ``missing_since``
     so a flapping dongle doesn't read as permanently gone.
     """
+    # Current time and the saved roster.
     now = time.time() if now is None else now
     roster = _load_roster()
+    # Read the slot map and boot id once for all devices.
     _slots = _pci_slot_map()          # read once, identical for every device
     _bid = boot_id()
+    # Controllers now passed through to VMs (empty if that can't be read).
     try:
         _pt_addrs = set(passthrough_controllers())
     except Exception:  # noqa: BLE001 — a missing set must not block the roster
         _pt_addrs = set()
+    # Update the entry for each dongle seen this tick.
     for bus, info in (present_by_bus or {}).items():
+        # Refresh its identity fields, keeping old values when the scan lacks them.
         e = roster.get(bus) or {}
         e["vidpid"] = (info or {}).get("vidpid") or e.get("vidpid") or ""
         e["product"] = (info or {}).get("product") or e.get("product") or ""
@@ -344,8 +377,10 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
                     roster.pop(_ob, None)
                     logger.info("usb_diagnostics: %s renumbered to %s (same port "
                                 "%s) — merged history", _ob, bus, _sid)
+        # Mark it seen now (first_seen only once).
         e.setdefault("first_seen", now)
         e["last_seen"] = now
+        # It was missing and is back: record how long it was gone.
         _ms = e.get("missing_since")
         if _ms is not None:
             try:
@@ -353,6 +388,7 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
             except (TypeError, ValueError):
                 _absent = 0.0
             e["last_absence_s"] = round(_absent, 1)
+            # Keep the last few absence durations.
             _hist = list(e.get("recent_absences") or [])
             _hist.append(round(_absent, 1))
             e["recent_absences"] = _hist[-_ABSENCE_SAMPLES:]
@@ -371,16 +407,20 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
                 logger.info("usb_diagnostics: %s returned after %.0fs absent — "
                             "treating as a REPLACED dongle (flaps return in seconds)",
                             bus, _absent)
+        # Clear the missing markers and save the entry.
         e["missing_since"] = None
         e.pop("missing_boot_id", None)
         e.pop("missing_passthrough", None)
         roster[bus] = e
     # Stamp the moment each known-but-absent bus went away, and expire entries
     # whose dongle has been gone long enough to count as removed, not lost.
+    # Process the dongles we know about that weren't seen this tick.
     for bus in list(roster):
         e = roster.get(bus) or {}
+        # Present ones were handled above.
         if bus in (present_by_bus or {}):
             continue
+        # Newly missing: stamp when and in which boot.
         if e.get("missing_since") is None:
             e["missing_since"] = now
             # Captured when it goes absent: on return this is the only way to
@@ -395,10 +435,13 @@ def record_presence(present_by_bus: Dict[str, Dict[str, Any]],
         # absence is not evidence of a human.
         if (e.get("pci_controller") or "") in _pt_addrs:
             e["missing_passthrough"] = True
+        # Gone longer than the TTL: drop it from the roster.
         if now - float(e.get("last_seen") or now) > ROSTER_TTL_S:
             roster.pop(bus, None)
             continue
+        # Keep the updated entry.
         roster[bus] = e
+    # Save and return the roster.
     _save_roster(roster)
     return roster
 
@@ -413,16 +456,20 @@ def _stable_id(bus: str, controller: str) -> str:
     a host with 18 physical dongles and two reboots reported 23 "ever seen",
     which is where the phantom missing entries came from.
     """
+    # Needs a controller and a bus path with a port chain.
     if not controller or "-" not in bus:
         return ""
+    # Controller address plus the port chain.
     return f"{controller}:{bus.split('-', 1)[1]}"
 
 
 def _observed_s(entry: Dict[str, Any]) -> Optional[int]:
     """Seconds between a roster entry's first and last sighting."""
+    # Both timestamps must be numbers, in order.
     fs, ls = (entry or {}).get("first_seen"), (entry or {}).get("last_seen")
     if isinstance(fs, (int, float)) and isinstance(ls, (int, float)) and ls >= fs:
         return int(ls - fs)
+    # Unknown.
     return None
 
 
@@ -433,6 +480,7 @@ def _is_established(entry: Dict[str, Any]) -> bool:
     stick plugged in for ten minutes became a permanent "missing" row the moment
     it was pulled — noise that would bury the real losses.
     """
+    # Established once observed for at least the minimum age.
     obs = _observed_s(entry)
     return obs is not None and obs >= INVENTORY_MIN_AGE_S
 
@@ -443,6 +491,7 @@ def purge_history() -> Dict[str, Any]:
     pulled), where the recorded history describes a machine that no longer
     exists and would otherwise report permanent phantom losses. The next pass
     rebuilds both from what is actually attached."""
+    # Delete each history file that exists.
     removed = []
     for f in (USB_PRESENCE_FILE, USB_BOOT_FILE):
         try:
@@ -451,6 +500,7 @@ def purge_history() -> Dict[str, Any]:
                 removed.append(os.path.basename(f))
         except OSError as e:
             logger.warning("usb_diagnostics: purge failed for %s: %s", f, e)
+    # Log and report what was removed.
     logger.info("usb_diagnostics: history purged (%s)", ", ".join(removed) or "nothing to remove")
     return {"purged": removed}
 
@@ -466,14 +516,18 @@ def missing_dongles(roster: Dict[str, Any], present_by_bus: Dict[str, Any],
     Roughly 4 dongles per host are permanently in this state, so counting them
     as losses would keep the panel permanently red for normal operation.
     """
+    # Current time, passthrough controllers, and the result list.
     now = time.time() if now is None else now
     pt = passthrough_addrs or set()
     out: List[Dict[str, Any]] = []
+    # Report every roster bus not present now.
     for bus, e in (roster or {}).items():
         if bus in (present_by_bus or {}):
             continue
+        # When it went missing.
         e = e or {}
         ms = e.get("missing_since")
+        # Build the report entry.
         out.append({
             "bus_path": bus,
             "vidpid": e.get("vidpid") or "",
@@ -490,6 +544,7 @@ def missing_dongles(roster: Dict[str, Any], present_by_bus: Dict[str, Any],
             "pci_controller": e.get("pci_controller") or "",
             "passed_through": bool(e.get("pci_controller") and e["pci_controller"] in pt),
         })
+    # Most recently lost first.
     out.sort(key=lambda x: -(x.get("missing_since") or 0))
     return out
 
@@ -503,26 +558,34 @@ def usb_power_settings() -> List[Dict[str, Any]]:
     dongle whose firmware doesn't resume cleanly then disappears — the classic
     slow multi-day decay — so this is the first thing to rule in or out.
     """
+    # Walk every USB device in sysfs.
     out: List[Dict[str, Any]] = []
     for dev in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        # Skip interfaces and root hubs.
         bus = os.path.basename(dev)
         if ":" in bus or bus.startswith("usb"):
             continue  # interface child / root hub
         def _read(rel):
+            """Read a sysfs attribute of this device; None if it can't be read."""
+            # Return the file's trimmed contents.
             try:
                 with open(os.path.join(dev, rel)) as f:
                     return f.read().strip()
             except OSError:
                 return None
+        # Skip entries without vendor/product IDs.
         vid, pid = _read("idVendor"), _read("idProduct")
         if not vid or not pid:
             continue
+        # Runtime-PM control mode and autosuspend delay.
         ctrl = _read("power/control")
         _delay_raw = _read("power/autosuspend_delay_ms")
+        # Parse the delay as a number if possible.
         try:
             _delay_ms = int(_delay_raw) if _delay_raw not in (None, "") else None
         except (TypeError, ValueError):
             _delay_ms = None
+        # Record this device's power settings.
         out.append({
             "bus_path": bus,
             "vidpid": f"{vid}:{pid}",
@@ -540,6 +603,7 @@ def usb_power_settings() -> List[Dict[str, Any]]:
             "autosuspend_enabled": (ctrl == "auto"
                                     and _delay_ms is not None and _delay_ms >= 0),
         })
+    # Return all devices.
     return out
 
 
@@ -558,25 +622,31 @@ def passthrough_controllers() -> List[str]:
     so record_presence can consult it WITHOUT the recursive sysfs walk that
     function does per controller -- it runs on the telemetry path.
     """
+    # Check every PCI device.
     out: List[str] = []
     for path in glob.glob("/sys/bus/pci/devices/0000:*"):
         addr = os.path.basename(path)
+        # Keep only USB controllers (class 0x0c03).
         try:
             with open(os.path.join(path, "class")) as f:
                 if not f.read().strip().startswith("0x0c03"):
                     continue
         except OSError:
             continue
+        # Collect those bound to a passthrough driver.
         if _pci_driver(addr) in _PASSTHROUGH_DRIVERS:
             out.append(addr)
+    # Return them.
     return out
 
 
 def _pci_driver(addr: str) -> str:
     """Driver currently bound to a PCI address ('' when unbound)."""
+    # The driver link's target name is the driver.
     try:
         return os.path.basename(os.path.realpath(
             f"/sys/bus/pci/devices/{addr}/driver"))
+    # No driver bound.
     except OSError:
         return ""
 
@@ -605,9 +675,11 @@ def _pci_slot_map() -> Dict[str, str]:
     loop runs every 3s while provisioning is active (20x/min). A glob per tick
     for a constant is pure waste.
     """
+    # Use the cache once it's been built.
     global _SLOT_MAP_CACHE
     if _SLOT_MAP_CACHE is not None:
         return _SLOT_MAP_CACHE
+    # Build the map from each slot's address file.
     out: Dict[str, str] = {}
     for p in glob.glob("/sys/bus/pci/slots/*/address"):
         try:
@@ -617,6 +689,7 @@ def _pci_slot_map() -> Dict[str, str]:
             continue
         if addr:
             out[addr] = os.path.basename(os.path.dirname(p))
+    # Cache and return it.
     _SLOT_MAP_CACHE = out
     return out
 
@@ -633,6 +706,8 @@ _PCI_VENDOR_NAMES = {
 
 
 def _sysfs_read(path: str) -> str:
+    """Read a sysfs file and return its trimmed text, or "" if it can't be read."""
+    # Return the file's trimmed contents.
     try:
         with open(path) as f:
             return f.read().strip()
@@ -652,14 +727,19 @@ def pci_location(addr: str, slots: Optional[Dict[str, str]] = None) -> Dict[str,
     already know, so an empty label (which callers omit entirely) is better than
     a confident-looking non-answer.
     """
+    # Result returned when the location can't be determined.
     unknown = {"pci_address": addr or "", "slot": None, "onboard": None,
                "vendor": "", "vidpid": "", "label": ""}
+    # No address: unknown.
     if not addr:
         return unknown
+    # Load the slot map if not given.
     if slots is None:
         slots = _pci_slot_map()
+    # Slot lookup uses the address without the function number.
     dbd = addr.rsplit(".", 1)[0]                  # strip the function
     slot = slots.get(dbd)
+    # Controller's vendor/device IDs and vendor name.
     vid = _sysfs_read(f"/sys/bus/pci/devices/{addr}/vendor")
     did = _sysfs_read(f"/sys/bus/pci/devices/{addr}/device")
     vendor = _PCI_VENDOR_NAMES.get(vid, vid or "")
@@ -676,32 +756,39 @@ def pci_location(addr: str, slots: Optional[Dict[str, str]] = None) -> Dict[str,
     # PCIe root port. This is what makes onboard-vs-card answerable on boards
     # that publish NO ACPI slot table -- which is most of them, and is why this
     # used to return the useless "add-in card or onboard" hedge.
+    # Parse the PCI bus number (-1 if unparseable).
     try:
         bus_no = int(addr.split(":")[1], 16)
     except (IndexError, ValueError):
         bus_no = -1
+    # In a known slot: an add-in card.
     if slot:
         onboard, label = False, f"PCIe slot {slot}"
     elif slots:
         # The board DOES publish a slot table and this controller is not in it,
         # so it is integrated. The most reliable branch.
         onboard, label = True, "onboard"
+    # On bus 0: integrated.
     elif bus_no == 0:
         onboard, label = True, "onboard"
+    # Intel/AMD controller: treat as integrated.
     elif vid in _CHIPSET_VENDORS:
         onboard, label = True, "onboard"
     elif bus_no > 0:
         # Definitely a card, just no slot NUMBER without an ACPI slot table.
         # Still worth saying: it narrows a hunt to the expansion slots.
         onboard, label = False, "add-in card"
+    # Otherwise we can't tell.
     else:
         return unknown
     # Name the card on every branch -- knowing an onboard controller is an
     # Intel a36d is as useful as knowing the add-in card is an ASMedia 2142.
     if card:
         label = f"{label} ({card})"
+    # Add the firmware label if there is one.
     if fw_label:
         label = f"{label} · {fw_label}"
+    # Return the location details.
     return {"pci_address": addr, "slot": slot, "onboard": onboard,
             "vendor": vendor, "vidpid": vidpid, "label": label}
 
@@ -709,6 +796,7 @@ def pci_location(addr: str, slots: Optional[Dict[str, str]] = None) -> Dict[str,
 def usb_port_of(bus: str) -> str:
     """Physical port on the controller's root hub. ``'16-3'`` → ``'3'``;
     ``'16-2.4'`` → ``'2.4'`` (port 4 of a hub plugged into port 2)."""
+    # The part after the dash is the port chain.
     return bus.split("-", 1)[1] if "-" in bus else ""
 
 
@@ -719,8 +807,10 @@ def usb_location(bus: str, controller: str = "",
     Either half may be unknown; joins only the parts that are, so an
     undeterminable controller yields ``'port 3'`` and not ``' · port 3'``.
     """
+    # Controller location and port.
     loc = pci_location(controller or usb_device_controller(bus), slots)
     port = usb_port_of(bus)
+    # Join the known parts.
     return " · ".join(p for p in (loc["label"], f"port {port}" if port else "") if p)
 
 
@@ -734,9 +824,11 @@ def location_for(bus: str, slots: Optional[Dict[str, str]] = None,
     recorded while it was still present is the whole reason that field is
     persisted. Returns '' when neither source knows.
     """
+    # Device present: work it out live.
     ctrl = usb_device_controller(bus)
     if ctrl:
         return usb_location(bus, ctrl, slots)
+    # Otherwise use the location saved in the roster.
     r = roster if roster is not None else _load_roster()
     return ((r or {}).get(bus) or {}).get("location") or ""
 
@@ -748,9 +840,11 @@ def controller_for(bus: str, roster: Optional[Dict[str, Any]] = None) -> str:
     'one bad card'. A display string would collide across two identical cards;
     the PCI address never does.
     """
+    # Device present: look it up live.
     ctrl = usb_device_controller(bus)
     if ctrl:
         return ctrl
+    # Otherwise use the controller saved in the roster.
     r = roster if roster is not None else _load_roster()
     return ((r or {}).get(bus) or {}).get("pci_controller") or ""
 
@@ -770,13 +864,16 @@ def usb_device_controller(bus: str) -> str:
     attributed to a controller — and therefore tell a genuine loss apart from a
     controller that was passed through to a VM.
     """
+    # Return the cached answer if we have one.
     cached = _CTRL_CACHE.get(bus)
     if cached is not None:
         return cached
+    # Resolve the device's real sysfs path.
     try:
         real = os.path.realpath(f"/sys/bus/usb/devices/{bus}")
     except OSError:
         return ""
+    # Find the last PCI address before the usbN part.
     last = ""
     for part in real.split(os.sep):
         if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", part):
@@ -788,6 +885,7 @@ def usb_device_controller(bus: str) -> str:
     # for the rest of the process even after it comes back.
     if last:
         _CTRL_CACHE[bus] = last
+    # Return it ("" if not found).
     return last
 
 
@@ -798,6 +896,7 @@ def _usb_device_names() -> List[str]:
     ``16-1.2``, ``16-0:1.0`` -- so a device behind an external hub is already
     present at the top level and needs no tree walk to find.
     """
+    # List the flat sysfs USB device directory.
     try:
         return os.listdir("/sys/bus/usb/devices")
     except OSError:
@@ -811,9 +910,11 @@ def ports_on_bus(bus: str) -> int:
     "3 of 4 ports down" can be stated as a fraction instead of a bare count.
     0 when it cannot be read.
     """
+    # Bus number from "usbN" or "N-..."; 0 if not numeric.
     num = str(bus or "").split("-", 1)[0].replace("usb", "")
     if not num.isdigit():
         return 0
+    # Read the root hub's port count.
     try:
         return int(_sysfs_read(f"/sys/bus/usb/devices/usb{num}/maxchild") or 0)
     except ValueError:
@@ -837,9 +938,11 @@ def _devices_behind_root_hub(root_hub: str, names: Optional[List[str]] = None) -
     is one listdir and gives the identical count. Names containing ':' are
     INTERFACES (16-0:1.0), not devices, and are excluded exactly as before.
     """
+    # Only root hubs ("usbN") are accepted.
     m = re.match(r"usb(\d+)$", root_hub or "")
     if not m:
         return 0
+    # Count devices whose name starts with "N-" (excluding interfaces).
     prefix = m.group(1) + "-"
     return sum(1 for n in (names if names is not None else _usb_device_names())
                if n.startswith(prefix) and ":" not in n)
@@ -860,6 +963,7 @@ def usb_controllers() -> List[Dict[str, Any]]:
     diagnostic reported those as missing dongles, which is a false alarm that
     would train an operator to ignore the panel.
     """
+    # Result list and controllers already listed.
     out: List[Dict[str, Any]] = []
     seen = set()
     # Read the ACPI slot table ONCE and pass it down — it is identical for every
@@ -868,12 +972,15 @@ def usb_controllers() -> List[Dict[str, Any]]:
     # Host-bound controllers, enumerated through their driver as before.
     for drv in ("xhci_hcd", "ehci-pci", "ehci_hcd"):
         for path in sorted(glob.glob(f"/sys/bus/pci/drivers/{drv}/0000:*")):
+            # Record each host-bound controller and its root hubs.
             addr = os.path.basename(path)
             seen.add(addr)
             buses, devices = [], 0
+            # Count devices behind each root hub.
             for usbdir in sorted(glob.glob(os.path.join(path, "usb*"))):
                 buses.append(os.path.basename(usbdir))
                 devices += _devices_behind_root_hub(os.path.basename(usbdir))
+            # Add the controller's entry.
             out.append({"driver": drv, "pci_address": addr, "root_hubs": buses,
                         "device_count": devices,
                         # Physical ports the card exposes, so a fault can be
@@ -886,22 +993,26 @@ def usb_controllers() -> List[Dict[str, Any]]:
     # by PCI class (0c03 = USB controller) and report them explicitly, so a card
     # that vanished from the host is visible as "given to a VM" rather than
     # simply absent.
+    # Then any other USB-class PCI device not already listed.
     for path in sorted(glob.glob("/sys/bus/pci/devices/0000:*")):
         addr = os.path.basename(path)
         if addr in seen:
             continue
+        # Skip non-USB controllers (class 0x0c03).
         try:
             with open(os.path.join(path, "class")) as f:
                 if not f.read().strip().startswith("0x0c03"):
                     continue
         except OSError:
             continue
+        # Report it with its driver and whether it's passed through.
         drv = _pci_driver(addr)
         out.append({"driver": drv or "(unbound)", "pci_address": addr,
                     "root_hubs": [], "device_count": 0,
                     "passthrough": drv in _PASSTHROUGH_DRIVERS,
                     **{f"loc_{k}": v for k, v in pci_location(addr, slots).items()
                        if k != "pci_address"}})
+    # Return all controllers.
     return out
 
 
@@ -920,8 +1031,10 @@ def usb_controllers() -> List[Dict[str, Any]]:
 
 # Lab-tested ceiling: more than this many dongles behind one hub misbehaves.
 # Matches the USB spec's 7 downstream ports per tier and the power budget above.
+# Configurable via environment variable.
 HUB_DONGLE_CEILING = int(os.environ.get("LM_PXMX_HUB_DONGLE_CEILING", "7") or 7)
 
+# USB class code for hubs.
 _USB_HUB_CLASS = "09"
 
 
@@ -937,15 +1050,19 @@ def hub_topology(ppps_hubs: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
     Root hubs (usbN) are included but flagged, since they are the controller
     itself and mostly do NOT support per-port power switching.
     """
+    # All USB device names, excluding interfaces.
     names = _usb_device_names()
     devices = [n for n in names if ":" not in n]
     # uhubctl identifies hubs as "<bus>-<port>" too, so a direct match works.
     ppps = {str((h or {}).get("hub") or "") for h in (ppps_hubs or [])}
+    # Check each device.
     out: List[Dict[str, Any]] = []
     for name in sorted(devices):
+        # Skip anything that isn't a hub.
         d = f"/sys/bus/usb/devices/{name}"
         if _sysfs_read(f"{d}/bDeviceClass") != _USB_HUB_CLASS:
             continue
+        # Number of downstream ports.
         try:
             ports = int(_sysfs_read(f"{d}/maxchild") or 0)
         except ValueError:
@@ -957,6 +1074,7 @@ def hub_topology(ppps_hubs: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
             prefix, is_root = m.group(1) + "-", True
         else:
             prefix, is_root = name + ".", False
+        # Direct children: names one tier below this hub.
         kids = [n for n in devices
                 if n.startswith(prefix) and "." not in n[len(prefix):]]
         # bmAttributes bit 6 (0x40) = self-powered. A bus-powered hub shares one
@@ -965,22 +1083,27 @@ def hub_topology(ppps_hubs: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
             attrs = int(_sysfs_read(f"{d}/bmAttributes") or "0", 16)
         except ValueError:
             attrs = 0
+        # Self-powered flag and the hub's declared maximum power draw.
         self_powered = bool(attrs & 0x40)
         raw_pw = _sysfs_read(f"{d}/bMaxPower") or ""
         try:
             max_power = int(re.sub(r"[^0-9]", "", raw_pw) or 0)
         except ValueError:
             max_power = 0
+        # Warnings worth acting on.
         warnings: List[str] = []
+        # Too many devices behind one hub.
         if len(kids) > HUB_DONGLE_CEILING:
             warnings.append(
                 f"{len(kids)} devices behind this hub — tested ceiling is "
                 f"{HUB_DONGLE_CEILING}; expect enumeration and power problems above it")
+        # A bus-powered hub carrying several devices.
         if not is_root and not self_powered and len(kids) > 2:
             warnings.append(
                 "bus-powered hub carrying multiple devices — one 500mA upstream "
                 "budget shared across them; an 802.11ac dongle draws ~300-450mA "
                 "under load. Use a POWERED hub")
+        # Record this hub.
         out.append({
             "bus_path": name, "is_root_hub": is_root,
             "product": _sysfs_read(f"{d}/product"),
@@ -990,6 +1113,7 @@ def hub_topology(ppps_hubs: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
             "pci_controller": usb_device_controller(name),
             "warnings": warnings,
         })
+    # Return all hubs.
     return out
 
 
@@ -1009,11 +1133,14 @@ async def uhubctl_support() -> Dict[str, Any]:
     unbind/rebind (see ``usb_controllers``), which resets everything on the
     controller rather than one port.
     """
+    # Run helper; imported here to avoid a circular import.
     from . import pve_cmds  # deferred — avoids a top-level import cycle
+    # Default answer: not installed, not supported.
     out: Dict[str, Any] = {"installed": False, "supported": False,
                            "version": "", "ppps_hubs": [], "hubs_seen": 0,
                            "install_hint": "apt-get install -y uhubctl",
                            "error": ""}
+    # Check the binary exists by asking for its version.
     try:
         rc, _ver, _ = await pve_cmds._run(["uhubctl", "-v"], check=False, timeout=10)
         ver = _text(_ver)
@@ -1023,11 +1150,14 @@ async def uhubctl_support() -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         out["error"] = f"version probe failed: {e}"
         return out
+    # Non-zero with no output: treat as not installed.
     if rc != 0 and not ver:
         out["error"] = "uhubctl not installed"
         return out
+    # Installed: record the first line of the version.
     out["installed"] = True
     out["version"] = (ver or "").strip().splitlines()[0] if ver else ""
+    # List the hubs uhubctl can see.
     try:
         rc, _listing, _err = await pve_cmds._run(["uhubctl"], check=False, timeout=20)
         listing, err = _text(_listing), _text(_err)
@@ -1038,9 +1168,11 @@ async def uhubctl_support() -> Dict[str, Any]:
         # uhubctl exits nonzero with "no compatible devices detected"
         out["error"] = (err or "no compatible smart hubs detected").strip()
         return out
+    # Parse each hub's status line.
     for line in (listing or "").splitlines():
         if "Current status for hub" not in line:
             continue
+        # Count it and pull out the hub id.
         out["hubs_seen"] += 1
         m = re.search(r"Current status for hub ([\w.:-]+)", line)
         hub = m.group(1) if m else "?"
@@ -1049,16 +1181,20 @@ async def uhubctl_support() -> Dict[str, Any]:
         mode = ("ppps" if re.search(r"\bppps\b", line, re.IGNORECASE)
                 else "ganged" if re.search(r"\bganged\b", line, re.IGNORECASE)
                 else "")
+        # Bracketed descriptor text, if any.
         desc = ""
         dm = re.search(r"\[(.+)\]", line)
         if dm:
             desc = dm.group(1)
+        # Keep hubs that support per-port power switching.
         if mode == "ppps":
             out["ppps_hubs"].append({"hub": hub, "mode": mode, "description": desc})
+    # Supported if at least one such hub exists; explain if not.
     out["supported"] = bool(out["ppps_hubs"])
     if not out["supported"] and not out["error"]:
         out["error"] = ("no PPPS-capable hub — uhubctl cannot cut port power on "
                         "this host's hubs (an externally powered hub usually can)")
+    # Return the result.
     return out
 
 
@@ -1104,25 +1240,32 @@ def record_port_reset(bus: str, now: Optional[float] = None) -> None:
     spontaneous, which is the safe direction (it over-reports hardware faults
     rather than hiding them).
     """
+    # Nothing to record without a bus.
     if not bus:
         return
+    # Current time.
     now = time.time() if now is None else now
+    # Any read or write error is only logged.
     try:
+        # Load the existing log, starting fresh if it's malformed.
         d = {}
         if os.path.exists(USB_RESET_LOG_FILE):
             with open(USB_RESET_LOG_FILE) as f:
                 d = json.load(f) or {}
         if not isinstance(d, dict):
             d = {}
+        # Drop this bus's expired entries, add now, and keep the last 200.
         hist = [t for t in (d.get(bus) or []) if isinstance(t, (int, float))
                 and now - t < _RESET_LOG_TTL_S]
         hist.append(now)
         d[bus] = hist[-200:]
+        # Prune expired entries for all buses, dropping empty ones.
         for k in list(d):
             d[k] = [t for t in (d.get(k) or [])
                     if isinstance(t, (int, float)) and now - t < _RESET_LOG_TTL_S]
             if not d[k]:
                 d.pop(k, None)
+        # Save atomically (temp file then rename).
         os.makedirs(PXMLIB, exist_ok=True)
         tmp = f"{USB_RESET_LOG_FILE}.tmp"
         with open(tmp, "w") as f:
@@ -1140,9 +1283,12 @@ def agent_reset_recently(bus: str, within_s: float, now: Optional[float] = None)
     take the device away from the VM holding it, which is indistinguishable from
     the dongle dropping its own passthrough unless the agent remembers doing it.
     """
+    # No bus: no.
     if not bus:
         return False
+    # Current time.
     now = time.time() if now is None else now
+    # True if any recorded reset falls within the window.
     try:
         hist = (_load_reset_log() or {}).get(bus) or []
         return any(isinstance(t, (int, float)) and 0 <= (now - t) <= within_s
@@ -1152,6 +1298,8 @@ def agent_reset_recently(bus: str, within_s: float, now: Optional[float] = None)
 
 
 def _load_reset_log() -> Dict[str, List[float]]:
+    """Load the reset log; empty dict if missing or unreadable."""
+    # Read and parse the file if it exists.
     try:
         if os.path.exists(USB_RESET_LOG_FILE):
             with open(USB_RESET_LOG_FILE) as f:
@@ -1172,28 +1320,38 @@ def attribute_kernel_events(by_bus: Dict[str, Dict[str, int]],
     disconnect category, is reported as spontaneous: a reset explains a
     disconnect, it does not explain an over-current.
     """
+    # Reset log and current time, if not supplied.
     resets = _load_reset_log() if resets is None else resets
     now = time.time() if now is None else now
+    # Totals and per-bus detail.
     self_n, spon_n = 0, 0
     detail: Dict[str, Dict[str, int]] = {}
+    # Split each bus's counts.
     for bus, cats in (by_bus or {}).items():
+        # Resets we did on this bus within the scan window.
         n_resets = len([t for t in (resets.get(bus) or [])
                         if isinstance(t, (int, float)) and (now - t) < DIAG_KERNEL_WINDOW_S])
+        # Each reset explains one disconnect; everything else is spontaneous.
         disc = int((cats or {}).get("disconnect", 0))
         credited = min(disc, n_resets)
         other = sum(int(v) for k, v in (cats or {}).items() if k != "disconnect")
         spont = (disc - credited) + other
+        # Add to the totals.
         self_n += credited
         spon_n += spont
+        # Record buses with any events.
         if credited or spont:
             detail[bus] = {"self_inflicted": credited, "spontaneous": spont,
                            "resets_by_agent": n_resets}
+    # Return the split.
     return {"self_inflicted": self_n, "spontaneous": spon_n, "by_bus": detail}
 
 
 def _parse_kernel_lines(log: str) -> Dict[str, Any]:
     """Pure CPU: categorise pre-filtered kernel lines. Run OFF the event loop."""
+    # Totals, per-bus counts and a few sample lines.
     out: Dict[str, Any] = {"totals": {}, "by_bus": {}, "samples": []}
+    # Check each line.
     for line in log.splitlines():
         # "hub" matters as much as "usb"/"hcd": the kernel logs over-current
         # against the HUB (e.g. "hub 2-0:1.0: over-current condition on port 3"),
@@ -1201,22 +1359,28 @@ def _parse_kernel_lines(log: str) -> Dict[str, Any]:
         _l = line.lower()
         if "usb" not in _l and "hcd" not in _l and "hub " not in _l:
             continue
+        # Count it under the first category that matches.
         for cat, rx in _KERNEL_PATTERNS:
             if not rx.search(line):
                 continue
             out["totals"][cat] = out["totals"].get(cat, 0) + 1
+            # Also count it per bus when the line names one.
             bm = _KERNEL_BUS_RE.search(line)
             if bm:
                 bus = bm.group(1)
                 out["by_bus"].setdefault(bus, {})
                 out["by_bus"][bus][cat] = out["by_bus"][bus].get(cat, 0) + 1
+            # Keep up to 25 sample lines.
             if len(out["samples"]) < 25:
                 out["samples"].append(line.strip()[:300])
             break
+    # Return the counts.
     return out
 
 
 def _load_kernel_state() -> Dict[str, Any]:
+    """Load the saved kernel-event accumulator; empty dict if missing or unreadable."""
+    # Read and parse the file if it exists and isn't empty.
     try:
         if os.path.exists(USB_KERNEL_FILE) and os.path.getsize(USB_KERNEL_FILE) > 0:
             with open(USB_KERNEL_FILE) as f:
@@ -1228,6 +1392,8 @@ def _load_kernel_state() -> Dict[str, Any]:
 
 
 def _save_kernel_state(d: Dict[str, Any]) -> None:
+    """Atomically save the kernel-event accumulator; failures are only logged."""
+    # Write to a temp file and rename it into place.
     try:
         os.makedirs(PXMLIB, exist_ok=True)
         tmp = f"{USB_KERNEL_FILE}.tmp"
@@ -1246,12 +1412,16 @@ def _fold_kernel_delta(state: Dict[str, Any], parsed: Dict[str, Any],
     24 small dicts, evicted by age, so the accumulator can never grow with log
     volume the way a raw event list would.
     """
+    # Keep buckets still inside the window.
     buckets = {k: v for k, v in (state.get("buckets") or {}).items()
                if str(k).isdigit() and (now - int(k)) <= window_s}
+    # Bucket for the current hour.
     hour = str(int(now // 3600) * 3600)
     b = buckets.setdefault(hour, {"totals": {}, "by_bus": {}})
+    # Add this scan's totals.
     for cat, n in (parsed.get("totals") or {}).items():
         b["totals"][cat] = int(b["totals"].get(cat, 0)) + int(n)
+    # Add this scan's per-bus counts.
     for bus, cats in (parsed.get("by_bus") or {}).items():
         dst = b["by_bus"].setdefault(bus, {})
         for cat, n in (cats or {}).items():
@@ -1262,8 +1432,11 @@ def _fold_kernel_delta(state: Dict[str, Any], parsed: Dict[str, Any],
 
 
 def _sum_kernel_buckets(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Add up all hourly buckets into overall and per-bus totals."""
+    # Running totals.
     totals: Dict[str, int] = {}
     by_bus: Dict[str, Dict[str, int]] = {}
+    # Add each bucket's counts.
     for b in (state.get("buckets") or {}).values():
         for cat, n in ((b or {}).get("totals") or {}).items():
             totals[cat] = totals.get(cat, 0) + int(n)
@@ -1271,6 +1444,7 @@ def _sum_kernel_buckets(state: Dict[str, Any]) -> Dict[str, Any]:
             dst = by_bus.setdefault(bus, {})
             for cat, n in (cats or {}).items():
                 dst[cat] = dst.get(cat, 0) + int(n)
+    # Return the sums.
     return {"totals": totals, "by_bus": by_bus}
 
 
@@ -1289,7 +1463,9 @@ async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S,
     say "no data", not "no errors". ``covers_s`` is the span actually
     accumulated so far, which is < window_s until the buckets fill.
     """
+    # Run helper; imported here to avoid a circular import.
     from . import pve_cmds
+    # Current time and the saved accumulator.
     now = time.time() if now is None else now
     state = await asyncio.to_thread(_load_kernel_state)
     last = state.get("last_scan_ts")
@@ -1301,12 +1477,15 @@ async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S,
     else:
         since = min(window_s, float(KERNEL_SEED_WINDOW_S))   # cold start
 
+    # Default result: nothing read yet.
     out: Dict[str, Any] = {"window_s": int(window_s), "totals": {}, "by_bus": {},
                            "samples": [], "available": False, "truncated": False,
                            "filtered": True, "scanned_s": int(since),
                            "covers_s": 0}
+    # journalctl command: kernel messages since the computed start, capped in lines.
     base = ["journalctl", "-k", "--no-pager", "-o", "cat",
             "--since", f"-{int(since)}s", "-n", str(_JOURNAL_MAX_LINES)]
+    # Read the log with server-side filtering; any error returns the empty result.
     try:
         rc, _log, _err = await pve_cmds._run(base + ["-g", _JOURNAL_GREP],
                                              check=False, timeout=30)
@@ -1318,19 +1497,24 @@ async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S,
                          _text(_err).strip()[:120])
             rc, _log, _ = await pve_cmds._run(base, check=False, timeout=30)
             out["filtered"] = False
+        # Decoded log text.
         log = _text(_log)
     except Exception as e:  # noqa: BLE001
         logger.debug("usb_diagnostics: journalctl failed: %s", e)
         return out
+    # Couldn't read the journal: report unavailable.
     if rc != 0:
         return out
+    # Parse the new lines in a worker thread.
     out["available"] = True
     parsed = {"totals": {}, "by_bus": {}, "samples": []}
     if log:
         out["truncated"] = (log.count("\n") + 1) >= _JOURNAL_MAX_LINES
         parsed = await asyncio.to_thread(_parse_kernel_lines, log)
+    # Fold them into the hourly buckets and save.
     state = _fold_kernel_delta(state, parsed, now, window_s)
     await asyncio.to_thread(_save_kernel_state, state)
+    # Report the summed counts.
     out.update(_sum_kernel_buckets(state))
     # Split the totals by who caused them. Reported alongside, never subtracted
     # silently: a reset that provokes a genuine link error is still worth
@@ -1339,9 +1523,11 @@ async def kernel_usb_events(window_s: int = DIAG_KERNEL_WINDOW_S,
         out["attribution"] = attribute_kernel_events(out.get("by_bus") or {}, now=now)
     except Exception as e:  # noqa: BLE001
         logger.debug("usb_diagnostics: attribution failed: %s", e)
+    # Sample lines and how far back the buckets reach.
     out["samples"] = state.get("samples") or []
     _keys = [int(k) for k in (state.get("buckets") or {}) if str(k).isdigit()]
     out["covers_s"] = int(now - min(_keys)) if _keys else 0
+    # Return the result.
     return out
 
 
@@ -1357,8 +1543,10 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
     means "no problem", never "no idea"; the caller distinguishes those via
     ``kernel["available"]``.
     """
+    # Nothing missing: no causes.
     if not missing:
         return []
+    # Causes found, the missing buses, and the kernel counts.
     out: List[Dict[str, Any]] = []
     missing_buses = {m["bus_path"] for m in missing}
     by_bus = (kernel or {}).get("by_bus") or {}
@@ -1371,6 +1559,7 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
         for cat, n in (by_bus.get(bus) or {}).items():
             hit[cat] = hit.get(cat, 0) + n
 
+    # Over-current on a missing bus.
     if hit.get("over_current"):
         out.append({
             "cause": "Port over-current",
@@ -1382,6 +1571,7 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
             "remedy": "Move these dongles to an externally POWERED hub — the port "
                       "cannot supply what they draw.",
         })
+    # Power budget rejections on a missing bus.
     if hit.get("insufficient_power"):
         out.append({
             "cause": "Bus power budget exhausted",
@@ -1393,6 +1583,7 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
             "remedy": "Externally powered hub, or spread the dongles across "
                       "controllers.",
         })
+    # Link or enumeration errors on a missing bus.
     if hit.get("link_error"):
         out.append({
             "cause": "Link / enumeration errors",
@@ -1415,6 +1606,7 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
     # disconnects produced an EMPTY cause list. Three of four lab hosts showed
     # 23-140 disconnects and no probable cause at all.
     if hit.get("disconnect") and not hit.get("link_error"):
+        # Number of clean disconnects.
         _n = hit["disconnect"]
         out.append({
             "cause": "Clean disconnect (no link error)",
@@ -1433,6 +1625,7 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
                       ". If it recurs on the SAME port with a different dongle, "
                       "the port or its power supply is at fault.",
         })
+    # A controller-level fault anywhere on the host.
     if totals.get("controller_fault"):
         out.append({
             "cause": "USB controller fault",
@@ -1471,6 +1664,7 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
     # the finding: a clean disappearance points at VBUS/PHY rather than a
     # protocol fault, which is exactly the power-cycle case.
     if not hit and not totals.get("controller_fault"):
+        # Journal couldn't be read: say so rather than guess.
         if not (kernel or {}).get("available"):
             out.append({
                 "cause": "No kernel log available",
@@ -1480,6 +1674,7 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
                 "evidence": "journalctl unavailable",
                 "remedy": "Check the agent can run journalctl -k on the host.",
             })
+        # Clean log: a silent disappearance.
         else:
             out.append({
                 "cause": "Silent disappearance (no kernel evidence)",
@@ -1494,19 +1689,24 @@ def correlate(missing: List[Dict[str, Any]], kernel: Dict[str, Any],
                            "No PPPS hub for uhubctl, so cut power by unbinding the "
                            "controller: "),
             })
+    # Return the ranked causes.
     return out
 
 
 async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Full diagnostic snapshot for the telemetry frame. Never raises."""
+    # Any failure returns an empty snapshot.
     try:
+        # Imported here to avoid a circular import.
         from . import usb_provision
+        # Scan for present dongles if the caller didn't supply them.
         if present_by_bus is None:
             present = await asyncio.to_thread(
                 usb_provision.scan_present_dongles,
                 usb_provision._dongle_vidpids(agent),
                 usb_provision._certified_types(agent))
             present_by_bus = present or {}
+        # Timestamp for this snapshot.
         now = time.time()
         # Every sysfs walk + roster write below is SYNCHRONOUS file I/O. On a host
         # with many devices that is enough to stall the event loop, and the
@@ -1518,15 +1718,18 @@ async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dic
         # of the roster's cross-reboot caveats (renumbering, controllers handed
         # to a VM, dongles physically moved between ports).
         baseline = await asyncio.to_thread(capture_boot_baseline, present_by_bus, now)
+        # Controller list (with passthrough flags).
         controllers = await asyncio.to_thread(usb_controllers)
         # Controllers handed to a VM. Dongles behind them leave the host BY
         # DESIGN (T1/T3 PCI passthrough), so they must not be counted as losses.
         pt_addrs = {c["pci_address"] for c in controllers if c.get("passthrough")}
+        # Roster-based missing dongles, split into passed-through, established and transient.
         missing_all = missing_dongles(roster, present_by_bus, now, pt_addrs)
         passed = [m for m in missing_all if m.get("passed_through")]
         _m_real = [m for m in missing_all if not m.get("passed_through")]
         missing = [m for m in _m_real if m.get("established")]
         missing_transient = [m for m in _m_real if not m.get("established")]
+        # Boot-baseline losses.
         lost_all = lost_since_boot(baseline, present_by_bus, pt_addrs, roster)
         # Split: a dongle absent because its controller was passed through to a
         # VM is exactly where it should be. Only the remainder is a real loss.
@@ -1537,9 +1740,11 @@ async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dic
         # not missing inventory.
         lost = [m for m in _real if m.get("established")]
         lost_transient = [m for m in _real if not m.get("established")]
+        # Kernel evidence, power settings and uhubctl support.
         kernel = await kernel_usb_events()
         power = await asyncio.to_thread(usb_power_settings)
         uhub = await uhubctl_support()
+        # Assemble the snapshot.
         return {
             "generated_at": now,
             "present_count": len(present_by_bus or {}),
@@ -1576,6 +1781,7 @@ async def collect(agent, present_by_bus: Optional[Dict[str, Any]] = None) -> Dic
             "causes": correlate(lost if baseline.get("trusted") else missing,
                                 kernel, power, controllers, uhub),
         }
+    # Unexpected error: log it and return an empty snapshot.
     except Exception as e:  # noqa: BLE001
         logger.warning("usb_diagnostics.collect failed: %s", e)
         return {}
