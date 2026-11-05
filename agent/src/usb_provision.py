@@ -20,6 +20,7 @@ full USB provisioning loop arrives in Phase E):
    provides the registry helpers now so Phase E just calls them.
 """
 
+# Standard library imports.
 import asyncio
 import json
 import logging
@@ -28,8 +29,10 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+# Shared agent logger.
 logger = logging.getLogger("PxmxAgent")
 
+# State directory and the blacklist file we write.
 PXMLIB = "/var/lib/pxmx"
 DONGLE_BLACKLIST_CONF = "/etc/modprobe.d/cs-dongle-blacklist.conf"
 
@@ -67,6 +70,7 @@ from .usb_resource_gate import (  # noqa: E402
     _load_resource_cache, _save_resource_cache,
 )
 
+# Valid lowercase vid:pid.
 _VIDPID_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{4}$")
 
 
@@ -80,23 +84,30 @@ _VIDPID_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{4}$")
 def _parse_vidpid_items(raw: Any) -> List[Any]:
     """Coerce a usb_vidpids/usb_ignored_vidpids value (JSON string, list, or
     legacy comma string) into a list of items (dicts or bare strings)."""
+    # Nothing configured.
     if raw is None:
         return []
+    # Already a list.
     if isinstance(raw, list):
         return raw
+    # Blank string.
     s = str(raw).strip()
     if not s:
         return []
+    # JSON array string.
     if s.startswith("["):
         try:
             parsed = json.loads(s)
             return parsed if isinstance(parsed, list) else []
         except (json.JSONDecodeError, ValueError):
             return []
+    # Legacy comma-separated string.
     return [p.strip() for p in s.split(",") if p.strip()]
 
 
 def _usb_cfg(agent) -> Dict[str, Any]:
+    """The cs ``usb_config`` section of the agent config (empty dict if absent)."""
+    # Nested lookup with empty-dict defaults.
     return (agent.config.get("client_simulation") or {}).get("usb_config") or {}
 
 
@@ -107,12 +118,14 @@ def _dongle_vidpids(agent) -> Set[str]:
     ``usb_vidpids``/``dongle_vidpids``/``certified_types`` fallbacks for older
     spoke builds. Empty until the hub delivers usb_config — the blacklist +
     telemetry classify as no-op/unknown."""
+    # Read the current key, falling back to older keys.
     cfg = _usb_cfg(agent)
     items = _parse_vidpid_items(cfg.get("vidpids"))
     if not items:  # legacy fallbacks (older cs spoke builds)
         items = (_parse_vidpid_items(cfg.get("usb_vidpids"))
                  or _parse_vidpid_items(cfg.get("dongle_vidpids"))
                  or list(cfg.get("certified_types") or []))
+    # Keep only valid vid:pid values.
     out: Set[str] = set()
     for v in items:
         vp = (v.get("vidpid") if isinstance(v, dict) else v)
@@ -125,10 +138,12 @@ def _dongle_vidpids(agent) -> Set[str]:
 def _certified_types(agent) -> Dict[str, str]:
     """``{vidpid: type}`` from the certified list (default ``wireless``). Reads
     the cs-spoke ``usb_config.vidpids`` array (legacy ``usb_vidpids`` fallback)."""
+    # Read the list (with legacy fallback).
     cfg = _usb_cfg(agent)
     items = _parse_vidpid_items(cfg.get("vidpids"))
     if not items:  # legacy fallback (older cs spoke builds)
         items = _parse_vidpid_items(cfg.get("usb_vidpids"))
+    # Map each valid entry to its type.
     out: Dict[str, str] = {}
     for v in items:
         if not isinstance(v, dict):
@@ -142,11 +157,13 @@ def _certified_types(agent) -> Dict[str, str]:
 def _ignored_vidpids(agent) -> Set[str]:
     """The ignored dongle VID:PID set (lowercased) from the cs-spoke
     ``usb_config.ignored_vidpids`` array (legacy ``usb_ignored_vidpids`` fallback)."""
+    # Read the list (with legacy fallback).
     cfg = _usb_cfg(agent)
     out: Set[str] = set()
     items = _parse_vidpid_items(cfg.get("ignored_vidpids"))
     if not items:  # legacy fallback (older cs spoke builds)
         items = _parse_vidpid_items(cfg.get("usb_ignored_vidpids"))
+    # Keep only valid vid:pid values.
     for v in items:
         vp = (v.get("vidpid") if isinstance(v, dict) else v)
         s = str(vp or "").strip().lower()
@@ -158,6 +175,7 @@ def _ignored_vidpids(agent) -> Set[str]:
 def _pci_vidpid_set(raw: Any) -> Set[str]:
     """Coerce a t1/t3_pci_vidpids config value (JSON array of bare ``vid:pid``
     strings, list, or comma-string) into a lowercased, regex-validated set."""
+    # Keep only valid vid:pid values.
     out: Set[str] = set()
     for v in _parse_vidpid_items(raw):
         vp = (v.get("vidpid") if isinstance(v, dict) else v)
@@ -197,7 +215,9 @@ async def cs_pci_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
     tab. Returns ``{'t1_pci_devices': [...], 't3_pci_devices': [...]}``, each a list
     of ``{address, vidpid, name}`` (the agent's ``_run`` shells out to lspci, so
     this is async). Best-effort — empty list on any failure, never raises."""
+    # Only needed here.
     from . import pve_cmds
+    # Look up present devices for each list; failures leave that list empty.
     out: Dict[str, List[Dict[str, Any]]] = {"t1_pci_devices": [], "t3_pci_devices": []}
     for key, vidpids in (("t1_pci_devices", _t1_pci_vidpids(agent)),
                          ("t3_pci_devices", _t3_pci_vidpids(agent))):
@@ -218,6 +238,7 @@ def _sim_pool(agent) -> Optional[str]:
     has no --pool). A pool that does not exist makes the clone fail, so the UI
     populates its dropdown from the pools the hosts actually report rather than
     letting an operator free-type one."""
+    # Blank means no pool.
     v = str(_usb_cfg(agent).get("sim_pool") or "").strip()
     return v or None
 
@@ -243,10 +264,13 @@ async def _ensure_sim_pool(agent) -> Optional[str]:
     pool. Self-heal instead: create the pool here the first time it's needed.
     Best-effort — on failure, clone still surfaces its own error same as
     before (no regression), just without ever getting a second chance."""
+    # Nothing to do if unset or already checked.
     pool = _sim_pool(agent)
     if not pool or pool in _verified_sim_pools:
         return pool
+    # Only needed here.
     from . import vm_inventory
+    # Use the pool if it exists, else create it; remember it either way.
     try:
         existing = await vm_inventory.list_pools(agent)
         if any(p.get("poolid") == pool for p in existing):
@@ -271,11 +295,14 @@ def _host_t1_excluded(agent) -> bool:
     Match is case-insensitive, exact OR prefix (so 'sim-svr-05' matches a full
     hostname 'sim-svr-05' and a prefix like 'sim-svr-05-...'). Empty list = every
     host with a matching controller runs T1 (the default)."""
+    # Our hostname; none means not excluded.
     hn = (getattr(agent, "hostname", "") or "").strip().lower()
     if not hn:
         return False
+    # Exclusion list (list or comma/space string).
     raw = _usb_cfg(agent).get("t1_exclude_hosts")
     items = raw if isinstance(raw, list) else str(raw or "").replace(",", " ").split()
+    # Excluded if any entry matches exactly or as a prefix.
     for h in items:
         entry = str(h or "").strip().lower()
         if entry and (hn == entry or hn.startswith(entry)):
@@ -287,11 +314,14 @@ def _host_t3_excluded(agent) -> bool:
     """Per-host T3 opt-out, mirroring ``_host_t1_excluded`` for
     ``usb_config.t3_exclude_hosts``. Same case-insensitive exact-or-prefix match;
     empty list = every host with a matching controller runs T3 (the default)."""
+    # Our hostname; none means not excluded.
     hn = (getattr(agent, "hostname", "") or "").strip().lower()
     if not hn:
         return False
+    # Exclusion list (list or comma/space string).
     raw = _usb_cfg(agent).get("t3_exclude_hosts")
     items = raw if isinstance(raw, list) else str(raw or "").replace(",", " ").split()
+    # Excluded if any entry matches exactly or as a prefix.
     for h in items:
         entry = str(h or "").strip().lower()
         if entry and (hn == entry or hn.startswith(entry)):
@@ -301,6 +331,7 @@ def _host_t3_excluded(agent) -> bool:
 
 # Cache the per-VM tier map — passthrough rarely changes, and resolving PCI
 # (qm config + lspci) for every VM on each ~60s telemetry tick is wasteful.
+# Cached tier map and its lifetime in seconds.
 _vm_tier_cache: Dict[str, Any] = {"ts": 0.0, "tiers": {}}
 _VM_TIER_TTL = 60.0
 
@@ -318,12 +349,14 @@ def usb_tiers_only(vms) -> Dict[str, str]:
     even when the expensive part times out -- these hosts run ~14 T2 to 4 T1, so
     this recovers most of the picture rather than none of it.
     """
+    # VMIDs that hold a dongle, per the saved USB state.
     try:
         st = load_usb_state()
         usb_vmids = {str(v) for v in (st.get("bus_to_vmid") or {}).values()
                      if str(v).lstrip("-").isdigit()}
     except Exception:  # noqa: BLE001
         return {}
+    # Mark each non-template VM holding a dongle as T2.
     out: Dict[str, str] = {}
     for v in (vms or []):
         vid = v.get("vmid") if isinstance(v, dict) else v
@@ -346,10 +379,13 @@ async def compute_vm_tiers(agent, vms) -> Dict[str, str]:
     determinable tier are omitted (the UI keeps its default). Cached ``_VM_TIER_TTL``
     seconds; templates are skipped. Consumed by ``_cs_telemetry_body`` (stamped
     per VM → cs spoke → Clients tab badge)."""
+    # Serve from cache while fresh.
     now = time.time()
     if _vm_tier_cache["tiers"] and (now - _vm_tier_cache["ts"]) < _VM_TIER_TTL:
         return dict(_vm_tier_cache["tiers"])
+    # Only needed here.
     from . import pve_cmds
+    # PCI lists and the VMIDs holding dongles.
     t1_set = _t1_pci_vidpids(agent)
     t3_set = _t3_pci_vidpids(agent)
     st = load_usb_state()
@@ -361,13 +397,17 @@ async def compute_vm_tiers(agent, vms) -> Dict[str, str]:
     # v["type"] (already known from the VM list) so pci_passthrough_vidpids
     # skips its detect_guest_type probe, and the addr→vidpid lspci lookups are
     # memoized module-level in pve_cmds (PCI topology is static while running).
+    # At most 4 config probes at a time.
     sem = asyncio.Semaphore(4)
 
     async def _classify(v) -> None:
+        """Work out one VM's tier and record it in ``tiers``."""
+        # Skip entries with no VMID.
         vid = v.get("vmid") if isinstance(v, dict) else v
         if vid in (None, ""):
             return
         svid = str(vid)
+        # Check PCI passthrough first (not for templates).
         tier = None
         if (t1_set or t3_set) and not (isinstance(v, dict) and v.get("is_template")):
             async with sem:
@@ -376,15 +416,18 @@ async def compute_vm_tiers(agent, vms) -> Dict[str, str]:
                         vid, v.get("type") if isinstance(v, dict) else None)
                 except Exception:  # noqa: BLE001
                     pci = set()
+            # PCI matches decide T3 or T1.
             if pci & t3_set:
                 tier = "t3"
             elif pci & t1_set:
                 tier = "t1"
+        # Otherwise a dongle makes it T2.
         if tier is None and svid in usb_vmids:
             tier = "t2"
         if tier:
             tiers[svid] = tier
 
+    # Classify all VMs, then cache the result.
     await asyncio.gather(*[_classify(v) for v in (vms or [])])
     _vm_tier_cache.update({"ts": now, "tiers": tiers})
     return dict(tiers)
@@ -536,11 +579,15 @@ _refresh_paused = False
 
 
 def set_refresh_paused(value: bool) -> None:
+    """Pause or resume the background refresh (stored in a module flag)."""
+    # Store as a plain bool.
     global _refresh_paused
     _refresh_paused = bool(value)
 
 
 def refresh_paused() -> bool:
+    """Whether the background refresh is paused."""
+    # Read the module flag.
     return _refresh_paused
 
 # The delete-gate decision trace (_delete_gate) lives in usb_resource_gate
@@ -560,6 +607,8 @@ _auto_provision_on: bool = False
 
 
 def _normalize_toggle(v: Any) -> str:
+    """Turn a toggle value into ``"on"`` or ``"off"`` (truthy words mean on)."""
+    # Normalise and compare against the truthy words.
     s = str(v or "").strip().lower()
     return "on" if s in ("on", "1", "true", "yes", "enabled") else "off"
 
@@ -581,6 +630,7 @@ def _toggle_on(usb_cfg: Dict[str, Any]) -> bool:
     authoritative ``usb_auto_provision`` whenever it is present; fall back to
     ``auto_provision`` only when usb_auto_provision is absent from the blob
     entirely. A present-but-off authoritative key now wins over a stale mirror."""
+    # Use the first key that is set; the hub UI's key wins.
     for key in ("usb_auto_provision", "auto_provision"):
         if key in usb_cfg and str(usb_cfg.get(key) or "").strip() != "":
             return _normalize_toggle(usb_cfg.get(key)) == "on"
@@ -589,6 +639,7 @@ def _toggle_on(usb_cfg: Dict[str, Any]) -> bool:
 
 def _cfg_first(usb_cfg: Dict[str, Any], keys: tuple, default: Any = None) -> Any:
     """First non-empty value among ``keys`` (union of the two relay schemas)."""
+    # Return the first set value.
     for k in keys:
         v = usb_cfg.get(k)
         if v is not None and str(v).strip() != "":
@@ -597,7 +648,10 @@ def _cfg_first(usb_cfg: Dict[str, Any], keys: tuple, default: Any = None) -> Any
 
 
 def _pct_setting(usb_cfg: Dict[str, Any], key: str, default: int) -> int:
+    """Read a 0-100 percentage setting, clamped; the default if unset or invalid."""
+    # Raw value.
     v = usb_cfg.get(key)
+    # Blank means default; otherwise parse and clamp.
     try:
         if v is None or str(v).strip() == "":
             return default
@@ -618,6 +672,7 @@ def current_deleting_vmids() -> List[int]:
     Stamped just before ``destroy_vm`` and kept for ``_DELETING_TTL_S`` so the
     brief deleting window survives at least one telemetry tick; the WebUI VM
     list renders these as 🔴 deleting. Prunes expired entries as a side effect."""
+    # Drop entries older than the TTL, then list the rest.
     now = time.time()
     for vmid in [v for v, ts in _deleting.items() if now - ts > _DELETING_TTL_S]:
         _deleting.pop(vmid, None)
@@ -632,6 +687,7 @@ def mark_deleting(vmid: int) -> None:
     mass delete showed the VMs as "running" until qm actually destroyed them
     and the next ~15s telemetry tick dropped them from the list. The shed gate
     also stamps directly, but that's harmless (same vmid, refreshes the ts)."""
+    # Stamp the time; ignore bad VMIDs.
     try:
         _deleting[int(vmid)] = time.time()
     except (TypeError, ValueError):
@@ -641,6 +697,7 @@ def mark_deleting(vmid: int) -> None:
 def mark_recloning(vmid: int) -> None:
     """Mark/refresh a VMID as currently recloning (called at each reclone phase
     so the "Recloning" badge stays live for the minutes a reclone takes)."""
+    # Stamp the time; ignore bad VMIDs.
     try:
         _recloning[int(vmid)] = time.time()
     except (TypeError, ValueError):
@@ -649,6 +706,7 @@ def mark_recloning(vmid: int) -> None:
 
 def clear_recloning(vmid: int) -> None:
     """Drop a VMID's recloning mark (reclone finished or failed)."""
+    # Remove the mark; ignore bad VMIDs.
     try:
         _recloning.pop(int(vmid), None)
     except (TypeError, ValueError):
@@ -658,6 +716,7 @@ def clear_recloning(vmid: int) -> None:
 def current_reclone_vmids() -> List[int]:
     """VMIDs currently being recloned (TTL-pruned). The WebUI VM list renders
     these as a "Recloning" badge. Prunes expired entries as a side effect."""
+    # Drop entries older than the TTL, then list the rest.
     now = time.time()
     for vmid in [v for v, ts in _recloning.items() if now - ts > _RECLONING_TTL_S]:
         _recloning.pop(vmid, None)
@@ -695,10 +754,12 @@ def clear_reclone_state() -> bool:
     no longer do anything.
     """
     global _reclone_state
+    # Running: refuse unless it has been stuck long enough to count as abandoned.
     if _reclone_state.get("status") == "running":
         age = time.time() - float(_reclone_state.get("started_at") or 0)
         if age < _RECLONE_STALE_S:
             return False
+    # Clear the state.
     _reclone_state = {}
     return True
 
@@ -708,8 +769,10 @@ def start_reclone_batch(total: int, rtype: str = "manual") -> bool:
     running — the handler treats that as a 409/conflict so a second click while
     a batch is active is rejected, not interleaved."""
     global _reclone_state, _reclone_stop
+    # Refuse a second batch.
     if _reclone_state.get("status") == "running":
         return False
+    # Reset the stop flag and start fresh state.
     _reclone_stop = False
     _reclone_state = {
         "status": "running",
@@ -728,9 +791,11 @@ def start_reclone_batch(total: int, rtype: str = "manual") -> bool:
 def request_reclone_stop() -> bool:
     """Signal a running fleet-reclone batch to stop after its in-flight VMs
     finish. Returns False (no-op) when no batch is running."""
+    # Only a running batch can be stopped.
     global _reclone_stop
     if _reclone_state.get("status") != "running":
         return False
+    # Set the stop flag.
     _reclone_stop = True
     return True
 
@@ -743,10 +808,13 @@ def reclone_stop_requested() -> bool:
 def mark_reclone_progress(vmid: int, phase: str, name: str = "") -> None:
     """Set the current VM + phase (destroying/cloning/starting/...) for the
     live progress bar. Refreshes the per-VM "Recloning" badge too."""
+    # Ignore when no batch is running.
     if _reclone_state.get("status") != "running":
         return
+    # Record the current VM and phase.
     _reclone_state["current_vm"] = int(vmid) if vmid is not None else None
     _reclone_state["phase"] = str(phase or "")
+    # Remember the VM's name for the log.
     if name:
         _reclone_state.setdefault("_names", {})[int(vmid)] = str(name)
 
@@ -754,8 +822,10 @@ def mark_reclone_progress(vmid: int, phase: str, name: str = "") -> None:
 def mark_reclone_vm_done(vmid: int, ok: bool, name: str = "") -> None:
     """Record one VM's terminal outcome + bump completed/failed. ``ok`` True →
     completed, False → failed. Called after each per-VM reclone resolves."""
+    # Ignore when no batch is running.
     if _reclone_state.get("status") != "running":
         return
+    # Append the outcome to the log.
     now = time.time()
     _reclone_state["log"].append({
         "vmid": int(vmid) if vmid is not None else None,
@@ -763,10 +833,12 @@ def mark_reclone_vm_done(vmid: int, ok: bool, name: str = "") -> None:
         "status": "completed" if ok else "failed",
         "timestamp": now,
     })
+    # Bump the matching counter.
     if ok:
         _reclone_state["completed"] = int(_reclone_state.get("completed", 0)) + 1
     else:
         _reclone_state["failed"] = int(_reclone_state.get("failed", 0)) + 1
+    # Clear the current VM if it was this one.
     if _reclone_state.get("current_vm") == (int(vmid) if vmid is not None else None):
         _reclone_state["current_vm"] = None
         _reclone_state["phase"] = ""
@@ -778,11 +850,14 @@ def end_reclone_batch(status: str = "completed") -> None:
     populated (terminal) so the final frame surfaces; the next batch
     start_reclone_batch overwrites it. ``status`` ∈ completed|failed|interrupted."""
     global _reclone_state
+    # Nothing to finalise.
     if not _reclone_state:
         return
+    # Copy the state and mark it finished.
     st = dict(_reclone_state)
     st["status"] = status or "completed"
     st["ended_at"] = time.time()
+    # Summary for the "last run" line.
     st["last_run"] = {
         "timestamp": st["ended_at"],
         "completed": int(st.get("completed", 0)),
@@ -790,6 +865,7 @@ def end_reclone_batch(status: str = "completed") -> None:
         "type": st.get("type", ""),
     }
     # Drop the transient _names map before publishing.
+    # Drop the internal name map and publish the final state.
     st.pop("_names", None)
     _reclone_state = st
 
@@ -819,6 +895,7 @@ def current_provision_cfg_snapshot() -> Dict[str, Any]:
 # spoke (per-host override / manual range for >25 slots) wins over the derived
 # block; vm_set_override (1-99, legacy VM_SET_OVERRIDE) replaces the batch id.
 
+# VMID block size per host and the default range.
 _VMID_BLOCK_STRIDE = 24
 _VMID_DEFAULT_START = 90000
 _VMID_DEFAULT_END = 99999
@@ -828,6 +905,7 @@ def _host_suffix_id(hostname: str, vm_set_override: Any = 0) -> int:
     """Trailing numeric suffix of a proxmox hostname → 1-based batch id
     (svr-02→2, svr-003→3, no-suffix→1). ``vm_set_override`` (1-99) replaces the
     derived id, mirroring the legacy ``VM_SET_OVERRIDE``."""
+    # A valid override wins.
     if vm_set_override:
         try:
             o = int(vm_set_override)
@@ -835,6 +913,7 @@ def _host_suffix_id(hostname: str, vm_set_override: Any = 0) -> int:
                 return o
         except (TypeError, ValueError):
             pass
+    # Otherwise use the hostname's trailing number (1 if none).
     m = re.search(r'(\d+)$', (hostname or '').strip())
     n = int(m.group(1)) if m else 1
     return max(1, n)
@@ -851,12 +930,15 @@ def _host_vmid_range(hostname: str, max_slots: int,
     Otherwise the block is derived from the hostname suffix (``derived=True``):
     ``start = 90000 + (batch_id-1)*24 + 1``, ``end = start + max_slots - 1``.
     """
+    # Is either end at its default?
     start_default = (cfg_start in (None, "") or int(cfg_start) == _VMID_DEFAULT_START)
     end_default = (cfg_end in (None, "") or int(cfg_end) == _VMID_DEFAULT_END)
+    # An explicit range wins.
     if not (start_default and end_default):
         s = int(cfg_start) if cfg_start not in (None, "") else _VMID_DEFAULT_START
         e = int(cfg_end) if cfg_end not in (None, "") else _VMID_DEFAULT_END
         return s, e, _host_suffix_id(hostname, vm_set_override), False
+    # Otherwise derive the block from the host number.
     bid = _host_suffix_id(hostname, vm_set_override)
     s = _VMID_DEFAULT_START + (bid - 1) * _VMID_BLOCK_STRIDE + 1
     e = s + max(1, max_slots) - 1
@@ -872,6 +954,7 @@ def _host_vmid_range(hostname: str, max_slots: int,
 # deterministic human name across re-clones; fall back to sim-{vmid}-{type} when
 # the VMID is outside the mapped range.
 
+# Name map, loaded on first use.
 _VM_NAMES: Optional[Dict[str, str]] = None
 
 
@@ -879,12 +962,14 @@ def _vm_name(vmid: int) -> Optional[str]:
     """Realistic hostname for a sim VMID from the legacy client-setup.conf map,
     or None if ``vmid`` is outside the 90001-100000 mapped range."""
     global _VM_NAMES
+    # Load the name map once (empty on error).
     if _VM_NAMES is None:
         try:
             with open(os.path.join(os.path.dirname(__file__), "vm_names.json")) as f:
                 _VM_NAMES = json.load(f) or {}
         except (OSError, json.JSONDecodeError):
             _VM_NAMES = {}
+    # Look up the VMID.
     return _VM_NAMES.get(str(vmid))
 
 
@@ -894,6 +979,7 @@ def _hostname_stamp_script(name: str) -> str:
     writes files instead of ``hostnamectl`` (D-Bus may be unready post-boot and can
     hang). Shared by the initial-clone stamp, the reclone stamp, AND the hostname
     audit re-stamp so all three write IDENTICALLY."""
+    # Shell commands that set the hostname and keep cloud-init from undoing it.
     return (
         f"echo '{name}' > /etc/hostname; "
         f"sed -i 's/^127\\.0\\.1\\.1.*/127.0.1.1\\t{name}/' /etc/hosts 2>/dev/null || true; "
@@ -918,6 +1004,8 @@ def current_auto_provision_on() -> bool:
 
 
 def _load_vmid_gap_last_run() -> float:
+    """Read when the VMID gap audit last ran (0 if unknown)."""
+    # Read the timestamp from the audit file if it has content.
     try:
         if os.path.exists(VMID_AUDIT_FILE) and os.path.getsize(VMID_AUDIT_FILE) > 0:
             with open(VMID_AUDIT_FILE) as f:
@@ -928,6 +1016,8 @@ def _load_vmid_gap_last_run() -> float:
 
 
 def _save_vmid_gap_last_run(ts: float) -> None:
+    """Save when the VMID gap audit last ran (best-effort)."""
+    # Write the timestamp to the audit file.
     try:
         os.makedirs(PXMLIB, exist_ok=True)
         with open(VMID_AUDIT_FILE, "w") as f:
@@ -938,6 +1028,7 @@ def _save_vmid_gap_last_run(ts: float) -> None:
 
 def _provisioning_vmids() -> Set[int]:
     """VMIDs currently mid-clone (prov_run items with status 'provisioning')."""
+    # Collect the VMIDs of items still provisioning.
     out: Set[int] = set()
     for it in _prov_run.get("items") or []:
         if str(it.get("status") or "") == "provisioning":
@@ -949,6 +1040,8 @@ def _provisioning_vmids() -> Set[int]:
 
 
 def _read_sysfs(path: str) -> str:
+    """Read a sysfs file, stripped and lowercased; empty string if unreadable."""
+    # Read the file; empty on error.
     try:
         with open(path) as f:
             return f.read().strip().lower()
@@ -959,18 +1052,21 @@ def _read_sysfs(path: str) -> str:
 def _discover_bound_dongle_drivers(dongle_vidpids: Set[str]) -> Set[str]:
     """Scan /sys/bus/usb/devices for dongle devices and collect the kernel
     drivers bound to their interface children (bash 1419-1440)."""
+    # List USB devices; none if unreadable.
     drivers: Set[str] = set()
     base = "/sys/bus/usb/devices"
     try:
         entries = os.listdir(base)
     except OSError:
         return drivers
+    # For each device (not interface) entry.
     for name in entries:
         dev = os.path.join(base, name)
         if not os.path.isdir(dev):
             continue
         if ":" in name:
             continue  # skip interface entries like "1-5:1.0"
+        # Its vid:pid; skip if not a dongle.
         vid = _read_sysfs(os.path.join(dev, "idVendor"))
         pid = _read_sysfs(os.path.join(dev, "idProduct"))
         if not vid or not pid:
@@ -979,6 +1075,7 @@ def _discover_bound_dongle_drivers(dongle_vidpids: Set[str]) -> Set[str]:
         if vidpid not in dongle_vidpids:
             continue
         # Interface children: <bus>:1.0, <bus>:1.1, ... → their bound driver.
+        # Collect the driver bound to each of its interfaces.
         for child in entries:
             if not child.startswith(f"{name}:"):
                 continue
@@ -994,7 +1091,10 @@ def _discover_bound_dongle_drivers(dongle_vidpids: Set[str]) -> Set[str]:
 
 
 def _render_blacklist_conf(drivers: List[str]) -> str:
+    """Text for the modprobe blacklist file, one driver per line."""
+    # One "blacklist" line per driver.
     body = "\n".join(f"blacklist {d}" for d in sorted(drivers))
+    # Header plus the lines.
     return (
         "# Auto-generated by pxmx client-sim agent — do not edit manually\n"
         "# Prevents the host from binding to USB dongles used for VM passthrough\n"
@@ -1005,16 +1105,20 @@ def _render_blacklist_conf(drivers: List[str]) -> str:
 async def blacklist_dongle_drivers(agent) -> Dict[str, Any]:
     """Write the modprobe blacklist for bound dongle drivers and rmmod them.
     Idempotent (only writes on diff). Returns the blacklisted driver list."""
+    # Only needed here.
     import asyncio
     from . import pve_cmds
 
+    # No dongles configured: nothing to do.
     dongles = _dongle_vidpids(agent)
     if not dongles:
         return {"action": "blacklist_dongle_drivers", "drivers": [], "note": "no dongle vidpids configured"}
+    # Find drivers bound to dongles; none means nothing to do.
     drivers = _discover_bound_dongle_drivers(dongles)
     if not drivers:
         return {"action": "blacklist_dongle_drivers", "drivers": []}
 
+    # Render the file and read the current one.
     rendered = _render_blacklist_conf(sorted(drivers))
     try:
         existing = ""
@@ -1025,6 +1129,7 @@ async def blacklist_dongle_drivers(agent) -> Dict[str, Any]:
         logger.warning(f"blacklist_dongle_drivers: read conf failed: {e}")
         existing = ""
 
+    # Changed: write it and rebuild module dependencies.
     if existing != rendered:
         try:
             with open(DONGLE_BLACKLIST_CONF, "w") as f:
@@ -1037,6 +1142,7 @@ async def blacklist_dongle_drivers(agent) -> Dict[str, Any]:
 
     # Unload currently-loaded drivers so the blacklist takes effect now (not
     # just next boot). Non-fatal if a driver is in use.
+    # Unload each driver that is loaded now.
     unloaded: List[str] = []
     for drv in sorted(drivers):
         rc, out, _ = await pve_cmds._run(["lsmod"], check=False, timeout=10)
@@ -1056,6 +1162,7 @@ async def blacklist_dongle_drivers(agent) -> Dict[str, Any]:
     # driver). Skips buses assigned to a VM (never disturb a live passthrough). This
     # is the "detach the driver when a dongle is certified" behaviour: certifying a
     # vidpid puts it in ``dongles``, so the next blacklist tick frees it.
+    # Release dongles not assigned to a VM from their host drivers.
     unbound: List[str] = []
     try:
         _st = load_usb_state()
@@ -1079,14 +1186,17 @@ def force_unbind_dongle_drivers(dongle_vidpids: Set[str],
     other devices (the case where blacklist_dongle_drivers' rmmod fails). Buses in
     ``skip_buses`` (dongles currently assigned to a VM) are left alone so a working
     passthrough isn't disturbed. Best-effort; never raises."""
+    # Result and the devices directory.
     skip_buses = skip_buses or set()
     out: Dict[str, Any] = {"action": "force_unbind_dongle_drivers",
                            "unbound": [], "failed": [], "drivers": []}
     base = "/sys/bus/usb/devices"
+    # List devices; none if unreadable.
     try:
         entries = os.listdir(base)
     except OSError:
         return out
+    # For each dongle device not assigned to a VM.
     drivers: Set[str] = set()
     for name in entries:
         if ":" in name:            # skip interface entries; we want the device
@@ -1096,6 +1206,7 @@ def force_unbind_dongle_drivers(dongle_vidpids: Set[str],
         dev = os.path.join(base, name)
         if not os.path.isdir(dev):
             continue
+        # Skip anything that isn't a dongle.
         vid = _read_sysfs(os.path.join(dev, "idVendor"))
         pid = _read_sysfs(os.path.join(dev, "idProduct"))
         if not vid or not pid or f"{vid}:{pid}" not in dongle_vidpids:
@@ -1103,6 +1214,7 @@ def force_unbind_dongle_drivers(dongle_vidpids: Set[str],
         for child in entries:      # its interface children: <name>:1.0, ...
             if not child.startswith(f"{name}:"):
                 continue
+            # Find the interface's bound driver.
             drv_link = os.path.join(base, child, "driver")
             try:
                 if not os.path.islink(drv_link):
@@ -1112,6 +1224,7 @@ def force_unbind_dongle_drivers(dongle_vidpids: Set[str],
                 continue
             if not drv or drv == ".":
                 continue
+            # Unbind the interface from it.
             drivers.add(drv)
             try:
                 with open(f"/sys/bus/usb/drivers/{drv}/unbind", "w") as f:
@@ -1121,6 +1234,7 @@ def force_unbind_dongle_drivers(dongle_vidpids: Set[str],
             except OSError as e:
                 out["failed"].append(child)
                 logger.warning(f"force-unbind: could not unbind {child} from {drv}: {e}")
+    # Report the drivers seen.
     out["drivers"] = sorted(drivers)
     return out
 
@@ -1132,6 +1246,7 @@ def _bus_attached(bus: str) -> bool:
     VM config still names it (the dropped-passthrough case reclone-on-detach
     recovers). Best-effort — a probe error reads as 'attached' so a transient
     sysfs hiccup never triggers a spurious reclone."""
+    # Attached if any interface is bound to usbfs; errors count as attached.
     base = "/sys/bus/usb/devices"
     try:
         for child in os.listdir(base):
@@ -1149,9 +1264,12 @@ async def _guest_sees_dongle(vid: int, vidpid) -> "Optional[bool]":
     """True/False whether the GUEST's ``lsusb`` lists ``vidpid``; None when the
     guest agent isn't responding (booting / no QGA) so the watchdog can't tell and
     must NOT escalate on a blind guess."""
+    # Only needed here.
     from . import pve_cmds
+    # Nothing to look for.
     if not vidpid:
         return None
+    # No guest agent means unknown; else grep lsusb in the guest.
     try:
         if not await pve_cmds.qm_agent_ping(vid):
             return None
@@ -1177,7 +1295,9 @@ async def _guest_health_probe(vid: int) -> "Optional[Dict[str, bool]]":
                        a reboot/reclone won't help; swap/quarantine the dongle.
     This is exactly the signal set that closes the "lsusb-visible but not working"
     hole (driver unbound / never associated / associated-but-no-gateway)."""
+    # Only needed here.
     from . import pve_cmds
+    # Each check is a shell command whose exit code is the answer.
     checks = {
         "netdev_present": "ls /sys/class/net 2>/dev/null | grep -qE '^wl'",
         "associated":     "ip route show default 2>/dev/null | grep -qE 'dev wl'",
@@ -1215,6 +1335,7 @@ async def _guest_health_probe(vid: int) -> "Optional[Dict[str, bool]]":
             "[ -n \"$tp\" ] && [ \"$tp\" -le -50 ]"
         ),
     }
+    # No guest agent means unknown; else run each check.
     try:
         if not await pve_cmds.qm_agent_ping(vid):
             return None
@@ -1246,7 +1367,9 @@ async def _guest_radio_scan_refused(vid: int) -> "Optional[bool]":
     Returns True (refused → dead), False (scan worked → NOT a dead radio), or
     None when the guest agent did not answer — callers must not escalate on None.
     """
+    # Only needed here.
     from . import pve_cmds
+    # Bring the wifi interface up and see if a scan is refused.
     script = (
         "W=$(ls /sys/class/net 2>/dev/null | grep -m1 -E '^wl'); "
         "[ -n \"$W\" ] || exit 1; "
@@ -1256,6 +1379,7 @@ async def _guest_radio_scan_refused(vid: int) -> "Optional[bool]":
         "iw dev \"$W\" scan 2>&1 "
         "| grep -qiE 'not permitted|not supported|network is down|resource busy'"
     )
+    # No guest agent means unknown; else run the scan check.
     try:
         if not await pve_cmds.qm_agent_ping(vid):
             return None
@@ -1285,7 +1409,9 @@ async def _guest_failure_sim_active(vid: int) -> "Optional[bool]":
     working test VM. The no_scan class is never gated on this, so a genuinely
     dead radio is still caught regardless.
     """
+    # Only needed here.
     from . import pve_cmds
+    # Use the client's own scripts to find its simulation and check its type.
     script = (
         "set +e; "
         "[ -r /usr/local/scripts/simulation.conf ] || exit 3; "
@@ -1301,12 +1427,14 @@ async def _guest_failure_sim_active(vid: int) -> "Optional[bool]":
         "  [ \"$v\" = on ] && { echo ACTIVE; exit 0; }; "
         "done; echo IDLE; exit 0"
     )
+    # Run it; no answer means unknown.
     try:
         out = await pve_cmds.qm_guest_exec_shell_out(vid, script)
     except Exception:  # noqa: BLE001
         return None
     if out is None:
         return None
+    # ACTIVE or IDLE from the output.
     t = (out or "").strip()
     if "ACTIVE" in t:
         return True
@@ -1327,18 +1455,22 @@ async def _guest_visible_ssids(vid: int) -> "Optional[list]":
     Returns None when it cannot be determined (QGA down, no tooling) -- callers
     must not read that as "sees nothing", which is the whole point of the check.
     """
+    # Only needed here.
     from . import pve_cmds
+    # List cached scan results as "signal|ssid", strongest first.
     script = (
         "nmcli -t -f SIGNAL,SSID dev wifi list --rescan no 2>/dev/null "
         "| awk -F: 'NF>1 && $2!=\"\" {print $1\"|\"$2}' | sort -rn | head -12; "
         "test -s /dev/null"
     )
+    # Run it; no answer means unknown.
     try:
         out = await pve_cmds.qm_guest_exec_shell_out(vid, script)
     except Exception:  # noqa: BLE001
         return None
     if out is None:
         return None
+    # Parse each line, keeping each SSID once.
     seen, rows = set(), []
     for line in (out or "").splitlines():
         line = line.strip()
@@ -1374,6 +1506,7 @@ def _classify_guest_health(probe) -> str:
     SSID -- an infra/config fault a reclone should not be chasing. Both climb
     the same ladder today; separating them makes the UI honest and leaves room
     to treat them differently later."""
+    # Check from the most basic failure up.
     if probe is None:
         return "unknown"
     if not probe.get("netdev_present"):
@@ -1394,6 +1527,7 @@ def _classify_guest_health(probe) -> str:
                 return "radio_dead"
             return "no_scan"
         return "no_assoc"
+    # Associated but no gateway.
     if not probe.get("gateway_ok"):
         return "no_gateway"
     return "healthy"
@@ -1417,6 +1551,7 @@ def build_idle_reason(culled: Dict[str, List[str]], any_present: bool,
     Callers that key on this string must accept BOTH prefixes; see
     ``fleet_health_alert._eval_dongle_shed``.
     """
+    # Count dongles in use and list the sidelined groups.
     n_assigned = len(culled.get("assigned") or [])
     sidelined = []
     if culled.get("quarantined"):
@@ -1425,9 +1560,11 @@ def build_idle_reason(culled: Dict[str, List[str]], any_present: bool,
         sidelined.append(f"{len(culled['excluded'])} excluded")
     if culled.get("type"):
         sidelined.append(f"{len(culled['type'])} wrong type for sim_phy={sim_phy}")
+    # Some in use: report the deployed count.
     if n_assigned:
         return (f"all dongles deployed ({n_assigned} in use"
                 + (f"; {', '.join(sidelined)}" if sidelined else "") + ")")
+    # None in use: explain why.
     detail = "; ".join(f"{k}={v}" for k, v in culled.items() if v)
     if not any_present:
         detail = "none present"
@@ -1443,9 +1580,11 @@ def recently_actioned_vmids(now: Optional[float] = None,
     For OTHER recovery paths to skip: a VM the ladder just rebooted is silent by
     design for a minute or two, and reads identically to a hung guest.
     """
+    # Time now and the window to look back.
     now = time.time() if now is None else now
     win = _HEALTH_ATTEMPT_COOLDOWN_S if within_s is None else within_s
     out: Set[int] = set()
+    # Collect VMIDs whose last health action falls inside the window.
     try:
         for rec in (load_usb_state().get("dongle_health") or {}).values():
             r = rec or {}
@@ -1464,6 +1603,7 @@ def recently_actioned_vmids(now: Optional[float] = None,
 def _usb_port_reset(bus: str) -> bool:
     """Host-side USB reset — de-authorize then re-authorize the device so it
     re-enumerates (the guest's usb-host sees a re-plug). Best-effort."""
+    # Toggle the device's authorized flag off then on.
     path = f"/sys/bus/usb/devices/{bus}/authorized"
     try:
         with open(path, "w") as f:
@@ -1474,6 +1614,7 @@ def _usb_port_reset(bus: str) -> bool:
         # device", and disconnect is a category the diagnostic counts as
         # evidence -- so without this the agent's own recovery attempts read
         # back as proof the dongle is failing.
+        # Note the reset so it isn't mistaken for a fault.
         try:
             from . import usb_diagnostics as _ud
             _ud.record_port_reset(bus)
@@ -1494,20 +1635,25 @@ async def _reattach_usb(vid: int, bus: str) -> bool:
     its own passthrough -- three of those and the bus is quarantined for
     "chronic detach" on perfectly good hardware.
     """
+    # Only needed here.
     from . import pve_cmds
+    # Note the reset so it isn't mistaken for a fault.
     try:
         from . import usb_diagnostics as _ud
         _ud.record_port_reset(bus)
     except Exception:  # noqa: BLE001 — attribution is never worth a failure
         pass
+    # Read the VM config.
     try:
         cfg = await pve_cmds.qm_config(vid)
     except Exception:  # noqa: BLE001
         return False
+    # Find the usbN entry for this bus.
     key = next((k for k, v in (cfg or {}).items()
                 if str(k).startswith("usb") and f"host={bus}" in str(v)), None)
     if not key:
         return False
+    # Remove it, wait, then add it back.
     await pve_cmds._run(["qm", "set", str(vid), "-delete", key], check=False, timeout=30)
     await asyncio.sleep(1)
     await pve_cmds._run(["qm", "set", str(vid), f"-{key}", f"host={bus}"], check=False, timeout=30)
@@ -1531,12 +1677,15 @@ async def dongle_health_check_and_recover(agent, present) -> int:
 
     One stage per bus per _HEALTH_ATTEMPT_COOLDOWN_S so the guest can recover
     between attempts. Returns the number of VMs acted on. Never raises."""
+    # Only needed here.
     import time as _t
     from . import pve_cmds, cs_sim
+    # Load state: bus map, ladder progress and in-guest health.
     st = load_usb_state()
     b2v = st.get("bus_to_vmid") or {}
     health = st.setdefault("dongle_health", {})
     gh = st.setdefault("guest_health", {})   # per-bus in-guest state → CS telemetry
+    # Time now, count of VMs acted on, and whether state needs saving.
     now = _t.time()
     acted = 0
     dirty = False
@@ -1546,6 +1695,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
         no_gateway/no_driver/not_visible are logged at ERROR (loud alarm — these
         are the states the operator must see); no_assoc at WARNING."""
         nonlocal dirty
+        # Store the new state; on a change, mark dirty and log problems.
         prev = (gh.get(bus) or {}).get("state")
         gh[bus] = {"state": state, "probe": probe, "vmid": vid, "at": now}
         if prev != state:
@@ -1575,16 +1725,20 @@ async def dongle_health_check_and_recover(agent, present) -> int:
         # retried by the normal provisioning pass, so nothing is lost by not
         # resetting it here.
         try:
+            # Skip buses already quarantined for good.
             _qt = (_read_quarantine() or {}).get(bus) or {}
             if _qt.get("permanent") or int(_qt.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
                 return
         except Exception:  # noqa: BLE001 — never block recovery on a read error
             pass
+        # This bus's ladder progress and the wait it needs.
         h = health.setdefault(bus, {"fails": 0, "last_attempt": 0.0, "stage": ""})
         cooldown = (_REBOOT_BEFORE_RECLONE_S if h.get("stage") == "reboot"
                     else _HEALTH_ATTEMPT_COOLDOWN_S)
+        # Wait out the cooldown.
         if now - float(h.get("last_attempt", 0)) < cooldown:
             return                                     # cooling down
+        # Next stage on the ladder; record the attempt.
         stage = ladder[min(h["fails"], len(ladder) - 1)]
         h["fails"] += 1
         h["last_attempt"] = now
@@ -1595,26 +1749,33 @@ async def dongle_health_check_and_recover(agent, present) -> int:
         # VM and the watchdog -- probing 300s later, mid-boot -- reads it as hung
         # and escalates to its own reset. Two recovery systems fighting over one
         # VM, each provoking the other's trigger.
+        # Remember the VM, mark state dirty and count the action.
         h["vmid"] = vid
         dirty = True
         acted += 1
         logger.warning("dongle health: VM %s bus %s %s — recovery stage '%s' "
                        "(attempt %d)", vid, bus, reason, stage, h["fails"])
+        # Run the chosen stage.
         try:
+            # Reset the USB port.
             if stage == "usb_reset":
                 _usb_port_reset(bus)
+            # Detach and reattach the passthrough.
             elif stage == "reattach":
                 await _reattach_usb(vid, bus)
+            # Hard-stop and restart the VM.
             elif stage == "reboot":
                 await pve_cmds.qm_stop_force(vid)
                 await asyncio.sleep(2)
                 await pve_cmds.qm_start(vid)
+            # Destroy the VM and forget the bus so a fresh VM is provisioned.
             elif stage == "reclone":
                 await cs_sim.destroy_vm(agent, vid, bus=bus)
                 b2v.pop(bus, None)
                 (st.get("vmid_to_bus") or {}).pop(str(vid), None)
                 health.pop(bus, None)
                 gh.pop(bus, None)                      # loop re-provisions a fresh VM
+            # Quarantine the bus, destroy the VM and forget the bus.
             elif stage == "quarantine":
                 quarantine_bus(bus, "dongle unrecoverable — " + reason)
                 await cs_sim.destroy_vm(agent, vid, bus=bus)
@@ -1627,12 +1788,15 @@ async def dongle_health_check_and_recover(agent, present) -> int:
         except Exception as e:  # noqa: BLE001 — one bad recovery never kills the loop
             logger.warning("dongle health: stage '%s' for VM %s failed: %s",
                            stage, vid, e)
+    # Check each dongle that has a VM.
     for bus, vmid in list(b2v.items()):
+        # Stop once this pass has acted on enough VMs.
         if acted >= _HEALTH_MAX_PER_PASS:
             logger.info("dongle health: per-pass cap (%d) reached — remaining "
                         "unhealthy clients are handled on later passes",
                         _HEALTH_MAX_PER_PASS)
             break
+        # Skip bad VMIDs.
         try:
             vid = int(vmid)
         except (TypeError, ValueError):
@@ -1643,6 +1807,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             dirty = health.pop(bus, None) is not None or dirty
             dirty = gh.pop(bus, None) is not None or dirty
             continue
+        # Only running VMs are checked; clear state for stopped ones.
         try:
             running = bool((await pve_cmds.vm_status(vid)).get("running"))
         except Exception:  # noqa: BLE001
@@ -1651,6 +1816,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             dirty = health.pop(bus, None) is not None or dirty
             dirty = gh.pop(bus, None) is not None or dirty
             continue
+        # Ask the guest whether it sees the dongle.
         seen = await _guest_sees_dongle(vid, present[bus].get("vidpid"))
         if seen is None:
             continue                                   # QGA down — can't tell
@@ -1658,6 +1824,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             # lsusb-visible does NOT mean WORKING — the dongle can be enumerated
             # but have no driver bound, never associate, or associate with no
             # gateway. Deeper READ-ONLY probe classifies it; act on the class.
+            # Visible: probe whether it actually works.
             _hp = await _guest_health_probe(vid)
             _hs = _classify_guest_health(_hp)
             if _hs == "unknown":
@@ -1671,17 +1838,20 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             # the badge / alarm / escalate, so a flood sim's expected transient
             # gateway loss never false-flags a healthy dongle. gh carries the
             # running streak; the badge stays clear (state=healthy) until confirmed.
+            # Count consecutive identical bad results; act only once confirmed.
             g = gh.get(bus) or {}
             streak = int(g.get("streak", 0)) + 1 if g.get("cand") == _hs else 1
             confirmed = streak >= _VISIBLE_CONFIRM
             # Capture what the radio can SEE for the wifi-side faults. Only for
             # those states (not every unhealthy client) so a no_driver box, whose
             # radio cannot scan by definition, does not pay for a guest exec.
+            # For scan/association faults, also note which SSIDs it can see.
             _ssids = g.get("ssids")
             if _hs in ("no_scan", "no_assoc", "radio_dead"):
                 _got = await _guest_visible_ssids(vid)
                 if _got is not None:
                     _ssids = _got
+            # Store the candidate state (shown as healthy until confirmed).
             gh[bus] = {"state": _hs if confirmed else "healthy", "cand": _hs,
                        "streak": streak, "probe": _hp, "vmid": vid, "at": now,
                        "ssids": _ssids}
@@ -1704,6 +1874,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             # Scoped to no_assoc ONLY. no_scan (radio sees nothing at all) is
             # never gated on this — no failure sim makes a radio blind, so that
             # stays a hardware fault and still escalates to quarantine.
+            # No association: hold off if a failure simulation may be the cause.
             if _hs == "no_assoc":
                 _fs = await _guest_failure_sim_active(vid)
                 if _fs is not False:      # True or UNKNOWN -> hold off
@@ -1719,6 +1890,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
                     continue
                 gh[bus] = dict(gh.get(bus) or {}, held_by_sim=False,
                                held_unknown=False)
+            # No gateway is a network problem: alarm only, never escalate.
             if _hs == "no_gateway":
                 # Associated (L2 up) but the gateway is unreachable ~15 min → an
                 # UPSTREAM/infra problem, NOT the dongle. Rebooting/recloning won't
@@ -1727,6 +1899,7 @@ async def dongle_health_check_and_recover(agent, present) -> int:
                 # mid-run-broken-client hole, now visible in the Hub UI ('no gw').
                 dirty = health.pop(bus, None) is not None or dirty
                 continue
+            # Possibly dead radio: confirm by checking whether a scan is refused.
             if _hs == "radio_dead":
                 # Confirm before shedding. The txpower hint alone is not enough:
                 # some Realtek out-of-tree drivers report a bogus value on a
@@ -1763,11 +1936,14 @@ async def dongle_health_check_and_recover(agent, present) -> int:
             # no_driver / no_assoc confirmed → climb the VISIBLE-broken sub-ladder
             # (reboot → reclone → quarantine); usb_reset/reattach are useless once
             # the device already enumerated in the guest.
+            # Other faults climb the visible ladder.
             await _escalate(bus, vid, _HEALTH_LADDER_VISIBLE,
                             "lsusb-visible but %s" % _hs)
             continue
+        # Not visible in the guest: climb the full ladder.
         _set_gh(bus, vid, "not_visible")               # guest can't even lsusb it
         await _escalate(bus, vid, _HEALTH_LADDER, "not visible in guest")
+    # Save state if anything changed.
     if dirty:
         save_usb_state(st)
     return acted
@@ -1780,6 +1956,7 @@ def current_visible_ssids() -> "Dict[str, list]":
     APs = dead radio) and answers the obvious no_assoc follow-up: is the SSID we
     want even on air? Absent for healthy clients — never collected for them."""
     try:
+        # Map each VM to the SSIDs recorded for it.
         out: "Dict[str, list]" = {}
         for rec in (load_usb_state().get("guest_health") or {}).values():
             vid, ssids = rec.get("vmid"), rec.get("ssids")
@@ -1797,6 +1974,7 @@ def current_guest_health() -> "Dict[str, str]":
     healthy / no_driver / no_scan / no_assoc / no_gateway / not_visible.
     Best-effort."""
     try:
+        # Map each VM to its recorded health state.
         out: "Dict[str, str]" = {}
         for rec in (load_usb_state().get("guest_health") or {}).values():
             vid, state = rec.get("vmid"), rec.get("state")
@@ -1830,12 +2008,15 @@ async def hostname_audit_and_restamp(agent) -> int:
     to just give up silently forever past the cap (operator/reclone territory,
     with nothing ever surfacing it). Never raises. Returns VMs re-stamped
     (does NOT count destroys — those free a slot rather than fix one in place)."""
+    # Only needed here.
     import time as _t
     from . import pve_cmds
     from . import cs_guard
+    # Load state: bus map and per-VM fix attempts.
     st = load_usb_state()
     b2v = st.get("bus_to_vmid") or {}
     fixes = st.setdefault("hostname_fix", {})
+    # Time now, count of VMs fixed, and whether state needs saving.
     now = _t.time()
     acted = 0
     dirty = False
@@ -1848,6 +2029,7 @@ async def hostname_audit_and_restamp(agent) -> int:
     # enumerate the host and filter with the standard sim guard: the 90000 floor
     # plus the protected set. vm_names.json is keyed by vmid across the whole
     # range and is tier-agnostic, so the identity source already covers T1/T3.
+    # Gather candidates: VMs in the dongle map first.
     protected = _protected_vmids(agent)
     candidates: List[int] = []
     seen_vids = set()
@@ -1861,6 +2043,7 @@ async def hostname_audit_and_restamp(agent) -> int:
         if vid not in seen_vids:
             seen_vids.add(vid)
             candidates.append(vid)
+    # Then every other simulation VM on the host.
     try:
         for vid in await pve_cmds.list_qemu_vmids():
             if vid in seen_vids:
@@ -1872,12 +2055,15 @@ async def hostname_audit_and_restamp(agent) -> int:
     except Exception as e:  # noqa: BLE001 — fall back to the dongle map alone
         logger.debug("hostname audit: host VM enumeration failed (%s) — "
                      "auditing the dongle map only", e)
+    # Check each candidate.
     for vid in candidates:
+        # Stop once this pass has acted on enough VMs.
         if acted >= _HOSTNAME_FIX_MAX_PER_PASS:
             logger.info("hostname audit: per-pass cap (%d) reached — remaining "
                         "misnamed VMs converge on later passes",
                         _HOSTNAME_FIX_MAX_PER_PASS)
             break
+        # The name it should have; skip if none.
         expected = _vm_name(vid)
         if not expected:
             continue                                   # unmapped vmid — no identity to enforce
@@ -1892,9 +2078,11 @@ async def hostname_audit_and_restamp(agent) -> int:
                     continue
             except Exception:  # noqa: BLE001 — unknown → treat as template, skip
                 continue
+        # This VM's fix history; skip while cooling down.
         rec = fixes.get(str(vid)) or {}
         if now - float(rec.get("last", 0)) < _HEALTH_ATTEMPT_COOLDOWN_S:
             continue                                   # let a just-fired reboot/destroy come back
+        # Too many attempts: destroy it so it gets recloned.
         if int(rec.get("attempts", 0)) >= _HOSTNAME_FIX_MAX:
             # Re-stamp+reboot never took after _HOSTNAME_FIX_MAX tries. This used
             # to just `continue` (skip) forever — the strike record sat here with
@@ -1923,6 +2111,7 @@ async def hostname_audit_and_restamp(agent) -> int:
                 logger.warning("hostname audit: reclone-on-giveup for VM %s "
                                "failed (%s) — will retry next pass", vid, de)
             continue
+        # Ask the guest its hostname (skip if the guest agent is down).
         try:
             if not await pve_cmds.qm_agent_ping(vid):
                 continue                               # QGA down — can't audit
@@ -1934,20 +2123,24 @@ async def hostname_audit_and_restamp(agent) -> int:
             # it IS turns every occurrence into an ssh session.
             actual = await pve_cmds.qm_guest_exec_shell_out(
                 vid, "hostname", exec_timeout=15, outer_timeout=25)
+            # No answer or empty: no evidence, try later.
             if actual is None:
                 continue                 # UNKNOWN (exec failed) — no strike, retry later
             actual = actual.strip()
             if not actual:
                 continue                 # empty is not evidence of a mismatch
+            # Correct: clear any strikes.
             if actual == expected:
                 dirty = fixes.pop(str(vid), None) is not None or dirty  # clear any strike
                 continue
             # MISMATCH → re-stamp the correct hostname, then reboot to apply.
+            # Wrong: count the attempt.
             attempts = int(rec.get("attempts", 0)) + 1
             logger.warning("hostname audit: VM %s wrong in-guest hostname "
                            "(is '%s', expected '%s') — re-stamp + reboot "
                            "(attempt %d/%d)",
                            vid, actual, expected, attempts, _HOSTNAME_FIX_MAX)
+            # Re-stamp the hostname (up to 3 tries).
             stamped = False
             for _ in range(3):
                 if await pve_cmds.qm_guest_exec_shell(
@@ -1956,22 +2149,26 @@ async def hostname_audit_and_restamp(agent) -> int:
                     stamped = True
                     break
                 await asyncio.sleep(3)
+            # Stamped: reboot to apply.
             if stamped:
                 try:
                     await pve_cmds.qm_guest_exec(vid, "reboot")  # fire-and-forget (agent dies)
                 except Exception:  # noqa: BLE001
                     pass
                 acted += 1
+            # Record the attempt.
             fixes[str(vid)] = {"attempts": attempts, "last": now,
                                "expected": expected, "actual": actual,
                                "stamped": stamped}
             dirty = True
+            # Out of attempts: warn that it will be destroyed next pass.
             if attempts >= _HOSTNAME_FIX_MAX:
                 logger.error("hostname audit: VM %s still misnamed after %d re-stamp "
                              "attempts (is '%s', expected '%s') — will destroy for "
                              "reclone next pass", vid, attempts, actual, expected)
         except Exception as e:  # noqa: BLE001 — one bad VM never sinks the audit
             logger.warning("hostname audit: VM %s check/restamp failed: %s", vid, e)
+    # Save state if anything changed.
     if dirty:
         save_usb_state(st)
     return acted
@@ -1989,11 +2186,14 @@ async def _vm_usb_bus(vid: int) -> Optional[str]:
     """The host USB BUS PATH a qemu VM passes through (``usbN: host=<bus>`` →
     ``<bus>``), or None. Only the bus-path form (e.g. ``5-1.4``) counts — a
     ``host=<vid>:<pid>`` vidpid passthrough isn't our bus-tracked model."""
+    # Only needed here.
     from . import pve_cmds
+    # Read the VM config.
     try:
         cfg = await pve_cmds.qm_config(vid)
     except Exception:  # noqa: BLE001
         return None
+    # Return the bus from the first usbN host=<bus> entry.
     for k, v in (cfg or {}).items():
         if str(k).startswith("usb") and "host=" in str(v):
             val = str(v).split("host=", 1)[1].split(",", 1)[0].strip()
@@ -2018,11 +2218,14 @@ async def _vm_has_pci_passthrough(vid: int) -> bool:
     the outside that looks like "T1 provisioned last"; it was actually T1 going
     first every time and being eaten. Each cycle also cost four clone+destroy
     pairs, which is real load on the host."""
+    # Only needed here.
     from . import pve_cmds
+    # Read the config; on error assume it has PCI.
     try:
         cfg = await pve_cmds.qm_config(vid)
     except Exception:  # noqa: BLE001 — unknown → treat as occupied, never reclaim
         return True
+    # Any hostpciN entry.
     return any(str(k).startswith("hostpci") for k in (cfg or {}))
 
 
@@ -2043,11 +2246,14 @@ async def _vm_has_usb_passthrough(vid: int) -> bool:
     'might be a real VM, don't destroy') — destroying a real client because a
     transient Proxmox RPC failed is far worse than skipping a real zombie for
     one tick (the next pass retries once the RPC is back)."""
+    # Only needed here.
     from . import pve_cmds
+    # Read the config; on error assume real.
     try:
         cfg = await pve_cmds.qm_config(vid)
     except Exception:  # noqa: BLE001 — conservative: assume real, skip reclaim
         return True
+    # Any usbN host= entry.
     for k, v in (cfg or {}).items():
         if str(k).startswith("usb") and "host=" in str(v):
             return True
@@ -2065,23 +2271,29 @@ async def reconcile_vm_configs(agent, start: int, end: int,
     dongle → active tracking; an absent dongle → tracked + missing_since=now so
     the teardown counts it down and sheds it. Non-passthrough VMs are never
     touched. Returns True if anything was re-tracked."""
+    # Only needed here.
     from . import pve_cmds
+    # VMIDs already tracked.
     st = load_usb_state()
     tracked = {int(v) for v in (st.get("bus_to_vmid") or {}).values()
                if str(v).lstrip("-").isdigit()}
     changed = False
+    # Check each untracked, non-template VM in our range.
     for vid in sorted(int(x) for x in existing if str(x).lstrip("-").isdigit()):
         if vid < start or vid > end or vid in tracked:
             continue
         if await pve_cmds.is_template(vid):
             continue
+        # Its USB bus; skip if none.
         bus = await _vm_usb_bus(vid)
         if not bus:
             continue  # not a dongle VM — never auto-track/shed it
+        # Track it under that bus.
         image = int((st.get("vmid_to_image") or {}).get(str(vid), 1) or 1)
         st.setdefault("bus_to_vmid", {})[bus] = str(vid)
         st.setdefault("vmid_to_bus", {})[str(vid)] = bus
         st.setdefault("vmid_to_image", {})[str(vid)] = image
+        # Present clears the missing timer; absent starts it.
         if bus in present:
             st.setdefault("missing_since", {}).pop(bus, None)
             _label = "present"
@@ -2091,6 +2303,7 @@ async def reconcile_vm_configs(agent, start: int, end: int,
         changed = True
         logger.info("reconcile_vm_configs: re-tracked VM %s → bus %s [%s]",
                     vid, bus, _label)
+    # Save if anything changed.
     if changed:
         save_usb_state(st)
     return changed
@@ -2108,16 +2321,19 @@ async def release_stale_assignments(existing) -> int:
     conservatively keep it (never strand a real client). A STOPPED VM whose config
     still names this bus is also kept (it legitimately owns the dongle). Returns
     the number released."""
+    # Load state and the set of existing VMs.
     st = load_usb_state()
     b2v = st.get("bus_to_vmid") or {}
     existset = {int(x) for x in existing if str(x).lstrip("-").isdigit()}
     released = 0
+    # Check each tracked bus.
     for bus, vmid in list(b2v.items()):
         try:
             vid = int(vmid)
         except (TypeError, ValueError):
             continue
         stale = False
+        # Stale if the VM is gone, moved buses, or lost its passthrough.
         if vid not in existset:
             stale = True                                    # VM gone
         else:
@@ -2129,6 +2345,7 @@ async def release_stale_assignments(existing) -> int:
             elif not await _vm_has_usb_passthrough(vid):
                 stale = True                                # VM has NO passthrough → lost its dongle
             # else: vidpid-form passthrough (host=vid:pid) — can't verify, keep
+        # Release a stale bus.
         if stale:
             b2v.pop(bus, None)
             if (st.get("vmid_to_bus") or {}).get(str(vid)) == bus:
@@ -2137,6 +2354,7 @@ async def release_stale_assignments(existing) -> int:
             released += 1
             logger.info("provision loop: released stale assignment bus %s -> VM %s "
                         "(gone / reconfigured / no passthrough) — dongle re-eligible", bus, vid)
+    # Save if anything was released.
     if released:
         save_usb_state(st)
     return released
@@ -2152,13 +2370,16 @@ def scan_present_dongles(dongle_vidpids: Set[str],
     in the configured set (bash ``scan_usb_devices`` 1537-1620). Returns
     ``{bus_path: {vidpid, product, type}}``. ``type`` comes from the certified
     map (default 'wireless')."""
+    # Results and the devices directory.
     certified_types = certified_types or {}
     out: Dict[str, Dict[str, Any]] = {}
     base = "/sys/bus/usb/devices"
+    # List devices; none if unreadable.
     try:
         entries = os.listdir(base)
     except OSError:
         return out
+    # Each device entry that is a configured dongle.
     for name in entries:
         if ":" in name:
             continue
@@ -2174,12 +2395,14 @@ def scan_present_dongles(dongle_vidpids: Set[str],
             continue
         # Product label from the first interface's product field, else the
         # sysfs product file.
+        # Record its name and type.
         product = _read_sysfs(os.path.join(dev, "product")) or name
         out[name] = {"vidpid": vidpid, "product": product,
                      "type": str(certified_types.get(vidpid, "wireless"))}
     return out
 
 
+# Cached lsusb names and when they were read.
 _LSUSB_CACHE: Dict[str, Any] = {"ts": 0.0, "map": {}}
 
 
@@ -2190,9 +2413,11 @@ def _lsusb_descriptions() -> Dict[str, str]:
     of the terse sysfs ``product`` (``802.11n NIC``). Cached ~60s — the vid:pid →
     name mapping is static — so the per-tick telemetry build doesn't fork lsusb
     every time. Best-effort: empty on any failure (lsusb / usb.ids absent)."""
+    # Serve from cache for 60 seconds.
     now = time.time()
     if now - float(_LSUSB_CACHE.get("ts", 0)) < 60 and _LSUSB_CACHE.get("map"):
         return _LSUSB_CACHE["map"]
+    # Run lsusb and map each vid:pid to its description.
     out: Dict[str, str] = {}
     try:
         import subprocess
@@ -2207,6 +2432,7 @@ def _lsusb_descriptions() -> Dict[str, str]:
                     out[vp] = desc
     except Exception:  # noqa: BLE001 — lsusb missing / no usb.ids → no descriptions
         pass
+    # Cache a non-empty result.
     if out:
         _LSUSB_CACHE["ts"] = now
         _LSUSB_CACHE["map"] = out
@@ -2224,6 +2450,7 @@ def _dongle_recovery_view(hh: Optional[dict], dr: Optional[dict],
       * ``detach_reclones`` — detach strikes: the passthrough keeps dropping
         (present but NOT usbfs), reclone attempts before the bus is quarantined.
     Returns None for a healthy dongle (no entry in either map)."""
+    # Health ladder entry present.
     if hh:
         stage = str(hh.get("stage") or "")
         n = int(hh.get("fails", 0))
@@ -2231,6 +2458,7 @@ def _dongle_recovery_view(hh: Optional[dict], dr: Optional[dict],
         # guest_health class so the operator sees the RIGHT reason: 'not_visible'
         # → the guest-blind ladder; no_driver/no_assoc → the visible-but-broken
         # ladder (device enumerates but has no working driver / never associated).
+        # Visible but not working.
         gs = str((gh_state or {}).get("state") or "")
         if gs in ("no_driver", "no_assoc", "no_scan"):
             _max = len(_HEALTH_LADDER_VISIBLE)
@@ -2241,10 +2469,12 @@ def _dongle_recovery_view(hh: Optional[dict], dr: Optional[dict],
                     "max": _max, "last_attempt": hh.get("last_attempt"),
                     "reason": f"{_what} — recovery stage '{stage}' "
                               f"(attempt {n} of {_max})"}
+        # Guest can't see the dongle.
         return {"state": "guest_blind", "stage": stage, "attempts": n,
                 "max": len(_HEALTH_LADDER), "last_attempt": hh.get("last_attempt"),
                 "reason": f"guest can't see the dongle — recovery stage "
                           f"'{stage}' (attempt {n} of {len(_HEALTH_LADDER)})"}
+    # Detach strikes.
     if dr:
         n = int(dr.get("n", 0))
         return {"state": "detached", "stage": "reclone", "attempts": n,
@@ -2272,28 +2502,35 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
     Best-effort: any failure returns empty lists (the cs speak tolerates
     empty). Mirrors the legacy cs bash agent's telemetry body so the cs speak's
     ``_apply_proxmox_telemetry_state`` ingests it unchanged."""
+    # Empty result used on failure.
     empty: Dict[str, List[Dict[str, Any]]] = {"usb_state": [], "present_usb": [],
                                               "unknown_usb": [], "quarantine": [],
                                               "excluded": []}
+    # Build everything; any failure returns the empty result.
     try:
+        # Configured sets and device names.
         certified = _dongle_vidpids(agent)
         ignored = _ignored_vidpids(agent)
         ctypes = _certified_types(agent)
         descmap = _lsusb_descriptions()   # {vidpid: full lsusb/usb.ids name}
+        # Result lists, and certified devices by bus.
         present: List[Dict[str, Any]] = []
         unknown: List[Dict[str, Any]] = []
         present_by_bus: Dict[str, Dict[str, Any]] = {}
         base = "/sys/bus/usb/devices"
+        # List devices.
         try:
             entries = os.listdir(base)
         except OSError:
             entries = []
+        # Classify each device entry.
         for name in entries:
             if ":" in name:
                 continue  # interface child, not a device
             dev = os.path.join(base, name)
             if not os.path.isdir(dev):
                 continue
+            # Its vid:pid, name and description.
             vid = _read_sysfs(os.path.join(dev, "idVendor"))
             pid = _read_sysfs(os.path.join(dev, "idProduct"))
             if not vid or not pid:
@@ -2301,51 +2538,64 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
             vidpid = f"{vid}:{pid}"
             product = _read_sysfs(os.path.join(dev, "product")) or name
             desc = descmap.get(vidpid, "")
+            # Certified: report as present.
             if vidpid in certified:
                 entry = {"bus_path": name, "vidpid": vidpid,
                          "product": product, "description": desc,
                          "type": str(ctypes.get(vidpid, "wireless"))}
                 present.append(entry)
                 present_by_bus[name] = entry
+            # Ignored: skip.
             elif vidpid in ignored:
                 continue
+            # Anything else: report as unknown.
             else:
                 unknown.append({"bus_path": name, "vidpid": vidpid,
                                 "name": product, "description": desc})
 
         # Physical location resolver for the PROBLEM dongles only. The slot
         # table and roster are read once here rather than per entry.
+        # Load the diagnostics helpers for location and card info.
         try:
             from . import usb_diagnostics as _usbdiag
             _slots = _usbdiag._pci_slot_map()
             _roster = _usbdiag._load_roster()
             def _loc(b):
+                """Physical location label for bus ``b`` ("" on error)."""
+                # Look it up; empty on error.
                 try:
                     return _usbdiag.location_for(b, _slots, _roster)
                 except Exception:
                     return ""
             def _ctrl(b):
+                """Controller for bus ``b`` ("" on error)."""
+                # Look it up; empty on error.
                 try:
                     return _usbdiag.controller_for(b, _roster)
                 except Exception:
                     return ""
             # T1/T3 allow-lists from hub config -- the same sets that classify a
             # PASSED-THROUGH device. Resolved once per telemetry pass.
+            # Configured card lists for each tier.
             _t1_vp, _t3_vp = _t1_pci_vidpids(agent), _t3_pci_vidpids(agent)
             _t2_vp = _t2_pci_vidpids(agent)
             def _card_ports(b):
+                """Number of ports on the card behind bus ``b`` (0 on error)."""
                 # Port count of the owning card, stamped so the quarantine panel
                 # can say "port 3 of 4" without a second lookup.
+                # Count them; 0 on error.
                 try:
                     return _usbdiag.ports_on_bus(b)
                 except Exception:
                     return 0
             def _card_devices(b):
+                """Number of devices behind the root hub for bus ``b`` (0 on error)."""
                 # Devices currently present on the whole card. Paired with
                 # card_ports (maxchild) this gives "6 of 7 ports populated",
                 # which is the pair an operator needs: maxchild identifies the
                 # card MODEL (the 4- and 7-port cards here share a vid:pid, so
                 # the id alone cannot), device_count says how loaded it is.
+                # Count devices on that root hub; 0 on error.
                 try:
                     num = str(b or "").split("-", 1)[0]
                     return _usbdiag._devices_behind_root_hub(f"usb{num}")
@@ -2361,9 +2611,11 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 definition -- T2 is the USB-dongle tier -- and this is only ever
                 called for a bus that has a dongle on it.
                 """
+                # The card's vid:pid; none means unknown.
                 vp = (_card(b) or "").lower()
                 if not vp:
                     return "", ""
+                # Match the configured lists.
                 if vp in _t1_vp:
                     return "t1", "config"
                 if vp in _t3_vp:
@@ -2377,34 +2629,46 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 # t2_pci_vidpids upgrades it to "config" and names the model.
                 return "t2", "inferred"
             def _card(b):
+                """PCI vid:pid of the card behind bus ``b`` ("" on error)."""
                 # vid:pid of the CONTROLLER CARD, kept as its own field rather
                 # than only embedded in the location string: the entry already
                 # carries the DONGLE's vidpid, and two identical-looking ids on
                 # one row are ambiguous unless they are labelled separately.
+                # Look it up; empty on error.
                 try:
                     return _usbdiag.pci_location(_usbdiag.controller_for(b, _roster),
                                                  _slots).get("vidpid") or ""
                 except Exception:
                     return ""
+        # Helpers unavailable: use versions that return empty values.
         except Exception:          # older/partial agent -- never break telemetry
             def _loc(b):
+                """Fallback: no location."""
                 return ""
             def _ctrl(b):
+                """Fallback: no controller."""
                 return ""
             def _card(b):
+                """Fallback: no card."""
                 return ""
             def _card_ports(b):
+                """Fallback: no ports."""
                 return 0
             def _card_devices(b):
+                """Fallback: no devices."""
                 return 0
             def _card_role(b):
+                """Fallback: no role."""
                 return "", ""
+        # Assigned-dongle rows, from the saved state.
         usb_state: List[Dict[str, Any]] = []
         try:
             st = load_usb_state()
         except Exception as exc:  # noqa: BLE001
             logger.debug("cs_usb_telemetry: load_usb_state failed: %s", exc)
             st = _new_usb_state()
+        # Per-bus state maps.
+        # How long each bus has been missing.
         missing_since = st.get("missing_since") or {}
         # Post-clone settle reboot schedule (stamped by set_assignment): surface
         # reboot_at so the WebUI can show "reboot in Xm" for a freshly-cloned VM.
@@ -2420,10 +2684,12 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
         # when now - missing_since >= missing_timeout, so shed_at = missing_since +
         # missing_timeout (same units the teardown compares — accurate regardless
         # of the min/sec relay convention). 0 = teardown disabled (no deadline).
+        # Missing-dongle timeout from config.
         usb_cfg = _usb_cfg(agent)
         missing_timeout = int(_cfg_first(usb_cfg,
                               ("usb_missing_timeout_seconds", "usb_missing_timeout",
                                "missing_timeout"), 0) or 0)
+        # One row per assigned bus.
         for bus, vmid in (st.get("bus_to_vmid") or {}).items():
             pe = present_by_bus.get(bus) or {}
             ms = missing_since.get(bus)
@@ -2449,6 +2715,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
             # Where to go LOOK -- stamped ONLY on problem dongles: one that is
             # climbing the recovery ladder or has gone missing. A healthy dongle
             # does not need finding, and this costs a sysfs walk per entry.
+            # Add card/location details for buses with a problem.
             if usb_state[-1]["recovery"] or ms is not None:
                 usb_state[-1]["location"] = _loc(bus)
                 usb_state[-1]["pci_address"] = _ctrl(bus)
@@ -2459,18 +2726,22 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
         # Quarantined dongles (dmesg kernel USB errors — the ONLY quarantine path)
         # for the WebUI badge: bus-id + reason + when, so an admin can see WHY a
         # dongle is sidelined and that it auto-recovers after QUARANTINE_RECOVERY_S.
+        # Quarantined buses, from the quarantine file.
         quarantined: List[Dict[str, Any]] = []
         try:
             qt = _read_quarantine()
         except Exception as exc:  # noqa: BLE001
             logger.debug("cs_usb_telemetry: read quarantine failed: %s", exc)
             qt = {}
+        # Time now, for countdowns.
         _now = time.time()
+        # Report only buses that are actually quarantined.
         for bus, entry in (qt or {}).items():
             e = entry or {}
             permanent = bool(e.get("permanent"))
             if not permanent and int(e.get("fails", 0)) < QUARANTINE_MAX_FAILS:
                 continue
+            # Present-device info and when it was quarantined.
             pe = present_by_bus.get(bus) or {}
             since = e.get("since")
             # Absolute epoch the 1h auto-recovery re-eligibles this bus — the
@@ -2478,6 +2749,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
             # A PERMANENT bus (5 strikes) never auto-recovers → no recovers_at.
             recovers_at = (float(since) + QUARANTINE_RECOVERY_S) \
                 if (since is not None and not permanent) else None
+            # Build its row.
             quarantined.append({
                 "bus_path": bus,
                 # Where to go LOOK. Only stamped on problem dongles (quarantined
@@ -2510,6 +2782,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
         # cleared once the bus goes absent or exclude_cooldown elapses, so ship
         # expires_at/expires_in_s for a live countdown. A legacy bare-1 value
         # (pre-timestamp) has no since → already expired, reported as None.
+        # Excluded buses with their cooldown expiry.
         excluded: List[Dict[str, Any]] = []
         for bus, val in (st.get("excluded_buses") or {}).items():
             since = float(val) if isinstance(val, (int, float)) and float(val) > 1e9 else None
@@ -2531,6 +2804,7 @@ def cs_usb_telemetry(agent) -> Dict[str, List[Dict[str, Any]]]:
                 "name": pe.get("product") or bus,
                 "vidpid": pe.get("vidpid") or "",
             })
+        # The USB telemetry.
         return {"usb_state": usb_state, "present_usb": present,
                 "unknown_usb": unknown, "quarantine": quarantined,
                 "excluded": excluded}
@@ -2545,6 +2819,7 @@ def _hub_reserve_enabled(agent) -> bool:
     Off via ``usb_hub_reserve: false`` for a host that genuinely needs every
     dongle in service at once and accepts the shared-bandwidth trade.
     """
+    # Unset means on; strings like "off" mean off.
     v = _usb_cfg(agent).get("usb_hub_reserve")
     if v is None:
         return True
@@ -2571,6 +2846,7 @@ def _bus_sort_key(bus: str):
     the primary key; the numeric path breaks ties so 16-3 sorts before 16-10
     (a plain string sort gets that backwards).
     """
+    # Hub depth, then the numeric path parts.
     depth = str(bus).count(".")
     parts = tuple(int(p) if p.isdigit() else 0
                   for p in re.split(r"[-.]", str(bus)))
@@ -2578,12 +2854,14 @@ def _bus_sort_key(bus: str):
 
 
 def _sim_phy_accepts(sim_phy: str, device_type: str) -> bool:
+    """Whether a dongle of ``device_type`` may be used for the configured ``sim_phy``."""
     # sim_phy is the sim VM's required physical layer (cs domain:
     # wireless | ethernet | any). device_type is the dongle class from the
     # LM usb_vidpids `type` field (wireless | wired | storage | other). A sim
     # requiring "ethernet" wants a *wired* dongle — map wired <-> ethernet so
     # the wired/wireless selector the tenant sets in LM is actually enforced.
     # "storage" (a real, known-incompatible class) only matches sim_phy == "any".
+    # Any type allowed.
     if sim_phy == "any":
         return True
     # An UNCLASSIFIED dongle ("other"/unknown/empty) is not filtered out on type:
@@ -2591,8 +2869,10 @@ def _sim_phy_accepts(sim_phy: str, device_type: str) -> bool:
     # mismatch (e.g. a "wired"/"storage" dongle when the sim wants "wireless") is
     # excluded. This stops a wireless dongle that got certified as "other" (the
     # certify UI's per-row type inference) from being wrongly rejected.
+    # Unknown types are allowed.
     if device_type in ("other", "unknown", ""):
         return True
+    # Exact match, or ethernet accepting wired.
     if sim_phy == device_type:
         return True
     if sim_phy == "ethernet" and device_type == "wired":
@@ -2626,17 +2906,21 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     """
     global _prov_run, _provision_reason, _provision_cfg_snapshot, \
         _provision_loop_last_run, _auto_provision_on
+    # Local import to avoid an import cycle.
     from . import pve_cmds  # local to avoid a top-level import cycle
+    # Settings and the certified dongle list.
     cs_cfg = agent.config.get("client_simulation") or {}
     usb_cfg = cs_cfg.get("usb_config") or {}
     dongle_vidpids = _dongle_vidpids(agent)
     # Heartbeat: the loop is alive. Stamped before any gate so
     # current_provision_loop_running() flips true on the very first tick (lets the
     # UI distinguish "loop not running" from "loop running but gated").
+    # Heartbeat for the "loop is running" check.
     _provision_loop_last_run = time.time()
 
     # Template-refresh pause: while a REFRESH_TEMPLATE wipes + restores this host,
     # do NOTHING (no shed/clone/teardown) so we don't fight the refresh.
+    # Paused during a template refresh.
     if _refresh_paused:
         _provision_reason = "template refresh in progress"
         return {"provisioned": 0, "torn_down": 0, "reason": _provision_reason}
@@ -2645,10 +2929,12 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # preconditions (dongle_vidpids / templates) below — a provisioning config
     # gap must NEVER disable the CPU/mem shed. Only when auto-provision is on.
     # Returns the VMID it shed (or None); counted into torn_down below.
+    # Read the toggle; run the delete gate early if it is on.
     ap_on = _toggle_on(usb_cfg)
     _auto_provision_on = ap_on
     _early_shed = await _run_delete_gate(agent, usb_cfg) if ap_on else None
 
+    # No dongles configured: nothing to provision.
     if not dongle_vidpids:
         # Silent gate made loud — this is the #1 cause of "nothing provisions" and
         # previously left no log line at all. Surface it in the log + telemetry.
@@ -2667,6 +2953,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # {vidpid, type} dicts), not a ``certified_types`` {vidpid: type} map — so
     # build the map via the accessor (which reads ``vidpids``) instead of the
     # stale legacy key. Used to tag each present dongle with its dongle class.
+    # Dongle types, which type to simulate, and whether to use every dongle.
     certified_types = _certified_types(agent)
     sim_phy = str(usb_cfg.get("sim_phy") or "any").lower()
     use_all = bool(usb_cfg.get("use_all_dongles", False))
@@ -2674,6 +2961,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # sim_pool is one value pushed to every host, so make sure THIS host
     # actually has it before any clone this pass tries to join it (a missing
     # pool otherwise fails every single clone attempt identically, forever).
+    # Make sure the sim pool exists.
     await _ensure_sim_pool(agent)
     # Validate the configured template ids are actually runnable Proxmox
     # templates before trusting them as clone sources — a stale/deleted
@@ -2681,6 +2969,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # resolve_template_vmid, proxmox-agent.sh:901-944). Falls back to the
     # lowest-numbered valid template on the cluster if the configured one no
     # longer checks out; stays None (as before) when nothing is configured.
+    # Template VMs for each image and the split between them.
     img1 = await _resolve_template_vmid(usb_cfg.get("image1_template_id"))
     img2 = await _resolve_template_vmid(usb_cfg.get("image2_template_id"))
     img1_pct = int(usb_cfg.get("image1_pct", 50) or 50)
@@ -2737,6 +3026,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     }
 
     # Resource state (sampled each tick by _usb_provision_loop → sample_resources).
+    # CPU and memory history, their 1-hour averages, and the latest CPU sample.
     _cpu_hist = usb_resource_gate.cpu_samples()
     _mem_hist = usb_resource_gate.mem_samples()
     cpu_avg = _resource_1h_average(_cpu_hist)
@@ -2745,6 +3035,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # Surface the exact 1h averages the gates decide on (WebUI shows these next
     # to the display CPU 1H / Mem 1H so the operator sees what auto-prov uses).
 
+    # Load state, existing VMs, present dongles and the time.
     state = load_usb_state()
     existing = set(await pve_cmds.list_all_vmids())
     present = scan_present_dongles(dongle_vidpids, certified_types)
@@ -2788,6 +3079,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # into a different physical port) can still be matched by vidpid below
     # (bash build_usb_state_json 1565-1572: "use live-scanned vidpid... update
     # stored value so it persists after the dongle goes physically missing").
+    # Remember each assigned dongle's vid:pid by bus.
     for bus in list(state["bus_to_vmid"]):
         if bus in present:
             state.setdefault("vidpid_by_bus", {})[bus] = present[bus].get("vidpid")
@@ -2817,14 +3109,17 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # Non-permanent: reset fails=0 (re-eligible for a retry) but PRESERVE the
     # strike/first_strike/last_strike history so the next quarantine increments
     # toward permanent. We no longer pop the entry (that would lose strike history).
+    # Clear the fail count on quarantined buses whose recovery time has passed.
     quarantine = _read_quarantine()
     changed = False
+    # Check each quarantined bus.
     for bus in list(quarantine):
         entry = quarantine[bus] or {}
         if entry.get("permanent"):
             continue  # permanent buses never auto-recover
         if int(entry.get("fails", 0)) < QUARANTINE_MAX_FAILS:
             continue  # already recovered/eligible this cycle
+        # Recovery time passed: reset the fail count.
         since = entry.get("since")
         if since is not None and now - float(since) >= QUARANTINE_RECOVERY_S:
             entry["fails"] = 0
@@ -2835,6 +3130,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                         bus, entry.get("reason", ""), QUARANTINE_RECOVERY_S,
                         "still present" if bus in present else "absent",
                         int(entry.get("strikes", 0)), QUARANTINE_PERMANENT_STRIKES)
+    # Save if anything changed.
     if changed:
         _save_quarantine(quarantine)
 
@@ -2855,6 +3151,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     if await _run_post_prov_reboot_queue(agent, state):
         save_usb_state(state)
 
+    # VMs torn down this pass (including the early shed).
     torn_down: List[int] = []
     if _early_shed is not None:
         torn_down.append(_early_shed)
@@ -2880,6 +3177,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         logger.info("auto-provision: %d sim VM(s) outside batch range %d-%d "
                     "(batch %d) — tearing down (migrating to per-host batches)",
                     len(out_of_range), start, end, batch_id)
+        # Destroy each and drop it from the state.
         for vmid, bus in out_of_range:
             try:
                 await cs_sim.destroy_vm(agent, vmid, bus=bus)
@@ -2896,6 +3194,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # 3. Provision thresholds (cs defaults: prov 80 / ceiling 90). The DELETE
     #    thresholds are read inside _run_delete_gate — the resource shed runs
     #    early now (before these provisioning preconditions).
+    # Thresholds above which provisioning halts.
     cpu_prov_thr = _pct_setting(usb_cfg, "cpu_provision_threshold", 80)
     cpu_prov_ceil = _pct_setting(usb_cfg, "cpu_provision_ceiling", 90)
     mem_prov_thr = _pct_setting(usb_cfg, "mem_provision_threshold", 80)
@@ -2905,6 +3204,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # AUTO-PROV cell reads (csProvThrottleBadge: cpu_pct/cpu_threshold/mem_pct/
     # mem_threshold) — the bash agent emits these (proxmox-agent.sh:2514-2526);
     # omitting them renders "CPU ?% ≥ ?%" placeholders in the Overview column.
+    # Halt provisioning while the averages are over threshold.
     cpu_over_prov = cpu_avg is not None and cpu_avg >= cpu_prov_thr
     mem_over_prov = mem_avg is not None and mem_avg >= mem_prov_thr
     if cpu_over_prov or mem_over_prov:
@@ -2938,19 +3238,24 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # the vidpid to its new bus instead, as long as that bus isn't already
     # claimed by a different tracked VM.
     vidpid_by_bus = state.setdefault("vidpid_by_bus", {})
+    # Follow dongles that moved to a new bus.
     for old_bus, vmid in list(state["bus_to_vmid"].items()):
         if old_bus in present:
             continue  # still on the same bus — nothing to migrate
+        # Its vid:pid; skip if unknown.
         vidpid = vidpid_by_bus.get(old_bus)
         if not vidpid:
             continue
+        # Find the same vid:pid on another present bus.
         new_bus = next((b for b, info in present.items()
                         if info.get("vidpid") == vidpid and b != old_bus), None)
         if not new_bus:
             continue
+        # Skip if a different VM already owns the new bus.
         other_vmid = state["bus_to_vmid"].get(new_bus)
         if other_vmid and other_vmid != vmid:
             continue  # new bus already claimed by a different tracked VM
+        # Move the assignment to the new bus.
         state["bus_to_vmid"].pop(old_bus, None)
         state["missing_since"].pop(old_bus, None)
         vidpid_by_bus.pop(old_bus, None)
@@ -2968,6 +3273,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     #     device's error can't strand an unrelated bus. A quarantined dongle that
     #     also drops off enumeration is torn down by the missing-dongle sweep
     #     below; the quarantine keeps it from being immediately re-cloned.
+    # Count recent kernel USB errors per bus.
     try:
         dmesg_errs = await scan_dmesg_usb_errors()
     except Exception as _e:  # noqa: BLE001
@@ -2977,6 +3283,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         # entire life of the function — quarantine never fired and nothing said so.
         logger.warning("provision loop: dmesg USB scan failed (%s) — dongle "
                        "quarantine detection is INACTIVE this pass", _e)
+    # Quarantine watched buses with too many errors.
     if dmesg_errs:
         _watched = set(present) | set(state.get("bus_to_vmid") or {})
         for _bus, _n in dmesg_errs.items():
@@ -2998,16 +3305,21 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             "DISABLED; a removed/unapproved dongle will NOT shed its VM. Set a "
             "non-zero 'Destroy after' timeout to enable it. (%d tracked dongles)",
             len(state["bus_to_vmid"]))
+    # Tear down VMs whose dongle has been missing past the timeout.
     if missing_timeout > 0:
         from . import cs_sim  # deferred — cs_sim imports usb_provision
+        # Check each assigned bus.
         for bus, vmid in list(state["bus_to_vmid"].items()):
+            # Present: clear its missing timer.
             if bus in present:
                 state["missing_since"].pop(bus, None)
                 continue
+            # Newly missing: start the timer.
             since = state["missing_since"].get(bus)
             if since is None:
                 state["missing_since"][bus] = now
                 continue
+            # Missing too long: destroy the VM and forget the bus.
             if now - float(since) >= missing_timeout:
                 try:
                     await cs_sim.destroy_vm(agent, int(vmid), bus=bus)
@@ -3028,10 +3340,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # gate as the missing-dongle shed.
     if ap_on and missing_timeout > 0:
         from . import cs_sim  # deferred — cs_sim imports usb_provision
+        # Per-bus detach timers, reclone counts and restart times.
         detached_since = state.setdefault("detached_since", {})
         detach_reclones = state.setdefault("detach_reclones", {})
         detach_restarted = state.setdefault("detach_restarted", {})
+        # Check each assigned bus for a dropped passthrough.
         for bus, vmid in list(state["bus_to_vmid"].items()):
+            # Absent or still attached: clear the detach timers.
             if bus not in present or _bus_attached(bus):
                 detached_since.pop(bus, None)
                 detach_restarted.pop(bus, None)
@@ -3039,12 +3354,14 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 # the instant it re-attaches (a reclone briefly re-grabs the dongle
                 # before it flaps again; clearing here would reset the count every
                 # cycle and never converge to quarantine).
+                # Forget old reclone strikes once the window passes.
                 _rc = detach_reclones.get(bus)
                 if _rc and (now - float(_rc.get("last", 0))) > _DETACH_STRIKE_WINDOW_S:
                     detach_reclones.pop(bus, None)
                 continue
             # Present but detached — only reclone a RUNNING VM (a stopped VM has no
             # passthrough by design; leave it alone).
+            # Only running VMs count; clear the timer otherwise.
             try:
                 _running = bool((await pve_cmds.vm_status(int(vmid))).get("running"))
             except Exception:  # noqa: BLE001 — conservative: skip on probe error
@@ -3052,10 +3369,12 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             if not _running:
                 detached_since.pop(bus, None)
                 continue
+            # Newly detached: start the timer.
             since = detached_since.get(bus)
             if since is None:
                 detached_since[bus] = now
                 continue
+            # Detached past the grace period.
             if now - float(since) >= _DETACHED_GRACE_S:
                 # Did WE take this dongle away? usb_reset and reattach both
                 # detach it from the VM on purpose, and that is byte-for-byte
@@ -3081,6 +3400,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                     pass
                 # Reboot before reclone: a cold restart makes QEMU re-grab the
                 # dongle. Reclone only if it is still detached 15 min later.
+                # First, try restarting the VM.
                 restarted_at = detach_restarted.get(bus)
                 if restarted_at is None:
                     logger.warning("provision loop: bus %s detached from RUNNING VM %s "
@@ -3094,13 +3414,16 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                     except Exception as e:  # noqa: BLE001
                         logger.warning("provision loop: restart of %s failed: %s", vmid, e)
                     continue
+                # Give the restart time to work.
                 if now - float(restarted_at) < _REBOOT_BEFORE_RECLONE_S:
                     continue
+                # Then count reclone strikes in this window.
                 detach_restarted.pop(bus, None)
                 rec = detach_reclones.get(bus)
                 if rec and (now - float(rec.get("first", now))) > _DETACH_STRIKE_WINDOW_S:
                     rec = None  # window expired → fresh episode
                 n = int((rec or {}).get("n", 0))
+                # Too many strikes: quarantine the bus and destroy the VM.
                 if n >= _DETACH_RECLONE_MAX:
                     # Reclone hasn't converged — the dongle keeps dropping its
                     # passthrough. Rebuilding the VM can't fix flapping hardware, so
@@ -3125,6 +3448,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                     (state.get("missing_since") or {}).pop(bus, None)
                     detach_reclones.pop(bus, None)  # episode closed — quarantine owns it now
                     continue
+                # Otherwise reclone: destroy the VM and record the strike.
                 logger.warning("provision loop: bus %s detached from RUNNING VM %s "
                                "(present but not usbfs) — recloning to re-grab the "
                                "dongle (attempt %d/%d)", bus, vmid, n + 1, _DETACH_RECLONE_MAX)
@@ -3140,12 +3464,14 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 detach_reclones[bus] = {"n": n + 1,
                                         "first": float((rec or {}).get("first", now)),
                                         "last": now}
+        # Save the detach bookkeeping.
         save_usb_state(state)
 
     # 5c. Per-client dongle-health watchdog (in-guest lsusb + recovery ladder).
     # Throttled — probing every guest is a QGA round-trip each. Recovers a dongle
     # that's attached host-side but the GUEST can't see (firmware wedge): usb_reset
     # -> reattach -> reboot -> reclone -> quarantine (last resort).
+    # Run the dongle health check on its interval.
     if ap_on and (now - float(getattr(agent, "_last_dongle_health_check", 0.0))) >= _HEALTH_CHECK_INTERVAL_S:
         agent._last_dongle_health_check = now
         try:
@@ -3160,6 +3486,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # keeps the TEMPLATE hostname (e.g. sim-rpi-0000), so it never matches its
     # registered client (no sim tags, wrong identity). Re-stamp the correct name
     # (_vm_name(vmid)) + reboot to apply. Same 300s throttle as the health check.
+    # Run the hostname audit on its interval.
     if ap_on and (now - float(getattr(agent, "_last_hostname_audit", 0.0))) >= _HEALTH_CHECK_INTERVAL_S:
         agent._last_hostname_audit = now
         try:
@@ -3184,6 +3511,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # dongle teardown / batch-range migration), so the existing snapshot from the
     # top of the pass is stale; the audit needs the live list to tell a real
     # untracked dongle VM (occupied → not a gap) from a truly free slot.
+    # Re-list VMs and run the VMID gap audit.
     existing = set(await pve_cmds.list_all_vmids())
     await _vmid_gap_audit(agent, state, start, end, now, existing, present)
     save_usb_state(state)
@@ -3200,6 +3528,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     #
     # Waiting costs one tick on a cold start; provisioning the wrong tier costs a
     # manual teardown, so hold until we can actually tell the tiers apart.
+    # No usb_config yet: hold off cloning.
     if not _usb_cfg(agent):
         _provision_reason = "usb_config not delivered yet"
         logger.info("auto-provision: usb_config has not arrived from the spoke yet "
@@ -3209,6 +3538,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         return {"provisioned": 0, "torn_down": len(torn_down),
                 "reason": _provision_reason}
 
+    # No templates: nothing to clone from.
     if not images:
         # Silent gate made loud — the #2 cause of "nothing provisions"; previously
         # returned with no log line. Surface it in the log + telemetry.
@@ -3220,6 +3550,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 "reason": "no template ids configured"}
 
     # 7. resource_ok gate + prov_run-already-active + slot cap before cloning.
+    # Delete cooldown and CPU ceiling checks.
     in_delete_cooldown = now < cooldown_until
     ceil_hit = cpu_instant is not None and cpu_instant >= cpu_prov_ceil
     # No data yet (cold start, or get_node_stats failing) → DO NOT gate: the card
@@ -3228,6 +3559,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # ``cpu_avg is not None and cpu_avg < thr`` form inverted this — None → False
     # → "resource gate" fired forever on a fresh / failed-sampling agent even
     # though there was no resource pressure at all.
+    # OK to clone only when no gate is blocking.
     resource_ok = (
         not delete_queued
         and not in_delete_cooldown
@@ -3235,6 +3567,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         and (cpu_avg is None or cpu_avg < cpu_prov_thr)
         and (mem_avg is None or mem_avg < mem_prov_thr)
     )
+    # Blocked: record which gate.
     if not resource_ok:
         # Pin the sub-cause so "resource gate" is self-diagnosing on the card
         # instead of a generic label — the user can't tell cpu/mem/cooldown/ceil
@@ -3258,6 +3591,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             "cpu_instant=%s delete_queued=%s cooldown=%s ceil=%s halt=%s)",
             cpu_avg, mem_avg, cpu_instant, delete_queued, in_delete_cooldown,
             ceil_hit, usb_resource_gate._provision_halt)
+        # Skip cloning this pass.
         return {"provisioned": 0, "torn_down": len(torn_down),
                 "reason": _provision_reason}
 
@@ -3270,6 +3604,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # (each maps to exactly one VM). Same clone-source template as T2 for now
     # (dedicated t1/t3 images come later). Runs under the same toggle + resource
     # gate; a no-op when no t1/t3_pci_vidpids are configured.
+    # Provision the T1 and T3 PCI tiers first, unless this host opts out.
     pci_provisioned = 0
     if ap_on and images:
         _pci_tpl = images[0]["template"]
@@ -3289,16 +3624,19 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                         getattr(agent, "hostname", "?"))
         else:
             pci_provisioned += await _provision_pci_tier(agent, "t3", _t3_pci_vidpids(agent), _pci_tpl, start, end, state)
+        # Save their follow-up entries.
         if pci_provisioned:
             logger.info("auto-provision: provisioned %d T1/T3 PCI VM(s) this tick", pci_provisioned)
             save_usb_state(state)  # persist their settle-reboot / retry entries
 
+    # A previous run is still marked as running.
     if _prov_run.get("running"):
         # Stuck-run watchdog: a prior pass that never completed (a clone/reclaim
         # hung) leaves _prov_run.running=True, which would short-circuit this and
         # every future tick at this gate → permanent wedge. If the run is older
         # than PROV_RUN_STUCK_S, force-clear it and let this tick proceed. The
         # orphaned gather writes to its captured run dict, not the global.
+        # Stuck too long: clear it; otherwise skip this pass.
         _st = _prov_run.get("started_at")
         if _st and (now - _st) > PROV_RUN_STUCK_S:
             logger.warning(
@@ -3313,6 +3651,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             logger.info("auto-provision gate: prov_run already active — skipping trigger")
             return {"provisioned": pci_provisioned, "torn_down": len(torn_down),
                     "reason": "prov_run active"}
+    # Stop at the slot cap.
     active_usb_vms = len(state["vmid_to_bus"])
     _provision_cfg_snapshot["active_usb_vms"] = active_usb_vms
     if active_usb_vms >= max_slots:
@@ -3324,6 +3663,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
 
     # Provisioning pass: pick unassigned, non-excluded, non-quarantined dongles
     # that match sim_phy (preferred) — plus overflow if use_all_dongles.
+    # Sort present dongles into usable, overflow and set-aside groups.
     quarantine = _read_quarantine()
     preferred, overflow = [], []
     # Per-bus cull reasons so "no eligible dongles" names WHICH gate dropped each
@@ -3331,7 +3671,9 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # generic label — the exact diagnosability fix the resource gate already got.
     culled: Dict[str, List[str]] = {"assigned": [], "excluded": [],
                                     "quarantined": [], "type": []}
+    # Check each present dongle.
     for bus, info in present.items():
+        # Already assigned or excluded: set aside.
         if state["bus_to_vmid"].get(bus):
             culled["assigned"].append(bus)
             continue
@@ -3344,11 +3686,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         # good dongle. Gate on the count, not mere file presence. A PERMANENT bus
         # (QUARANTINE_PERMANENT_STRIKES reached) is always skipped — its fails is
         # kept at MAX and the recovery sweep never resets it.
+        # Quarantined: set aside.
         qentry = quarantine.get(bus) or {}
         if qentry.get("permanent") or int(qentry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
             culled["quarantined"].append(
                 f"{bus}({qentry.get('fails')}{'/P' if qentry.get('permanent') else ''})")
             continue
+        # Matching type is preferred; others are overflow only with use_all.
         dtype = info["type"]
         if _sim_phy_accepts(sim_phy, dtype):
             preferred.append(bus)
@@ -3360,6 +3704,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # Direct card ports first, hub-attached last -- within each tier, so the
     # sim_phy preference still outranks topology (a matching dongle behind a hub
     # is still better than a non-matching one on the card).
+    # Direct ports first, then hub ports.
     preferred.sort(key=_bus_sort_key)
     overflow.sort(key=_bus_sort_key)
     ordered = preferred + overflow
@@ -3377,6 +3722,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     #
     # A hub tier shares one upstream link and one 500mA budget, so keeping
     # clients off it while the card has room is also the better placement.
+    # Hold hub-attached dongles back while direct ports are free.
     if _hub_reserve_enabled(agent):
         _direct = [b for b in ordered if "." not in str(b)]
         _hubbed = [b for b in ordered if "." in str(b)]
@@ -3388,6 +3734,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         elif _hubbed:
             logger.info("provision: no free direct card ports — releasing %d "
                         "reserve dongle(s) behind hub(s)", len(_hubbed))
+    # Nothing to place: record why.
     if not ordered:
         # Nothing left to place a VM on. That is NOT automatically a fault: the
         # fleet is meant to run every dongle, so "every dongle is already driving
@@ -3403,10 +3750,12 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
         logger.info("auto-provision: %s", _provision_reason)
         return {"provisioned": pci_provisioned, "torn_down": len(torn_down)}
 
+    # Fresh VM list, image-1 count and protected VMs.
     existing_after = set(await pve_cmds.list_all_vmids())
     img1_count = sum(1 for v in state["vmid_to_image"].values() if v == 1)
     protected = _protected_vmids(agent)
 
+    # Limit concurrent clones.
     sem = asyncio.Semaphore(concurrency)
     # Serializes the find-a-free-VMID + reserve step across concurrent _do calls
     # (reclone_concurrency > 1) so two dongles can't both pick the same vid — the
@@ -3434,6 +3783,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
 
     # prov_run live state (cs _default_provision_run_state 3576-3586): one item
     # per dongle, status provisioning → done/failed as each clone settles.
+    # Per-dongle run items, published for telemetry.
     items = [{"vmid": None, "vidpid": present[b].get("vidpid", ""),
               "bus": b, "status": "provisioning"} for b in ordered]
     this_run = {"running": True, "items": items,
@@ -3443,16 +3793,20 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     item_by_bus = {b: items[i] for i, b in enumerate(ordered)}
 
     async def _do(bus: str) -> bool:
+        """Clone and set up one VM for the dongle on ``bus``; True if it succeeded."""
         # The pacing branch below publishes a 'pacing' halt into the resource
         # gate's state (usb_resource_gate._provision_halt) so telemetry sees it.
+        # This dongle's info.
         info = present[bus]
         # ── Stagger + CPU-ramp admission pacing runs OUTSIDE the semaphore: a
         # staggered clone's 14s admission sleep must NOT hold a sem slot idle
         # (that head-of-line-blocked the next clone for the whole stagger). Only
         # the real clone work below is bounded by ``sem``.
+        # Take an admission number.
         async with _admission_lock:
             my_slot = _admitted[0]
             _admitted[0] += 1
+        # After the first clone, wait and stop the batch if CPU is too high.
         if my_slot > 0 and concurrency > 1:
             await asyncio.sleep(14)
             cpu_now = await _current_cpu_pct(agent)
@@ -3483,7 +3837,9 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                     cpu_now, cpu_prov_ceil, my_slot)
                 item_by_bus[bus]["status"] = "failed"
                 return False
+        # One clone at a time (up to the concurrency limit).
         async with sem:
+            # Batch already halted.
             if _pacing_halted[0]:
                 item_by_bus[bus]["status"] = "failed"
                 return False
@@ -3492,6 +3848,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             # mid-batch halts every clone not yet started, instead of the batch
             # running to the slot cap. A clone already past this point finishes —
             # a running ``qm clone`` can't be safely aborted. Log once on the flip.
+            # Stop if auto-provision was turned off mid-batch.
             if not _toggle_halted[0] and not _toggle_on(
                     (agent.config.get("client_simulation") or {}).get("usb_config") or {}):
                 _toggle_halted[0] = True
@@ -3507,6 +3864,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             # VMIDs, not allocation candidates — exclude them explicitly in
             # addition to existing_after (which already covers present templates
             # but not a just-deleted one mid-reclone).
+            # Template VMIDs, which must never be reused.
             templates = set()
             for _t in ([_im["template"] for _im in images] + [img1, img2]):
                 try:
@@ -3531,13 +3889,17 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             # picking the same vid (the "two dongles both got 90078" race); the
             # reservation is rolled back on clone failure so the vid stays
             # reusable next pass.
+            # Pick a free VMID in our range (one allocator at a time).
             async with _alloc_lock:
                 vid = start
                 while vid <= end:
+                    # Skip VMIDs already assigned or used by templates.
                     if str(vid) in state["vmid_to_bus"] or vid in templates:
                         vid += 1
                         continue
+                    # VMID taken by an existing VM.
                     if vid in existing_after:
+                        # Never touch protected VMs.
                         if vid in protected:
                             vid += 1
                             continue
@@ -3557,23 +3919,28 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                                          "— skipping (not a zombie)", vid)
                             vid += 1
                             continue
+                        # A leftover half-clone is reclaimed; otherwise move on.
                         if not await _reclaim_zombie_vmid(agent, vid):
                             vid += 1
                             continue
                         existing_after.discard(vid)
                     # Reserve now, before the clone, so a concurrent _do can't
                     # grab the same vid. Rolled back on clone failure below.
+                    # Claim it.
                     state["vmid_to_bus"][str(vid)] = bus
                     break
+            # Range full: give up.
             if vid > end:
                 logger.info("provision loop: no free VM slot — stopping")
                 item_by_bus[bus]["status"] = "failed"
                 return False
+            # Show the chosen VMID.
             item_by_bus[bus]["vmid"] = vid
             # N-way weighted fill: pick the configured image whose current share
             # is furthest BELOW its target (ceil of pct% of the post-clone total).
             # Generalizes the old 2-image IMAGE1_PCT split to any number of images
             # (image_count + image{i}_template_id/_pct — see _resolve_images).
+            # Count VMs per image to keep the configured split.
             total = len(state["vmid_to_image"]) + 1
             _counts = {}
             for _v in state["vmid_to_image"].values():
@@ -3581,12 +3948,14 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                     _counts[int(_v)] = _counts.get(int(_v), 0) + 1
                 except (TypeError, ValueError):
                     pass
+            # Pick the image furthest below its share.
             _pick = None
             _best = None
             for _im in images:
                 _deficit = ((_im["pct"] * total + 99) // 100) - _counts.get(_im["num"], 0)
                 if _pick is None or _deficit > _best:
                     _pick, _best = _im, _deficit
+            # Its number and template; no template means failure.
             image_num = _pick["num"] if _pick else 1
             template = _pick["template"] if _pick else None
             if not template:
@@ -3594,6 +3963,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 state["vmid_to_bus"].pop(str(vid), None)
                 item_by_bus[bus]["status"] = "failed"
                 return False
+            # Clone and set up the VM, then record it.
             try:
                 await _clone_and_provision(agent, vid, bus, info, int(template),
                                             image_num, state)
@@ -3602,6 +3972,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 existing_after.add(vid)
                 item_by_bus[bus]["status"] = "done"
                 return True
+            # Failure: free the VMID and clean up the partial VM.
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"provision loop: clone {vid} on {bus} failed: {e}")
                 # Roll back the pre-clone reservation so the vid is reusable next
@@ -3621,6 +3992,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
                 # root of the "3 idle dongles stuck, not turning up clients" bug.
                 # A dongle is quarantined ONLY for kernel USB (dmesg) errors on its
                 # bus — a real hardware-fault signal (step 4c above).
+                # Mark it failed.
                 item_by_bus[bus]["status"] = "failed"
                 return False
 
@@ -3635,11 +4007,13 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # marked 'failed' so this_run completes and the loop advances. 600s matches
     # the watchdog's existing "stuck" definition, so a legitimately slow _do
     # would already have been flagged stuck by it.
+    # Run all clones, giving up after the stuck limit.
     try:
         results = await asyncio.wait_for(
             asyncio.gather(*[_do(b) for b in ordered], return_exceptions=True),
             timeout=PROV_RUN_STUCK_S,
         )
+    # Timed out: mark unfinished items failed.
     except asyncio.TimeoutError:
         logger.warning(
             "provision pass gather timed out after %ss — a clone/reclaim wedged "
@@ -3649,6 +4023,7 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
             if it.get("status") == "provisioning":
                 it["status"] = "failed"
         results = []
+    # Save state and count the results.
     save_usb_state(state)
     provisioned = sum(1 for r in results if r is True)
     # A mid-batch toggle-off marks the un-started clones 'cancelled' (not 'failed')
@@ -3658,16 +4033,19 @@ async def run_provision_loop(agent) -> Dict[str, Any]:
     # If the stuck-run watchdog reassigns the global to a fresh run while this
     # gather was hung, writing to the global here would clobber the fresh run;
     # this_run keeps the orphan's late writes isolated.
+    # Close out the run record.
     this_run["running"] = False
     this_run["completed"] = provisioned
     this_run["cancelled"] = cancelled
     this_run["failed"] = len(ordered) - provisioned - cancelled
     this_run["completed_at"] = int(time.time())
+    # Reason line for the UI.
     if cancelled:
         _provision_reason = (f"auto-provision turned off mid-batch — provisioned "
                              f"{provisioned}, cancelled {cancelled} of {len(ordered)}")
     else:
         _provision_reason = f"provisioning: attempted {len(ordered)}, provisioned {provisioned}"
+    # Summary.
     return {"provisioned": provisioned + pci_provisioned, "torn_down": len(torn_down),
             "attempted": len(ordered), "cancelled": cancelled}
 
@@ -3703,6 +4081,7 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
     # Proxmox host with contended storage even this tiny read/write can stall
     # the loop long enough to miss the ACCEPTED window for a relayed command
     # (py-spy caught the loop parked in json.load here during a bulk delete).
+    # Run at most once per interval; record this run.
     if now - await asyncio.to_thread(_load_vmid_gap_last_run) < VMID_AUDIT_INTERVAL_S:
         return
     await asyncio.to_thread(_save_vmid_gap_last_run, now)
@@ -3713,23 +4092,28 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
     # is already assigned. A bus still in bus_to_vmid counts as assigned
     # (missing-dongle teardown only drops it after missing_timeout, not same
     # tick), so a dongle that just unplugged doesn't read as "unassigned" here.
+    # A free present dongle can fill a gap itself, so do nothing.
     bus_to_vmid = state.get("bus_to_vmid") or {}
     if any(bus not in bus_to_vmid for bus in present):
         return
+    # VMIDs assigned in our range.
     try:
         assigned = sorted(int(v) for v in state["vmid_to_bus"].keys()
                           if start <= int(v) <= end)
     except (TypeError, ValueError):
         return
     # Active = not currently provisioning (in-flight clones aren't stable yet).
+    # Ignore VMs still being cloned; need at least two.
     provisioning = _provisioning_vmids()
     active = [v for v in assigned if v not in provisioning]
     if len(active) < 2:
         return
+    # Find the lowest gap below the highest VMID.
     active_set = set(active)
     gap_max = active[-1]
     lowest_gap: Optional[int] = None
     for chk in range(start, gap_max):
+        # Filled slots are not gaps.
         if chk in active_set:
             continue
         # Guard 2 — a vid on the host with a USB *or* PCI passthrough but NOT
@@ -3739,21 +4123,27 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
         # highest tracked VM every pass trying to fill an occupied slot. A vid
         # not on the host is truly free → a real gap. Only on-host vids cost a
         # qm_config, so the stale-existing race is limited to a 1-tick miss.
+        # Untracked VMs with passthrough are not gaps either.
         if chk in existing and (await _vm_has_usb_passthrough(chk)
                                 or await _vm_has_pci_passthrough(chk)):
             continue
         lowest_gap = chk
         break
+    # No gap: done.
     if lowest_gap is None:
         return
+    # The highest VM above the gap is the one to delete.
     above_gap = [v for v in active if v > lowest_gap]
     if not above_gap:
         return
     target = max(above_gap)
+    # Its bus; skip if unknown.
     bus = state["vmid_to_bus"].get(str(target))
     if not bus:
         return
+    # Deferred to avoid an import cycle.
     from . import cs_sim  # deferred — cs_sim imports usb_provision
+    # Destroy it and drop it from the state.
     try:
         await cs_sim.destroy_vm(agent, target, bus=bus)
         state["bus_to_vmid"].pop(bus, None)
@@ -3770,6 +4160,7 @@ async def _vmid_gap_audit(agent, state: Dict[str, Any],
 def _pci_short(addr: str) -> str:
     """Normalize a PCI address to its domain-less short form (``01:00.0``) so
     full-domain (``0000:01:00.0``) and short forms compare equal."""
+    # Strip a leading "0000:" domain.
     a = str(addr or "").strip().lower()
     return a[5:] if a.startswith("0000:") else a
 
@@ -3777,14 +4168,19 @@ def _pci_short(addr: str) -> str:
 # PCI controllers held by an in-flight reclone (short addr → vmid). Between the
 # reclone's destroy and its re-attach the controller and VMID look free; the
 # T1/T3 provisioner must not hand them to a new VM in that window.
+# PCI addresses held for a reclone, mapped to the VMID.
 _pci_reclone_hold: Dict[str, int] = {}
 
 
 def hold_pci_for_reclone(addr: str, vmid: int) -> None:
+    """Reserve the PCI address for a VM being recloned."""
+    # Store by short address.
     _pci_reclone_hold[_pci_short(addr)] = int(vmid)
 
 
 def release_pci_hold(addr: str) -> None:
+    """Drop the reservation on a PCI address."""
+    # Remove by short address.
     _pci_reclone_hold.pop(_pci_short(addr), None)
 
 
@@ -3792,12 +4188,15 @@ async def _pci_addrs_in_use(agent) -> Set[str]:
     """Short-form PCI addresses already attached to ANY VM (its ``hostpciN``
     lines) or held by a reclone — so the T1/T3 provisioner never double-passes
     a controller."""
+    # Only needed here.
     from . import pve_cmds
+    # Start with held addresses; list all VMs.
     used: Set[str] = set(_pci_reclone_hold)
     try:
         vmids = await pve_cmds.list_all_vmids()
     except Exception:  # noqa: BLE001
         return used
+    # Add every hostpciN address from each VM's config.
     for vid in vmids:
         try:
             cfg = await pve_cmds.qm_config(vid)
@@ -3816,10 +4215,13 @@ async def _free_pci_controllers(agent, pci_vidpids) -> List[tuple]:
 
     Returns ``[(full_domain_addr, vidpid)]`` — the addr in the form
     ``qm set -hostpciN`` expects. Empty when none configured/present."""
+    # Only needed here.
     from . import pve_cmds
+    # Present controllers matching the list.
     present = await pve_cmds.list_host_pci_by_vidpid(pci_vidpids)  # {addr: vidpid}
     if not present:
         return []
+    # Drop the ones already in use.
     used = await _pci_addrs_in_use(agent)
     return [(addr, vp) for addr, vp in present.items() if _pci_short(addr) not in used]
 
@@ -3834,16 +4236,21 @@ async def _clone_and_provision_pci(agent, vmid: int, pci_addr: str, vidpid: str,
     ``compute_vm_tiers`` and protected by the delete gate. It still gets the same
     post-clone finish (``finish_clone``), recorded in ``state``. NOTE: the clone-source template must be q35 + IOMMU-ready for hostpci
     to attach; validate on the host. Returns True if cloned + started."""
+    # Only needed here.
     from . import pve_cmds
+    # Protected VMs and the new VM's name.
     protected = _protected_vmids(agent)
     name = _vm_name(vmid) or f"sim-{vmid}-{tier}"
+    # Clone, set autostart, and attach the controller.
     await pve_cmds.qm_clone(template, vmid, name, protected=protected,
                             pool=_sim_pool(agent), timeout=600)
     await pve_cmds.qm_set(vmid, "--onboot", "1", "--startup", "order=2,up=60", protected=protected)
     await pve_cmds.qm_set(vmid, "-hostpci0", f"{pci_addr},pcie=1", protected=protected)
+    # Optional VLAN bridge for the NIC.
     vlan = (agent.config.get("client_simulation") or {}).get("usb_config", {}).get("vlan_nic")
     if vlan:
         await pve_cmds.qm_set(vmid, "-net0", f"virtio,bridge={vlan}", protected=protected)
+    # Start it and finish setup.
     await pve_cmds.qm_start(vmid, protected=protected)
     logger.info("provision loop: %s VM %s cloned + PCI passthrough %s (%s)",
                 tier.upper(), vmid, pci_addr, vidpid)
@@ -3857,20 +4264,26 @@ async def _provision_pci_tier(agent, tier: str, pci_vidpids, template: int,
     """Provision one T1/T3 VM per FREE controller (the physical device count is the
     natural cap). Allocates the lowest free VMID in the guarded [start,end] block
     (above the 90000 floor, skipping PROTECTED + in-use ids). Returns the count."""
+    # Only needed here.
     from . import pve_cmds
+    # Nothing configured.
     if not pci_vidpids or not template:
         return 0
+    # Free controllers; none means nothing to do.
     free = await _free_pci_controllers(agent, pci_vidpids)
     if not free:
         return 0
+    # VMIDs we must not use.
     protected = _protected_vmids(agent)
     try:
         in_use = set(await pve_cmds.list_all_vmids())
     except Exception:  # noqa: BLE001
         in_use = set()
     in_use |= set(_pci_reclone_hold.values())
+    # One VM per free controller.
     provisioned = 0
     for addr, vidpid in free:
+        # Lowest free VMID in range.
         vmid = None
         for cand in range(int(start), int(end) + 1):
             if cand < _VMID_DEFAULT_START or cand in in_use or cand in protected:
@@ -3878,10 +4291,12 @@ async def _provision_pci_tier(agent, tier: str, pci_vidpids, template: int,
             vmid = cand
             in_use.add(cand)
             break
+        # Range full: stop.
         if vmid is None:
             logger.warning("provision loop: %s — no free VMID in %s-%s for controller %s",
                            tier.upper(), start, end, addr)
             break
+        # Clone it.
         try:
             await _clone_and_provision_pci(agent, vmid, addr, vidpid, template, tier, state)
             provisioned += 1
@@ -3903,19 +4318,24 @@ async def _clone_and_provision(agent, vmid: int, bus: str,
     saves the WHOLE state object once at the end of the tick; a separate
     load+save here would get silently overwritten by that later blanket save.
     """
+    # Only needed here.
     from . import pve_cmds
+    # Protected VMs and the new VM's name.
     protected = _protected_vmids(agent)
     name = _vm_name(vmid) or f"sim-{vmid}-{info.get('type', 'wireless')}"
+    # Clone, set autostart, and attach the dongle.
     await pve_cmds.qm_clone(template, vmid, name, protected=protected,
                             pool=_sim_pool(agent), timeout=600)
     await pve_cmds.qm_set(vmid, "--onboot", "1", "--startup", "order=2,up=60",
                          protected=protected)
     await pve_cmds.qm_set(vmid, "-usb0", f"host={bus}", protected=protected)
     # Optional VLAN NIC (usb_cfg.vlan_nic e.g. "vlan20") — best-effort.
+    # Optional VLAN bridge for the NIC.
     vlan = (agent.config.get("client_simulation") or {}).get("usb_config", {}).get("vlan_nic")
     if vlan:
         await pve_cmds.qm_set(vmid, "-net0", f"virtio,bridge={vlan}",
                               protected=protected)
+    # Start it, record the assignment, and finish setup.
     await pve_cmds.qm_start(vmid, protected=protected)
     set_assignment(vmid, bus, image_num)
     await finish_clone(agent, vmid, name, state, bus=bus, image_num=image_num,
@@ -3947,21 +4367,27 @@ async def finish_clone(agent, vmid: int, name: str,
     when there is no such caller (reclone) and the queues are saved here.
     ``bus`` is None for a T1/T3 (PCI) VM. Returns True if the guest came back
     from the reboot."""
+    # Only needed here.
     from . import pve_cmds
     protected = _protected_vmids(agent)
     # Stamped first: guest_watchdog treats the VM as freshly cloned (not hung)
     # from this stamp on.
+    # Queue the settle reboot.
     st = load_usb_state() if state is None else state
     stamp_post_prov_reboot(st, vmid, bus, image_num)
     if state is None:
         save_usb_state(st)
     # A reclone keeps its "Recloning" badge (short TTL) live through the waits.
+    # Whether this is a reclone (to keep its badge alive).
     recloning = int(vmid) in _recloning
 
     def _keepalive() -> None:
+        """Refresh the "recloning" mark during long waits."""
+        # Only for reclones.
         if recloning:
             mark_recloning(vmid)
 
+    # Wait for the guest agent.
     agent_up_at = None
     for _ in range(40):
         _keepalive()
@@ -3971,20 +4397,24 @@ async def finish_clone(agent, vmid: int, name: str,
         await asyncio.sleep(5)
     # hostnamectl is deliberately avoided (D-Bus may be unready post-boot and
     # can hang the task) — the script writes /etc/hostname + /etc/hosts.
+    # Stamp the hostname (up to 3 tries).
     host_script = _hostname_stamp_script(name)
     for _ in range(3):
         if await pve_cmds.qm_guest_exec_shell(vmid, host_script, exec_timeout=60,
                                               outer_timeout=90, protected=protected):
             break
         await asyncio.sleep(5)
+    # USB dongle: tell the guest its type.
     if dtype:
         # Tell the guest's startup.sh which phy type its USB dongle is.
         await pve_cmds.qm_guest_exec_shell(
             vmid, f"echo 'sim_phy={dtype}' > /usr/local/scripts/usb-phy-override.conf",
             exec_timeout=60, outer_timeout=90, protected=protected)
+    # It's no longer an orphan.
     remove_orphan_vm(vmid)
 
     # A freshly-cloned guest can corrupt if rebooted too soon after first boot.
+    # Wait out the settle time before rebooting.
     if agent_up_at is not None:
         remaining = _FIRST_REBOOT_SETTLE_S - (time.time() - agent_up_at)
         if remaining > 0:
@@ -3993,10 +4423,12 @@ async def finish_clone(agent, vmid: int, name: str,
             await asyncio.sleep(remaining)
     _keepalive()
     # `qm guest exec ... reboot` never replies (the agent dies with the guest).
+    # Reboot the guest.
     try:
         await pve_cmds.qm_guest_exec(vmid, "reboot", protected=protected)
     except Exception:  # noqa: BLE001
         pass
+    # Wait up to 5 minutes for it to come back.
     came_back = False
     deadline = time.time() + 300
     while time.time() < deadline:
@@ -4005,6 +4437,7 @@ async def finish_clone(agent, vmid: int, name: str,
         if await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10):
             came_back = True
             break
+    # Back: run update.sh.
     if came_back:
         try:
             await pve_cmds.qm_guest_exec_shell(
@@ -4014,6 +4447,7 @@ async def finish_clone(agent, vmid: int, name: str,
             logger.warning(f"provision loop: update.sh failed on VM {vmid} "
                            f"(will retry on next boot): {e}")
         _keepalive()
+    # Not back: queue it for retries.
     else:
         now_ts = time.time()
         st = load_usb_state() if state is None else state
@@ -4034,31 +4468,40 @@ async def _run_post_prov_retry_queue(agent, state: Dict[str, Any]) -> bool:
     the retry entry; past 1 hour unresponsive, destroy the VM so the normal
     provisioning pass reclones it fresh. Returns True if ``state`` was
     mutated (caller should persist it)."""
+    # Nothing queued.
     retry = state.get("post_prov_retry") or {}
     if not retry:
         return False
+    # Local imports.
     from . import cs_sim, pve_cmds  # local: pve_cmds is imported per-function
+    # Protected VMs, time, and whether state changed.
     protected = _protected_vmids(agent)
     now = time.time()
     mutated = False
+    # Check each entry.
     for vmid_s, entry in list(retry.items()):
         vmid = int(vmid_s)
+        # Retry every 10 minutes.
         if now - float(entry.get("last_ts", 0)) < 600:
             continue
+        # Drop entries whose bus no longer matches.
         bus = entry.get("bus")
         if state["vmid_to_bus"].get(vmid_s) != bus:
             logger.info(f"post-prov retry: VM {vmid} bus mismatch (stale entry) — dropping")
             retry.pop(vmid_s, None)
             mutated = True
             continue
+        # Drop entries whose VM is gone.
         cfg = await pve_cmds.qm_config(vmid)
         if not cfg:
             logger.info(f"post-prov retry: VM {vmid} no longer exists — dropping retry entry")
             retry.pop(vmid_s, None)
             mutated = True
             continue
+        # Time since cloning; ping the guest.
         elapsed = now - float(entry.get("start_ts", now))
         responded = await pve_cmds.qm_agent_ping(vmid, protected=protected, timeout=10)
+        # Responded: run update.sh and drop the entry.
         if responded:
             logger.info(f"post-prov retry: VM {vmid} guest agent responded after "
                        f"{int(elapsed)}s — running update.sh")
@@ -4070,6 +4513,7 @@ async def _run_post_prov_retry_queue(agent, state: Dict[str, Any]) -> bool:
                 logger.warning(f"post-prov retry: update.sh failed on VM {vmid}: {e}")
             retry.pop(vmid_s, None)
             mutated = True
+        # Over an hour: destroy the VM so it is recloned.
         elif elapsed > 3600:
             logger.warning(f"post-prov retry: VM {vmid} unresponsive for >1h — "
                            "destroying; provision loop will reclone")
@@ -4089,6 +4533,7 @@ async def _run_post_prov_retry_queue(agent, state: Dict[str, Any]) -> bool:
             state["vmid_to_image"].pop(vmid_s, None)
             state["missing_since"].pop(bus, None)
             state.get("vidpid_by_bus", {}).pop(bus, None)
+        # Otherwise try again later.
         else:
             entry["last_ts"] = now
             mutated = True
@@ -4106,13 +4551,17 @@ async def _run_post_prov_reboot_queue(agent, state: Dict[str, Any]) -> bool:
     clean restart after its settle/update window. Survives an agent restart
     because it lives in ``usb_state.json``. Returns True if ``state`` was
     mutated (caller should persist it)."""
+    # Nothing queued.
     q = state.get("post_prov_reboot") or {}
     if not q:
         return False
+    # Local import.
     from . import pve_cmds  # local: pve_cmds is imported per-function
+    # Protected VMs, time, and whether state changed.
     protected = _protected_vmids(agent)
     now = time.time()
     mutated = False
+    # Check each entry; skip ones not yet due.
     for vmid_s, entry in list(q.items()):
         vmid = int(vmid_s)
         if now < float(entry.get("reboot_at", 0)):
@@ -4121,11 +4570,13 @@ async def _run_post_prov_reboot_queue(agent, state: Dict[str, Any]) -> bool:
         # Stale entry — the VM was reassigned to a different bus (reclone onto
         # a new dongle would overwrite its entry via set_assignment, but a
         # partial clear could strand one). Drop without rebooting.
+        # Drop entries whose bus no longer matches.
         if state["vmid_to_bus"].get(vmid_s) != bus:
             logger.info(f"post-prov reboot: VM {vmid} bus mismatch (stale entry) — dropping")
             q.pop(vmid_s, None)
             mutated = True
             continue
+        # Drop entries whose VM is gone.
         cfg = await pve_cmds.qm_config(vmid)
         if not cfg:
             logger.info(f"post-prov reboot: VM {vmid} no longer exists — dropping reboot entry")
@@ -4137,6 +4588,7 @@ async def _run_post_prov_reboot_queue(agent, state: Dict[str, Any]) -> bool:
         # qm_guest_exec is fire-and-forget on reboot — the guest agent dies —
         # so swallow the channel-died error; the reboot was already issued.
         # Fall back to a hardware qm reset (vm_action_any) if QGA won't take it.
+        # Reboot through the guest agent, falling back to a Proxmox reboot.
         try:
             await pve_cmds.qm_guest_exec(vmid, "reboot", protected=protected)
         except Exception as e:  # noqa: BLE001
@@ -4147,6 +4599,7 @@ async def _run_post_prov_reboot_queue(agent, state: Dict[str, Any]) -> bool:
             except Exception as e2:  # noqa: BLE001
                 logger.warning(f"post-prov reboot: qm reset fallback also failed "
                                f"for VM {vmid}: {e2}")
+        # Log it and drop the entry.
         logger.info(f"post-prov reboot: VM {vmid} rebooted "
                     f"{int(now - float(entry.get('cloned_at', now)))}s after clone")
         q.pop(vmid_s, None)
@@ -4155,6 +4608,8 @@ async def _run_post_prov_reboot_queue(agent, state: Dict[str, Any]) -> bool:
 
 
 def _protected_vmids(agent) -> Set[int]:
+    """VMIDs that must never be touched, from the cs config."""
+    # Resolve them with the guard helper.
     from .cs_guard import resolve_protected_vmids
     return resolve_protected_vmids(agent.config.get("client_simulation"))
 
@@ -4164,7 +4619,9 @@ async def _is_runnable_template(vmid: int) -> bool:
     vmid_is_runnable_template: ``qm status`` succeeds + ``template: 1`` in
     config). ``qm_config`` already returns ``{}`` for a nonexistent vmid, so
     a missing/deleted template id falls straight through to False."""
+    # Local import.
     from . import pve_cmds  # local: pve_cmds is imported per-function
+    # Template flag from the config.
     cfg = await pve_cmds.qm_config(vmid)
     return cfg.get("template") == "1"
 
@@ -4173,8 +4630,10 @@ def _normalize_image_pcts(images: list) -> None:
     """Coerce each image's ``pct`` to 0-100. Images with a missing/invalid pct
     split the remaining share evenly; if NOTHING is set, split 100 evenly. Keeps
     the weighted-fill selection sane regardless of what the UI/config sent."""
+    # Nothing to do.
     if not images:
         return
+    # Clamp valid values; collect the ones without a value.
     unassigned = []
     assigned = 0
     for im in images:
@@ -4184,12 +4643,14 @@ def _normalize_image_pcts(images: list) -> None:
         except (TypeError, ValueError):
             im["pct"] = None
             unassigned.append(im)
+    # Split the leftover share among those without a value.
     if unassigned:
         rem = max(0, 100 - assigned)
         share = rem // len(unassigned)
         for im in unassigned:
             im["pct"] = share
         unassigned[-1]["pct"] += rem - share * len(unassigned)
+    # All zero: split 100 evenly.
     if sum(im["pct"] for im in images) == 0:
         share = 100 // len(images)
         for im in images:
@@ -4207,22 +4668,27 @@ async def _resolve_images(usb_cfg: Dict[str, Any], legacy_img1: Any = None,
     ``image1``/``image2`` + ``image1_pct`` pair (image2 gets the remaining %).
     Images whose template can't be resolved are dropped; pcts are normalized to
     sum ~100 so the fleet fills to the intended proportions."""
+    # Number of images configured.
     try:
         count = int(usb_cfg.get("image_count") or 0)
     except (TypeError, ValueError):
         count = 0
+    # Build the list of images with a resolved template.
     images: list = []
+    # Generic form: image1..imageN.
     if count > 0:
         for i in range(1, count + 1):
             t = await _resolve_template_vmid(usb_cfg.get(f"image{i}_template_id"))
             if not t:
                 continue
             images.append({"num": i, "template": int(t), "pct": usb_cfg.get(f"image{i}_pct")})
+    # Legacy form: two images.
     else:
         if legacy_img1:
             images.append({"num": 1, "template": int(legacy_img1), "pct": legacy_img1_pct})
         if legacy_img2:
             images.append({"num": 2, "template": int(legacy_img2), "pct": None})
+    # Normalise the shares.
     _normalize_image_pcts(images)
     return images
 
@@ -4252,11 +4718,14 @@ async def _resolve_template_vmid(configured: Any) -> Optional[int]:
       * multiple matches on this SAME node → log an error + return None (a real
         local duplicate; refuse to pick rather than clone from the wrong source).
         The operator must make the name unique (rename one VM) or use the VMID."""
+    # Local import.
     from . import pve_cmds  # local: pve_cmds is imported per-function
+    # Nothing configured.
     raw = str(configured).strip() if configured is not None else ""
     if not raw:
         return None
     # ── numeric → vmid lookup (original path) ─────────────────────────────
+    # Numeric: use it if it exists, else the lowest template on the cluster.
     if raw.lstrip("-").isdigit():
         cvid = int(raw)
         # Exists as any VM (qm_config returns {} only for a nonexistent vmid) →
@@ -4276,12 +4745,15 @@ async def _resolve_template_vmid(configured: Any) -> Optional[int]:
     # ── non-numeric → resolve by NAME, scoped to the LOCAL node ───────────
     # On a cluster, /cluster/resources sees every node's copy of the same-named
     # template; the clone is local, so only THIS node's copy is a valid source.
+    # Name: look for an exact match on this node.
     local_node = await pve_cmds.local_node_name()
     cluster_vms = await pve_cmds.list_qemu_vms_cluster()
     local_matches = [vid for vid, name, node in cluster_vms
                      if name == raw and node == local_node]
+    # Exactly one: use it.
     if len(local_matches) == 1:
         return local_matches[0]
+    # None here: explain where it is, if anywhere.
     if not local_matches:
         # Distinguish "nowhere" from "only on other nodes" for an actionable log.
         other_nodes = sorted({node for vid, name, node in cluster_vms if name == raw})
@@ -4295,6 +4767,7 @@ async def _resolve_template_vmid(configured: Any) -> Optional[int]:
                         f"{raw!r} not found on this node ({local_node}) — clones "
                         "will fail (check the VM name / use the VMID instead)")
         return None
+    # Several matches: refuse to pick.
     logger.warning(f"provision loop: configured clone-source template name "
                 f"{raw!r} matches multiple vmids {sorted(local_matches)} on this "
                 f"node ({local_node}) — refusing to pick; clones will fail (make "
@@ -4309,12 +4782,15 @@ async def _reclaim_zombie_vmid(agent, vid: int) -> bool:
     zombie cleanup, proxmox-agent.sh:1900-1949). Returns True if ``vid`` is
     now free to clone into; False to leave it alone and try the next vmid
     (mirrors bash giving up on this one vmid, not the whole dongle)."""
+    # Only needed here.
     from . import cs_sim
+    # Try to destroy it.
     try:
         r = await cs_sim.destroy_vm(agent, vid)
     except Exception as e:  # noqa: BLE001 — GuardError or a pve_cmds failure
         logger.warning(f"provision loop: zombie reclaim of {vid} failed: {e}")
         return False
+    # Success frees the VMID.
     if r.get("ok"):
         logger.warning(f"provision loop: reclaimed zombie VMID {vid} "
                        "(existed in Proxmox with no tracked assignment)")

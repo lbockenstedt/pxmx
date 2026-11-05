@@ -13,19 +13,29 @@ existing ``usb_provision.X`` callers (and its own internal unqualified calls) ar
 unchanged.
 """
 
+# asyncio moves the dmesg line parsing off the event loop.
 import asyncio
+# json reads and writes the quarantine and destroy-fail files.
 import json
+# logging reports permanent quarantines.
 import logging
+# os handles file existence checks, sizes and directory creation.
 import os
+# re matches kernel USB error lines.
 import re
+# time stamps exclusions and quarantine strikes.
 import time
+# Type hints only; they document the shapes of values passed around.
 from typing import Any, Dict, Optional
 
+# Shared usb_state.json loader/saver (bus exclusions and orphan VMs live there).
 from . import usb_state_store
 
+# Share the main agent logger so quarantine messages appear with other agent output.
 logger = logging.getLogger("PxmxAgent")
 
 # Mirrors usb_provision.PXMLIB (this module owns its JSON files).
+# Directory holding the agent's persistent USB state, and the two files this module owns.
 PXMLIB = "/var/lib/pxmx"
 USB_QUARANTINE_FILE = f"{PXMLIB}/usb_quarantine.json"
 DESTROY_FAILS_FILE = f"{PXMLIB}/destroy_fails.json"
@@ -62,6 +72,7 @@ _DMESG_GREP = (r"device descriptor read|unable to enumerate|not accepting addres
                r"error -71|error -110|can't set config|cannot enable port|reset .*fail")
 # Hard cap on lines handed back, so a pathological flood cannot be unbounded.
 _DMESG_MAX_LINES = int(os.environ.get("LM_PXMX_DMESG_MAX_LINES", "2000") or 2000)
+# Fewer hits than this in the window is treated as a transient glitch, not a bad dongle.
 _DMESG_USB_QUARANTINE_MIN = 3    # >= this many error lines in-window → quarantine
 
 
@@ -69,17 +80,21 @@ _DMESG_USB_QUARANTINE_MIN = 3    # >= this many error lines in-window → quaran
 def clear_excluded_buses() -> int:
     """Wipe all bus exclusions (bash ``provision_unassigned`` dispatch 4078-4084).
     Returns the count cleared."""
+    # Load the shared state, count the current exclusions, then clear and save them.
     st = usb_state_store.load_usb_state()
     n = len(st.get("excluded_buses", {}))
     st["excluded_buses"] = {}
     usb_state_store.save_usb_state(st)
+    # Tell the caller how many exclusions were removed.
     return n
 
 
 def exclude_bus(bus: str) -> None:
+    """Exclude a bus from provisioning, recording when it was excluded for the cooldown."""
     # Store the exclusion TIMESTAMP (not a bare 1) so the provision loop can
     # auto-return the bus after EXCLUDE_COOLDOWN_S. Legacy bare-1 values are
     # treated as already-expired by the reconcile cooldown clear.
+    # Load the shared state, stamp this bus with the current time, and save it back.
     st = usb_state_store.load_usb_state()
     st["excluded_buses"][bus] = time.time()
     usb_state_store.save_usb_state(st)
@@ -87,40 +102,55 @@ def exclude_bus(bus: str) -> None:
 
 # ── dongle quarantine (usb_quarantine.json) ───────────────────────────────
 def clear_quarantine(bus: Optional[str] = None) -> None:
+    """Clear the quarantine for one bus, or for every bus when ``bus`` is None."""
+    # Quarantine file this function rewrites.
     path = USB_QUARANTINE_FILE
+    # File errors are swallowed: clearing quarantine is best-effort.
     try:
+        # Make sure the state directory exists before writing.
         os.makedirs(PXMLIB, exist_ok=True)
+        # Single bus: load the current file (if non-empty), drop that bus, and write it back.
         if bus:
             data: Dict[str, Any] = {}
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 with open(path) as f:
                     data = json.load(f) or {}
             data.pop(bus, None)
+            # Remove just this bus and write the rest back.
             with open(path, "w") as f:
                 json.dump(data, f)
+        # No bus given: reset the whole quarantine to an empty map.
         else:
             with open(path, "w") as f:
                 json.dump({}, f)
+    # Unreadable or corrupt file: nothing sensible to do, so leave it.
     except (OSError, json.JSONDecodeError):
         pass
 
 
 def _read_quarantine() -> Dict[str, Any]:
+    """Load the quarantine map, returning {} if the file is missing, empty or corrupt."""
+    # Read the file only if it exists and has content; anything but a dict is ignored.
     try:
         if os.path.exists(USB_QUARANTINE_FILE) and os.path.getsize(USB_QUARANTINE_FILE) > 0:
             with open(USB_QUARANTINE_FILE) as f:
                 d = json.load(f)
             return d if isinstance(d, dict) else {}
+    # Missing or corrupt file is treated as "nothing quarantined".
     except (OSError, json.JSONDecodeError):
         pass
+    # Fallback: empty quarantine.
     return {}
 
 
 def _save_quarantine(d: Dict[str, Any]) -> None:
+    """Write the quarantine map to disk (best-effort; errors are ignored)."""
+    # Create the directory if needed, then overwrite the file.
     try:
         os.makedirs(PXMLIB, exist_ok=True)
         with open(USB_QUARANTINE_FILE, "w") as f:
             json.dump(d, f)
+    # Write failures are ignored; the next save will try again.
     except OSError:
         pass
 
@@ -132,6 +162,7 @@ async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str
     bus_path dongles are tracked by, so a persistently-erroring bus can be
     quarantined and not re-provisioned. Best-effort via ``journalctl -k``; empty
     dict on any failure (never quarantines on missing data)."""
+    # pve_cmds._run is the agent's shared async subprocess helper.
     from . import pve_cmds  # deferred — avoid a top-level import cycle
     # Filter in journalctl (C) rather than in Python. This runs every 60s over a
     # 180s window, so every line is read THREE times; on a host whose controller
@@ -144,8 +175,10 @@ async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str
     # carried across to here, and this path only started doing real work at all
     # once the bytes/str crash was fixed -- before that it raised on line one and
     # cost nothing.
+    # journalctl kernel-log query: plain message text, limited to the window and a line cap.
     base = ["journalctl", "-k", "--no-pager", "-o", "cat",
             "--since", f"-{int(window_s)}s", "-n", str(_DMESG_MAX_LINES)]
+    # First try the fast server-side filtered query.
     try:
         rc, out, _ = await pve_cmds._run(base + ["-g", _DMESG_GREP],
                                          check=False, timeout=10)
@@ -154,8 +187,10 @@ async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str
             # missing flag degrades to "slower", never to "quarantine stops
             # working" -- this is the only automatic quarantine path.
             rc, out, _ = await pve_cmds._run(base, check=False, timeout=10)
+    # journalctl could not run at all: report no errors rather than guessing.
     except Exception:  # noqa: BLE001
         return {}
+    # Failed query or empty output: no data, so nothing to quarantine.
     if rc != 0 or not out:
         return {}
     # ``_run`` returns stdout as BYTES. Iterating it yields bytes lines, and
@@ -173,13 +208,19 @@ async def scan_dmesg_usb_errors(window_s: int = _DMESG_USB_WINDOW_S) -> Dict[str
     # completion is what feeds the systemd watchdog, so a busy host must not be
     # able to stall it here.
     def _count(text: str) -> Dict[str, int]:
+        """Count matching error lines per USB bus id."""
+        # Per-bus error counts.
         errs: Dict[str, int] = {}
+        # Check each kernel log line for a per-device USB error.
         for line in text.splitlines():
             m = _USB_DMESG_ERROR_RE.search(line)
+            # Matched: group(1) is the bus id such as "3-1.2".
             if m:
                 errs[m.group(1)] = errs.get(m.group(1), 0) + 1
+        # Map of bus id to number of error lines.
         return errs
 
+    # Run the counting in a worker thread and return its result.
     return await asyncio.to_thread(_count, out)
 
 
@@ -195,15 +236,20 @@ def quarantine_bus(bus: str, reason: str) -> None:
     A permanent bus no-ops here (it's already as sidelined as it can be). Manual
     ``clear_usb_quarantine`` pops the whole entry, resetting strike history.
     """
+    # Load the current quarantine entry for this bus (empty if none).
     q = _read_quarantine()
     entry = q.get(bus) or {}
+    # Permanently sidelined buses cannot get any worse.
     if entry.get("permanent"):
         return
+    # Already quarantined in this episode.
     if int(entry.get("fails", 0)) >= QUARANTINE_MAX_FAILS:
         return  # already quarantined this episode — don't double-count a strike
+    # New episode: count a strike and decide whether it makes the bus permanent.
     now = int(time.time())
     strikes = int(entry.get("strikes", 0)) + 1
     permanent = strikes >= QUARANTINE_PERMANENT_STRIKES
+    # Record the quarantine with its reason and strike history (first strike preserved).
     q[bus] = {
         "fails": QUARANTINE_MAX_FAILS,
         "since": now,
@@ -213,7 +259,9 @@ def quarantine_bus(bus: str, reason: str) -> None:
         "first_strike": entry.get("first_strike") or now,
         "last_strike": now,
     }
+    # Persist the updated quarantine map.
     _save_quarantine(q)
+    # Make a permanent quarantine loud in the log so the operator notices.
     if permanent:
         logger.warning(
             "auto-provision: bus %s reached %d quarantine strikes — PERMANENTLY "
@@ -223,21 +271,28 @@ def quarantine_bus(bus: str, reason: str) -> None:
 
 # ── destroy-fail counters (destroy_fails.json) ────────────────────────────
 def _read_destroy_fails() -> Dict[str, int]:
+    """Load per-VM destroy-failure counts (VMID string to count), {} if unavailable."""
+    # Read the file only if it exists and has content; normalise keys/values to str/int.
     try:
         if os.path.exists(DESTROY_FAILS_FILE) and os.path.getsize(DESTROY_FAILS_FILE) > 0:
             with open(DESTROY_FAILS_FILE) as f:
                 d = json.load(f)
             return {str(k): int(v) for k, v in d.items()} if isinstance(d, dict) else {}
+    # Missing or corrupt file means no recorded failures.
     except (OSError, json.JSONDecodeError):
         pass
+    # Fallback: no failures recorded.
     return {}
 
 
 def _save_destroy_fails(d: Dict[str, int]) -> None:
+    """Write the destroy-failure counts to disk (best-effort; errors are ignored)."""
+    # Create the directory if needed, then overwrite the file.
     try:
         os.makedirs(PXMLIB, exist_ok=True)
         with open(DESTROY_FAILS_FILE, "w") as f:
             json.dump(d, f)
+    # Write failures are ignored; counting resumes on the next attempt.
     except OSError:
         pass
 
@@ -245,18 +300,23 @@ def _save_destroy_fails(d: Dict[str, int]) -> None:
 def record_destroy_fail(vmid: int, bus: str) -> Dict[str, Any]:
     """Count a destroy failure; on reaching DESTROY_MAX_FAILS declare the VM an
     orphan (bash 1321-1351). Returns {count, orphaned}."""
+    # Load the counters and bump this VM's count.
     fails = _read_destroy_fails()
     count = int(fails.get(str(int(vmid)), 0)) + 1
     fails[str(int(vmid))] = count
+    # Too many failures: stop retrying and hand the VM to the orphan list instead.
     orphaned = count >= DESTROY_MAX_FAILS
     if orphaned:
         fails.pop(str(int(vmid)), None)
         usb_state_store.add_orphan_vm(int(vmid), bus)
+    # Persist the updated counters and report the outcome.
     _save_destroy_fails(fails)
     return {"count": count, "orphaned": orphaned}
 
 
 def clear_destroy_fails(vmid: int) -> None:
+    """Forget the destroy-failure count for a VM (e.g. after it was finally destroyed)."""
+    # Load the counters, drop this VM, and save.
     fails = _read_destroy_fails()
     fails.pop(str(int(vmid)), None)
     _save_destroy_fails(fails)

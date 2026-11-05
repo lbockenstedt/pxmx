@@ -24,17 +24,20 @@ safeguard). ``reseed`` is intentionally unguarded — it targets a template VMID
 terminal ``failed`` result so the cs queue command is always acked.
 """
 
+# Standard-library helpers for async tasks, paths, logging and type hints.
 import asyncio
 import os
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+# Proxmox command wrappers, USB provisioning state, and the sim-VM safety guard.
 from . import pve_cmds
 from . import usb_provision
 from .cs_guard import GuardError, assert_sim_vm, resolve_protected_vmids
 from .pve_cmds import PveError
 
+# Share the main agent logger so cs messages appear with other agent output.
 logger = logging.getLogger("PxmxAgent")
 
 # Actions handled here (the accepted+progress pattern), not in cs_commands.
@@ -46,10 +49,14 @@ LONG_ACTIONS = frozenset({
 
 
 def _protected(agent) -> set:
+    """Return the set of VMIDs that must never be touched (from the client_simulation config)."""
+    # Resolve the protected VMIDs from config.
     return resolve_protected_vmids(agent.config.get("client_simulation"))
 
 
 def _usb_cfg(agent) -> Dict[str, Any]:
+    """Return the hub-managed ``client_simulation.usb_config`` blob (empty dict if missing)."""
+    # Missing sections become empty dicts so callers can call .get() safely.
     return (agent.config.get("client_simulation") or {}).get("usb_config") or {}
 
 
@@ -58,6 +65,7 @@ def _vm_lock(agent, vmid: int) -> "asyncio.Lock":
     retry in cs_commands) can't race a not-yet-reaped prior run on the same
     vmid. destroy_vm is already idempotent (already_gone → completed), so this
     is defense-in-depth against two concurrent teardowns of a present VM."""
+    # Lock table stored on the agent, created the first time it's needed.
     locks = getattr(agent, "_cs_vm_locks", None)
     if locks is None:
         locks = agent._cs_vm_locks = {}
@@ -77,10 +85,12 @@ async def _progress(agent, cs_cmd_id: str, action: str, status: str,
                     step: str, pct: Optional[int] = None,
                     message: Optional[str] = None, **extra) -> None:
     """Emit a CS_PROGRESS frame. ``status`` ∈ starting/running/completed/failed."""
+    # Base frame fields; pct is clamped to 0–100.
     data: Dict[str, Any] = {"cs_cmd_id": cs_cmd_id, "action": action,
                             "status": status, "step": step}
     if pct is not None:
         data["pct"] = max(0, min(100, int(pct)))
+    # Optional message and caller-supplied extras (e.g. vmid).
     if message:
         data["message"] = message
     data.update(extra)
@@ -89,6 +99,7 @@ async def _progress(agent, cs_cmd_id: str, action: str, status: str,
     # for the minutes a reclone runs. See _terminal for the clear.
     if action == "reclone_vm" and extra.get("vmid") is not None:
         usb_provision.mark_recloning(extra["vmid"])
+    # Send the frame up to the hub.
     await agent.send_cs_event("CS_PROGRESS", data)
 
 
@@ -96,6 +107,7 @@ async def _terminal(agent, cs_cmd_id: str, action: str, status: str,
                      message: str, **extra) -> None:
     """Emit the terminal CS_COMMAND_RESULT. ``status`` ∈ completed/failed — the
     cs spoke maps these onto ``ack_command(completed|failed)``."""
+    # Base result fields plus extras.
     data: Dict[str, Any] = {"cs_cmd_id": cs_cmd_id, "action": action,
                             "status": status, "message": message}
     data.update(extra)
@@ -112,6 +124,7 @@ async def _terminal(agent, cs_cmd_id: str, action: str, status: str,
             "status": "SUCCESS" if status == "completed" else "ERROR",
             "message": message, "cs_cmd_id": cs_cmd_id, "action": action,
         }
+    # Send the terminal result up to the hub.
     await agent.send_cs_event("CS_COMMAND_RESULT", data)
 
 
@@ -130,11 +143,14 @@ async def _expire_pending_commands(agent, vmid: int, kind: str) -> None:
     from the agent side. Relayed hub-side via the CS_* ingest map (main.py
     ``_CS_INGEST_MAP``); never raises — a failed purge must not block the
     destroy that follows."""
+    # Read the guest's hostname (lxc) or VM name (qemu) from its config.
     try:
         cfg = await (pve_cmds.pct_config(vmid) if kind == "lxc" else pve_cmds.qm_config(vmid))
         hostname = cfg.get("hostname" if kind == "lxc" else "name")
+        # Ask the spoke to drop anything still queued for that hostname.
         if hostname:
             await agent.send_cs_event("CS_EXPIRE_PENDING_COMMANDS", {"target": hostname})
+    # Failure only logs; the destroy goes ahead.
     except Exception as e:  # noqa: BLE001
         logger.warning(f"destroy_vm {vmid}: pending-command expire failed: {e}")
 
@@ -157,10 +173,12 @@ async def _notify_client_torn_down(agent, vid: int) -> None:
     the VM may already be gone by the time this runs (the already_gone early
     return), so a live query would just fail. Best-effort; never raises —
     the destroy itself must never be blocked or failed by this."""
+    # Look up the deterministic VM name and ask the spoke to remove its client record.
     try:
         name = usb_provision._vm_name(vid)
         if name:
             await agent.send_cs_event("CS_TEARDOWN_CLIENT", {"hostname": name})
+    # Failure only logs; it must never block the destroy.
     except Exception as e:  # noqa: BLE001
         logger.warning(f"destroy_vm {vid}: client-teardown notify failed: {e}")
 
@@ -188,6 +206,7 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
     (usb_provision's reconcile step, "Clear exclusions ... for buses no
     longer present") — it is not a permanent ban.
     """
+    # Check the VMID is a sim VM (raises GuardError otherwise) and find out if it's qemu or lxc.
     prot = protected if protected is not None else _protected(agent)
     vid = assert_sim_vm(vmid, prot)  # GuardError if invalid → caller handles
     kind = await pve_cmds.detect_guest_type(vid)
@@ -200,6 +219,7 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
     if await pve_cmds.is_template(vid, kind):
         raise GuardError(
             f"vmid {vid} is a template (clone source) — refusing to destroy")
+    # Use the given bus, or look up which USB bus this VM was assigned.
     bus = bus or usb_provision.bus_for_vmid(vid)
     # Idempotent: if the guest is already gone (a prior tick shed it, an admin
     # delete raced us, or it was deleted manually), don't stop/destroy a ghost —
@@ -207,14 +227,18 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
     # the stale assignment WITHOUT arming a shed cooldown (nothing was actually
     # removed, so the real over-threshold shed should proceed the same/next tick).
     if not await pve_cmds.guest_exists(vid, kind):
+        # Clear its assignment, failure count and orphan entry.
         usb_provision.clear_assignment(vid, bus)
         usb_provision.clear_destroy_fails(vid)
         usb_provision.remove_orphan_vm(vid)
+        # An admin delete excludes the bus so it isn't immediately re-provisioned.
         if exclude_bus_after and bus:
             usb_provision.exclude_bus(bus)
+        # Tell the spoke the client is gone and report success.
         await _notify_client_torn_down(agent, vid)
         return {"ok": True, "orphaned": False, "bus": bus, "kind": kind,
                 "already_gone": True}
+    # Purge queued guest commands so they don't hit whichever VM reuses this slot.
     await _expire_pending_commands(agent, vid, kind)
     # Surface a 🔴 deleting telemetry frame for this VM the moment we begin
     # tearing it down — every destroy path (admin delete_vm, reclone, the
@@ -222,23 +246,28 @@ async def destroy_vm(agent, vmid: Any, *, bus: Optional[str] = None,
     # all. Without it a manual mass-delete kept the VMs showing "running" until
     # the next ~15s telemetry tick dropped them from the list.
     usb_provision.mark_deleting(vid)
+    # Stop and destroy the guest with the matching pct or qm commands.
     if kind == "lxc":
         await pve_cmds.pct_stop(vid, prot)
         ok, reason = await pve_cmds.pct_destroy(vid, prot)
     else:
         await pve_cmds.qm_stop_force(vid, prot)
         ok, reason = await pve_cmds.qm_destroy(vid, prot)
+    # Success: clear the bus assignment, failure count and orphan entry.
     if ok:
         usb_provision.clear_assignment(vid, bus)
         usb_provision.clear_destroy_fails(vid)
         usb_provision.remove_orphan_vm(vid)
+        # Optionally exclude the bus, notify the spoke, and report success.
         if exclude_bus_after and bus:
             usb_provision.exclude_bus(bus)
         await _notify_client_torn_down(agent, vid)
         return {"ok": True, "orphaned": False, "bus": bus, "kind": kind}
+    # Failure: count it; past the limit the VM is orphaned and its bus released.
     res = usb_provision.record_destroy_fail(vid, bus or "")
     if res["orphaned"]:
         usb_provision.clear_assignment(vid, bus)
+        # Orphaned during an admin delete: also exclude the bus.
         if exclude_bus_after and bus:
             usb_provision.exclude_bus(bus)
     # ``reason`` carries the actual qm/pct stderr so the delete-gate trace on the
@@ -272,18 +301,24 @@ async def _destroy_sim_vm(agent, vid: int, prot) -> Dict[str, Any]:
         # and never escalates to QT; it only stops an instant auto-reprovision so
         # the delete sticks.
         usb_provision.clear_recovery_state(r.get("bus"))
+    # Return destroy_vm's result for the caller to report.
     return r
 
 
 async def _delete_vm(agent, data, cs_cmd_id) -> None:
+    """Long op ``delete_vm``: destroy one sim VM and report progress and the result."""
+    # Accept either field name for the VMID.
     vmid = data.get("vmid") or data.get("vm_id")
     prot = _protected(agent)
     vid = assert_sim_vm(vmid, prot)  # raises → run_long_op emits terminal failed
+    # Report progress, then do the teardown.
     await _progress(agent, cs_cmd_id, "delete_vm", "running", "stopping", 10, vmid=vid)
     r = await _destroy_sim_vm(agent, vid, prot)
+    # Success: report completion with the guest type.
     if r["ok"]:
         await _terminal(agent, cs_cmd_id, "delete_vm", "completed",
                         f"VM {vid} destroyed", vmid=vid, kind=r["kind"])
+    # Failure: report why.
     else:
         msg = (f"VM {vid} destroy failed — declared orphan (bus released)"
                if r["orphaned"] else
@@ -308,18 +343,21 @@ async def _delete_vms(agent, data, cs_cmd_id) -> None:
     down so the UI can drop that row the instant it's gone, then ONE terminal
     ``CS_COMMAND_RESULT`` summarizing the batch. ``destroy_vm`` is idempotent
     (already-gone → ok), so a requeued/re-spawned batch re-runs safely."""
+    # The VMID list may be nested under "args" and may use either field name.
     args = data.get("args") if isinstance(data.get("args"), dict) else data
     raw = []
     if isinstance(args, dict):
         raw = args.get("vmids") or args.get("vm_ids") or []
     if not raw:
         raw = data.get("vmids") or []
+    # Protected VMIDs for the guard checks.
     prot = _protected(agent)
     # Validate up front: a per-VM guard failure (protected / out-of-sim-range)
     # is recorded as that VM's failure — it must never abort the whole batch.
     targets: list = []
     invalid: list = []
     seen_ids: set = set()
+    # Check each VMID; bad ones are recorded as failures and duplicates are skipped.
     for x in raw:
         try:
             vid = assert_sim_vm(x, prot)
@@ -330,18 +368,21 @@ async def _delete_vms(agent, data, cs_cmd_id) -> None:
             continue  # de-dupe a vmid listed twice
         seen_ids.add(vid)
         targets.append(vid)
+    # Nothing to do: complete immediately.
     total = len(targets) + len(invalid)
     if not total:
         await _terminal(agent, cs_cmd_id, "delete_vms", "completed",
                         "no VMs specified", deleted=0, failed=0, total=0)
         return
 
+    # Announce the batch, then report each invalid VMID as failed straight away.
     await _progress(agent, cs_cmd_id, "delete_vms", "running", "starting", 0,
                     total=total)
     for x, msg in invalid:
         await _progress(agent, cs_cmd_id, "delete_vms", "running", "failed", None,
                         vmid=x, result="failed", error=msg)
 
+    # Results, a limit of 2 concurrent destroys, and a lock around the shared counters.
     ok_ids: list = []
     fail_ids: list = []
     sem = asyncio.Semaphore(2)
@@ -349,7 +390,9 @@ async def _delete_vms(agent, data, cs_cmd_id) -> None:
     done = len(invalid)
 
     async def _one(vid: int) -> None:
+        """Destroy one VM in the batch and report its outcome as a progress frame."""
         nonlocal done
+        # Run the teardown under the concurrency limit and turn the result into ok/error.
         async with sem:
             try:
                 r = await _destroy_sim_vm(agent, vid, prot)
@@ -357,27 +400,33 @@ async def _delete_vms(agent, data, cs_cmd_id) -> None:
                 err = None if ok else (
                     "declared orphan (bus released)" if r.get("orphaned")
                     else f"destroy failed (attempt {r.get('fails')}/3)")
+            # Guard failure or unexpected error: record it, keep the batch going.
             except GuardError as e:
                 ok, err = False, str(e)
             except Exception as e:  # noqa: BLE001 — one VM must not sink the batch
                 logger.exception("delete_vms: VM %s teardown error", vid)
                 ok, err = False, str(e)
+        # Update the shared counters and percentage under the lock.
         async with counter_lock:
             done += 1
             (ok_ids if ok else fail_ids).append(vid)
             pct = int(100 * done / total)
+        # Report this VM's outcome so the UI can update its row.
         await _progress(agent, cs_cmd_id, "delete_vms", "running",
                         "deleted" if ok else "failed", pct,
                         vmid=vid, result="completed" if ok else "failed",
                         error=err)
 
+    # Destroy all targets concurrently (bounded by the semaphore).
     await asyncio.gather(*[_one(v) for v in targets], return_exceptions=True)
 
+    # Total failures, including invalid VMIDs.
     fail_ct = len(fail_ids) + len(invalid)
     # Terminal status mirrors _reclone_all: the command RAN, so it's "completed"
     # unless EVERY VM failed. The per-VM progress already told the UI which
     # individual VMs failed; this is only the queue-ack disposition.
     status = "failed" if (ok_ids == [] and fail_ct) else "completed"
+    # Summarise the counts and send the terminal result.
     msg = f"deleted {len(ok_ids)}/{total} VM(s)"
     if fail_ct:
         msg += f", {fail_ct} failed"
@@ -399,33 +448,40 @@ async def _quarantine_dongle_and_destroy(agent, data, cs_cmd_id) -> None:
     do NOT want destroy's exclusion-cooldown path to also fire (that auto-returns
     the bus; quarantine's own 1h recovery / permanent semantics own the lifecycle).
     """
+    # Resolve and guard the VMID, the reason, and the USB bus.
     vmid = data.get("vmid") or data.get("vm_id")
     prot = _protected(agent)
     vid = assert_sim_vm(vmid, prot)  # raises → run_long_op emits terminal failed
     reason = data.get("reason") or "client never connected (no IP / no SSID)"
     bus = data.get("bus_path") or usb_provision.bus_for_vmid(vid)
+    # Hold the per-VM lock while quarantining and destroying.
     async with _vm_lock(agent, vid):
+        # Quarantine the bus if there is one.
         if bus:
             usb_provision.quarantine_bus(bus, reason)
             logger.warning(
                 "quarantine_dongle_and_destroy: VM %s bus %s quarantined (%s)",
                 vid, bus, reason)
+        # No bus: just log; the VM is still destroyed below.
         else:
             # No bus mapping → not a T2 USB client (or the dongle already cleared).
             # Still shed the dead VM; nothing to quarantine.
             logger.warning(
                 "quarantine_dongle_and_destroy: VM %s has no bus — destroying "
                 "without quarantine (reason: %s)", vid, reason)
+        # Report progress, then destroy without the exclusion cooldown.
         await _progress(agent, cs_cmd_id, "quarantine_dongle_and_destroy",
                         "running", "destroying", 20, vmid=vid)
         r = await destroy_vm(agent, vid, bus=bus, protected=prot,
                              exclude_bus_after=False)
+    # Report the outcome.
     if r["ok"]:
         await _terminal(agent, cs_cmd_id, "quarantine_dongle_and_destroy",
                         "completed",
                         f"VM {vid} shed (bus {bus or '—'} quarantined, "
                         f"reason: {reason})",
                         vmid=vid, bus=bus, kind=r["kind"])
+    # Failure: report whether the VM was orphaned.
     else:
         msg = (f"VM {vid} shed failed — declared orphan (bus released)"
                if r["orphaned"] else
@@ -444,21 +500,27 @@ def _reclone_vm_name(vid: int, existing: str = "") -> str:
     existing Proxmox name (a custom rename), then ``sim-<vmid>``. Centralized so
     the fleet + single-VM reclone paths agree and the resolution is unit-tested.
     """
+    # Prefer the vm_names.json name, then the current name, then sim-<vmid>.
     return usb_provision._vm_name(vid) or existing or f"sim-{vid}"
 
 
 async def _reclone_vm(agent, data, cs_cmd_id) -> None:
+    """Long op ``reclone_vm``: destroy and re-clone one sim VM, then report the result."""
+    # Target VM, optional clone source, and guard check.
     vmid = data.get("vmid") or data.get("vm_id")
     source_vmid = data.get("source_vmid") or data.get("template_id")
     prot = _protected(agent)
     vid = assert_sim_vm(vmid, prot)
+    # Run the reclone under the per-VM lock.
     async with _vm_lock(agent, vid):
         r = await _reclone_vm_core(agent, vid, source_vmid, prot=prot,
                                     cs_cmd_id=cs_cmd_id, name=data.get("name") or "")
+    # Failure: report the error.
     if not r["ok"]:
         await _terminal(agent, cs_cmd_id, "reclone_vm", "failed",
                         r.get("error") or f"reclone VM {vid} failed", vmid=vid)
         return
+    # Success: report the bus and image used.
     await _terminal(agent, cs_cmd_id, "reclone_vm", "completed",
                     f"VM {vid} recloned on {r['bus']}", vmid=vid,
                     result={"bus": r["bus"], "image": r["image"]})
@@ -467,6 +529,7 @@ async def _reclone_vm(agent, data, cs_cmd_id) -> None:
 def _pci_passthrough_addr(cfg: Dict[str, Any]) -> str:
     """PCI address of a VM's first ``hostpciN`` passthrough (``0000:05:00.0``),
     or '' if it has none."""
+    # Check hostpci0, hostpci1, ... in order and return the first address found.
     for k in sorted(k for k in (cfg or {}) if str(k).startswith("hostpci")):
         addr = str(cfg[k]).split(",", 1)[0].strip()
         if addr:
@@ -486,13 +549,16 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
     semaphore + emits ONE batch terminal). ``emit_progress`` gates the per-phase
     CS_PROGRESS frames so a batch can drive its own overall-pct progress
     instead of N interleaved per-VM bars."""
+    # Fall back to the configured protected set.
     if prot is None:
         prot = _protected(agent)
     async def _prog(step, pct, **extra):
+        """Send a reclone progress frame for this VM (only when progress is enabled)."""
         if emit_progress and cs_cmd_id:
             await _progress(agent, cs_cmd_id, "reclone_vm", "running", step, pct, vmid=vid, **extra)
 
     def _fail(error: str, bus_: Optional[str]) -> Dict[str, Any]:
+        """Log a reclone failure and return the failure result."""
         # Log every failure on the agent too — the per-VM error otherwise only
         # rides CS_PROGRESS to the browser and never lands in pxmx-agent.log.
         logger.error("reclone VM %s failed: %s", vid, error)
@@ -500,6 +566,7 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
     # Recover the USB bus path: state first, then `qm config` usb0 host= (bash 2436-2451).
     # A T1/T3 VM has no USB bus: it passes a whole PCI controller (hostpciN) and
     # is recloned onto that same controller.
+    # Bus from state; otherwise read the VM config for a PCI passthrough or a usb host= entry.
     bus = usb_provision.bus_for_vmid(vid)
     pci = ""
     if not bus:
@@ -509,15 +576,18 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
             if not pci and k.startswith("usb") and "host=" in v:
                 bus = v.split("host=", 1)[1].split(",", 1)[0].strip()
                 break
+    # Fail if there is neither a present USB bus nor a PCI controller.
     if not pci and (not bus or not os.path.isdir(f"/sys/bus/usb/devices/{bus}")):
         return _fail(f"no present USB bus or PCI passthrough for VM {vid}", bus)
 
+    # Which image this VM used, and the configured template for that image.
     state = usb_provision.load_usb_state()
     image_num = int(state["vmid_to_image"].get(str(vid), 1) or 1)
     usb_cfg = _usb_cfg(agent)
     configured = source_vmid or (usb_cfg.get("image1_template_id") if image_num == 1
                                  else usb_cfg.get("image2_template_id")) \
         or usb_cfg.get("image1_template_id")
+    # No template configured: fail.
     if not configured:
         return _fail("no template id configured", bus or pci)
     # Resolve the clone source BEFORE destroying, through the same resolver the
@@ -526,6 +596,7 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
     # straight to `qm clone` destroyed the VM and then failed the clone whenever
     # the configured template didn't exist on this host, leaving it gone.
     template = await usb_provision._resolve_template_vmid(configured)
+    # Template not found: fail without destroying anything.
     if not template:
         return _fail(f"clone source {configured!r} not found on this host "
                      "and no fallback template — VM left untouched", bus or pci)
@@ -534,6 +605,7 @@ async def _reclone_vm_core(agent, vid: int, source_vmid: Any = None,
     # VMID) so the T1/T3 provisioner can't hand it to a new VM meanwhile.
     if pci:
         usb_provision.hold_pci_for_reclone(pci, vid)
+    # Rebuild the VM and always release the PCI hold afterwards.
     try:
         return await _rebuild_vm(agent, vid, template, image_num, usb_cfg, bus, pci,
                                  prot, name, _prog, _fail)
@@ -553,6 +625,7 @@ async def _rebuild_vm(agent, vid, template, image_num, usb_cfg, bus, pci,
     pool = usb_provision._sim_pool(agent)
     if pool not in usb_provision._verified_sim_pools:
         pool = None
+    # Destroy the old VM; fail unless it's gone or was orphaned.
     await _prog("destroying", 20)
     dr = await destroy_vm(agent, vid, bus=bus, protected=prot)
     if not dr["ok"] and not dr["orphaned"]:
@@ -567,45 +640,55 @@ async def _rebuild_vm(agent, vid, template, image_num, usb_cfg, bus, pci,
     # the guest hostname came up as sim-9xxxx, losing the username programmed
     # into the local map.
     vm_name = name or _reclone_vm_name(vid)
+    # Track the current phase for the error message.
     phase = "cloning"
     try:
+        # Clone from the template (can take several minutes).
         await _prog("cloning", 40)
         await pve_cmds.qm_clone(template, vid, vm_name, protected=prot,
                                 pool=pool, timeout=600)
+        # Configure autostart and attach the USB bus or PCI controller.
         phase = "configuring"
         await pve_cmds.qm_set(vid, "--onboot", "1", "--startup", "order=2,up=60", protected=prot)
         if pci:
             await pve_cmds.qm_set(vid, "-hostpci0", f"{pci},pcie=1", protected=prot)
         else:
             await pve_cmds.qm_set(vid, "-usb0", f"host={bus}", protected=prot)
+        # Put the NIC on the configured VLAN bridge, if any.
         vlan = usb_cfg.get("vlan_nic")
         if vlan:
             await pve_cmds.qm_set(vid, "-net0", f"virtio,bridge={vlan}", protected=prot)
 
+        # Start the new VM.
         phase = "starting"
         await _prog("starting", 60)
         await pve_cmds.qm_start(vid, prot)
+    # Pass cancellation through; any other failure reports the phase it hit.
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 — report the phase + qm stderr, don't lose it
         return _fail(f"{phase} from template {template} failed: {e}", bus or pci)
 
+    # USB clients: record the bus assignment and look up the dongle type.
     dtype = ""
     if not pci:
         usb_provision.set_assignment(vid, bus, image_num)
         dtype = _usb_device_type(agent, bus)
+    # Report progress and keep the "Recloning" badge live.
     await _prog("waiting_guest_agent", 75)
     usb_provision.mark_recloning(vid)  # finish_clone keeps it live from here
     # Same post-clone finish as auto-provision: hostname, sim_phy (USB),
     # settle, reboot, update.sh, +15-min settle reboot, post-prov retry.
     await usb_provision.finish_clone(agent, vid, vm_name, None, bus=bus or None,
                                      image_num=image_num, dtype=dtype)
+    # Report success with the bus/controller and image.
     return {"ok": True, "bus": bus or pci, "image": image_num}
 
 
 def _usb_device_type(agent, bus: str) -> str:
     """Certified type (wireless/wired/...) of the dongle on ``bus``, the same
     lookup auto-provision uses; ``wireless`` if unknown."""
+    # Read the dongle's vendor:product id from sysfs and look up its certified type.
     base = f"/sys/bus/usb/devices/{bus}"
     vidpid = (f"{usb_provision._read_sysfs(base + '/idVendor')}:"
               f"{usb_provision._read_sysfs(base + '/idProduct')}")
@@ -622,10 +705,12 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
     progress bar advances live (current_vm / phase / done-of-total / per-VM log).
     One batch at a time — a second while one is running is rejected (409-style
     failed terminal) so two clicks don't interleave."""
+    # Read options (possibly nested under "args") and the concurrency limit (at least 1).
     args = data.get("args") or data if isinstance(data, dict) else {}
     if not isinstance(args, dict):
         args = {}
     concurrency = max(1, int(args.get("concurrency", 0) or 0))
+    # Protected VMIDs for the guard checks.
     prot = _protected(agent)
 
     # Refuse a second concurrent batch (the tracker stays "running" until
@@ -640,22 +725,27 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
     # USB bus — the set a per-VM reclone would actually act on. Templates are
     # excluded by name (sim-* VMIDs in the vmid range) + the template flag; the
     # _reclone_vm_core / destroy_vm guards re-assert "never destroy a template".
+    # List all VMs; fail the command if that isn't possible.
     try:
         vmlist = await agent.get_vm_list()
     except Exception as e:  # noqa: BLE001
         await _terminal(agent, cs_cmd_id, "proxmox_reclone_all", "failed",
                         f"failed to enumerate VMs: {e}")
         return
+    # Build the list of VMs to reclone.
     candidates = []
     for v in (vmlist or {}).get("vms", []) or []:
+        # Only qemu VMs that are not templates.
         if str(v.get("type", "")).lower() != "qemu":
             continue
         if int(v.get("template", 0) or 0):
             continue
+        # Must pass the sim-VM guard.
         try:
             vid = assert_sim_vm(v.get("vmid"), prot)
         except GuardError:
             continue
+        # Must have a USB dongle that is currently plugged in.
         bus = usb_provision.bus_for_vmid(vid)
         if not bus or not os.path.isdir(f"/sys/bus/usb/devices/{bus}"):
             continue
@@ -667,27 +757,34 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
         candidates.append({"vmid": vid,
                            "name": _reclone_vm_name(vid, v.get("name") or "")})
 
+    # Nothing eligible: complete immediately.
     if not candidates:
         await _terminal(agent, cs_cmd_id, "proxmox_reclone_all", "completed",
                         "no eligible VMs with a present USB bus to reclone")
         return
 
+    # Start the batch tracker, announce the batch, and set the concurrency limit.
     usb_provision.start_reclone_batch(len(candidates), rtype="manual")
     await _progress(agent, cs_cmd_id, "proxmox_reclone_all", "running", "starting", 0,
                     total=len(candidates))
     sem = asyncio.Semaphore(concurrency)
 
     async def _one(c: Dict[str, Any]) -> None:
+        """Reclone one VM in the fleet batch, updating the tracker and sending per-VM progress."""
+        # This VM's id and the name to give it.
         vid = c["vmid"]; vname = c["name"]
+        # Respect the concurrency limit.
         async with sem:
             # Stop requested (Stop button → proxmox_reclone_stop): skip this VM
             # and every one still queued behind the semaphore. In-flight reclones
             # are allowed to finish (a half-destroyed VM would be left broken).
             if usb_provision.reclone_stop_requested():
                 return
+            # Mark the VM as in progress and tell the UI.
             usb_provision.mark_reclone_progress(vid, "destroying", vname)
             await _progress(agent, cs_cmd_id, "proxmox_reclone_all", "running",
                             "recloning", None, vmid=vid, name=vname)
+            # Run the reclone without per-phase progress; any exception counts as a failure.
             try:
                 r = await _reclone_vm_core(agent, vid, None, prot=prot,
                                             cs_cmd_id=cs_cmd_id, name=vname,
@@ -697,6 +794,7 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
                 logger.exception("fleet reclone: VM %s raised", vid)
                 ok = False
                 r = {"error": str(e)}
+            # Record the outcome and report overall progress from the tracker counts.
             usb_provision.mark_reclone_vm_done(vid, ok, vname)
             done = usb_provision.current_reclone_state().get("completed", 0) + \
                 usb_provision.current_reclone_state().get("failed", 0)
@@ -707,6 +805,7 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
                             result="completed" if ok else "failed",
                             error=(r.get("error") if not ok else None))
 
+    # Reclone all candidates concurrently (bounded by the semaphore).
     try:
         await asyncio.gather(*[_one(c) for c in candidates], return_exceptions=True)
     finally:
@@ -718,6 +817,7 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
         # left for the Stop button to signal — Clear Errors then refuses
         # ("N still running (stop first)") permanently, even though nothing
         # is actually running anymore.
+        # Work out the batch status from the tracker and close the batch.
         st = usb_provision.current_reclone_state()
         completed = int(st.get("completed", 0))
         failed = int(st.get("failed", 0))
@@ -726,6 +826,7 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
             "completed" if failed == 0 else ("failed" if completed == 0 else "completed"))
         usb_provision.end_reclone_batch(batch_status)
 
+    # Terminal status: failed if stopped or nothing succeeded; summarise the counts.
     term_status = "failed" if (stopped or (failed and not completed)) else "completed"
     msg = (f"fleet reclone stopped: {completed} completed, {failed} failed "
            f"({len(candidates) - completed - failed} skipped)" if stopped
@@ -736,6 +837,10 @@ async def _reclone_all(agent, data, cs_cmd_id) -> None:
 
 
 async def _clone_lxc(agent, data, cs_cmd_id) -> None:
+    """Long op ``clone_lxc``: destroy a sim container and re-clone it from a source, keeping its
+    settings.
+    """
+    # Target CT, clone source, and guard check.
     vmid = data.get("vmid") or data.get("vm_id")
     source_vmid = data.get("source_vmid") or data.get("template_id")
     prot = _protected(agent)
@@ -747,24 +852,30 @@ async def _clone_lxc(agent, data, cs_cmd_id) -> None:
         await _terminal(agent, cs_cmd_id, "clone_lxc", "failed",
                         f"CT {vid} is a template — refusing to destroy", vmid=vid)
         return
+    # A clone source is required.
     if not source_vmid:
         await _terminal(agent, cs_cmd_id, "clone_lxc", "failed",
                         "no source_vmid provided", vmid=vid)
         return
 
     # Snapshot the config keys to reapply after clone (bash 1822-1845).
+    # Read the current config so its settings survive the reclone.
     cfg = await pve_cmds.pct_config(vid)
     reapply = []
+    # Collect the settings to put back after cloning.
     for key in ("onboot", "startup", "cores", "memory", "swap", "features",
                 "protection", "tags", "description", "nameserver", "searchdomain",
                 "unprivileged"):
         if cfg.get(key):
             reapply += [f"--{key}", cfg[key]]
+    # Keep the network interface definitions too.
     for k, v in cfg.items():
         if k.startswith("net") and v:
             reapply += [f"--{k}", v]
+    # Keep the container's hostname (or the mapped name).
     ct_name = cfg.get("hostname") or usb_provision._vm_name(vid) or f"ct-{vid}"
 
+    # Stop and destroy the old container; stop here if the destroy fails.
     await _progress(agent, cs_cmd_id, "clone_lxc", "running", "destroying", 20, vmid=vid)
     await pve_cmds.pct_stop(vid, prot)
     ok, reason = await pve_cmds.pct_destroy(vid, prot)
@@ -773,11 +884,13 @@ async def _clone_lxc(agent, data, cs_cmd_id) -> None:
                         f"destroy of CT {vid} before clone failed: {reason}", vmid=vid)
         return
 
+    # Clone from the source and put the saved settings back.
     await _progress(agent, cs_cmd_id, "clone_lxc", "running", "cloning", 50, vmid=vid)
     await pve_cmds.pct_clone(source_vmid, vid, ct_name, protected=prot, timeout=600)
     if reapply:
         await pve_cmds.pct_set(vid, *reapply, protected=prot)
 
+    # Start the new container and report success.
     await _progress(agent, cs_cmd_id, "clone_lxc", "running", "starting", 80, vmid=vid)
     await pve_cmds.pct_start(vid, prot)
     await _terminal(agent, cs_cmd_id, "clone_lxc", "completed",
@@ -785,49 +898,63 @@ async def _clone_lxc(agent, data, cs_cmd_id) -> None:
 
 
 async def _provision_unassigned(agent, data, cs_cmd_id) -> None:
+    """Long op ``provision_unassigned``: clear exclusions and quarantine, then run one provisioning
+    pass.
+    """
     # Unconditionally clear all bus exclusions AND quarantine, then run one
     # provision pass (bash ``provision_unassigned`` dispatch 4078-4084 +
     # ``usb_provision_loop``). Clearing quarantine too makes this the single
     # operator "unstick this host" action — without it a quarantined dongle had
     # NO clear path (quarantine only auto-clears after the dongle is unplugged
     # for 2x missing_timeout), so a manual Provision left it silently skipped.
+    # Clear exclusions and quarantine, then report progress.
     cleared = usb_provision.clear_excluded_buses()
     usb_provision.clear_quarantine()
     await _progress(agent, cs_cmd_id, "provision_unassigned", "running", "provisioning", 30,
                     cleared_exclusions=cleared)
+    # Run one provisioning pass; report any error as a failure.
     try:
         r = await usb_provision.run_provision_loop(agent)
     except Exception as e:  # noqa: BLE001
         await _terminal(agent, cs_cmd_id, "provision_unassigned", "failed",
                         f"provision loop error: {e}")
         return
+    # Report how many VMs were provisioned and torn down.
     await _terminal(agent, cs_cmd_id, "provision_unassigned", "completed",
                     f"provisioned {r.get('provisioned', 0)} VM(s), "
                     f"tore down {r.get('torn_down', 0)}", result=r)
 
 
 async def _backup(agent, data, cs_cmd_id) -> None:
+    """Long op ``backup``: vzdump each sim VM and upload it to Azure Blob storage with azcopy."""
+    # shutil.which checks that azcopy is installed.
     import shutil
+    # Accept a single VMID or a list.
     vm_ids = data.get("vm_ids") or data.get("vmids") or []
     if isinstance(vm_ids, (str, int)):
         vm_ids = [vm_ids]
+    # Job details and Azure credentials from the request.
     job_id = data.get("job_id")
     azure_account = data.get("azure_account")
     azure_container = data.get("azure_container")
     azure_key = data.get("azure_key")
     retention = data.get("retention")
+    # The upload path uses the spoke id (defaults to this agent's id).
     spoke_id = data.get("spoke_id") or agent.agent_id
     prot = _protected(agent)
 
+    # All Azure settings and at least one VM are required.
     if not vm_ids or not azure_account or not azure_container or not azure_key:
         await _terminal(agent, cs_cmd_id, "backup", "failed",
                         "missing vm_ids / azure_account / azure_container / azure_key")
         return
+    # azcopy must be installed.
     if not shutil.which("azcopy"):
         await _terminal(agent, cs_cmd_id, "backup", "failed",
                         "azcopy not installed on this host")
         return
 
+    # Track whether every VM succeeded.
     overall = True
     # azcopy reads the Azure creds from the env (bash 3877-3878 exports
     # AZCOPY_ACCOUNT_NAME/AZCOPY_ACCOUNT_KEY). Forward them so the upload
@@ -835,7 +962,9 @@ async def _backup(agent, data, cs_cmd_id) -> None:
     az_env = dict(os.environ)
     az_env["AZCOPY_ACCOUNT_NAME"] = str(azure_account)
     az_env["AZCOPY_ACCOUNT_KEY"] = str(azure_key)
+    # Back up each VM in turn.
     for vmid in vm_ids:
+        # Skip VMs that fail the guard check and report them.
         try:
             vid = assert_sim_vm(vmid, prot)
         except GuardError as e:
@@ -843,15 +972,18 @@ async def _backup(agent, data, cs_cmd_id) -> None:
                             vmid=vmid, error=str(e))
             overall = False
             continue
+        # Per-VM dump directory.
         dump_dir = f"/tmp/cs-backup/{vid}"
         # Clean any stale artifact from a crashed prior run before writing
         # (bash 3882: rm -rf then mkdir), so sorted(...)[-1] picks up only this run.
         _cleanup(dump_dir)
         os.makedirs(dump_dir, exist_ok=True)
+        # Report the start and the vzdump step.
         await _progress(agent, cs_cmd_id, "backup", "starting", "starting", 0,
                         vmid=vid, job_id=job_id)
         await _progress(agent, cs_cmd_id, "backup", "running", "vzdump", 15,
                         vmid=vid, job_id=job_id)
+        # Run vzdump; on failure report it, clean up and move on.
         try:
             await pve_cmds.vzdump(vid, dump_dir, protected=prot)
         except PveError as e:
@@ -860,6 +992,7 @@ async def _backup(agent, data, cs_cmd_id) -> None:
             overall = False
             _cleanup(dump_dir)
             continue
+        # Find the archive vzdump produced.
         files = sorted(f for f in os.listdir(dump_dir)
                        if os.path.isfile(os.path.join(dump_dir, f)))
         if not files:
@@ -868,24 +1001,29 @@ async def _backup(agent, data, cs_cmd_id) -> None:
             overall = False
             _cleanup(dump_dir)
             continue
+        # Upload the newest file to <account>/<container>/<spoke>/<vmid>/.
         backup_file = os.path.join(dump_dir, files[-1])
         dest = (f"https://{azure_account}.blob.core.windows.net/{azure_container}"
                 f"/{spoke_id}/{vid}/{os.path.basename(backup_file)}")
         await _progress(agent, cs_cmd_id, "backup", "running", "uploading", 80,
                         vmid=vid, job_id=job_id, spoke_id=spoke_id)
+        # Upload with azcopy (up to an hour).
         rc, _, _ = await pve_cmds._run(
             ["azcopy", "copy", backup_file, dest, "--overwrite=true"],
             check=False, timeout=3600, env=az_env)
+        # Upload failed: report it, clean up and move on.
         if rc != 0:
             await _progress(agent, cs_cmd_id, "backup", "failed", "uploading", 100,
                             vmid=vid, job_id=job_id, error="azcopy upload failed")
             overall = False
             _cleanup(dump_dir)
             continue
+        # Report success and remove the local dump.
         await _progress(agent, cs_cmd_id, "backup", "completed", "completed", 100,
                         vmid=vid, job_id=job_id)
         _cleanup(dump_dir)
 
+    # Send the overall result.
     status = "completed" if overall else "failed"
     await _terminal(agent, cs_cmd_id, "backup", status,
                     "backup job complete" if overall else "backup job finished with errors",
@@ -898,50 +1036,63 @@ async def _reseed(agent, data, cs_cmd_id) -> None:
     clone source, below the 90000 floor), so this is intentionally unguarded —
     like ``unlock_template``. The legacy ``clone.sh`` step is retired in the
     unified agent (clone logic now lives in ``usb_provision._clone_and_provision``)."""
+    # shutil.which locates the restore tools.
     import shutil
+    # Download URL, target template VMID (default 100) and job id.
     blob_url = data.get("blob_url")
     vm_id = int(data.get("vm_id") or data.get("vmid") or 100)
     job_id = data.get("job_id")
+    # Where the archive is downloaded to.
     download = f"/tmp/reseed-vm-{vm_id}.vma.zst"
     # Concurrency lock (bash RESEED_LOCK_FILE): a reseed is a heavy single-host
     # op (download + restore + template); refuse a second concurrent one so
     # they don't collide on the same download path / VMID.
     lock = "/tmp/.proxmox_reseed_lock"
 
+    # A download URL is required.
     if not blob_url:
         await _terminal(agent, cs_cmd_id, "reseed", "failed",
                         "no blob_url supplied (download+restore required)")
         return
+    # Refuse to run two reseeds at once.
     if os.path.exists(lock):
         await _terminal(agent, cs_cmd_id, "reseed", "failed",
                         "a reseed is already in progress", vmid=vm_id, job_id=job_id)
         return
+    # Create the lock file (advisory; a failure doesn't stop the reseed).
     try:
         Path(lock).touch()
     except OSError:
         pass  # proceed best-effort; the lock is advisory
 
+    # Always remove the lock when finished (see finally).
     try:
+        # Report the start and the download step.
         await _progress(agent, cs_cmd_id, "reseed", "starting", "starting", 0,
                         vmid=vm_id, job_id=job_id)
         await _progress(agent, cs_cmd_id, "reseed", "running", "downloading", 15,
                         vmid=vm_id, job_id=job_id)
+        # curl is needed for the download.
         if not shutil.which("curl"):
             await _terminal(agent, cs_cmd_id, "reseed", "failed",
                             "curl not installed", vmid=vm_id)
             return
+        # Download the archive (up to 10 minutes).
         rc, _, _ = await pve_cmds._run(["curl", "-L", "-o", download, blob_url],
                                         check=False, timeout=600)
+        # Download failed: report it and clean up.
         if rc != 0:
             await _terminal(agent, cs_cmd_id, "reseed", "failed",
                             "download failed", vmid=vm_id, job_id=job_id)
             _cleanup(download)
             return
 
+        # Restore the archive over the target VMID.
         await _progress(agent, cs_cmd_id, "reseed", "running", "restoring", 45,
                         vmid=vm_id, job_id=job_id)
         rc, _, err = await pve_cmds._run(["qmrestore", download, str(vm_id), "--force"],
                                          check=False, timeout=600)
+        # Restore failed: report it and clean up.
         if rc != 0:
             await _terminal(agent, cs_cmd_id, "reseed", "failed",
                             f"qmrestore failed: {err.decode().strip()[:200]}",
@@ -949,18 +1100,22 @@ async def _reseed(agent, data, cs_cmd_id) -> None:
             _cleanup(download)
             return
 
+        # Convert the restored VM into a template, then remove the download.
         await _progress(agent, cs_cmd_id, "reseed", "running", "templating", 75,
                         vmid=vm_id, job_id=job_id)
         rc, _, err = await pve_cmds._run(["qm", "template", str(vm_id)],
                                          check=False, timeout=120)
         _cleanup(download)
+        # Templating failed: report it.
         if rc != 0:
             await _terminal(agent, cs_cmd_id, "reseed", "failed",
                             f"qm template failed: {err.decode().strip()[:200]}",
                             vmid=vm_id, job_id=job_id)
             return
+        # Report success.
         await _terminal(agent, cs_cmd_id, "reseed", "completed",
                         f"reseed complete for template {vm_id}", vmid=vm_id, job_id=job_id)
+    # Remove the lock file whatever happened.
     finally:
         try:
             os.remove(lock)
@@ -972,13 +1127,16 @@ async def _update_agent(agent, data, cs_cmd_id) -> None:
     """Trigger an immediate self-update (pull + sync + restart). The agent's
     ``_apply_update`` os._exit(3)s after the restart, so the terminal result is
     only reached when there was no new version to apply."""
+    # Report progress, then run the update (which restarts the agent if there's a new version).
     await _progress(agent, cs_cmd_id, "update_agent", "running", "applying_update", 50)
     try:
         await agent.trigger_update()
+    # Update failed: report the error.
     except Exception as e:  # noqa: BLE001
         await _terminal(agent, cs_cmd_id, "update_agent", "failed",
                         f"update failed: {e}")
         return
+    # Only reached when no restart happened.
     await _terminal(agent, cs_cmd_id, "update_agent", "completed",
                     "update applied; agent restarting (or already current)")
 
@@ -987,9 +1145,11 @@ def request_reclone_stop() -> bool:
     """Fast op (NOT a long op — must not queue behind _LONG_OP_SEM, which the
     running batch holds): signal the fleet-reclone batch to stop. Returns whether
     a batch was running to stop."""
+    # Pass the stop request on to the batch tracker.
     return usb_provision.request_reclone_stop()
 
 
+# Map each long-op action name to its handler.
 _HANDLERS = {
     "delete_vm": _delete_vm,
     "delete_vms": _delete_vms,
@@ -1026,16 +1186,19 @@ async def run_long_op(agent, action: str, data: Dict[str, Any],
     CS_COMMAND_RESULT for every outcome (success, logical failure, or an
     unexpected exception) so the cs queue command is always acked. Bounded by
     _LONG_OP_SEM so a bulk action can't starve the event loop."""
+    # Look up the handler; unknown actions fail immediately.
     handler = _HANDLERS.get(action)
     if not handler:
         await _terminal(agent, cs_cmd_id, action, "failed",
                         f"unknown long op: {action}")
         return
+    # Run the handler, turning every kind of failure into a terminal result.
     try:
         if action in _BATCH_LONG_OPS:
             # Self-pacing batch op — do NOT hold a global _LONG_OP_SEM slot for
             # its (minutes-long) lifetime, or single ops queue behind it.
             await handler(agent, data, cs_cmd_id)
+        # Single ops share the global 2-at-a-time limit.
         else:
             async with _LONG_OP_SEM:
                 await handler(agent, data, cs_cmd_id)
@@ -1045,9 +1208,11 @@ async def run_long_op(agent, action: str, data: Dict[str, Any],
         await _terminal(agent, cs_cmd_id, action, "failed",
                         f"{action} cancelled")
         raise
+    # Guard refused the target VM: log it and report the failure.
     except GuardError as e:
         logger.warning(f"long op {action} refused by guard: {e}")
         await _terminal(agent, cs_cmd_id, action, "failed", str(e))
+    # Unexpected error: log the traceback and report the failure.
     except Exception as e:  # noqa: BLE001 — never let a long op vanish silently
         logger.exception(f"long op {action} error")
         await _terminal(agent, cs_cmd_id, action, "failed", f"{action} error: {e}")
@@ -1055,7 +1220,9 @@ async def run_long_op(agent, action: str, data: Dict[str, Any],
 
 def _cleanup(path: str) -> None:
     """Remove a tmp file/dir, ignoring errors (bash 3925/3978 cleanup)."""
+    # Errors are ignored; this is best-effort cleanup.
     try:
+        # Directory: remove every file inside it, then the directory itself.
         if os.path.isdir(path):
             for root, _dirs, files in os.walk(path):
                 for f in files:
@@ -1064,6 +1231,7 @@ def _cleanup(path: str) -> None:
                     except OSError:
                         pass
             os.rmdir(path)
+        # Single file: remove it.
         elif os.path.exists(path):
             os.remove(path)
     except OSError:
