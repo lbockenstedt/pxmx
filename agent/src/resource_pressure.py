@@ -18,8 +18,10 @@ NOTE: this is ONLY the back-pressure signal. The CPU/mem 1h averaging stays
 per-tier (each computes what it displays / gates on independently) — deliberately
 not shared, so the display metric and the gate metric remain their own concerns.
 """
+# Postpone evaluation of type hints so annotations stay plain strings at runtime.
 from __future__ import annotations
 
+# Type hints only; stdlib so this file vendors into any tier without extra deps.
 from typing import List, Optional
 
 
@@ -35,13 +37,19 @@ def pressure_score(cpu_pct: Optional[float] = None,
 
     0.0 = idle, ~1.0 = at the ceiling on some axis, > 1.0 = overloaded. Missing
     signals (``None``) are ignored, so a tier only scores on what it can measure."""
+    # Collect one normalised ratio (value / ceiling) per signal we actually have.
     signals: List[float] = []
+    # CPU: skip if unmeasured or the ceiling is invalid (avoids divide-by-zero);
+    # negative readings are clamped to 0.
     if cpu_pct is not None and cpu_ceiling > 0:
         signals.append(max(0.0, float(cpu_pct)) / cpu_ceiling)
+    # Memory: same normalisation against its own ceiling.
     if mem_pct is not None and mem_ceiling > 0:
         signals.append(max(0.0, float(mem_pct)) / mem_ceiling)
+    # Event-loop lag: same normalisation against the lag ceiling in milliseconds.
     if loop_lag_ms is not None and lag_ceiling > 0:
         signals.append(max(0.0, float(loop_lag_ms)) / lag_ceiling)
+    # The worst axis wins; with no signals at all the tier reports idle (0.0).
     return max(signals) if signals else 0.0
 
 
@@ -49,7 +57,9 @@ def combine_pressure(*scores: Optional[float]) -> float:
     """Fold several tiers' pressure scores into one (the MAX) — so a spoke that
     is itself calm but whose Proxmox host is slammed still reports high pressure
     and throttles its clients."""
+    # Drop tiers that did not report (None) and coerce the rest to float.
     vals = [float(s) for s in scores if s is not None]
+    # The most loaded tier decides; no scores at all means no pressure.
     return max(vals) if vals else 0.0
 
 
@@ -61,14 +71,19 @@ def throttle_interval(base_s: float, pressure: Optional[float],
     multiplier 1× → 3×; above 1.0 keep climbing toward *max_mult* (overloaded →
     heavy back-off). Monotonic and capped so a runaway signal can't push the
     interval to infinity. Returns a float ≥ base_s."""
+    # Work in float so the multiplied result is never truncated.
     base = float(base_s)
+    # Unknown pressure or below the soft threshold: keep the normal interval.
     if pressure is None or pressure <= soft:
         return base
+    # Between the soft threshold and the ceiling: gentle linear ramp.
     if pressure <= 1.0:
         # soft..1.0  →  1x..3x
         frac = (pressure - soft) / max(1e-6, (1.0 - soft))
         mult = 1.0 + 2.0 * frac
+    # Past the ceiling (overloaded): steeper back-off, capped at max_mult.
     else:
         # >1.0  →  3x climbing to max_mult (each +1.0 pressure adds ~ the span)
         mult = min(max_mult, 3.0 + (pressure - 1.0) * (max_mult - 3.0))
+    # Apply the multiplier, re-capping as a safety net against odd parameter values.
     return base * min(max_mult, mult)

@@ -35,8 +35,10 @@ import os as _os
 _req = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
                      "requirements.txt")
 _ensure_requirements(_req)
+# Clean up the temporary names so they don't leak into the module.
 del _os, _ensure_requirements, _req
 
+# Standard library and third-party imports.
 import asyncio
 import base64
 import collections
@@ -55,6 +57,7 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
+# Signing helpers and the agent's own modules.
 from .security_utils import MessageSigner, encode_frame, split_frame
 from . import cs_commands
 from . import host_tuning
@@ -92,13 +95,21 @@ class WebSocketLogHandler(logging.Handler):
     _RELAY_PREFIXES = ("PxmxAgent", "ProxmoxAgent", "HubDiscovery")
 
     def __init__(self, agent, buffer_size: int = 1000):
+        """Set the relay level to INFO and create the bounded buffer for records logged while
+        disconnected.
+        """
+        # Relay INFO and above only.
         super().__init__(level=logging.INFO)
+        # Keep the agent (for its socket) and a bounded buffer.
         self.agent = agent
         self._buffer: "collections.deque" = collections.deque(maxlen=buffer_size)
 
     def emit(self, record):
+        """Relay one log record to the hub, or buffer it while disconnected."""
+        # Ignore records from other libraries.
         if not record.name.startswith(self._RELAY_PREFIXES):
             return
+        # Format the record; a formatting failure is reported the standard way.
         try:
             item = (self.format(record), record.levelname)
         except Exception:
@@ -116,9 +127,11 @@ class WebSocketLogHandler(logging.Handler):
         """Schedule a send on the running loop. Returns False (caller buffers)
         when there is no running loop."""
         try:
+            # Need a running event loop to schedule the send.
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return False
+        # Send in the background.
         loop.create_task(self.agent.send_log(item[0], item[1]))
         return True
 
@@ -126,6 +139,7 @@ class WebSocketLogHandler(logging.Handler):
         """Drain buffered records after a (re)connect. Called from the async
         connect flow (running loop present). Best-effort: send_log itself never
         raises, so a still-flaky socket just re-drops rather than blocking."""
+        # Send each buffered record in order.
         while self._buffer:
             self._dispatch(self._buffer.popleft())
 
@@ -137,16 +151,19 @@ def get_log_path():
     Falls back to a local ``logs/`` dir if that path isn't writable (e.g. run
     by hand as an unprivileged user without the install step).
     """
+    # Use the shared log path if we can write to it.
     primary = "/var/log/lm/pxmx-agent.log"
     try:
         with open(primary, "a") as f:
             pass
         return primary
+    # Otherwise log under ./logs.
     except Exception:
         local_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(local_dir, exist_ok=True)
         return os.path.join(local_dir, "pxmx-agent.log")
 
+# Use the shared logging setup if available, else a simple fallback.
 try:
     from logging_setup import configure_logging, set_log_level
 except ImportError:
@@ -157,16 +174,24 @@ except ImportError:
         _FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         _DFMT = '%Y-%m-%d %H:%M:%S'
         def configure_logging(default_level=_logging.INFO, *, log_file=None, **_):
+            """
+            Fallback logging setup: basicConfig with the standard format, to a file and the console
+            if given.
+            """
+            # File plus console handlers when a log file is given.
             handlers = ([_logging.FileHandler(log_file), _logging.StreamHandler()]
                         if log_file else None)
             _logging.basicConfig(level=default_level, force=True,
                                  format=_FMT, datefmt=_DFMT, handlers=handlers)
         def set_log_level(enabled):
+            """Fallback: switch every logger between DEBUG and INFO and return the level used."""
+            # Apply the level to the root logger and every named logger.
             level = _logging.DEBUG if enabled else _logging.INFO
             _logging.getLogger().setLevel(level)
             for _n in list(_logging.root.manager.loggerDict):
                 _logging.getLogger(_n).setLevel(level)
             return level
+# Set up logging to the chosen file.
 _log_path = get_log_path()
 configure_logging(log_file=_log_path)
 # When writing to the canonical /var/log/lm file, the systemd unit captures
@@ -181,6 +206,7 @@ if _log_path == "/var/log/lm/pxmx-agent.log":
     for _h in list(logging.getLogger().handlers):
         if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
             logging.getLogger().removeHandler(_h)
+# This module's logger.
 logger = logging.getLogger("PxmxAgent")
 
 
@@ -189,6 +215,7 @@ logger = logging.getLogger("PxmxAgent")
 # runs, the agent emits AGENT_PROGRESS keepalives so the upstream deadlines are
 # extended instead of the request being killed. Fast commands finish before the
 # first keepalive interval and never emit a frame.
+# Commands that send keepalive progress frames while running.
 _KEEPALIVE_CMDS = frozenset({
     "GET_VM_LIST", "GET_NODE_STATS", "GET_SYSTEM_STATS", "RUN_COMMAND",
 })
@@ -201,23 +228,34 @@ _KEEPALIVE_CMDS = frozenset({
 # the file stays a single circular file with NO backups to maintain. Daemon
 # thread, best-effort (never crashes the agent). LM_LOG_MAX_BYTES=0 disables.
 def _start_pxmx_log_cap_watchdog(log_file, interval=30.0):
+    """Start a daemon thread that truncates any .log file in the log directory once it exceeds
+    LM_LOG_MAX_BYTES (default 50 MB; 0 disables).
+    """
+    # Only needed here.
     import threading
+    # Size limit from the environment, default 50 MB.
     try:
         max_bytes = int((os.environ.get("LM_LOG_MAX_BYTES") or "").strip())
     except (TypeError, ValueError):
         max_bytes = 50 * 1024 * 1024
+    # Zero or negative disables the watchdog.
     if max_bytes <= 0:
         return
+    # Directory whose .log files are capped.
     log_dir = os.path.dirname(log_file) or "/var/log/lm"
 
     def _loop():
+        """Every ``interval`` seconds, truncate any oversized .log file in the directory."""
+        # Run forever in the background thread.
         while True:
             try:
+                # Check each .log file.
                 for _name in os.listdir(log_dir):
                     if not _name.endswith(".log"):
                         continue
                     _p = os.path.join(log_dir, _name)
                     try:
+                        # Truncate it in place if it's over the limit.
                         if os.path.isfile(_p) and os.path.getsize(_p) > max_bytes:
                             with open(_p, "w"):
                                 pass  # O_TRUNC in place — same inode, no backups
@@ -225,12 +263,15 @@ def _start_pxmx_log_cap_watchdog(log_file, interval=30.0):
                         pass
             except Exception:
                 pass
+            # Wait before checking again.
             time.sleep(interval)
 
+    # Start the watchdog thread.
     threading.Thread(target=_loop, name="pxmx-log-cap-watchdog",
                      daemon=True).start()
 
 
+# Start the log size watchdog now.
 _start_pxmx_log_cap_watchdog(_log_path)
 
 
@@ -238,6 +279,7 @@ _start_pxmx_log_cap_watchdog(_log_path)
 # and the spokes' /var/lib/lm/<spoke_id>/ so a co-located box never collides.
 # The external health-gate watchdog (lm-component-update-restart) reads the
 # pending manifest + healthy marker here and rolls back a failed self-update.
+# Update-recovery state directory.
 AGENT_STATE_DIR = os.environ.get("LM_PXMX_STATE_DIR", "/var/lib/pxmx/update-state")
 
 # Last hub-pushed agent config, persisted so a self-update restart (or any
@@ -245,9 +287,11 @@ AGENT_STATE_DIR = os.environ.get("LM_PXMX_STATE_DIR", "/var/lib/pxmx/update-stat
 # sitting idle until the hub happens to re-push UPDATE_CONFIG — which, on a
 # co-located/loaded box, can be lost in the spoke's request backlog and leave
 # auto-provisioning silently off. Root-only (same dir as usb_state.json).
+# Where the last config pushed by the spoke is saved.
 AGENT_CONFIG_FILE = os.environ.get(
     "LM_PXMX_CONFIG_FILE", "/var/lib/pxmx/agent_config.json")
 
+# Defaults used to complete a pinned spoke URL.
 _AGENT_WS_PATH = "/ws/agent"
 _AGENT_DEFAULT_SCHEME = "wss"
 _AGENT_DEFAULT_PORT = "443"
@@ -305,11 +349,14 @@ def _normalize_spoke_url(url: Optional[str]) -> Optional[str]:
     Idempotent: an already-fully-specified URL passes through unchanged;
     ``None``/``""``/``"auto"`` are left alone (the auto-discovery sentinel).
     """
+    # Leave empty and "auto" alone.
     if not url or url == "auto":
         return url
+    # Add the default scheme if missing.
     raw = url.strip()
     if "://" not in raw:
         raw = f"{_AGENT_DEFAULT_SCHEME}://{raw}"
+    # Split the URL into parts.
     parts = urlsplit(raw)
     scheme = parts.scheme or _AGENT_DEFAULT_SCHEME
     netloc = parts.netloc
@@ -320,9 +367,11 @@ def _normalize_spoke_url(url: Optional[str]) -> Optional[str]:
     host_part = netloc.rsplit("]", 1)[-1] if netloc else netloc
     if netloc and ":" not in host_part:
         netloc = f"{netloc}:{_AGENT_DEFAULT_PORT}"
+    # Use the agent path unless the URL already ends with it.
     path = parts.path.rstrip("/")
     if not path.endswith(_AGENT_WS_PATH):
         path = _AGENT_WS_PATH
+    # Rebuild the URL.
     return urlunsplit((scheme, netloc, path, "", ""))
 
 
@@ -339,14 +388,17 @@ def _deep_merge_config(base, incoming):
     next bridge push. Merging keeps sibling sub-trees intact; ``vidpids`` (a
     list) is still replaced whole, so removing a dongle type still takes effect.
     """
+    # Non-dicts: the incoming value replaces the base.
     if not isinstance(base, dict) or not isinstance(incoming, dict):
         return incoming
+    # Merge nested dicts key by key; replace everything else.
     out = dict(base)
     for k, v in incoming.items():
         if isinstance(out.get(k), dict) and isinstance(v, dict):
             out[k] = _deep_merge_config(out[k], v)
         else:
             out[k] = v
+    # Return the merged copy.
     return out
 
 
@@ -359,9 +411,11 @@ def _sd_notify(state: str) -> None:
     ``NOTIFY_SOCKET`` is unset (non-systemd / standalone runs), so it is safe
     to call unconditionally.
     """
+    # Not running under systemd: nothing to do.
     addr = os.environ.get("NOTIFY_SOCKET")
     if not addr:
         return
+    # Send the state over the notify socket; errors are ignored.
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         try:
@@ -384,6 +438,7 @@ def get_version():
     format copy that self-update never overwrote) still reports the current
     .NN instead of the stale value. Falls back to the install_dir copy, the
     source tree (dev), then CWD."""
+    # Candidate VERSION files in priority order.
     here = os.path.dirname(os.path.abspath(__file__))
     paths = [
         os.path.join(here, "..", ".pxmx_repo", "VERSION"),  # self-update checkout — current .NN
@@ -391,6 +446,7 @@ def get_version():
         os.path.join(here, "..", "..", "VERSION"),           # dev source tree: pxmx/VERSION
         "VERSION",                                           # CWD (last resort)
     ]
+    # Return the first non-empty one.
     for p in paths:
         try:
             if os.path.exists(p):
@@ -400,6 +456,7 @@ def get_version():
                         return v
         except Exception:
             pass
+    # None found.
     return "unknown"
 
 
@@ -411,12 +468,14 @@ def _ws_keepalive_env(name: str, default: float) -> float:
     synchronous agent command can block the loop past 20s and the spoke's
     ping_timeout would tear down the WS, killing every in-flight VNC console.
     Clamped to >=5s. See open_vnc_ws (pve_cmds) for the Proxmox-leg exception."""
+    # Read the value, at least 5 seconds; fall back to the default on bad input.
     try:
         return max(5.0, float(os.environ.get(name, str(default))))
     except Exception:
         return default
 
 
+# Version string reported to the spoke.
 version = get_version()
 
 
@@ -432,6 +491,7 @@ class ProxmoxAgent:
 
     def __init__(self, spoke_url: str, agent_id: str, secret: Optional[str] = None,
                  spoke_ip: Optional[str] = None):
+        """Set up the agent's identity, credentials, caches, session tables and log relay."""
         # Two ways to point the agent at its spoke:
         #   * spoke_ip  — the operator supplies ONLY an IP/host; the agent probes
         #     the known /ws/agent listener endpoints (wss:443, ws:8767, …) at
@@ -448,6 +508,7 @@ class ProxmoxAgent:
             self.spoke_url = ""                                 # probe in _resolve_spoke_url
         else:
             self.spoke_url = _normalize_spoke_url(spoke_url)    # None/"" → hub auto-discovery
+        # Agent id and its shared secret.
         self.agent_id = agent_id
         self.secret = secret or self._load_secret()
         # No secret is OK — we will connect without one and wait for approval.
@@ -569,8 +630,10 @@ class ProxmoxAgent:
         that, like the agent secret, are only ever pinned via .env (written by
         install_agent.sh at install time) and never baked into the systemd
         unit's ExecStart args, so they don't show up in `ps`/the unit file."""
+        # Path of the installer-written .env file.
         env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
         env_path = os.path.abspath(env_path)
+        # Return the first non-empty value for this key.
         try:
             if os.path.exists(env_path):
                 with open(env_path) as f:
@@ -581,9 +644,11 @@ class ProxmoxAgent:
                                 return val
         except Exception:
             pass
+        # Not set.
         return None
 
     def _load_secret(self) -> Optional[str]:
+        """Load the agent's shared secret: from .env first, then other configured sources."""
         # 1. Prefer the hub-provisioned secret persisted to .env. This is the
         #    authoritative secret — it is the control plane's own agent_secret,
         #    handed to us on approval (see _save_secret), so it is guaranteed to
@@ -616,8 +681,10 @@ class ProxmoxAgent:
 
     def _save_secret(self, secret: str):
         """Persist a provisioned secret to .env so it survives restarts."""
+        # Path of the .env file.
         env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
         env_path = os.path.abspath(env_path)
+        # Rewrite .env without any old secret line, then append the new one.
         try:
             lines = []
             if os.path.exists(env_path):
@@ -627,6 +694,7 @@ class ProxmoxAgent:
             with open(env_path, "w") as f:
                 f.writelines(lines)
             logger.info(f"Provisioned secret saved to {env_path}")
+        # A failure is logged; the secret still works for this run.
         except Exception as e:
             logger.error(f"Could not save provisioned secret: {e}")
 
@@ -641,8 +709,10 @@ class ProxmoxAgent:
         that file is a hub-side artifact, stale-or-absent on the node, and falling back to
         it is what used to drive the "bad secret → bad secret → zero-touch" flap.
         """
+        # Path of the .env file.
         env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
         env_path = os.path.abspath(env_path)
+        # Rewrite .env without the secret line.
         try:
             if os.path.exists(env_path):
                 with open(env_path) as f:
@@ -651,6 +721,7 @@ class ProxmoxAgent:
                     f.writelines(lines)
         except Exception as e:
             logger.warning(f"Could not clear secret from .env: {e}")
+        # Forget the secret in memory and stop signing.
         self.secret = None
         self.signer = MessageSigner("")
 
@@ -662,18 +733,21 @@ class ProxmoxAgent:
         """Load the last hub-pushed agent config from disk (empty dict if none
         or unreadable). Lets a restart resume client-simulation mode without
         waiting for the hub to re-push UPDATE_CONFIG."""
+        # Read and parse the saved config if present.
         try:
             if os.path.exists(AGENT_CONFIG_FILE) and os.path.getsize(AGENT_CONFIG_FILE) > 0:
                 with open(AGENT_CONFIG_FILE) as f:
                     data = json.load(f)
                 if isinstance(data, dict):
                     return data
+        # Unreadable file: log it and start with no config.
         except (OSError, json.JSONDecodeError) as e:
             logger.warning(f"Could not load persisted config {AGENT_CONFIG_FILE}: {e}")
         return {}
 
     def _save_persisted_config(self, config: Dict[str, Any]) -> None:
         """Persist the latest hub-pushed agent config (best-effort, root-only)."""
+        # Write to a temp file and rename it into place.
         try:
             os.makedirs(os.path.dirname(AGENT_CONFIG_FILE), exist_ok=True)
             tmp = AGENT_CONFIG_FILE + ".tmp"
@@ -689,27 +763,36 @@ class ProxmoxAgent:
         so a crash's traceback reaches Setup → Agent Logs + AppBuilder, not only
         the local file via systemd stderr capture. The asyncio-task counterpart
         is installed in run() once the loop exists."""
+        # Keep the previous hook so it still runs.
         _prev = sys.excepthook
 
         def _hook(exc_type, exc, tb):
+            """Log an uncaught exception (except Ctrl-C) through the relayed logger, then call the
+            previous hook.
+            """
+            # Log it unless it's a Ctrl-C; always pass it on.
             try:
                 if not issubclass(exc_type, KeyboardInterrupt):
                     logger.error("Uncaught exception", exc_info=(exc_type, exc, tb))
             finally:
                 _prev(exc_type, exc, tb)
 
+        # Install the hook.
         sys.excepthook = _hook
 
     def _asyncio_exception_relay(self, loop, context) -> None:
         """asyncio loop exception handler — logs unhandled task exceptions via
         the PxmxAgent logger so they relay to the hub, then defers to the
         default handler for local reporting."""
+        # The exception (if any) and the message.
         exc = context.get("exception")
         msg = context.get("message") or "unhandled asyncio exception"
+        # Log with the traceback when there is one.
         if exc is not None:
             logger.error("Uncaught asyncio exception: %s", msg, exc_info=exc)
         else:
             logger.error("asyncio error: %s", msg)
+        # Then let asyncio's default handler report it too.
         loop.default_exception_handler(context)
 
     def _machine_fingerprint(self) -> str:
@@ -717,6 +800,7 @@ class ProxmoxAgent:
         onto a different physical box). /etc/machine-id first (regenerated per
         clone by most provisioning), then the SMBIOS/DMI product UUID. '' if
         neither is readable — binding is skipped (fail-open, never blind re-mint)."""
+        # Return the first readable, non-empty machine id.
         for path in ("/etc/machine-id", "/var/lib/dbus/machine-id",
                      "/sys/class/dmi/id/product_uuid"):
             try:
@@ -726,10 +810,14 @@ class ProxmoxAgent:
                     return v
             except Exception:
                 continue
+        # None readable.
         return ""
 
     def _env_get(self, key: str) -> str:
+        """Read one ``KEY=value`` from the agent .env; "" if missing or unreadable."""
+        # Path of the .env file.
         env_path = self._env_path()
+        # Return the value of the first matching line.
         try:
             if os.path.exists(env_path):
                 with open(env_path) as f:
@@ -738,15 +826,18 @@ class ProxmoxAgent:
                             return line.split("=", 1)[1].strip()
         except Exception:
             pass
+        # Not found.
         return ""
 
     def _env_upsert(self, updates: dict) -> None:
         """Write/replace each key in ``updates`` in .env (create the file/keys if absent)."""
+        # Existing lines minus the keys being replaced.
         env_path = self._env_path()
         lines = []
         if os.path.exists(env_path):
             with open(env_path) as f:
                 lines = [l for l in f if not any(l.startswith(f"{k}=") for k in updates)]
+        # Append the new values and write the file.
         for k, v in updates.items():
             lines.append(f"{k}={v}\n")
         with open(env_path, "w") as f:
@@ -765,10 +856,13 @@ class ProxmoxAgent:
         existing UUID = a pre-binding install: backfill the fingerprint, keep UUID.
         We trust only what lands on disk: a failed write returns '' (no correlation).
         """
+        # Any failure returns "" (no identity correlation).
         try:
+            # This machine's fingerprint and any saved UUID.
             cur_fp = self._machine_fingerprint()
             existing = self._env_get("INSTALL_UUID")
             if existing:
+                # The machine the UUID was minted on.
                 stored_fp = self._env_get("INSTALL_UUID_MACHINE")
                 if cur_fp and stored_fp and stored_fp != cur_fp:
                     logger.warning(
@@ -784,6 +878,7 @@ class ProxmoxAgent:
                 if cur_fp and not stored_fp:
                     self._env_upsert({"INSTALL_UUID_MACHINE": cur_fp})
                 return existing
+            # No UUID yet: mint one bound to this machine.
             new_uuid = str(uuid.uuid4())
             upd = {"INSTALL_UUID": new_uuid}
             if cur_fp:
@@ -791,6 +886,7 @@ class ProxmoxAgent:
             self._env_upsert(upd)
             logger.info(f"Install UUID minted and saved to {self._env_path()}")
             return self._env_get("INSTALL_UUID")
+        # Write failed: log it.
         except Exception as e:
             logger.warning(f"Could not ensure INSTALL_UUID in .env: {e}")
             return ""
@@ -799,6 +895,7 @@ class ProxmoxAgent:
 
     def _pvesh_bin(self) -> str:
         """Locate the pvesh binary; checks common Proxmox install paths."""
+        # Return the first pvesh that exists, else rely on PATH.
         for candidate in ["/usr/bin/pvesh", "/usr/sbin/pvesh", "pvesh"]:
             if candidate == "pvesh":
                 return candidate  # fall back to PATH
@@ -808,12 +905,14 @@ class ProxmoxAgent:
 
     async def _pvesh(self, path: str) -> Any:
         """Run pvesh get <path> locally and return parsed JSON. No auth needed."""
+        # Start pvesh get with JSON output.
         bin_ = self._pvesh_bin()
         proc = await asyncio.create_subprocess_exec(
             bin_, "get", path, "--output-format", "json",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Wait up to 15 seconds.
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
         except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -830,8 +929,10 @@ class ProxmoxAgent:
             # telemetry loop — forever after the kill.
             await pve_cmds._kill_and_reap(proc)
             raise
+        # Non-zero exit is an error.
         if proc.returncode != 0:
             raise RuntimeError(stderr.decode().strip() or f"pvesh exited {proc.returncode}")
+        # Parse the JSON.
         return json.loads(stdout.decode())
 
     async def _pvesh_action(self, verb: str, path: str, *args: str,
@@ -839,15 +940,18 @@ class ProxmoxAgent:
         """Run pvesh <verb> <path> [*args] locally. ``verb`` is create/delete/put/
         set/etc. Returns parsed JSON (when json_out) or stdout text. Raises
         RuntimeError on non-zero exit. Used by token provisioning (Phase F)."""
+        # Build the command line.
         bin_ = self._pvesh_bin()
         cmd = [bin_, verb, path, *args]
         if json_out:
             cmd += ["--output-format", "json"]
+        # Start pvesh.
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Wait within the timeout.
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -855,8 +959,10 @@ class ProxmoxAgent:
             # D-state pvesh can't wedge this coroutine after the kill.
             await pve_cmds._kill_and_reap(proc)
             raise
+        # Non-zero exit is an error.
         if proc.returncode != 0:
             raise RuntimeError(stderr.decode().strip() or f"pvesh {verb} exited {proc.returncode}")
+        # Return text, or parsed JSON when possible.
         if not json_out:
             return stdout.decode()
         try:
@@ -866,6 +972,7 @@ class ProxmoxAgent:
 
     def _pvenode_bin(self) -> str:
         """Locate the pvenode binary (same pve-manager package as pvesh)."""
+        # Return the first pvenode that exists, else rely on PATH.
         for candidate in ["/usr/bin/pvenode", "/usr/sbin/pvenode", "pvenode"]:
             if candidate == "pvenode":
                 return candidate  # fall back to PATH
@@ -879,6 +986,7 @@ class ProxmoxAgent:
     # (b) on timeout verify the deployed cert by fingerprint instead of trusting
     # the process exit. The cert is "deployed" once it's on disk; pveproxy
     # finishes reloading on its own. See _pveproxy_cert_matches.
+    # Where pveproxy's certificate lives and how long to wait for it to update.
     _PVEPROXY_CERT_PATH = "/etc/pve/local/pveproxy-ssl.pem"
     _PVENODE_WAIT_TIMEOUT = 600.0  # 10 min — generous upper bound for a slow pveproxy restart
 
@@ -887,11 +995,13 @@ class ProxmoxAgent:
         """SHA256 of the first (leaf) cert's DER in a PEM cert/chain, or None.
         Comparing fingerprints (not raw bytes) is robust to any whitespace /
         newline normalization pvenode does when it writes pveproxy-ssl.pem."""
+        # Find the first certificate in the PEM text.
         try:
             m = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
                           pem_text, re.S)
             if not m:
                 return None
+            # Convert to DER and hash it.
             der = ssl.PEM_cert_to_DER_cert(m.group(0))
             return hashlib.sha256(der).hexdigest() if der else None
         except Exception:
@@ -904,14 +1014,17 @@ class ProxmoxAgent:
         check — independent of whether the pvenode process finished or timed
         out during a slow restart. Returns False if the file is absent or
         unreadable (not a Proxmox node, or pvenode hasn't written it yet)."""
+        # Fingerprint of the cert we want; can't compare without one.
         want = self._leaf_der_fingerprint(fullchain)
         if not want:
             return False
+        # Fingerprint of the deployed cert (unreadable means no match).
         try:
             with open(self._PVEPROXY_CERT_PATH, "rb") as f:
                 got = self._leaf_der_fingerprint(f.read().decode(errors="replace"))
         except OSError:
             return False
+        # Match only if both exist and are equal.
         return bool(got) and want == got
 
     async def install_cert(self, fullchain: str, privkey: str,
@@ -937,12 +1050,14 @@ class ProxmoxAgent:
         so if the wait times out during a slow restart we verify the deployed
         cert by fingerprint — SUCCESS if it matches (pveproxy finishes reloading
         on its own), ERROR only if the cert genuinely isn't on disk."""
+        # Validate the PEM inputs.
         fullchain = (fullchain or "").strip()
         privkey = (privkey or "").strip()
         if not fullchain or "BEGIN CERTIFICATE" not in fullchain:
             return {"status": "ERROR", "message": "missing or invalid fullchain PEM"}
         if not privkey or "PRIVATE KEY" not in privkey:
             return {"status": "ERROR", "message": "missing or invalid private key PEM"}
+        # pvenode only works on the local node; warn if another was asked for.
         if node and node.lower() != self.hostname.lower():
             logger.warning("INSTALL_CERT: requested node '%s' != local '%s'; "
                            "pvenode installs on the local node only",
@@ -964,21 +1079,26 @@ class ProxmoxAgent:
                     "message": f"cert already deployed on {self.hostname} "
                                f"(unchanged — no restart)"}
 
+        # Root-only temp files for the cert and key.
         cert_fd, cert_path = tempfile.mkstemp(prefix="pve-cert-", suffix=".pem")
         key_fd, key_path = tempfile.mkstemp(prefix="pve-key-", suffix=".pem")
+        # Clean up the temp files whatever happens.
         try:
+            # Write the cert and key, then restrict permissions.
             os.write(cert_fd, fullchain.encode())
             os.close(cert_fd)
             os.write(key_fd, privkey.encode())
             os.close(key_fd)
             os.chmod(cert_path, 0o600)
             os.chmod(key_path, 0o600)
+            # Run pvenode to install the cert and restart pveproxy.
             bin_ = self._pvenode_bin()
             proc = await asyncio.create_subprocess_exec(
                 bin_, "cert", "set", cert_path, key_path, "--force", "--restart",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            # Wait for it, up to the timeout.
             try:
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(), timeout=self._PVENODE_WAIT_TIMEOUT)
@@ -992,6 +1112,7 @@ class ProxmoxAgent:
                     proc.kill()
                 except Exception:  # noqa: BLE001
                     pass
+                # Timed out: success only if the cert is already on disk.
                 if self._pveproxy_cert_matches(fullchain):
                     logger.info("INSTALL_CERT: pveproxy cert installed on %s "
                                 "(fingerprint verified after slow restart)", self.hostname)
@@ -1003,6 +1124,7 @@ class ProxmoxAgent:
                 return {"status": "ERROR",
                         "message": "pvenode cert set timed out and cert not on disk "
                                    "(pveproxy restart hung?)"}
+            # pvenode failed: build the error text.
             if proc.returncode != 0:
                 err = (stderr.decode().strip() or stdout.decode().strip()
                        or f"pvenode exited {proc.returncode}")
@@ -1015,6 +1137,7 @@ class ProxmoxAgent:
                 # reloading on its own, so report SUCCESS (the deploy succeeded).
                 # This is the "cert landed on the node but the UI shows failed"
                 # symptom. Only a cert that genuinely isn't on disk is an ERROR.
+                # Still treat it as installed if the cert made it to disk.
                 if self._pveproxy_cert_matches(fullchain):
                     logger.info("INSTALL_CERT: pvenode exited %s on %s but cert "
                                 "verified on disk — treating as installed (%s)",
@@ -1026,15 +1149,19 @@ class ProxmoxAgent:
                                "disk — %s", self.hostname, err[:200])
                 return {"status": "ERROR",
                         "message": f"pvenode cert set failed: {err[:300]}"}
+            # Success.
             logger.info("INSTALL_CERT: pveproxy cert installed on %s (pvenode restart)",
                         self.hostname)
             return {"status": "SUCCESS",
                     "message": f"cert installed on {self.hostname} (pveproxy restarted)"}
+        # pvenode isn't installed.
         except FileNotFoundError:
             return {"status": "ERROR", "message": "pvenode not found (not a Proxmox node?)"}
+        # Any other failure.
         except Exception as e:  # noqa: BLE001
             return {"status": "ERROR", "message": f"install_cert failed: {str(e)[:300]}"}
         finally:
+            # Remove the temp files.
             for p in (cert_path, key_path):
                 try:
                     os.unlink(p)
@@ -1045,26 +1172,32 @@ class ProxmoxAgent:
     # Extracted to template_ops.py (free functions); these thin wrappers keep the
     # _connect_once dispatch chain (self.<method>) untouched.
     def _start_template_backup(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Start a background template backup (delegates to template_ops)."""
         return template_ops.start_template_backup(data)
 
     def _start_template_refresh(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Start a background template refresh (delegates to template_ops)."""
         return template_ops.start_template_refresh(self, data)
 
     async def _fetch_cluster_name(self) -> str:
         """Returns the Proxmox cluster name, or this node's hostname for standalone nodes."""
+        # Read the cluster status; any failure falls back to the hostname.
         try:
             items = await self._pvesh("/cluster/status")
+            # Return the cluster entry's name.
             for item in (items if isinstance(items, list) else []):
                 if item.get("type") == "cluster":
                     return item.get("name", self.hostname)
         except Exception as e:
             logger.warning(f"Could not fetch cluster name via pvesh: {e}")
+        # Standalone node: use the hostname.
         return self.hostname
 
     async def collect_metrics(self) -> Dict[str, Any]:
         """Agent host OS metrics. cpu_percent uses interval=None (non-blocking,
         since-last-call) — primed once in __init__; interval=1 stalled the event
         loop 1s per telemetry tick."""
+        # CPU, memory and disk usage plus a timestamp.
         return {
             "cpu_usage":    psutil.cpu_percent(interval=None),
             "memory_usage": psutil.virtual_memory().percent,
@@ -1079,10 +1212,12 @@ class ProxmoxAgent:
         pvesh call; the 5s TTL expires before the next ~60s tick so cross-tick
         reads always re-fetch fresh data. Raises on failure so callers fall
         through to their per-node fallback paths (same as a bare _pvesh error)."""
+        # Serve the cache while fresh.
         now = time.time()
         if (self._cluster_resources_cache is not None
                 and (now - self._cluster_resources_ts) < self._cluster_resources_ttl):
             return self._cluster_resources_cache
+        # Otherwise fetch and cache it.
         resources = await self._pvesh("/cluster/resources")
         self._cluster_resources_cache = resources
         self._cluster_resources_ts = now
@@ -1094,10 +1229,12 @@ class ProxmoxAgent:
         dropdown). Returns ``[{storage, type, avail, total, shared}]``; ``[]`` on
         failure. The TTL keeps this off the per-tick pvesh budget (storages
         rarely change) while a hit avoids a round-trip every ~60s frame."""
+        # Serve the cache while fresh.
         now = time.time()
         if (self._cs_storages_cache is not None
                 and (now - self._cs_storages_ts) < self._cs_storages_ttl):
             return self._cs_storages_cache
+        # Fetch this node's image storages and cache them.
         node = str(getattr(self, "_local_node", "") or self.hostname or "").strip()
         storages = await self.list_node_storages(node, "images") if node else []
         self._cs_storages_cache = storages
@@ -1114,11 +1251,14 @@ class ProxmoxAgent:
         try:
             # Primary: /cluster/resources filtered for nodes — cpu from pvestatd (always live)
             try:
+                # Primary: node rows from /cluster/resources.
                 resources = await self._cluster_resources()
                 nodes = []
+                # Build a stats entry for each node row.
                 for r in (resources if isinstance(resources, list) else []):
                     if r.get("type") != "node":
                         continue
+                    # Name and memory figures.
                     node_name = r.get("node", "")
                     mem_used  = r.get("mem", 0)
                     mem_total = r.get("maxmem", 1)
@@ -1139,6 +1279,7 @@ class ProxmoxAgent:
                 # first node's /status (PVE version is cluster-wide) and fill it
                 # into every node — otherwise the hub's Nodes "Version" column
                 # always shows "—". Best-effort: stays "" if the lookup fails.
+                # Add the Proxmox version from the first node's status.
                 if nodes:
                     try:
                         stat = await self._pvesh(f"/nodes/{nodes[0]['node']}/status")
@@ -1149,6 +1290,7 @@ class ProxmoxAgent:
                     if pve_ver:
                         for n in nodes:
                             n["proxmox_version"] = pve_ver
+                # Return the nodes if we found any.
                 if nodes:
                     return {"nodes": nodes, "cluster": self.cluster_name}
             except Exception as e:
@@ -1166,6 +1308,7 @@ class ProxmoxAgent:
             # /nodes already reports as not "online" — never SSH a known-dead
             # node; (2) run the survivors CONCURRENTLY under a short per-call
             # deadline so one slow node can't serialize-block the rest.
+            # Fallback: list the nodes and split online from offline.
             raw_nodes = await self._pvesh("/nodes")
             candidates, offline = [], []
             for n in (raw_nodes if isinstance(raw_nodes, list) else []):
@@ -1174,18 +1317,24 @@ class ProxmoxAgent:
             # LOG the down member(s) by name — a dead node is a real operational
             # signal the operator needs to see; we skip the SSH poll but not the
             # visibility. WARNING, throttled by the ~60s telemetry tick.
+            # Log nodes being skipped because they're offline.
             if offline:
                 logger.warning(
                     "cluster node(s) not online — skipping status poll (no SSH): %s",
                     ", ".join(f"{n.get('node','?')}={n.get('status','?')}" for n in offline))
 
             async def _node_stat(n: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                """Fetch one online node's status (8 s limit) as a stats entry; None on failure."""
+                # Node name.
                 node_name = n.get("node", "")
+                # Read the node's status; a failure only skips this node.
                 try:
                     stat = await asyncio.wait_for(
                         self._pvesh(f"/nodes/{node_name}/status"), timeout=8)
+                    # Memory and CPU details.
                     mem      = stat.get("memory", {})
                     cpu_info = stat.get("cpuinfo", {})
+                    # Build the stats entry.
                     return {
                         "cluster":         self.cluster_name,
                         "node":            node_name,
@@ -1202,6 +1351,7 @@ class ProxmoxAgent:
                     logger.warning(f"Node status error for {node_name}: {e}")
                     return None
 
+            # Query all online nodes concurrently and keep the successful ones.
             results = await asyncio.gather(*[_node_stat(n) for n in candidates],
                                            return_exceptions=True)
             nodes = [r for r in results if isinstance(r, dict)]
@@ -1217,20 +1367,26 @@ class ProxmoxAgent:
     # wrappers keep the externally-called entry points (dispatch + cs_sim's
     # agent.get_vm_list()) untouched.
     async def list_pools(self) -> list:
+        """List Proxmox resource pools (delegates to vm_inventory)."""
         return await vm_inventory.list_pools(self)
 
     async def list_node_isos(self, node: str) -> list:
+        """List ISO images available on a node (delegates to vm_inventory)."""
         return await vm_inventory.list_node_isos(self, node)
 
     async def list_node_storages(self, node: str, content_filter: str = "images") -> list:
+        """List a node's storages that hold the given content type (delegates to vm_inventory)."""
         return await vm_inventory.list_node_storages(self, node, content_filter)
 
     async def get_vm_list(self) -> Dict[str, Any]:
+        """Return the VM/CT inventory (delegates to vm_inventory)."""
         return await vm_inventory.get_vm_list(self)
 
     async def send_log(self, message: str, level: str):
         """Send an AGENT_LOG message upstream (relayed to AppBuilder by the Hub)."""
+        # Best-effort: a send failure is ignored.
         try:
+            # Build the AGENT_LOG message.
             log_msg = {
                 "header": {
                     "message_id":   str(uuid.uuid4()),
@@ -1244,6 +1400,7 @@ class ProxmoxAgent:
                              "hostname": self.hostname, "agent_type": self.agent_type},
                 },
             }
+            # Sign and send it.
             await self.websocket.send(encode_frame(self.signer, log_msg))
         except Exception:
             pass
@@ -1259,7 +1416,9 @@ class ProxmoxAgent:
         outstanding waiter. Runs as a background task; the receive loop cancels
         it the instant the handler returns. Best-effort — a send failure just
         stops the emitter (the command result path owns real error handling)."""
+        # Runs until cancelled.
         try:
+            # Every interval, send a "still working" frame for this command.
             while True:
                 await asyncio.sleep(interval)
                 frame = {
@@ -1276,6 +1435,7 @@ class ProxmoxAgent:
                 await websocket.send(encode_frame(self.signer, frame))
                 logger.debug("AGENT_PROGRESS keepalive sent for %s (%s)",
                              cmd_type, str(corr_id)[:8])
+        # Cancelled when the command finishes.
         except asyncio.CancelledError:
             pass
         except Exception as e:  # noqa: BLE001 — socket closed mid-handle
@@ -1288,7 +1448,9 @@ class ProxmoxAgent:
         so the hub's AGENT_RELAY_UP dispatcher can route CS_* payloads to the cs
         spoke. Best-effort: never raises (watchdogs must proceed even if the
         socket is gone)."""
+        # Best-effort: any failure is ignored.
         try:
+            # Build the event message.
             msg = {
                 "header": {
                     "message_id":    str(uuid.uuid4()),
@@ -1314,28 +1476,36 @@ class ProxmoxAgent:
     # Extracted to console_relay.py (free functions taking ``agent``); these thin
     # wrappers keep the _connect_once dispatch chain (self.<method>) untouched.
     async def send_vnc_event(self, event_type: str, data: Dict[str, Any]):
+        """Send a VNC relay event upstream (delegates to console_relay)."""
         await console_relay.send_vnc_event(self, event_type, data)
 
     async def _start_vnc_session(self, session_id: str, vmid: Any,
                                  node: str, kind: str) -> str:
+        """Open a VNC console session for a VM (delegates to console_relay)."""
         return await console_relay.start_vnc_session(self, session_id, vmid, node, kind)
 
     async def _vnc_teardown(self, session_id: str, send_disconnect: bool) -> None:
+        """Close a VNC session, optionally telling the hub (delegates to console_relay)."""
         await console_relay.vnc_teardown(self, session_id, send_disconnect)
 
     async def send_shell_event(self, event_type: str, data: Dict[str, Any]):
+        """Send a host-shell relay event upstream (delegates to console_relay)."""
         await console_relay.send_shell_event(self, event_type, data)
 
     async def _start_shell_session(self, session_id: str) -> None:
+        """Open a host-shell session (delegates to console_relay)."""
         await console_relay.start_shell_session(self, session_id)
 
     def _shell_write(self, session_id: str, data: bytes) -> None:
+        """Write input to a host-shell session (delegates to console_relay)."""
         console_relay.shell_write(self, session_id, data)
 
     def _shell_resize(self, session_id: str, rows: int, cols: int) -> None:
+        """Resize a host-shell session's terminal (delegates to console_relay)."""
         console_relay.shell_resize(self, session_id, rows, cols)
 
     async def _shell_teardown(self, session_id: str, send_disconnect: bool) -> None:
+        """Close a host-shell session, optionally telling the hub (delegates to console_relay)."""
         await console_relay.shell_teardown(self, session_id, send_disconnect)
 
     # ── Self-update ───────────────────────────────────────────────────────────
@@ -1346,23 +1516,29 @@ class ProxmoxAgent:
         The agent self-updates by pulling its own checkout, so pinning "main"
         here would drag a dev/qa host back onto main on the next update sweep.
         Detached HEAD (or any git failure) falls back to main."""
+        # Only needed here.
         import subprocess
+        # Ask git for the current branch name.
         try:
             out = subprocess.check_output(
                 ["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"],
                 timeout=10, stderr=subprocess.DEVNULL,
             ).decode().strip()
             return out if out and out != "HEAD" else "main"
+        # Any failure: main.
         except Exception:
             return "main"
 
     def _git_behind_count(self, repo_dir: str) -> int:
         """Return number of commits the local repo is behind its remote branch."""
+        # Only needed here.
         import subprocess
+        # Fetch from the remote.
         subprocess.check_call(
             ["git", "-C", repo_dir, "fetch", "--quiet"],
             timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        # Count commits between HEAD and the remote branch.
         branch = self._repo_branch(repo_dir)
         out = subprocess.check_output(
             ["git", "-C", repo_dir, "rev-list", "--count", f"HEAD..origin/{branch}"],
@@ -1384,11 +1560,14 @@ class ProxmoxAgent:
         the watchdog script isn't installed yet (pre-reinstall), the Popen fails
         silently and we degrade to the pre-rollback behavior (restart, no rollback).
         """
+        # Only needed here.
         import subprocess, shutil, pathlib
         from . import update_recovery as ur
+        # Current version, deployed-commit marker, and branch.
         current = get_version()
         marker_path = pathlib.Path(install_dir) / ".pxmx_deployed_sha"
         _branch = self._repo_branch(repo_dir)
+        # Fetch and read the remote branch's commit ("" on failure).
         try:
             subprocess.check_call(
                 ["git", "-C", repo_dir, "fetch", "--quiet", "origin", _branch],
@@ -1399,6 +1578,7 @@ class ProxmoxAgent:
             ).decode().strip()
         except Exception:
             remote_hash = ""
+        # Commit currently deployed, if recorded.
         installed_hash = ""
         try:
             installed_hash = marker_path.read_text().strip()
@@ -1418,6 +1598,7 @@ class ProxmoxAgent:
         # reported the checkout as up to date. trigger_update() calls this
         # with NO prior behind-count gate, so this check must stay — its
         # BASIS is what changed, not its presence.
+        # Record HEAD, pull the latest code, then record the new HEAD.
         old_hash = subprocess.check_output(
             ["git", "-C", repo_dir, "rev-parse", "HEAD"], timeout=10
         ).decode().strip()
@@ -1482,6 +1663,7 @@ class ProxmoxAgent:
             logger.error("pre-update snapshot failed (%s) — aborting update to keep "
                          "a valid rollback point; retrying next cycle.", e)
             return
+        # Copy from the repo's agent directory into the install directory.
         src = pathlib.Path(repo_dir) / "agent"
         dst = pathlib.Path(install_dir)
         # ATOMIC per-item swap. The old code did `rmtree(dest)` then an in-place
@@ -1492,10 +1674,12 @@ class ProxmoxAgent:
         # FULLY first (dest untouched), then renamed into place — so dest is
         # always either the complete old tree or the complete new tree, never a
         # half-written one. A crash leaves only stale temp dirs, cleaned below.
+        # Swap each item in (skipping the local .env and venv).
         pid = os.getpid()
         for item in src.iterdir():
             if item.name in {".env", "venv"}:
                 continue
+            # Final path and temp paths for this item.
             dest = dst / item.name
             tmp_new = dst / f".{item.name}.new-{pid}"
             tmp_old = dst / f".{item.name}.old-{pid}"
@@ -1507,12 +1691,14 @@ class ProxmoxAgent:
                         _p.unlink()
                     except OSError:
                         pass
+            # Directories: copy fully, move the old aside, move the new in, delete the old.
             if item.is_dir():
                 shutil.copytree(str(item), str(tmp_new))   # full copy; dest intact
                 if dest.exists():
                     os.rename(str(dest), str(tmp_old))      # move old aside (atomic)
                 os.rename(str(tmp_new), str(dest))          # move new in (atomic)
                 shutil.rmtree(str(tmp_old), ignore_errors=True)
+            # Files: copy then atomically replace.
             else:
                 shutil.copy2(str(item), str(tmp_new))
                 os.replace(str(tmp_new), str(dest))         # atomic file replace
@@ -1523,10 +1709,12 @@ class ProxmoxAgent:
             shutil.copy2(str(pathlib.Path(repo_dir) / "VERSION"), str(dst / "VERSION"))
         except Exception as e:
             logger.warning(f"self-update: could not refresh {dst}/VERSION: {e}")
+        # Record the deployed commit.
         try:
             marker_path.write_text(new_hash + "\n")
         except Exception as e:
             logger.warning(f"self-update: could not write deployed SHA marker: {e}")
+        # Reinstall requirements if the venv exists.
         pip = dst / "venv" / "bin" / "pip"
         req = dst / "requirements.txt"
         if pip.exists() and req.exists():
@@ -1572,12 +1760,16 @@ class ProxmoxAgent:
         there is no repo or no new version (``_apply_update`` os._exit(3)s when
         it actually applies, so the caller's terminal result is only reached
         when the agent was already current)."""
+        # Only needed here.
         import pathlib
+        # Install directory and its self-update git checkout.
         install_dir = str(pathlib.Path(__file__).resolve().parent.parent)
         repo_dir = str(pathlib.Path(install_dir) / ".pxmx_repo")
+        # No checkout: nothing to update from.
         if not os.path.isdir(os.path.join(repo_dir, ".git")):
             logger.warning("trigger_update: no .pxmx_repo checkout — skipping")
             return
+        # Run the blocking update in a worker thread.
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._apply_update, install_dir, repo_dir)
 
@@ -1600,6 +1792,7 @@ class ProxmoxAgent:
         cached value rather than rotating it — a rotation would invalidate the
         token the cs spoke is already using. ``force=True`` rotates. Best-effort;
         the secret is never logged. Mirrors bash ``handle_create_proxmox_token``."""
+        # Token user and name.
         TOKEN_ID = "cs-hub"
         USER = "root@pam"
         if self._cs_hub_token and not force:
@@ -1609,29 +1802,36 @@ class ProxmoxAgent:
                                      {"request_id": request_id, "status": "provisioned",
                                       "token": self._cs_hub_token})
             return
+        # Any failure is logged and reported as an error.
         try:
+            # Delete any old token so a fresh secret is issued.
             try:
                 await self._pvesh_action("delete",
                                          f"/access/users/{USER}/token/{TOKEN_ID}",
                                          json_out=False, timeout=10)
             except Exception:
                 pass  # token may not exist yet — expected
+            # Create the token (no privilege separation).
             data = await self._pvesh_action(
                 "create", f"/access/users/{USER}/token/{TOKEN_ID}",
                 "--privsep", "0", timeout=20)
+            # Pull the secret from the reply.
             secret = ""
             if isinstance(data, dict):
                 secret = str(data.get("value") or "").strip()
+            # No secret: report the error.
             if not secret:
                 logger.error(f"cs-hub token provision {request_id}: pvesh returned no value")
                 await self.send_cs_event("CS_TOKEN_RESULT",
                                           {"request_id": request_id, "status": "error",
                                            "error": "pvesh returned no token value"})
                 return
+            # Cache the full token string and send it to the cs spoke.
             self._cs_hub_token = f"{USER}!{TOKEN_ID}={secret}"
             await self.send_cs_event("CS_TOKEN_RESULT",
                                      {"request_id": request_id, "status": "provisioned",
                                       "token": self._cs_hub_token})
+            # Drop the local copy of the secret.
             del secret
             logger.info(f"Proxmox cs-hub token root@pam!cs-hub provisioned + relayed "
                         f"(request_id={request_id}, value not logged)")
@@ -1645,23 +1845,32 @@ class ProxmoxAgent:
     # it through the cached provisioner so a re-request re-emits the SAME token
     # instead of rotating one the cs spoke is already using.
     async def _provision_proxmox_token(self, request_id: str) -> None:
+        """
+        Old entry point for token provisioning; returns the cached token, creating it on first use.
+        """
         await self._ensure_cs_hub_token(request_id)
 
     async def _update_check_loop(self):
         """Check for new versions every 10 minutes and self-update when found."""
+        # Only needed here.
         import pathlib
         await asyncio.sleep(120)  # wait before first check
+        # Check forever; errors are logged at debug level and retried.
         while True:
             try:
+                # Install directory and its self-update checkout.
                 install_dir = str(pathlib.Path(__file__).resolve().parent.parent)
                 repo_dir = str(pathlib.Path(install_dir) / ".pxmx_repo")
+                # No checkout: check again later.
                 if not os.path.isdir(os.path.join(repo_dir, ".git")):
                     await asyncio.sleep(600)
                     continue
+                # Count new commits in a worker thread.
                 loop = asyncio.get_running_loop()
                 behind = await loop.run_in_executor(
                     None, self._git_behind_count, repo_dir
                 )
+                # Behind: apply the update (the process exits if it does).
                 if behind > 0:
                     logger.info(f"Agent is {behind} commit(s) behind — applying update")
                     await loop.run_in_executor(
@@ -1669,6 +1878,7 @@ class ProxmoxAgent:
                     )
             except Exception as e:
                 logger.debug(f"Update check: {e}")
+            # Wait 10 minutes between checks.
             await asyncio.sleep(600)
 
     def _tiers_fallback(self, vms) -> Dict[str, str]:
@@ -1681,9 +1891,11 @@ class ProxmoxAgent:
         stayed that way. Observed as the Class column reading all-unknown fleet
         wide while the agent was CPU-starved.
         """
+        # Use the last good map if we have one.
         last = getattr(self, "_last_tiers", None)
         if last:
             return dict(last)
+        # Otherwise classify by USB only.
         try:
             return usb_provision.usb_tiers_only((vms or {}).get("vms", []) or [])
         except Exception as e:  # noqa: BLE001
@@ -1713,8 +1925,10 @@ class ProxmoxAgent:
         one failing must not stop the other.
         """
         await asyncio.sleep(45)   # let boot + the first telemetry ticks settle
+        # Run forever, checking each job's schedule every 15 seconds.
         while True:
             now = time.time()
+            # Time for the USB diagnostic: run it within its deadline and log a summary.
             if (now - getattr(self, "_last_usb_diag_ts", 0.0)) >= _USB_DIAG_INTERVAL_S:
                 self._last_usb_diag_ts = now
                 try:
@@ -1748,6 +1962,7 @@ class ProxmoxAgent:
                     # collector that fails every cycle must be loud.
                     logger.warning("usb_diagnostics failed: %s: %s",
                                    type(e).__name__, e, exc_info=True)
+            # Time for the guest watchdog: run a pass if client simulation is on.
             if (now - getattr(self, "_last_guest_wd_ts", 0.0)) >= guest_watchdog.WATCHDOG_INTERVAL_S:
                 self._last_guest_wd_ts = now
                 try:
@@ -1785,6 +2000,10 @@ class ProxmoxAgent:
         WatchdogSec.
         """
         def _env_int(name, default, floor=1):
+            """Read an integer from the environment, at least ``floor``; the default if unset or
+            invalid.
+            """
+            # Parse and clamp; fall back to the default on bad input.
             try:
                 return max(floor, int(os.environ.get(name, str(default))))
             except (TypeError, ValueError):
@@ -1799,19 +2018,26 @@ class ProxmoxAgent:
         # Before the first tick completes (startup: spoke resolve, auth, first
         # collect) there is no progress signal yet, so feed unconditionally.
         startup_grace = _env_int("LM_PXMX_WATCHDOG_STARTUP_GRACE_S", 300)
+        # When we started (for the startup grace period).
         started = time.time()
 
         _sd_notify("READY=1")  # harmless under Type=simple
+        # When we stopped feeding systemd, if we have.
         starved_since = None
+        # Check progress every interval.
         while True:
+            # Feed unless telemetry has stalled.
             feed, why = True, ""
             try:
+                # Time the last telemetry tick finished.
                 last = getattr(self, "_last_tick_done_ts", None)
+                # None yet: stall only after the startup grace period.
                 if last is None:
                     if (time.time() - started) > startup_grace:
                         feed = False
                         why = (f"no telemetry tick completed within {startup_grace}s of start")
                 else:
+                    # Otherwise: stalled if the last tick is older than the threshold.
                     cadence = getattr(self, "_last_interval_s", None) or 60
                     stall_after = max(stall_floor, stall_mult * cadence)
                     age = time.time() - last
@@ -1825,6 +2051,7 @@ class ProxmoxAgent:
                 logger.debug("sd watchdog progress check failed (feeding anyway): %s", e)
                 feed, why = True, ""
 
+            # Healthy: ping systemd (and log recovery if we were starved).
             if feed:
                 if starved_since is not None:
                     logger.warning("agent watchdog: telemetry advancing again after %.0fs "
@@ -1855,8 +2082,10 @@ class ProxmoxAgent:
              then mDNS and target its pxmx-agent listener.
         Best-effort throughout: on no result the sentinel is left in place so
         run()'s reconnect loop retries."""
+        # Already have a concrete URL.
         if self.spoke_url not in ("", "auto", None):
             return
+        # Load the discovery helpers (package or flat import).
         try:
             from .discovery import discover_hub_url, resolve_agent_url
         except ImportError:
@@ -1881,6 +2110,7 @@ class ProxmoxAgent:
             return
 
         # 2. No IP given → fall back to hub auto-discovery.
+        # No IP given: auto-discover the hub.
         url = await asyncio.to_thread(discover_hub_url, 5.0, None, True)
         if url:
             self.spoke_url = _normalize_spoke_url(url)
@@ -1895,6 +2125,7 @@ class ProxmoxAgent:
         health (the external update watchdog treats the marker as the positive
         "new code booted OK" signal)."""
         try:
+            # Delete the marker if it exists.
             m = os.path.join(AGENT_STATE_DIR, "healthy")
             if os.path.exists(m):
                 os.remove(m)
@@ -1905,6 +2136,7 @@ class ProxmoxAgent:
         """Mark the agent healthy after spoke auth completes — the watchdog's
         positive health signal (presence => new code booted + authed)."""
         try:
+            # Create the empty marker file.
             os.makedirs(AGENT_STATE_DIR, exist_ok=True)
             open(os.path.join(AGENT_STATE_DIR, "healthy"), "w").close()
         except Exception as e:  # pragma: no cover - state dir not writable
@@ -1917,10 +2149,12 @@ class ProxmoxAgent:
         reconnects forever (exponential-ish backoff) on socket loss; re-raises
         on repeated auth failure so a bad secret doesn't spin forever.
         """
+        # Only needed here.
         import websockets
         # Route uncaught asyncio-task exceptions through the PxmxAgent logger so
         # their tracebacks relay to the hub (Setup → Agent Logs + AppBuilder),
         # not just the local file. Set here because the loop is now running.
+        # Log uncaught asyncio task exceptions through the relayed logger.
         try:
             asyncio.get_running_loop().set_exception_handler(self._asyncio_exception_relay)
         except Exception:  # noqa: BLE001
@@ -1930,9 +2164,11 @@ class ProxmoxAgent:
         # treats it as the "new code booted OK" signal. Without this a
         # crash-looping new version could inherit a stale marker and the watchdog
         # would never roll back.
+        # Fresh start must re-prove health; reset backoff and auth-failure count.
         self._clear_healthy_marker()
         backoff = 5
         _consecutive_auth_fails = 0
+        # Start the self-update and systemd watchdog loops.
         asyncio.create_task(self._update_check_loop())
         asyncio.create_task(self._sd_watchdog_loop())
         # Host tuning, re-asserted on every start. The installer applies the
@@ -1944,6 +2180,7 @@ class ProxmoxAgent:
         # Slow periodic jobs, deliberately OFF the telemetry loop so they
         # can never starve the systemd watchdog (see _slow_jobs_loop).
         asyncio.create_task(self._slow_jobs_loop())
+        # Work out the spoke URL, then connect forever.
         await self._resolve_spoke_url()
         while True:
             # Re-discover each pass while the URL is still the sentinel so a hub
@@ -1958,6 +2195,7 @@ class ProxmoxAgent:
             if self.spoke_url in ("", "auto", None):
                 await asyncio.sleep(5)
                 continue
+            # One connection; return means it closed cleanly.
             try:
                 await self._connect_once()
                 backoff = 5  # reset on clean disconnect
@@ -1968,6 +2206,7 @@ class ProxmoxAgent:
                 self._reconnect_count = getattr(self, "_reconnect_count", 0) + 1
                 self._last_disconnect_reason = "connection closed (spoke/hub restart or network)"
                 self._last_disconnect_ts = time.time()
+            # Credentials rejected.
             except _AuthError:
                 _consecutive_auth_fails += 1
                 self._last_disconnect_reason = "auth rejected by spoke — awaiting admin approval"
@@ -1984,6 +2223,7 @@ class ProxmoxAgent:
                     logger.warning("Pre-configured secret also rejected — entering zero-touch provisioning.")
                     self.secret = None
                 await asyncio.sleep(5)
+            # Network or WebSocket failure.
             except (OSError, websockets.exceptions.WebSocketException) as e:
                 self._last_disconnect_reason = f"connect failed: {type(e).__name__}: {str(e)[:120]}"
                 self._last_disconnect_ts = time.time()
@@ -2001,6 +2241,7 @@ class ProxmoxAgent:
                 # — a big slice of the "several-minute lag after an update". 20s
                 # keeps reconnect prompt without hammering a genuinely-down spoke.
                 backoff = min(backoff * 2, 20)
+            # Anything else.
             except Exception as e:
                 logger.error(f"Unexpected error: {e} — retrying in {backoff}s")
                 await asyncio.sleep(backoff)
@@ -2037,17 +2278,23 @@ class ProxmoxAgent:
               to an unverified context (the footgun: they'd believe the spoke
               cert is authenticated when it isn't).
         """
+        # Only needed here.
         import ssl as _ssl
+        # Plain ws:// needs no TLS context.
         if not (spoke_url or "").lower().startswith("wss://"):
             return None, "plaintext (loopback/legacy)"
+        # Build the context; failure means no TLS.
         try:
+            # Verification requested.
             if os.environ.get("LM_HUB_TLS_VERIFY", "0").strip() in ("1", "true", "yes"):
+                # Optional CA file to pin.
                 ca = os.environ.get("LM_HUB_CA_CERT", "").strip()
                 if ca and not os.path.isfile(ca):
                     logger.error("wss: LM_HUB_TLS_VERIFY=1 but CA path %s does not "
                                  "exist — refusing to silently downgrade to "
                                  "unverified. Fix the path or unset LM_HUB_TLS_VERIFY.", ca)
                     return None, "TLS disabled (CA path missing)"
+                # Pin the given CA.
                 if ca:
                     ctx = _ssl.create_default_context(cafile=ca)
                     return ctx, f"TLS verified (CA={ca})"
@@ -2066,6 +2313,10 @@ class ProxmoxAgent:
             return None, "TLS disabled (context build failed)"
 
     async def _connect_once(self):
+        """Make one connection to the spoke: authenticate (or wait for approval), then run the
+        command/telemetry loops until the socket closes.
+        """
+        # Only needed here.
         import websockets
         logger.info(f"pxmx-agent {version} connecting to {self.spoke_url}...")
 
@@ -2083,15 +2334,18 @@ class ProxmoxAgent:
         # LM_WS_PING_INTERVAL_S / LM_WS_PING_TIMEOUT_S) to match the hub<->spoke
         # and spoke->agent legs — NOT the websockets library default 20s/20s.
         # See _ws_keepalive_env above for why the default kills idle VNC sessions.
+        # Open the WebSocket with the configured keepalive settings.
         async with websockets.connect(
             self.spoke_url, ssl=ssl_ctx,
             ping_interval=_ws_keepalive_env("LM_WS_PING_INTERVAL_S", 30.0),
             ping_timeout=_ws_keepalive_env("LM_WS_PING_TIMEOUT_S", 90.0),
         ) as websocket:
+            # Keep a reference for other senders.
             self.websocket = websocket
 
             # 1. Agent → Spoke handshake
             # Send without secret if we don't have one yet (zero-touch provisioning)
+            # Handshake: our id plus a secret or onboarding credentials.
             handshake: Dict[str, Any] = {"agent_id": self.agent_id}
             if self.secret:
                 handshake["secret"] = self.secret
@@ -2104,13 +2358,16 @@ class ProxmoxAgent:
             # install_uuid + hostname let the hub detect a clone-and-rename of this
             # node and carry over the agent's config/approval. Empty install_uuid =
             # .env unwritable → hub skips correlation (agent treated as before).
+            # Identify the install and host.
             if self.install_uuid:
                 handshake["install_uuid"] = self.install_uuid
             if self.hostname:
                 handshake["hostname"] = self.hostname
+            # Send the handshake.
             await websocket.send(json.dumps(handshake))
 
             # 2. Hub response — may be APPROVAL_REQUIRED, HUB_VERIFIED, or 1008 close
+            # Wait up to 5 seconds for the spoke's reply; a policy close means auth failed.
             try:
                 hub_proof = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5.0))
             except Exception as exc:
@@ -2118,6 +2375,7 @@ class ProxmoxAgent:
                     raise _AuthError(str(exc)) from exc
                 raise
 
+            # The spoke's answer.
             hub_status = hub_proof.get("status")
 
             # ── Zero-touch: pending admin approval ────────────────────────────
@@ -2126,10 +2384,12 @@ class ProxmoxAgent:
                     f"Agent '{self.agent_id}' is waiting for admin approval. "
                     "Approve this Proxmox node agent from the LM WebUI: Setup → Spokes & Agents (Agents tile)."
                 )
+                # Wait for the approval message.
                 async for raw in websocket:
                     # Onboarding status frames ({"status":...}) are raw JSON;
                     # signed frames are <sig>.<body>. Accept either.
                     msg = json.loads(raw if raw[:1] == "{" else split_frame(raw)[1])
+                    # Approved: save the issued secret and reconnect with it.
                     if msg.get("status") == "APPROVED":
                         provisioned_secret = msg.get("secret")
                         if provisioned_secret:
@@ -2146,6 +2406,7 @@ class ProxmoxAgent:
                 await websocket.close(1008, "Spoke identity not verified")
                 raise _AuthError(f"Spoke identity proof failed: {hub_proof}")
 
+            # Confirm and finish authentication.
             await websocket.send(json.dumps({"status": "HUB_OK"}))
             logger.info("Spoke identity verified. Auth complete.")
             # New code booted + authed with the spoke → mark healthy. The external
@@ -2159,6 +2420,7 @@ class ProxmoxAgent:
             # process lifetime (added in __init__).
             self._ws_log_handler.flush_buffered()
 
+            # Start the heartbeat and telemetry loops.
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             telemetry_task = asyncio.create_task(self._telemetry_loop())
 
@@ -2169,21 +2431,25 @@ class ProxmoxAgent:
             # loaded spoke's request backlog. The websocket is up here, so
             # telemetry/CS frames can flow. A later UPDATE_CONFIG just refreshes
             # self.config (same enabled state → no redundant restart).
+            # Restore client simulation if the saved config had it on.
             if not self.cs_enabled and bool(
                     (self.config.get("client_simulation") or {}).get("enabled")):
                 logger.info("Resuming client_simulation mode from persisted config")
                 await self._set_cs_enabled(True)
 
+            # Handle incoming commands until the socket closes.
             try:
                 async for message in websocket:
                     # Wire form <sig>.<body>: verify the RECEIVED body bytes
                     # directly, parse once (matches the hub's new frame format).
+                    # Split off and check the signature; drop forged frames.
                     sig, body = split_frame(message)
                     msg_data = json.loads(body)
                     if sig and not self.signer.verify_bytes(body.encode(), sig):
                         logger.warning("Invalid signature — dropping")
                         continue
 
+                    # Unpack the command type, data and correlation id.
                     payload  = msg_data.get("payload", {})
                     cmd_type = payload.get("type")
                     data     = payload.get("data", {})
@@ -2194,17 +2460,20 @@ class ProxmoxAgent:
                     # (e.g. UPDATE_CONFIG → "client_simulation enabled=true").
                     # See logging-observability-contract.md (normalization).
                     logger.debug(f"Command: {cmd_type}")
+                    # Default reply for unknown commands.
                     result = {"status": "ERROR", "message": "Unknown command"}
 
                     # Keepalive: for potentially-slow commands, emit periodic
                     # AGENT_PROGRESS frames while the handler runs so the spoke
                     # (and hub) extend their response deadlines instead of timing
                     # out on a busy backend. Cancelled just before the ack below.
+                    # For slow commands, send progress pings so the spoke does not time out.
                     _prog_task = None
                     if cmd_type in _KEEPALIVE_CMDS and corr_id:
                         _prog_task = asyncio.create_task(
                             self._emit_command_progress(websocket, corr_id, cmd_type))
 
+                    # Merge new config, save it, and react to changed settings.
                     if cmd_type == "UPDATE_CONFIG":
                         old_cs = bool((self.config.get("client_simulation") or {}).get("enabled"))
                         # Deep-merge, don't wholesale-replace: partial pushes from
@@ -2220,34 +2489,42 @@ class ProxmoxAgent:
                         # The hub has (re)confirmed CS config this session — release
                         # the USB-provision loop's startup guard so it can act on a
                         # toggle we KNOW is current, not a possibly-stale cache.
+                        # The spoke has now told us the cs setting.
                         if "client_simulation" in (data or {}):
                             self._cs_config_synced = True
+                        # Turn client simulation on or off if it changed.
                         new_cs = bool((self.config.get("client_simulation") or {}).get("enabled"))
                         if old_cs != new_cs:
                             await self._set_cs_enabled(new_cs)
                         # Managed crontab: apply immediately when the operator's
                         # pasted content is part of this push (idempotent; the
                         # telemetry loop also drift-corrects periodically).
+                        # Apply a changed managed crontab.
                         if "managed_crontab" in data:
                             self._managed_crontab_status = await managed_crontab.apply_managed_crontab(
                                 self.config.get("managed_crontab") or "")
                             self._last_cron_reconcile = time.time()
                         result = {"status": "SUCCESS", "message": "Config updated"}
 
+                    # VM list.
                     elif cmd_type == "GET_VM_LIST":
                         result = await self.get_vm_list()
 
+                    # Node stats.
                     elif cmd_type == "GET_NODE_STATS":
                         result = await self.get_node_stats()
 
+                    # System metrics.
                     elif cmd_type == "GET_SYSTEM_STATS":
                         result = await self.collect_metrics()
 
+                    # Change the log level.
                     elif cmd_type == "SET_LOG_LEVEL":
                         level = set_log_level(data.get("enabled"))
                         result = {"status": "SUCCESS",
                                   "message": f"Log level → {logging.getLevelName(level)}"}
 
+                    # Run a local command in a worker thread.
                     elif cmd_type == "RUN_COMMAND":
                         # Remote Console: the hub relayed a signed RUN_COMMAND
                         # down through the owning spoke (Global-Admin gated +
@@ -2265,6 +2542,7 @@ class ProxmoxAgent:
                             result = {"ok": False, "rc": None, "stdout": "", "stderr": "",
                                       "truncated": False, "error": f"runner error: {_rce}"}
 
+                    # Client-simulation sub-commands.
                     elif cmd_type == "CS_COMMAND":
                         # Client-Simulation command. Fast commands (start/stop/
                         # reboot/snapshot vm, batches, unlock_template,
@@ -2277,6 +2555,7 @@ class ProxmoxAgent:
                         result = await cs_commands.handle_cs_command(
                             self, data.get("action"), data or {})
 
+                    # Create the Proxmox token in the background and reply right away.
                     elif cmd_type == "CS_CREATE_PROXMOX_TOKEN":
                         # Phase F: hub asks us to create the cs-hub Proxmox API
                         # token (we have local pvesh; the cs spoke doesn't). Ack
@@ -2289,6 +2568,7 @@ class ProxmoxAgent:
                         task.add_done_callback(self._cs_long_ops.discard)
                         result = {"status": "ACCEPTED", "request_id": request_id}
 
+                    # Single VM action.
                     elif cmd_type == "PXMX_VM_ACTION":
                         # Hypervisors view lifecycle: start/stop/reboot/snapshot
                         # ANY vmid (unguarded — real tenant VMs, not the sim
@@ -2305,6 +2585,7 @@ class ProxmoxAgent:
                         except pve_cmds.PveError as e:
                             result = {"status": "ERROR", "message": str(e)}
 
+                    # Same action on many VMs, at most 6 at a time.
                     elif cmd_type == "PXMX_VM_ACTION_BULK":
                         # ONE message → the SAME action on MANY VMs on this node
                         # (the Hypervisors bulk start/stop/reboot/snapshot/backup),
@@ -2316,6 +2597,9 @@ class ProxmoxAgent:
                         _sem = asyncio.Semaphore(6)
 
                         async def _bulk_one(it):
+                            """Run the action on one VM and return a per-VM result (never raises).
+                            """
+                            # Limit concurrency.
                             async with _sem:
                                 try:
                                     r = await pve_cmds.vm_action_any(
@@ -2328,10 +2612,12 @@ class ProxmoxAgent:
                                 except Exception as e:  # noqa: BLE001
                                     return {"vmid": it.get("vmid"), "ok": False, "error": str(e)}
 
+                        # Run all and collect the results.
                         _res = await asyncio.gather(
                             *[_bulk_one(it) for it in _items if isinstance(it, dict)])
                         result = {"status": "SUCCESS", "results": list(_res)}
 
+                    # List storages usable for backups.
                     elif cmd_type == "PXMX_LIST_STORAGE":
                         # Backup-capable storages on this host for the Setup →
                         # Hypervisors dropdown (auto-list-from-host).
@@ -2341,6 +2627,7 @@ class ProxmoxAgent:
                         except Exception as e:
                             result = {"status": "ERROR", "message": str(e)}
 
+                    # Change the tenant tag on VMs.
                     elif cmd_type == "PXMX_RETAG_TENANT":
                         # Cross-tenant migration: swap a tenant's proxmox_tag on
                         # every VM/CT that carries it (old_tag -> new_tag).
@@ -2350,6 +2637,7 @@ class ProxmoxAgent:
                         except Exception as e:
                             result = {"status": "ERROR", "message": str(e)}
 
+                    # Node maintenance mode.
                     elif cmd_type == "OS_MAINTENANCE":
                         # HA maintenance mode around a hub auto-reboot of a
                         # clustered host (see pve_cmds.node_maintenance).
@@ -2359,6 +2647,7 @@ class ProxmoxAgent:
                         except Exception as e:  # noqa: BLE001
                             result = {"status": "ERROR", "message": str(e)}
 
+                    # OS updates and reboot, refused while provisioning work is running.
                     elif cmd_type in ("OS_UPDATE_CHECK", "OS_UPDATE_APPLY",
                                       "OS_UPDATE_APPLY_PACKAGES", "OS_REBOOT"):
                         # Fleet OS updates, hub-orchestrated. The agent runs ON the
@@ -2377,6 +2666,7 @@ class ProxmoxAgent:
                         # packages; OS_REBOOT is the operator's explicit reboot.
                         try:
                             from . import os_update
+                            # Check whether provisioning, recloning or deletes are in progress.
                             busy = None
                             try:
                                 pr = usb_provision.current_prov_run()
@@ -2388,10 +2678,12 @@ class ProxmoxAgent:
                                     busy = "VMs are being deleted"
                             except Exception:  # noqa: BLE001 — never block on a status probe
                                 busy = None
+                            # Busy: refuse anything but a check.
                             if cmd_type != "OS_UPDATE_CHECK" and busy:
                                 verb = "reboot" if cmd_type == "OS_REBOOT" else "apply updates"
                                 result = {"status": "ERROR", "busy": True,
                                           "message": f"refusing to {verb}: {busy}"}
+                            # Check: list updates and add cluster info.
                             elif cmd_type == "OS_UPDATE_CHECK":
                                 result = await asyncio.to_thread(
                                     os_update.check_updates,
@@ -2400,20 +2692,25 @@ class ProxmoxAgent:
                                 if cluster:
                                     result["pve_cluster"] = cluster
                                     result["features"] = list(result.get("features") or []) + ["maintenance"]
+                            # Install selected packages.
                             elif cmd_type == "OS_UPDATE_APPLY_PACKAGES":
                                 result = await asyncio.to_thread(
                                     os_update.apply_updates,
                                     list((data or {}).get("packages") or []))
+                            # Reboot.
                             elif cmd_type == "OS_REBOOT":
                                 result = await asyncio.to_thread(os_update.reboot_node)
+                            # Install all updates.
                             else:
                                 result = await asyncio.to_thread(os_update.apply_updates)
+                            # Tag the reply with this node.
                             result.setdefault("status", "SUCCESS")
                             result["node_id"] = self.agent_id
                             result["hostname"] = self.hostname
                         except Exception as e:  # noqa: BLE001
                             result = {"status": "ERROR", "message": str(e)}
 
+                    # Report who this agent is and where it connects.
                     elif cmd_type == "PXMX_GET_IDENTITY":
                         # "Where does this agent think it is pointing?" Each pxmx
                         # host is meant to dial its OWN cs spoke; when telemetry
@@ -2440,13 +2737,16 @@ class ProxmoxAgent:
                         # was configured. Guarded to the sim VMID range so it can
                         # never sweep a non-sim VM into the pool.
                         try:
+                            # Target pool and the VMs we must never touch.
                             _pool = str((data or {}).get("pool") or "").strip()
                             _prot = usb_provision._protected_vmids(self)
+                            # Candidate VMs: the requested ones, or every VM on the node.
                             _req = (data or {}).get("vmids")
                             if _req:
                                 _cand = [int(v) for v in _req]
                             else:
                                 _cand = await pve_cmds.list_qemu_vmids()
+                            # Only simulation VMs are added; report the rest as skipped.
                             _vms = [v for v in _cand if cs_guard.is_sim_vm(v, _prot)]
                             _skipped = [v for v in _cand if v not in _vms]
                             result = await pve_cmds.pool_add_vms(_pool, _vms)
@@ -2470,9 +2770,11 @@ class ProxmoxAgent:
                         # dispatches the latest desired map on the next change, so
                         # tags never fall behind). apply_sim_tags is idempotent and
                         # best-effort per VM, so a dropped/failed run self-heals.
+                        # Skip if a previous tag pass is still running.
                         _prev = getattr(self, "_sim_tag_apply_task", None)
                         if _prev is not None and not _prev.done():
                             result = {"status": "ACCEPTED", "skipped": "in_progress"}
+                        # Otherwise start one in the background and reply right away.
                         else:
                             _task = asyncio.create_task(
                                 pve_cmds.apply_sim_tags(data.get("tags") or {}))
@@ -2496,6 +2798,8 @@ class ProxmoxAgent:
                             # sends template_unique_id "<cluster>/<node>/<vmid>"
                             # (and the same value as unique_id for routing), or
                             # explicit vmid/node/type.
+                            # Work out node and template VMID from the unique id, or from separate
+                            # fields.
                             tuid = data.get("template_unique_id") or data.get("unique_id") or ""
                             if tuid and "/" in tuid:
                                 parts = tuid.split("/")
@@ -2504,16 +2808,19 @@ class ProxmoxAgent:
                             else:
                                 node = data.get("node") or ""
                                 template_vmid = data.get("template_vmid")
+                            # Template and name are required.
                             if template_vmid is None:
                                 raise pve_cmds.PveError(
                                     "template_vmid or template_unique_id required")
                             name = (data.get("name") or "").strip()
                             if not name:
                                 raise pve_cmds.PveError("name is required")
+                            # Detect the guest type if not given.
                             kind = (data.get("type") or "").lower()
                             if kind not in ("qemu", "lxc"):
                                 kind = await pve_cmds.detect_guest_type(
                                     int(template_vmid))
+                            # Pick a free VMID if not given.
                             new_vmid = data.get("new_vmid")
                             if new_vmid is None:
                                 new_vmid = await pve_cmds.next_free_vmid()
@@ -2522,6 +2829,7 @@ class ProxmoxAgent:
                             # name as the visible label + the proxmox_tag which the
                             # Hypervisor→NetBox VM sync matches on). A single
                             # tenant_tag string is accepted for back-compat.
+                            # Tenant tags and optional pool.
                             ttags_in = data.get("tenant_tags") or (
                                 [data.get("tenant_tag")] if data.get("tenant_tag") else [])
                             tenant_tags = [str(t).strip() for t in ttags_in
@@ -2540,6 +2848,7 @@ class ProxmoxAgent:
                             # even if the template had none) and append the tenant
                             # labels (dedup, case-insensitive). Best-effort: a tag
                             # failure does not undo a successful clone.
+                            # Read the template's tags.
                             tags = []
                             try:
                                 cfg = await self._pvesh(
@@ -2551,11 +2860,13 @@ class ProxmoxAgent:
                                 logger.warning("clone: could not read template "
                                                 "tags for %s/%s: %s", node,
                                                 template_vmid, e)
+                            # Add any tenant tags not already present.
                             lower_tags = {t.lower() for t in tags}
                             for tt in tenant_tags:
                                 if tt.lower() not in lower_tags:
                                     tags.append(tt)
                                     lower_tags.add(tt.lower())
+                            # Apply the tags to the new VM.
                             if tags:
                                 try:
                                     await pve_cmds.set_tags_any(
@@ -2563,6 +2874,7 @@ class ProxmoxAgent:
                                 except pve_cmds.PveError as e:
                                     logger.warning("clone: tag set failed for new "
                                                    "VM %s: %s", new_vmid, e)
+                            # Describe the new VM.
                             result = {
                                 "status": "SUCCESS",
                                 "unique_id": f"{self.cluster_name}/{node}/{new_vmid}",
@@ -2584,6 +2896,7 @@ class ProxmoxAgent:
                     elif cmd_type == "PXMX_LIST_POOLS":
                         # Proxmox resource pool list for the clone/create-VM UI's
                         # pool dropdown. Best-effort; [] when /pools is unavailable.
+                        # List resource pools.
                         try:
                             pools = await self.list_pools()
                             result = {"status": "SUCCESS", "pools": pools,
@@ -2596,6 +2909,7 @@ class ProxmoxAgent:
                         # ISO images on a node for the create-VM-from-ISO flow.
                         # pvesh /nodes/{node}/storage is cluster-wide, so this
                         # works for any node in the agent's cluster.
+                        # List ISO images on the node.
                         try:
                             node = data.get("node") or ""
                             isos = await self.list_node_isos(node)
@@ -2608,6 +2922,7 @@ class ProxmoxAgent:
                     elif cmd_type == "PXMX_LIST_STORAGES":
                         # Storages on a node accepting 'images' (boot-disk targets)
                         # for the create-VM-from-ISO disk dropdown.
+                        # List storages with the given content type.
                         try:
                             node = data.get("node") or ""
                             content_filter = data.get("content") or "images"
@@ -2621,6 +2936,7 @@ class ProxmoxAgent:
                     elif cmd_type == "PXMX_DRIVE_HEALTH":
                         # Drive health monitoring: query SSD wear levels via smartctl
                         # with multi-vendor support and cciss/auto fallback.
+                        # Load the drive health module and read the report.
                         try:
                             try:
                                 from . import drive_health
@@ -2632,12 +2948,14 @@ class ProxmoxAgent:
                             logger.exception("PXMX_DRIVE_HEALTH failed")
                             result = {"status": "ERROR", "message": str(e), "drives": [],
                                       "summary": {"total_drives": 0, "healthy": 0, "warning": 0, "critical": 0, "unknown": 0}}
+                        # Tag the reply with node, cluster and version.
                         result["node"] = result.get("node") or self.hostname
                         result["cluster"] = result.get("cluster") or self.cluster_name
                         result["agent_version"] = getattr(self, "version", "unknown")
 
                     elif cmd_type == "PXMX_INSTALL_SSACLI":
                         # Install HPE SSA CLI tools if not present.
+                        # Install the HP ssacli tool if needed.
                         try:
                             try:
                                 from . import drive_health
@@ -2661,6 +2979,7 @@ class ProxmoxAgent:
                         # place it in a pool. The VM is created stopped; the user
                         # boots the ISO and installs via the VNC console.
                         try:
+                            # Required fields: node, name and ISO.
                             node = (data.get("node") or "").strip()
                             if not node:
                                 raise pve_cmds.PveError("node is required")
@@ -2670,9 +2989,11 @@ class ProxmoxAgent:
                             volid = (data.get("volid") or "").strip()
                             if not volid:
                                 raise pve_cmds.PveError("volid (ISO) is required")
+                            # Pick a free VMID if not given.
                             new_vmid = data.get("new_vmid")
                             if new_vmid is None:
                                 new_vmid = await pve_cmds.next_free_vmid()
+                            # Tenant tags, pool and hardware sizes (with defaults).
                             ttags_in = data.get("tenant_tags") or (
                                 [data.get("tenant_tag")] if data.get("tenant_tag") else [])
                             tenant_tags = [str(t).strip() for t in ttags_in if str(t).strip()]
@@ -2684,6 +3005,7 @@ class ProxmoxAgent:
                             disk_gb = int(data.get("disk_gb") or 32)
                             bridge = (data.get("bridge") or "vmbr0").strip() or "vmbr0"
                             # pvesh create /nodes/{node}/qemu (cluster-wide API).
+                            # qm create arguments.
                             args = [
                                 "--vmid", str(new_vmid),
                                 "--name", name,
@@ -2694,13 +3016,16 @@ class ProxmoxAgent:
                                 "--net0", f"virtio,bridge={bridge}",
                                 "--ostype", "l26",
                             ]
+                            # Optional pool and tags.
                             if pool:
                                 args += ["--pool", pool]
                             if tags_joined:
                                 args += ["--tags", tags_joined]
+                            # Create the VM.
                             await self._pvesh_action(
                                 "create", f"/nodes/{node}/qemu", *args,
                                 json_out=True, timeout=120)
+                            # Describe the new VM.
                             result = {
                                 "status": "SUCCESS",
                                 "unique_id": f"{self.cluster_name}/{node}/{new_vmid}",
@@ -2728,11 +3053,13 @@ class ProxmoxAgent:
                         # the RFB session. down_q buffers browser frames until
                         # the WSS is open. vmid is unguarded — Hypervisors
                         # console targets real tenant VMs, not the sim floor.
+                        # Session id is required.
                         session_id = data.get("session_id") or ""
                         if not session_id:
                             result = {"status": "ERROR",
                                       "message": "VNC_START requires session_id",
                                       "session_id": session_id}
+                        # New session: register it and start the console proxy.
                         elif session_id not in self._vnc_sessions:
                             self._vnc_sessions[session_id] = {
                                 "down_q": asyncio.Queue(), "px_ws": None, "tasks": [],
@@ -2749,10 +3076,12 @@ class ProxmoxAgent:
                                 result = {"status": "ERROR",
                                           "message": str(e)[:300],
                                           "session_id": session_id}
+                            # Started: return the ticket.
                             else:
                                 result = {"status": "SUCCESS",
                                           "session_id": session_id,
                                           "ticket": ticket}
+                        # Already started: return its existing ticket.
                         else:
                             sess = self._vnc_sessions.get(session_id)
                             if sess is None:
@@ -2769,6 +3098,7 @@ class ProxmoxAgent:
                         # down_q (the drain task forwards to the WSS). No ack —
                         # high-volume; `continue` skips the AGENT_RESPONSE send
                         # so we don't ack every keystroke.
+                        # Queue the browser's bytes for the console session.
                         session_id = data.get("session_id") or ""
                         sess = self._vnc_sessions.get(session_id) if session_id else None
                         if sess is not None:
@@ -2777,12 +3107,14 @@ class ProxmoxAgent:
                                 sess["down_q"].put_nowait(raw)
                             except Exception:
                                 pass
+                        # No reply for streamed frames.
                         continue
 
                     elif cmd_type == "VNC_DISCONNECT":
                         # Browser closed the console (or hub tore down). Close
                         # the Proxmox WSS + drop the session. Don't re-emit
                         # VNC_DISCONNECT up — the hub initiated this side.
+                        # Tear down the session in the background.
                         session_id = data.get("session_id") or ""
                         if session_id:
                             asyncio.create_task(
@@ -2793,6 +3125,7 @@ class ProxmoxAgent:
                         # Hub→spoke→agent: open a PTY bash on THIS node and relay
                         # it to the browser (agent-terminates-PTY, mirrors VNC).
                         # Gated hub-side (admin + opt-in toggle + audit).
+                        # New session: register it and start the shell.
                         session_id = data.get("session_id") or ""
                         if session_id and session_id not in self._shell_sessions:
                             self._shell_sessions[session_id] = {"master_fd": None, "tasks": []}
@@ -2806,27 +3139,32 @@ class ProxmoxAgent:
                                 self._shell_sessions.pop(session_id, None)
                                 result = {"status": "ERROR", "message": str(e)[:300],
                                           "session_id": session_id}
+                        # Already running.
                         else:
                             result = {"status": "SUCCESS", "session_id": session_id}
 
                     elif cmd_type == "SHELL_IN":
                         # Browser→PTY keystrokes. No ack (high-volume) — write to
                         # the PTY and `continue` past the AGENT_RESPONSE send.
+                        # Write the keystrokes to the shell.
                         session_id = data.get("session_id") or ""
                         if session_id:
                             try:
                                 self._shell_write(session_id, base64.b64decode(data.get("data") or ""))
                             except Exception:
                                 pass
+                        # No reply for streamed input.
                         continue
 
                     elif cmd_type == "SHELL_RESIZE":
+                        # Resize the terminal; no reply.
                         session_id = data.get("session_id") or ""
                         if session_id:
                             self._shell_resize(session_id, data.get("rows", 24), data.get("cols", 80))
                         continue
 
                     elif cmd_type == "SHELL_DISCONNECT":
+                        # Tear down the shell in the background.
                         session_id = data.get("session_id") or ""
                         if session_id:
                             asyncio.create_task(
@@ -2839,6 +3177,7 @@ class ProxmoxAgent:
                         # here to install on this node's pveproxy. We install on
                         # the LOCAL node (pvenode is inherently local); the spoke
                         # routed this to us because we own `identifier`/node.
+                        # Install the certificate.
                         result = await self.install_cert(
                             data.get("fullchain", ""), data.get("privkey", ""),
                             node=data.get("identifier") or data.get("node") or "")
@@ -2848,14 +3187,17 @@ class ProxmoxAgent:
                         # the archive to the hub's template repo. ACK immediately;
                         # the long vzdump+upload runs in the background and reports
                         # progress via the token'd /progress endpoint on the hub.
+                        # Start a template backup.
                         result = self._start_template_backup(data)
 
                     elif cmd_type == "REFRESH_TEMPLATE":
                         # Hub-triggered destructive refresh: pause auto-prov, wipe
                         # this host's sim VMs, restore the backup to the template
                         # VMID, resume auto-prov. ACK now; runs in the background.
+                        # Refresh a template.
                         result = self._start_template_refresh(data)
 
+                    # Build the signed reply.
                     resp = {
                         "header": {
                             "message_id":   str(uuid.uuid4()),
@@ -2866,11 +3208,13 @@ class ProxmoxAgent:
                         },
                         "payload": {"type": "AGENT_RESPONSE", "data": result},
                     }
+                    # Stop progress pings and send the reply.
                     if _prog_task is not None:
                         _prog_task.cancel()
                     await websocket.send(encode_frame(self.signer, resp))
 
             finally:
+                # Socket closed: stop the background loops.
                 heartbeat_task.cancel()
                 telemetry_task.cancel()
                 # Clear the socket reference. _HubLogRelayHandler.emit gates on
@@ -2886,8 +3230,11 @@ class ProxmoxAgent:
                 # connect, instead of being dropped.
 
     async def _heartbeat_loop(self):
+        """Send a heartbeat every 30 seconds until the socket fails."""
+        # Loop until cancelled or a send fails.
         while True:
             try:
+                # Build and send the heartbeat, then wait.
                 msg = {
                     "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
                                "sender_id": self.agent_id, "destination_id": "pxmx-spoke"},
@@ -2895,6 +3242,7 @@ class ProxmoxAgent:
                 }
                 await self.websocket.send(encode_frame(self.signer, msg))
                 await asyncio.sleep(30)
+            # Let cancellation through.
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -2908,12 +3256,16 @@ class ProxmoxAgent:
                 return
 
     async def _telemetry_loop(self):
+        """Collect metrics, VM list and node stats each cycle and send them as telemetry."""
+        # Loop until cancelled; each pass sends one frame.
         while True:
             try:
+                # Start time of this pass.
                 _body_t0 = time.time()
                 # Resolve cluster name on startup, then re-check every TTL — a host
                 # can join/leave a Proxmox cluster, or the first lookup can hit a
                 # transient pvesh failure, so this must not be a one-shot resolution.
+                # Re-read the cluster name when its cache expires.
                 if (_body_t0 - self._cluster_name_ts) >= self._cluster_name_ttl:
                     resolved = await self._fetch_cluster_name()
                     if resolved != self.cluster_name:
@@ -2942,6 +3294,7 @@ class ProxmoxAgent:
                     """(name, value|None, elapsed_ms, error|None). Bounds the phase
                     at _COLLECT_DEADLINE_S; never raises except on task cancellation
                     (which must propagate so a reconnect can tear the loop down)."""
+                    # Run the coroutine within the deadline and time it.
                     _t0 = time.time()
                     try:
                         _r = await asyncio.wait_for(coro, timeout=_COLLECT_DEADLINE_S)
@@ -2950,10 +3303,12 @@ class ProxmoxAgent:
                         raise
                     except Exception as _e:  # noqa: BLE001
                         return name, None, int((time.time() - _t0) * 1000), _e
+                # Run the three collectors in parallel.
                 _phase = {n: (val, ms, err) for (n, val, ms, err) in await asyncio.gather(
                     _timed("metrics",    self.collect_metrics()),
                     _timed("vm_list",    self.get_vm_list()),
                     _timed("node_stats", self.get_node_stats()))}
+                # Unpack each result.
                 (_m_val, _m_ms, _m_err) = _phase["metrics"]
                 (_v_val, _v_ms, _v_err) = _phase["vm_list"]
                 (_n_val, _n_ms, _n_err) = _phase["node_stats"]
@@ -2967,6 +3322,7 @@ class ProxmoxAgent:
                 # 'telemetry stale' badge is honest, going dark is not. _*_ms
                 # carries the REAL elapsed even on failure so the freshness
                 # diagnostic points at the culprit (~25000ms reads as "stalled").
+                # Use fresh results, or the last good ones where a phase failed.
                 if _m_err is None:
                     metrics = self._last_metrics = _m_val
                 else:
@@ -2984,6 +3340,7 @@ class ProxmoxAgent:
                 # each ran before its deadline — turns the old opaque "collect
                 # exceeded 25s" into an actionable "vm_list=25000ms (TimeoutError)"
                 # while the other phases still shipped live.
+                # Log any phases that failed.
                 _failed = [(n, _phase[n][1], _phase[n][2])
                            for n in ("metrics", "vm_list", "node_stats")
                            if _phase[n][2] is not None]
@@ -2994,6 +3351,7 @@ class ProxmoxAgent:
                         "those, live for the rest: %s", _COLLECT_DEADLINE_S,
                         ", ".join(f"{n}={ms}ms ({type(e).__name__}: {e})"
                                   for (n, ms, e) in _failed))
+                # Record phase timings and count this pass.
                 self._last_phase_ms = {
                     "metrics_ms":    _m_ms,
                     "vm_list_ms":    _v_ms,
@@ -3001,11 +3359,13 @@ class ProxmoxAgent:
                 }
                 self._telemetry_iter = getattr(self, "_telemetry_iter", 0) + 1
 
+                # Log collector errors.
                 if vms.get("error"):
                     logger.error(f"get_vm_list error: {vms['error']}")
                 if nodes.get("error"):
                     logger.error(f"get_node_stats error: {nodes['error']}")
 
+                # Counts for logging.
                 _vm_n = len(vms.get('vms', []))
                 _node_n = len(nodes.get('nodes', []))
                 # Per-tick detail stays DEBUG (chatty, every ~60s).
@@ -3016,10 +3376,12 @@ class ProxmoxAgent:
                 # enabling DEBUG — the normalization demoted the per-tick line, so
                 # this restores a periodic heartbeat that also surfaces the #1
                 # question ("is CS mode on?"). cs_mode=off → VM Server will be empty.
+                # Every 5 minutes, log a one-line status.
                 _now = time.time()
                 if _now - getattr(self, "_last_status_log", 0.0) >= 300:
                     self._last_status_log = _now
                     _reason = None
+                    # Include why provisioning is running, if it is.
                     if self.cs_enabled:
                         try:
                             from . import usb_provision as _up
@@ -3035,6 +3397,7 @@ class ProxmoxAgent:
                 # the first tick → applies the persisted config after a restart).
                 # config.get is None until the operator has ever set it, so we
                 # NEVER touch root's crontab on a node that doesn't use this.
+                # Every 10 minutes, re-apply the managed crontab.
                 _cron = self.config.get("managed_crontab")
                 if _cron is not None and (_now - getattr(self, "_last_cron_reconcile", 0.0) >= 600):
                     self._last_cron_reconcile = _now
@@ -3043,6 +3406,7 @@ class ProxmoxAgent:
                     except Exception:  # noqa: BLE001 — telemetry must not die on a cron error
                         pass
 
+                # Build the telemetry frame.
                 msg = {
                     "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
                                "sender_id": self.agent_id, "destination_id": "pxmx-spoke"},
@@ -3066,6 +3430,7 @@ class ProxmoxAgent:
                 # Bound the send so a backpressured hub can't hang here and
                 # freeze the telemetry loop (defeating the collect watchdogs). On
                 # timeout, log and skip THIS frame — the loop advances.
+                # Send it, giving up after 10 seconds.
                 try:
                     await asyncio.wait_for(
                         self.websocket.send(encode_frame(self.signer, msg)),
@@ -3082,6 +3447,7 @@ class ProxmoxAgent:
                 # 60s tick (the bash agent pushed every 3s; HEALTH_STALE_SECS=180
                 # gives ample margin). send_cs_event injects hostname + agent_id.
                 _usb_sig = None   # USB present-set for the fast-tick trigger below
+                # Client-simulation telemetry.
                 if self.cs_enabled:
                     try:
                         # Classify each VM's tier by passthrough (cached ~60s) in
@@ -3097,6 +3463,7 @@ class ProxmoxAgent:
                         # vms/nodes and the LAST-KNOWN tiers (tiers change slowly, so
                         # reusing them one tick is harmless; the VM list is what the
                         # operator is waiting on).
+                        # Compute VM tiers within the deadline, falling back if slow.
                         try:
                             tiers = await asyncio.wait_for(
                                 usb_provision.compute_vm_tiers(
@@ -3116,6 +3483,8 @@ class ProxmoxAgent:
                         # Present T1/T3 PCI devices (host lspci ∩ the t1/t3 allow-lists)
                         # for the WebUI PCI tab. Best-effort; cache so a transient lspci
                         # miss keeps the last-known list instead of blanking the tab.
+                        # Collect PCI device info within the deadline, keeping the last list if
+                        # slow.
                         try:
                             # Bounded like tiers: lspci can block on a host under
                             # heavy qm load, and the PCI tab is cosmetic next to
@@ -3135,6 +3504,7 @@ class ProxmoxAgent:
                         # refresh "Destination storage" dropdown. 120s TTL memo +
                         # bounded like PCI/tiers so a slow pvesh can't stall the
                         # loop; on timeout keep the last-known list.
+                        # Collect local storages within the deadline.
                         try:
                             self._last_storages = await asyncio.wait_for(
                                 self._local_node_storages(), timeout=_PCI_DEADLINE_S)
@@ -3145,6 +3515,7 @@ class ProxmoxAgent:
                                 _PCI_DEADLINE_S)
                         except Exception as _se:  # noqa: BLE001
                             logger.debug(f"local_node_storages failed: {_se}")
+                        # Build and send the cs telemetry.
                         cs_body = self._cs_telemetry_body(vms, nodes, tiers)
                         # Bounded like the AGENT_TELEMETRY send above. An
                         # unbounded send stalls the WHOLE loop behind a
@@ -3164,6 +3535,7 @@ class ProxmoxAgent:
                         # must propagate in seconds, but a USB change flips none of
                         # the VM/node/prov flags — so fold it into the fast-tick
                         # diff below (was: dongles waited out the full 60s tick).
+                        # Fingerprint the USB devices seen.
                         try:
                             _all_usb = ((cs_body.get("present_usb") or [])
                                         + (cs_body.get("unknown_usb") or [])
@@ -3185,6 +3557,7 @@ class ProxmoxAgent:
                 # VM Server / Overview / USB view reflects them. Diff this tick's
                 # vmid set + node count + USB present-set vs the last; on a change,
                 # open a short fast-tick window so it propagates in seconds.
+                # Fingerprint VMs, their states, node count and USB devices.
                 try:
                     _sig = (
                         frozenset(str(v.get("vmid")) for v in (vms or {}).get("vms", [])
@@ -3201,6 +3574,7 @@ class ProxmoxAgent:
                     )
                 except Exception:  # noqa: BLE001
                     _sig = None
+                # Changed: tick fast for a while (not on the first pass).
                 if _sig is not None and _sig != getattr(self, "_last_vm_sig", None):
                     # Skip the very first tick (last is None → establishing baseline).
                     if getattr(self, "_last_vm_sig", None) is not None:
@@ -3213,7 +3587,9 @@ class ProxmoxAgent:
                 # deleting, or recloning — OR just after ANY VM/node change (above)
                 # — tick fast (~3s, the old bash cadence) so the UI shows changes in
                 # near real time; fall back to 60s when idle.
+                # Normal cadence is 60 seconds.
                 interval = 60
+                # Tick every 3 seconds while provisioning, deleting or recloning.
                 if self.cs_enabled:
                     try:
                         pr = usb_provision.current_prov_run()
@@ -3244,6 +3620,7 @@ class ProxmoxAgent:
                             # After _FAST_CADENCE_MAX_S of CONTINUOUS fast ticking,
                             # back off: sustained activity means something is stuck,
                             # and polling it 20x/min is not what unsticks it.
+                            # Note when fast ticking started; cap it if it has lasted too long.
                             _fs = getattr(self, "_fast_since", None)
                             if _fs is None:
                                 self._fast_since = _now
@@ -3258,6 +3635,7 @@ class ProxmoxAgent:
                                         "USB controller detaching dongles in a loop; check the "
                                         "quarantine list for several ports on ONE card.",
                                         _now - _fs, 3, _FAST_CADENCE_BACKOFF_S)
+                        # Idle: reset the fast-tick state.
                         else:
                             if getattr(self, "_fast_capped", False):
                                 logger.info("telemetry cadence back to normal — "
@@ -3266,6 +3644,7 @@ class ProxmoxAgent:
                             self._fast_capped = False
                     except Exception:  # noqa: BLE001 — cadence hint only
                         pass
+                # Recent VM change: tick fast too (unless capped).
                 if _now < getattr(self, "_vm_change_fast_until", 0):
                     # The VM-change burst is self-limiting (a short window after a
                     # change), so it is not capped -- but it must not undercut the
@@ -3274,6 +3653,7 @@ class ProxmoxAgent:
                 # Record the cadence chosen this tick + when we finished, so the
                 # detail page can show the effective interval and the true gap
                 # between telemetry frames (not just the per-phase durations).
+                # Record the cadence and that this tick finished (the watchdog reads these).
                 self._last_interval_s = interval
                 self._last_tick_done_ts = time.time()
                 # TOTAL loop-body time, separate from the per-collect phases. The
@@ -3282,11 +3662,14 @@ class ProxmoxAgent:
                 # frame age with healthy-looking phase_ms, which reads as
                 # "spoke/hub relay lag" when the agent itself is the one stuck.
                 # Recording it makes body-vs-sleep answerable at a glance.
+                # Record how long the pass took.
                 try:
                     (self._last_phase_ms or {})["body_ms"] = int((self._last_tick_done_ts - _body_t0) * 1000)
                 except Exception:  # noqa: BLE001 — diagnostics only
                     pass
+                # Wait for the next pass.
                 await asyncio.sleep(interval)
+            # Any error: log and retry in 10 seconds.
             except Exception as e:
                 logger.error(f"Telemetry push failed: {e}")
                 await asyncio.sleep(10)
@@ -3305,8 +3688,10 @@ class ProxmoxAgent:
         classified against the hub-delivered certified/ignored vidpid sets.
         Hostname/agent_id are added by ``send_cs_event``.
         """
+        # Client-simulation settings.
         cs_cfg = self.config.get("client_simulation") or {}
 
+        # First node's stats make up the node summary.
         nodes_list = (nodes_resp or {}).get("nodes", []) or []
         first = nodes_list[0] if nodes_list else {}
         mem_used = first.get("mem_used", 0) or 0
@@ -3327,18 +3712,23 @@ class ProxmoxAgent:
         }
 
         def _is_template(v: Dict[str, Any]) -> bool:
+            """True if the VM is a template, or is tagged or named as one."""
             # Honor the real Proxmox ``template: 1`` flag first — a VM converted
             # with ``qm template`` carries this even when it has no "template"
             # tag and a non-template name (the case that misfiled templates as
             # 'Other'). int flags from /cluster/resources: 1 = template.
+            # Proxmox template flag.
             if int(v.get("template", 0) or 0):
                 return True
+            # Template tag.
             tags = [str(t).lower() for t in (v.get("tags") or [])]
             if any(t in ("template", "tmpl", "is-template") for t in tags):
                 return True
+            # Template name prefix.
             name = str(v.get("name", "")).lower()
             return name.startswith(("template-", "tmpl-"))
 
+        # Per-VM tier, health and visible Wi-Fi data (advisory; empty on error).
         tiers = tiers or {}
         try:
             _health = usb_provision.current_guest_health()
@@ -3360,6 +3750,7 @@ class ProxmoxAgent:
         # (name mismatch / an older agent that predates the ``node`` field),
         # keep the unfiltered list. Showing a cluster-wide count is a much
         # smaller failure than blanking the fleet's VM list entirely.
+        # Keep only VMs on this node, warning once if none match.
         _all_vms = (vms_resp or {}).get("vms", []) or []
         _local = str(getattr(self, "_local_node", "") or self.hostname or "").strip()
         if _local and _all_vms:
@@ -3374,6 +3765,7 @@ class ProxmoxAgent:
                     "UNFILTERED cluster-wide list; the per-host VM count will be a "
                     "cluster total", _local,
                     sorted({str((v or {}).get("node") or "?") for v in _all_vms})[:5])
+        # Build the per-VM records.
         vms = []
         for v in _all_vms:
             v = v or {}
@@ -3410,6 +3802,7 @@ class ProxmoxAgent:
         # default the allocator derives a per-host block from this host's
         # hostname suffix (svr-02→90025-90048), so reporting the flat default
         # here would be wrong. Resolve the same way (incl. vm_set_override).
+        # This host's VMID range.
         _usb = cs_cfg.get("usb_config") or {}
         _max_slots = int(usb_provision._cfg_first(
             _usb, ("usb_max_slots", "max_slots"), 24) or 24)
@@ -3423,6 +3816,7 @@ class ProxmoxAgent:
         # USB passthrough detail: scan /sys/bus/usb/devices and classify against
         # the hub-delivered certified/ignored vidpid sets. Best-effort → empty
         # lists on any failure (the cs spoke tolerates empty).
+        # Scan USB devices.
         try:
             usb = usb_provision.cs_usb_telemetry(self)
         except Exception as exc:  # noqa: BLE001
@@ -3430,6 +3824,7 @@ class ProxmoxAgent:
             usb = {"usb_state": [], "present_usb": [], "unknown_usb": [],
                    "quarantine": [], "excluded": []}
 
+        # The full telemetry body.
         return {
             "node":             node,
             "vms":              vms,
@@ -3536,6 +3931,8 @@ class ProxmoxAgent:
     # _hw_watchdog_loop, _vm_agent_watchdog_loop) inside _start_cs_tasks.
 
     async def _set_cs_enabled(self, enabled: bool) -> None:
+        """Turn client simulation on or off, starting or stopping its background tasks."""
+        # Turning on: start the cs tasks and make sure the hub token exists.
         if enabled and not self.cs_enabled:
             self.cs_enabled = True
             cs_cfg = self.config.get("client_simulation") or {}
@@ -3548,6 +3945,7 @@ class ProxmoxAgent:
             _tok_task = asyncio.create_task(self._ensure_cs_hub_token("auto"))
             self._cs_long_ops.add(_tok_task)
             _tok_task.add_done_callback(self._cs_long_ops.discard)
+        # Turning off: stop the cs tasks.
         elif not enabled and self.cs_enabled:
             self.cs_enabled = False
             logger.info("client_simulation disabled")
@@ -3567,6 +3965,7 @@ class ProxmoxAgent:
         its precondition is absent, so spawning them unconditionally on CS-enable
         is safe.
         """
+        # Start each loop and keep it in the task set.
         self._cs_tasks.add(asyncio.create_task(watchdogs.hw_watchdog_loop(self)))
         self._cs_tasks.add(asyncio.create_task(watchdogs.vm_agent_watchdog_loop(self)))
         self._cs_tasks.add(asyncio.create_task(self._usb_blacklist_loop()))
@@ -3578,6 +3977,7 @@ class ProxmoxAgent:
         """Re-apply the dongle-driver blacklist every 5 min. Idempotent
         (usb_provision.blacklist_dongle_drivers only writes on diff) and a no-op
         when no dongle_vidpids are configured (pre-Phase D)."""
+        # Re-apply every 5 minutes; errors are logged and retried.
         while True:
             try:
                 await usb_provision.blacklist_dongle_drivers(self)
@@ -3590,6 +3990,7 @@ class ProxmoxAgent:
     async def _usb_provision_loop(self) -> None:
         """Periodic USB-provision pass (Phase E). No-ops when no dongle_vidpids
         are configured. Interval defaults to 60s (env USB_PROVISION_INTERVAL_S)."""
+        # Pass interval, at least 15 seconds.
         interval = 60
         try:
             interval = max(15, int(os.environ.get("USB_PROVISION_INTERVAL_S", "60")))
@@ -3607,15 +4008,18 @@ class ProxmoxAgent:
             cfg_wait_s = max(0, int(os.environ.get("USB_PROVISION_CONFIG_WAIT_S", "300")))
         except Exception:
             pass
+        # Wait up to the limit for the hub to send its config.
         waited = 0.0
         while not self._cs_config_synced and waited < cfg_wait_s:
             await asyncio.sleep(2)
             waited += 2
+        # Log whether the config arrived.
         if self._cs_config_synced:
             logger.info("usb_provision: hub config confirmed after %.0fs — starting provision passes", waited)
         else:
             logger.warning("usb_provision: hub config NOT confirmed after %ds — proceeding on cached config; "
                            "auto-provision may act on stale settings until the hub reconnects", cfg_wait_s)
+        # Run a pass each interval; errors are logged and retried.
         while True:
             try:
                 # Feed the rolling 1h cpu/mem window the auto-provision brain
@@ -3635,9 +4039,11 @@ class ProxmoxAgent:
         """Cancel every running CS background task + any in-flight long op /
         token-provision task and clear the groups. A disabled host stops
         mutating VMs immediately."""
+        # Cancel and forget the background loops.
         for task in list(self._cs_tasks):
             task.cancel()
         self._cs_tasks.clear()
+        # Cancel and forget in-flight long operations.
         for task in list(self._cs_long_ops):
             task.cancel()
         self._cs_long_ops.clear()
@@ -3645,6 +4051,7 @@ class ProxmoxAgent:
 
 
 if __name__ == "__main__":
+    # Command-line options.
     parser = argparse.ArgumentParser()
     # --spoke-ip is the normal way to pin the agent: supply ONLY the spoke's IP
     # (or hostname) and the agent probes its known /ws/agent endpoints to work
@@ -3667,11 +4074,13 @@ if __name__ == "__main__":
     parser.add_argument("--id", default=None)
     parser.add_argument("--secret")
     args = parser.parse_args()
+    # Default the agent id to the hostname.
     if not args.id:
         # Derived id = the bare hostname (no "-agent" suffix). A pinned --id
         # still wins; only the unpinned/derived case is affected.
         args.id = socket.gethostname()
 
+    # Start the agent; Ctrl-C exits quietly.
     try:
         agent = ProxmoxAgent(args.spoke_url, args.id, args.secret,
                              spoke_ip=args.spoke_ip)

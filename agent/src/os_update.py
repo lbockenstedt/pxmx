@@ -45,20 +45,26 @@ VENDORED: ``pxmx/agent/src/os_update.py`` is a verbatim copy. Change both.
 """
 from __future__ import annotations
 
+# base64 safely ships the helper file over a shell; logging for diagnostics.
 import base64
 import logging
+# os/pwd for paths and users; pty/select drive su/sudo password prompts.
 import os
 import pty
 import pwd
+# re validates names; shlex quotes shell args; shutil finds binaries.
 import re
 import select
 import shlex
 import shutil
+# signal/subprocess/time run and time-limit the apt and helper commands.
 import signal
 import subprocess
 import time
+# Type hints only.
 from typing import Any, Dict, List, Optional
 
+# Named logger for OS-update messages.
 logger = logging.getLogger("OsUpdate")
 
 # apt needs an explicit non-interactive posture or a changed config file opens a
@@ -70,11 +76,13 @@ _APT_ENV = {
     "APT_LISTCHANGES_FRONTEND": "none",
     "NEEDRESTART_MODE": "a",
 }
+# dpkg options: keep existing config files, take the package default for new ones.
 _APT_CONF = [
     "-o", "Dpkg::Options::=--force-confdef",
     "-o", "Dpkg::Options::=--force-confold",
 ]
 
+# Subprocess timeouts for check (list) and apply (upgrade) runs.
 CHECK_TIMEOUT_S = 180
 APPLY_TIMEOUT_S = 3600      # a PVE dist-upgrade on a slow mirror genuinely takes this long
 
@@ -87,6 +95,8 @@ _APPLY_LOCK_TIMEOUT_S = 600
 
 
 def _lock_flags(timeout_s: int) -> List[str]:
+    """Return apt options telling it to wait up to timeout_s for the dpkg lock."""
+    # apt's lock-wait option.
     return ["-o", f"DPkg::Lock::Timeout={timeout_s}"]
 
 
@@ -94,25 +104,31 @@ def _lock_flags(timeout_s: int) -> List[str]:
 # hub only offers package selection / reboot for nodes that report them.
 FEATURES = ["packages", "reboot", "fix_access"]
 
+# Root helper install path, its source in this repo, its sudoers rule, and the fix timeout.
 HELPER = "/usr/local/bin/lm-os-update"
 HELPER_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "..", "..", "scripts", "lm-os-update")
 SUDOERS_FILE = "/etc/sudoers.d/lm-os-update"
 FIX_ACCESS_TIMEOUT_S = 120
+# Valid Linux user names.
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_.-]*$")
 # Debian package name, optionally arch-qualified. Same rule as the helper's.
 _PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.\-]*(:[a-z0-9\-]+)?$")
 
 
 def _is_root() -> bool:
+    """True when running as root (or on a platform without geteuid)."""
+    # Missing geteuid (non-POSIX) counts as root.
     return getattr(os, "geteuid", lambda: 0)() == 0
 
 
 def _privileged(action: str, args: Optional[List[str]] = None) -> List[str]:
     """argv for a root-only step: direct when root, else via the sudo helper."""
+    # Non-root nodes go through the sudo helper with the same action name.
     args = list(args or [])
     if not _is_root():
         return ["sudo", "-n", HELPER, action, *args]
+    # Root nodes run the equivalent command directly.
     direct = {
         "update": ["apt-get", "update", "-qq", *_lock_flags(_CHECK_LOCK_TIMEOUT_S)],
         "dist-upgrade": ["apt-get", "dist-upgrade", "-y", *_APT_CONF,
@@ -126,14 +142,18 @@ def _privileged(action: str, args: Optional[List[str]] = None) -> List[str]:
 
 def _privilege_blocker() -> str:
     """Why this node can't run apt/reboot itself ("" when it can)."""
+    # Root, or the helper is installed: nothing blocks.
     if _is_root() or os.path.exists(HELPER):
         return ""
+    # Otherwise explain how to fix it.
     return ("this node runs as a non-root user and the lm-os-update helper is not "
             "installed — use Fix access (one-time root password) or re-run the "
             "node's installer")
 
 
 def _run(argv: List[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run a command with captured text output, a timeout, and the non-interactive apt env."""
+    # Capture stdout/stderr as text and apply the apt env.
     return subprocess.run(argv, capture_output=True, text=True,
                           timeout=timeout, env=_APT_ENV)
 
@@ -151,19 +171,23 @@ def detect_capability() -> Dict[str, Any]:
         return {"eligible": False, "manager": None, "flavor": "truenas",
                 "reason": "TrueNAS is appliance-managed — update it from its own UI "
                           "(apt here corrupts the appliance updater)"}
+    # OPNsense is FreeBSD; apt does not apply.
     if os.path.exists("/usr/local/sbin/opnsense-version"):
         return {"eligible": False, "manager": None, "flavor": "opnsense",
                 "reason": "OPNsense is FreeBSD and appliance-managed — update it "
                           "from its own UI"}
+    # No apt-get at all: not Debian-family.
     if not shutil.which("apt-get"):
         return {"eligible": False, "manager": None, "flavor": "unknown",
                 "reason": "no apt-get on this node — not a Debian-family host"}
+    # Debian-family host; note whether it is Proxmox.
     flavor = "proxmox" if shutil.which("pveversion") else "debian"
     return {"eligible": True, "manager": "apt", "flavor": flavor, "reason": ""}
 
 
 def _reboot_required() -> bool:
     """Debian marks this file; Proxmox kernel updates set it too."""
+    # Either location of the marker file means a reboot is pending.
     return os.path.exists("/var/run/reboot-required") or os.path.exists("/run/reboot-required")
 
 
@@ -179,14 +203,18 @@ def _parse_upgradable(text: str) -> List[Dict[str, str]]:
     everything regardless; the flag exists so the approval panel can show what a
     batch actually contains rather than just a count.
     """
+    # Parsed rows.
     out: List[Dict[str, str]] = []
+    # Skip blank lines, the "Listing..." header, and anything without a suite.
     for line in (text or "").splitlines():
         line = line.strip()
         if not line or line.startswith("Listing") or "/" not in line:
             continue
+        # Pull package, suite, candidate version, and current version.
         m = re.match(r"^([^/\s]+)/(\S+)\s+(\S+)\s+\S+\s+\[upgradable from:\s*([^\]]+)\]", line)
         if not m:
             continue
+        # Flag security updates by suite name.
         suite = m.group(2)
         out.append({"package": m.group(1), "suite": suite,
                     "candidate": m.group(3), "current": m.group(4).strip(),
@@ -196,6 +224,7 @@ def _parse_upgradable(text: str) -> List[Dict[str, str]]:
 
 def os_release() -> Dict[str, str]:
     """``{"id": "debian", "codename": "trixie"}`` from /etc/os-release."""
+    # Read KEY=value lines; a missing file yields empty fields.
     info: Dict[str, str] = {}
     try:
         with open("/etc/os-release") as f:
@@ -204,6 +233,7 @@ def os_release() -> Dict[str, str]:
                 info[key] = value.strip().strip('"')
     except OSError:
         pass
+    # Return just the distro id and codename.
     return {"id": info.get("ID", ""), "codename": info.get("VERSION_CODENAME", "")}
 
 
@@ -213,12 +243,15 @@ def installed_packages() -> List[List[str]]:
     Rows are ``[package, version]``, or ``[package, version, source,
     source_version]`` when the source package differs — CVEs are tracked per
     source package. Read-only; [] if dpkg-query fails."""
+    # dpkg-query format: status, package, version, source package, source version.
     fmt = "${db:Status-Abbrev}\t${Package}\t${Version}\t${source:Package}\t${source:Version}\n"
+    # Run dpkg-query; on failure return nothing.
     try:
         r = _run(["dpkg-query", "-W", "-f", fmt], CHECK_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001
         logger.warning("dpkg-query failed: %s", exc)
         return []
+    # Keep installed ("ii") rows; add source fields only when they differ.
     rows: List[List[str]] = []
     for line in (r.stdout or "").splitlines():
         parts = line.split("\t")
@@ -231,13 +264,16 @@ def installed_packages() -> List[List[str]]:
 
 def check_updates(refresh: bool = True) -> Dict[str, Any]:
     """List pending OS package updates. Read-only — never installs anything."""
+    # Not eligible: return an empty, successful result with the reason.
     cap = detect_capability()
     if not cap["eligible"]:
         return {"status": "SUCCESS", "eligible": False, "reason": cap["reason"],
                 "flavor": cap["flavor"], "packages": [], "count": 0,
                 "reboot_required": False}
+    # Non-fatal warnings and whether we have privilege to refresh.
     warnings: List[str] = []
     blocker = _privilege_blocker()
+    # Refresh the package lists if asked and allowed; failures only warn.
     if refresh and blocker:
         warnings.append("package lists not refreshed: " + blocker)
     elif refresh:
@@ -252,6 +288,7 @@ def check_updates(refresh: bool = True) -> Dict[str, Any]:
             warnings.append(f"apt-get update timed out after {CHECK_TIMEOUT_S}s")
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"apt-get update failed: {exc}")
+    # List upgradable packages; a failure here is an error.
     try:
         r = _run(["apt", "list", "--upgradable"], CHECK_TIMEOUT_S)
         pkgs = _parse_upgradable(r.stdout)
@@ -260,6 +297,7 @@ def check_updates(refresh: bool = True) -> Dict[str, Any]:
                 "message": f"listing upgradable packages failed: {exc}",
                 "packages": [], "count": 0, "reboot_required": _reboot_required(),
                 "warnings": warnings}
+    # Count security updates and return the full result plus the CVE inventory.
     sec = sum(1 for p in pkgs if p.get("security"))
     return {"status": "SUCCESS", "eligible": True, "flavor": cap["flavor"],
             "packages": pkgs, "count": len(pkgs),
@@ -280,18 +318,22 @@ def apply_updates(packages: Optional[List[str]] = None) -> Dict[str, Any]:
     surface a badge. Output is tail-capped: a dist-upgrade log is enormous and
     the useful part is the end.
     """
+    # Only eligible nodes are upgraded.
     cap = detect_capability()
     if not cap["eligible"]:
         # Refuse rather than fall back to something clever. An "update" path that
         # improvises on an appliance is exactly how you break one.
         return {"status": "ERROR", "eligible": False, "reason": cap["reason"],
                 "message": f"refusing to apply updates: {cap['reason']}"}
+    # Need root or the helper.
     blocker = _privilege_blocker()
     if blocker:
         return {"status": "ERROR", "eligible": True, "message": blocker,
                 "reboot_required": _reboot_required()}
+    # Packages actually upgraded and those skipped as no longer pending.
     selected: List[str] = []
     skipped: List[str] = []
+    # Selective mode: require at least one name and validate every name.
     if packages is not None:
         names = [str(p).strip() for p in packages if str(p).strip()]
         if not names:
@@ -301,11 +343,14 @@ def apply_updates(packages: Optional[List[str]] = None) -> Dict[str, Any]:
         if bad:
             return {"status": "ERROR", "eligible": True,
                     "message": f"invalid package name(s): {', '.join(bad[:10])}"}
+    # Refresh and snapshot what is pending before the upgrade.
     before = check_updates(refresh=True)
+    # Selective mode: upgrade only names that are still pending.
     if packages is not None:
         pending = {p.get("package") for p in before.get("packages") or []}
         selected = [p for p in dict.fromkeys(names) if p in pending]
         skipped = [p for p in dict.fromkeys(names) if p not in pending]
+        # Nothing left to do: report success without running apt.
         if not selected:
             return {"status": "SUCCESS", "eligible": True, "flavor": cap["flavor"],
                     "mode": "packages", "applied": 0, "packages_applied": [],
@@ -313,8 +358,10 @@ def apply_updates(packages: Optional[List[str]] = None) -> Dict[str, Any]:
                     "reboot_required": _reboot_required(),
                     "message": "none of the selected packages are still pending"}
         argv = _privileged("upgrade-only", selected)
+    # Full mode: dist-upgrade everything.
     else:
         argv = _privileged("dist-upgrade")
+    # Run the upgrade; a timeout or launch failure is reported, never retried.
     try:
         r = _run(argv, APPLY_TIMEOUT_S)
     except subprocess.TimeoutExpired:
@@ -325,9 +372,12 @@ def apply_updates(packages: Optional[List[str]] = None) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         return {"status": "ERROR", "eligible": True, "message": str(exc),
                 "reboot_required": _reboot_required()}
+    # Re-list (no refresh) to count what was applied.
     after = check_updates(refresh=False)
+    # Success flag and a label for the error message.
     ok = r.returncode == 0
     step = "dist-upgrade" if packages is None else "package upgrade"
+    # Result with counts, reboot flag, and the tail of the output.
     return {
         "status": "SUCCESS" if ok else "ERROR",
         "eligible": True,
@@ -351,13 +401,16 @@ def reboot_node() -> Dict[str, Any]:
     Only ever called on an explicit operator action. The delay lets this node
     answer the hub before it goes down; ``shutdown -c`` on the host cancels it.
     """
+    # Only eligible nodes can be rebooted.
     cap = detect_capability()
     if not cap["eligible"]:
         return {"status": "ERROR", "eligible": False,
                 "message": f"refusing to reboot: {cap['reason']}"}
+    # Need root or the helper.
     blocker = _privilege_blocker()
     if blocker:
         return {"status": "ERROR", "eligible": True, "message": blocker}
+    # Schedule the reboot; report a launch failure or non-zero exit.
     try:
         r = _run(_privileged("reboot"), 30)
     except Exception as exc:  # noqa: BLE001
@@ -379,25 +432,30 @@ def _run_with_password(argv: List[str], password: str, max_prompts: int,
     rejected, so the child is killed instead of left waiting. Returns
     ``(returncode, output)`` with the password scrubbed from the output.
     """
+    # Fork a child on a new pty and exec the command in it.
     pid, fd = pty.fork()
     if pid == 0:  # child
         try:
             os.execvp(argv[0], argv)
         finally:
             os._exit(127)
+    # Output so far, how much of it was already answered, and a deadline.
     out = b""
     answered_upto = 0
     answers = 0
     deadline = time.monotonic() + timeout
     killed = False
     try:
+        # Read output until the child exits, the deadline passes, or a password is rejected.
         while True:
             if time.monotonic() > deadline:
                 killed = True
                 break
+            # Wait briefly for output so the deadline is checked regularly.
             ready, _, _ = select.select([fd], [], [], 0.5)
             if not ready:
                 continue
+            # Read output; EIO or EOF means the child is done.
             try:
                 chunk = os.read(fd, 1024)
             except OSError:  # EIO: the child closed the terminal
@@ -405,6 +463,7 @@ def _run_with_password(argv: List[str], password: str, max_prompts: int,
             if not chunk:
                 break
             out += chunk
+            # Answer a new "Password:" prompt, unless we already used every allowed answer.
             pending = out[answered_upto:]
             if b"assword" in pending.lower() and pending.rstrip().endswith(b":"):
                 if answers >= max_prompts:
@@ -414,6 +473,7 @@ def _run_with_password(argv: List[str], password: str, max_prompts: int,
                 answers += 1
                 answered_upto = len(out)
     finally:
+        # Kill the child if we gave up; always close the pty and reap it.
         if killed:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -421,6 +481,7 @@ def _run_with_password(argv: List[str], password: str, max_prompts: int,
                 pass
         os.close(fd)
         _, status = os.waitpid(pid, 0)
+    # Exit code (-1 when killed), and output with the password scrubbed.
     rc = os.waitstatus_to_exitcode(status) if not killed else -1
     text = out.decode(errors="replace").replace(password, "***")
     return rc, text
@@ -434,6 +495,7 @@ def _install_script(helper: bytes, svc_user: str) -> str:
     dotted temp name (sudo ignores those) and only moved into place once
     ``visudo`` accepts it.
     """
+    # Encode the helper and build the sudoers line.
     b64 = base64.b64encode(helper).decode()
     rule = f"{svc_user} ALL=(ALL) NOPASSWD: {HELPER} *"
     # The helper goes in LAST: its presence is what marks the node unblocked,
@@ -460,39 +522,48 @@ def fix_access(username: str, password: str) -> Dict[str, Any]:
     su + sudo) to install the lm-os-update helper and its sudoers rule. The
     password is used for this one call and then dropped.
     """
+    # Already unblocked: nothing to do.
     if not _privilege_blocker():
         return {"status": "SUCCESS", "message": "updates are already enabled on this node"}
+    # Default to root; validate the user name and require a password.
     username = (username or "root").strip()
     if not _USER_RE.match(username):
         return {"status": "ERROR", "message": "invalid username"}
     if not password:
         return {"status": "ERROR", "message": "a password is required"}
+    # Read the helper script from this checkout.
     try:
         with open(HELPER_SOURCE, "rb") as f:
             helper = f.read()
     except OSError:
         return {"status": "ERROR",
                 "message": "helper script not found on this node — update LM on it first"}
+    # The service user gets the sudoers rule; wrap the install script for su -c.
     svc_user = pwd.getpwuid(os.geteuid()).pw_name
     command = "sh -c " + shlex.quote(_install_script(helper, svc_user))
+    # root needs one prompt (su); another user needs su then sudo.
     if username == "root":
         max_prompts = 1
     else:
         command = "sudo -S -p Password: " + command
         max_prompts = 2
+    # Run it via su on a pty, typing the password.
     try:
         rc, output = _run_with_password(["su", username, "-c", command], password,
                                         max_prompts, FIX_ACCESS_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001
         return {"status": "ERROR", "message": f"could not run su: {exc}"}
+    # Failed, or still blocked: report why.
     if rc != 0 or _privilege_blocker():
         tail = output.strip().splitlines()[-1:] or [""]
         reason = "wrong password or not allowed" if rc == -1 else tail[0][:200]
         return {"status": "ERROR", "message": f"fix failed as {username}: {reason}"}
+    # Confirm sudo now accepts the helper without a password.
     check = _run(["sudo", "-n", "-l", HELPER, "update"], 30)
     if check.returncode != 0:
         return {"status": "ERROR",
                 "message": "helper installed but sudo still refuses it — check "
                            f"{SUDOERS_FILE} on the node"}
+    # Log and report success.
     logger.warning("os-update: helper + sudoers installed via %s", username)
     return {"status": "SUCCESS", "message": f"updates enabled (installed via {username})"}
