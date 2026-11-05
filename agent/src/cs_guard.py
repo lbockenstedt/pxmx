@@ -16,9 +16,12 @@ Guards are consulted only on the CS command path (gated by
 ``client_simulation.enabled``); a non-CS host never reaches this code.
 """
 
+# logging reports invalid protected-VMID configuration.
 import logging
+# Type hints only; they document the shapes of values passed around.
 from typing import Any, Dict, Iterable, Optional, Set
 
+# Share the main agent logger so guard warnings appear alongside other agent output.
 logger = logging.getLogger("PxmxAgent")
 
 # Simulation VMIDs are allocated 90001+ (per-host block
@@ -47,13 +50,18 @@ def resolve_protected_vmids(cs_cfg: Optional[Dict[str, Any]]) -> Set[int]:
     as-is — full per-host control, including removing 1001. Otherwise the
     default ``{1001}`` protects the hub container.
     """
+    # No client_simulation config at all: fall back to protecting the hub container.
     if not cs_cfg:
         return set(DEFAULT_PROTECTED_VMIDS)
+    # Look for a hub-supplied override of the protected list.
     cfg_list = cs_cfg.get("protected_vmids")
+    # Key absent (as opposed to an empty list): use the default protection.
     if cfg_list is None:
         return set(DEFAULT_PROTECTED_VMIDS)
+    # Coerce every entry to int so string VMIDs from JSON still match.
     try:
         return {int(v) for v in cfg_list}
+    # A non-iterable or non-numeric entry means the config is broken; stay safe with the default.
     except (TypeError, ValueError):
         logger.warning(
             f"client_simulation.protected_vmids invalid ({cfg_list!r}); "
@@ -70,8 +78,10 @@ def assert_sim_vm(vmid: Any, protected: Iterable[int], *,
       1. ``vmid`` parses to an int and is ``>= sim_min`` (the 90000 floor).
       2. ``vmid`` is not in the protected set.
     """
+    # Accept strings or ints; anything that is not a whole number is refused outright.
     try:
         vid = int(vmid)
+    # Non-numeric VMID from the hub: refuse with a clear message.
     except (TypeError, ValueError):
         raise GuardError(f"invalid vmid {vmid!r} — expected an integer")
     # Check the protected set first so targeting the hub container (e.g. 1001,
@@ -81,19 +91,23 @@ def assert_sim_vm(vmid: Any, protected: Iterable[int], *,
         raise GuardError(
             f"vmid {vid} is protected (hub/system container) — cannot be managed"
         )
+    # Anything below the simulation floor is a real customer/system VM -- never touch it.
     if vid < sim_min:
         raise GuardError(
             f"vmid {vid} is outside the Client-Simulation range (>= {sim_min}) "
             f"— refusing to touch a non-simulation VM"
         )
+    # Passed both checks: this VMID is a simulation VM we may mutate.
     return vid
 
 
 def is_sim_vm(vmid: Any, protected: Iterable[int], *,
               sim_min: int = SIM_VMIN) -> bool:
     """Non-raising variant of :func:`assert_sim_vm` for batch filtering."""
+    # Reuse the strict check and translate its outcome into True/False.
     try:
         assert_sim_vm(vmid, protected, sim_min=sim_min)
         return True
+    # The guard refused this VMID, so it is not a manageable simulation VM.
     except GuardError:
         return False
