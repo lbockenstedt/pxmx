@@ -60,6 +60,7 @@ from urllib.parse import urlsplit, urlunsplit
 # Signing helpers and the agent's own modules.
 from .security_utils import MessageSigner, encode_frame, split_frame
 from . import cs_commands
+from .hw_identity import collect_hw_identity
 from . import host_tuning
 from . import cs_sim
 from . import watchdogs
@@ -3238,7 +3239,9 @@ class ProxmoxAgent:
                 msg = {
                     "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
                                "sender_id": self.agent_id, "destination_id": "pxmx-spoke"},
-                    "payload": {"type": "AGENT_HEARTBEAT", "data": {}},
+                    "payload": {"type": "AGENT_HEARTBEAT",
+                                "data": await asyncio.get_running_loop().run_in_executor(
+                                    None, collect_hw_identity)},
                 }
                 await self.websocket.send(encode_frame(self.signer, msg))
                 await asyncio.sleep(30)
