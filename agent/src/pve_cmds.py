@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Guard helpers that keep mutations limited to sim VMs.
@@ -812,39 +813,144 @@ async def cluster_info() -> Dict[str, Any]:
             "nodes": len(nodes)}
 
 
+# Guests this host shut down for maintenance (they could not be live-migrated);
+# started again when maintenance ends, even across the reboot.
+_MAINT_STATE = Path("/var/lib/lm/pve_maintenance.json")
+_SHUTDOWN_TIMEOUT_S = 120
+_drain_task: Optional["asyncio.Task"] = None
+
+
+def _load_shutdown() -> List[Dict[str, Any]]:
+    try:
+        return list(json.loads(_MAINT_STATE.read_text()).get("shutdown") or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _save_shutdown(items: List[Dict[str, Any]]) -> None:
+    try:
+        if items:
+            _MAINT_STATE.parent.mkdir(parents=True, exist_ok=True)
+            _MAINT_STATE.write_text(json.dumps({"shutdown": items}))
+        else:
+            _MAINT_STATE.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning("maintenance state not saved: %s", e)
+
+
+async def _ha_state(node: str) -> Tuple[Dict[str, Any], List[str], Set[int]]:
+    """``(manager_status, HA guests still active here, vmids of ALL HA-managed guests)``."""
+    status = await _pvesh_json("/cluster/ha/status/manager_status")
+    ms = (status.get("manager_status") or {}) if isinstance(status, dict) else {}
+    services = ms.get("service_status") or {}
+    here = sorted(sid for sid, sv in services.items()
+                  if (sv or {}).get("node") == node
+                  and (sv or {}).get("state") not in ("stopped", "disabled", "ignored", "error"))
+    managed: Set[int] = set()
+    for sid in services:
+        tail = str(sid).split(":", 1)[-1]
+        if tail.isdigit():
+            managed.add(int(tail))
+    return ms, here, managed
+
+
+async def _running_guests(node: str, skip: Set[int]) -> List[Tuple[int, str]]:
+    """Running, non-template qemu VMs and LXC containers on ``node`` that HA does not manage."""
+    out: List[Tuple[int, str]] = []
+    for kind in ("qemu", "lxc"):
+        rows = await _pvesh_json(f"/nodes/{node}/{kind}")
+        for r in (rows if isinstance(rows, list) else []):
+            try:
+                vmid = int(r.get("vmid"))
+            except (TypeError, ValueError):
+                continue
+            if r.get("status") == "running" and not r.get("template") and vmid not in skip:
+                out.append((vmid, kind))
+    return sorted(out)
+
+
+async def _drain_node(node: str, clustered: bool, skip: Set[int]) -> None:
+    """Move every running non-HA guest off this host: live-migrate to another
+    cluster node when possible, otherwise shut it down gracefully (forced only
+    if that times out) and remember it so maintenance-off starts it again."""
+    peers: List[str] = []
+    if clustered:
+        rows = await _pvesh_json("/cluster/status") or []
+        peers = [r["name"] for r in rows if r.get("type") == "node"
+                 and r.get("name") != node and r.get("online") in (1, True)]
+    shut = _load_shutdown()
+    for i, (vmid, kind) in enumerate(await _running_guests(node, skip)):
+        tool = "qm" if kind == "qemu" else "pct"
+        if peers:
+            rc, _, _ = await _run(
+                [tool, "migrate", str(vmid), peers[i % len(peers)],
+                 "--online" if kind == "qemu" else "--restart"],
+                check=False, timeout=1800)
+            if rc == 0:
+                logger.warning("maintenance: %s %s migrated away", kind, vmid)
+                continue
+        rc, _, _ = await _run([tool, "shutdown", str(vmid), "--timeout", str(_SHUTDOWN_TIMEOUT_S)],
+                              check=False, timeout=_SHUTDOWN_TIMEOUT_S + 60)
+        if rc != 0:
+            await _run([tool, "stop", str(vmid)], check=False, timeout=120)
+        logger.warning("maintenance: %s %s could not move — shut down", kind, vmid)
+        shut.append({"vmid": vmid, "kind": kind})
+        _save_shutdown(shut)
+
+
+async def _restart_shutdown_guests() -> List[int]:
+    """Start the guests maintenance shut down; any that fail to start stay recorded."""
+    left: List[Dict[str, Any]] = []
+    started: List[int] = []
+    for g in _load_shutdown():
+        tool = "qm" if g.get("kind") == "qemu" else "pct"
+        rc, _, _ = await _run([tool, "start", str(g["vmid"])], check=False, timeout=120)
+        if rc == 0:
+            started.append(g["vmid"])
+        else:
+            left.append(g)
+    _save_shutdown(left)
+    return started
+
+
 async def node_maintenance(action: str) -> Dict[str, Any]:
-    """HA maintenance mode for THIS node: ``action`` is enable, disable or
-    status. Enabling makes the HA stack migrate this node's HA guests to the
-    other nodes (non-HA guests stay put); it survives a reboot until disabled.
-    Always answers with the current state:
-    ``{status, node, maintenance, ha_guests: ["vm:100", ...]}`` where
-    ``ha_guests`` are the HA guests still on this node (empty = safe to
-    reboot)."""
+    """Maintenance mode for THIS host: ``action`` is enable, disable or status.
+
+    Enable: on a cluster the HA stack migrates the HA guests away
+    (``ha-manager node-maintenance``); a background drain then live-migrates every
+    other running guest, and shuts down gracefully the ones that cannot move
+    (a standalone host shuts everything down). Disable clears HA maintenance and
+    starts the guests shut down for it. Always answers with the current state:
+    ``{status, node, maintenance, ha_guests, local_guests, draining}`` — empty
+    ``ha_guests`` and ``local_guests`` means safe to reboot."""
+    global _drain_task
     # Reject unknown actions.
     if action not in ("enable", "disable", "status"):
         return {"status": "ERROR", "message": f"unknown maintenance action {action!r}"}
-    # This node's name.
     node = await local_node_name()
-    # Enable or disable maintenance via ha-manager.
-    if action != "status":
+    clustered = bool(await cluster_info())
+    if action != "status" and clustered:
         rc, _, err = await _run(["ha-manager", "crm-command", "node-maintenance", action, node],
                                 check=False, timeout=30)
         if rc != 0:
             return {"status": "ERROR", "node": node,
                     "message": f"ha-manager node-maintenance {action} failed: "
                                f"{err.decode('utf-8', 'replace').strip()[:300]}"}
-    # Read the HA manager state.
-    status = await _pvesh_json("/cluster/ha/status/manager_status")
-    ms = (status.get("manager_status") or {}) if isinstance(status, dict) else {}
-    services = ms.get("service_status") or {}
-    # HA guests still running on this node.
-    ha_here = sorted(sid for sid, sv in services.items()
-                     if (sv or {}).get("node") == node
-                     and (sv or {}).get("state") not in ("stopped", "disabled", "ignored", "error"))
-    # Report the maintenance state and remaining HA guests.
-    return {"status": "SUCCESS", "node": node,
-            "maintenance": (ms.get("node_status") or {}).get(node) == "maintenance",
-            "ha_guests": ha_here}
+    ms, ha_here, managed = await _ha_state(node) if clustered else ({}, [], set())
+    if action == "enable" and not (_drain_task and not _drain_task.done()):
+        _drain_task = asyncio.ensure_future(_drain_node(node, clustered, managed))
+    restarted: List[int] = []
+    if action == "disable":
+        if _drain_task and not _drain_task.done():
+            _drain_task.cancel()
+        _drain_task = None
+        restarted = await _restart_shutdown_guests()
+    draining = bool(_drain_task and not _drain_task.done())
+    local = [] if action == "disable" else [f"{k}:{v}" for v, k in await _running_guests(node, managed)]
+    maint = ((ms.get("node_status") or {}).get(node) == "maintenance") if clustered else (
+        action == "enable" or bool(_load_shutdown()))
+    return {"status": "SUCCESS", "node": node, "maintenance": maint, "ha_guests": ha_here,
+            "local_guests": local, "draining": draining, "restarted": restarted}
 
 
 async def list_qemu_vms_cluster() -> List[Tuple[int, str, str]]:
