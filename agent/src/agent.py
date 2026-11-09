@@ -2692,7 +2692,8 @@ class ProxmoxAgent:
                                 cluster = await pve_cmds.cluster_info()
                                 if cluster:
                                     result["pve_cluster"] = cluster
-                                    result["features"] = list(result.get("features") or []) + ["maintenance"]
+                                # Standalone hosts too: maintenance shuts guests down before a reboot.
+                                result["features"] = list(result.get("features") or []) + ["maintenance"]
                             # Install selected packages.
                             elif cmd_type == "OS_UPDATE_APPLY_PACKAGES":
                                 result = await asyncio.to_thread(

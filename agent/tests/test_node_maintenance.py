@@ -45,6 +45,10 @@ def _fake_run(outputs, calls):
     return _run
 
 
+async def _noop_drain(*_a):
+    return None
+
+
 def test_cluster_info_only_for_multi_node_clusters(monkeypatch):
     calls = []
     monkeypatch.setattr(pve_cmds, "_run", _fake_run({"/cluster/status": (0, CLUSTER)}, calls))
@@ -61,9 +65,10 @@ def test_maintenance_enable_reports_ha_guests_still_on_the_node(monkeypatch):
     monkeypatch.setattr(pve_cmds, "_run", _fake_run({
         "/cluster/status": (0, CLUSTER),
         "/cluster/ha/status/manager_status": (0, MANAGER)}, calls))
+    monkeypatch.setattr(pve_cmds, "_drain_node", _noop_drain)
     r = asyncio.run(pve_cmds.node_maintenance("enable"))
     assert ["ha-manager", "crm-command", "node-maintenance", "enable", "pve1"] in calls
-    assert r == {"status": "SUCCESS", "node": "pve1", "maintenance": True, "ha_guests": ["vm:100"]}
+    assert r["maintenance"] is True and r["ha_guests"] == ["vm:100"] and r["local_guests"] == []
 
 
 def test_maintenance_failure_and_bad_action(monkeypatch):
@@ -73,3 +78,46 @@ def test_maintenance_failure_and_bad_action(monkeypatch):
     r = asyncio.run(pve_cmds.node_maintenance("disable"))
     assert r["status"] == "ERROR" and "boom" in r["message"]
     assert asyncio.run(pve_cmds.node_maintenance("reboot"))["status"] == "ERROR"
+
+
+def test_drain_migrates_then_shuts_down_what_cannot_move(monkeypatch, tmp_path):
+    monkeypatch.setattr(pve_cmds, "_MAINT_STATE", tmp_path / "m.json")
+    calls = []
+
+    async def _run(argv, **_kw):
+        calls.append(argv)
+        if argv[0] == "pvesh":
+            out = {"/cluster/status": [CLUSTER[0], CLUSTER[1], {**CLUSTER[2], "online": 1}],
+                   "/nodes/pve1/qemu": [{"vmid": 200, "status": "running"},
+                                        {"vmid": 201, "status": "running"},
+                                        {"vmid": 202, "status": "stopped"}],
+                   "/nodes/pve1/lxc": []}.get(argv[2])
+            return 0, json.dumps(out).encode(), b""
+        # vm 201 has a local disk: its migration fails
+        return (1 if argv[:3] == ["qm", "migrate", "201"] else 0), b"", b""
+
+    monkeypatch.setattr(pve_cmds, "_run", _run)
+    asyncio.run(pve_cmds._drain_node("pve1", True, set()))
+    assert ["qm", "migrate", "200", "pve2", "--online"] in calls
+    assert ["qm", "shutdown", "201", "--timeout", "120"] in calls
+    assert not any(c[:3] == ["qm", "shutdown", "200"] for c in calls)
+    assert pve_cmds._load_shutdown() == [{"vmid": 201, "kind": "qemu"}]
+    # maintenance off starts only what was shut down
+    calls.clear()
+    assert asyncio.run(pve_cmds._restart_shutdown_guests()) == [201]
+    assert calls == [["qm", "start", "201"]] and pve_cmds._load_shutdown() == []
+
+
+def test_standalone_host_shuts_guests_down(monkeypatch, tmp_path):
+    monkeypatch.setattr(pve_cmds, "_MAINT_STATE", tmp_path / "m.json")
+    calls = []
+
+    async def _run(argv, **_kw):
+        calls.append(argv)
+        rows = [{"vmid": 300, "status": "running"}] if argv[:3] == ["pvesh", "get", "/nodes/pve1/lxc"] else []
+        return 0, json.dumps(rows).encode(), b""
+
+    monkeypatch.setattr(pve_cmds, "_run", _run)
+    asyncio.run(pve_cmds._drain_node("pve1", False, set()))
+    assert ["pct", "shutdown", "300", "--timeout", "120"] in calls
+    assert not any(c[1:2] == ["migrate"] for c in calls)
