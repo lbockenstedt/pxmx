@@ -317,6 +317,11 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    - Document behaviour exactly as the owner described it, including
      operational caveats.
 3. **Docs-only PRs** are reviewed but not gated on accuracy.
+4. **Timing tests must not flake on a busy CI runner.** Do all setup
+   (imports, parsing, building fakes) before starting the clock, and keep
+   at least a 2x gap between the pass bound and the failure case (for
+   example parallel 0.5s, serial 1.0s, bound 0.7s). A flaky required test
+   blocks every promotion behind it.
 
 ## 10. AppBuilder (AB)
 
