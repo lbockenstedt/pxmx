@@ -9,6 +9,10 @@ on:
     branches: [ dev ]
   pull_request:
     branches: [ main, qa, dev ]
+  # Sent by lm's spoke-dispatch.yml when lm/core changes on dev: re-test this
+  # repo's dev against that lm commit. Report only; it gates nothing.
+  repository_dispatch:
+    types: [ lm-changed ]
 
 jobs:
   test:
@@ -16,6 +20,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Empty (the default ref) except for an lm-changed dispatch.
+          ref: ${{ github.event.client_payload.spoke_ref }}
       # This repo inherits BaseSpoke from the LM core repo (imported as
       # `base_spoke` / `core.src.base_spoke`). In dev that resolves via the
       # sibling lm checkout; alone in CI it fails with
@@ -26,6 +33,8 @@ jobs:
           repository: lbockenstedt/lm
           path: _lm
           sparse-checkout: core
+          # lm main normally; the exact lm commit for an lm-changed dispatch.
+          ref: ${{ github.event.client_payload.lm_ref }}
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - name: Install dependencies
