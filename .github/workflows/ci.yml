@@ -84,4 +84,4 @@ jobs:
       - name: Run tests
         env:
           PYTHONPATH: ${{ github.workspace }}/_lm:${{ github.workspace }}/_lm/core/src
-        run: pytest --timeout=300 --timeout-method=thread -q agent/tests tests
+        run: pytest -x --timeout=300 --timeout-method=thread -q agent/tests tests
