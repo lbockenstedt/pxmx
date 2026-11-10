@@ -169,6 +169,22 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
      failure).
    - Reconnect when a session expires.
    - Make anything pushed JSON-safe (datetimes, sets, bytes).
+8. **Keep reads and writes to the downstream system minimal.** NetBox,
+   Zabbix and other sinks are not a lookup database (rule 2); an unbounded
+   loop of calls to them has pegged a VM before.
+   - Read from the local cache; refresh lists in the background on a floor
+     of minutes, never per page view, per item or per cycle of a faster loop.
+     Don't pull a full list to answer a single lookup.
+   - Compare before writing: send only the fields that changed, and write
+     nothing when the data is the same. A second identical sync cycle must
+     make zero writes.
+   - Pick one value deterministically when sources disagree (for example,
+     the port that learned the fewest MACs). Never "first answer wins": the
+     field flips on every run and rewrites the record each time.
+   - Stamp timestamps such as `last_seen` at most daily, not on every pass.
+   - A feeder that adds or changes a sync path adds a test with a counting
+     fake client: the second cycle makes no writes, and a cached list is not
+     re-fetched inside its TTL.
 
 ## 5. Security and secrets
 
@@ -367,6 +383,7 @@ reviewers and the AB panel.
 | WebUI ratchet, secret hygiene and JS syntax tests | lm `ci.yml` | 7.1, 5.2 |
 | `check-direction` (branch flow), VERSION guard | `branch-flow` / `promote.yml` | 2.1, 2.2 |
 | PR intent statement | AB review panel | 2.4 |
+| Call-rate and NetBox churn health check (writes per hour, flapping fields, commands called far above their refresh interval) | AB hub health check | 4.8 |
 
 See `lm/docs/ci-checks.md` for what each check does and how to run it
 locally.
