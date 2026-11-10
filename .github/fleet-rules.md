@@ -38,7 +38,11 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    fleet for the same pattern and fix every copy. When an issue comes back,
    read the git history of the earlier attempts before patching again.
 5. **Verify, don't assume.**
-   - Run the tests for what you changed.
+   - Before every push, run `../lm/.github/scripts/smoke.sh` from the repo
+     root. It runs the same checks and tests as CI, in the same order, and
+     stops at the first failure. GitHub CI is the backstop, not the first
+     place a failure shows up. Install it as a pre-push hook with
+     `smoke.sh --install-hook`.
    - After a deploy, check the live result: login works, the page renders,
      and the data shows up end to end in LM, NetBox, Zabbix and ClearPass.
    - An audit is not finished until the findings are fixed and verified.
