@@ -1,0 +1,22 @@
+name: Fleet rules
+
+# Thin caller; the checks live in lm's fleet-rules-reusable.yml (see
+# lm/docs/ci-checks.md). Dev only: the promotion PRs into qa/main carry
+# commits that already passed here.
+
+on:
+  push:
+    branches: [ dev ]
+  pull_request:
+    branches: [ dev ]
+
+concurrency:
+  group: fleet-rules-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rules:
+    uses: lbockenstedt/lm/.github/workflows/fleet-rules-reusable.yml@main
