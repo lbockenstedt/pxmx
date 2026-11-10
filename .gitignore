@@ -16,7 +16,9 @@ hub_secret.json
 secrets.json
 
 # Claude Code local worktrees/config
-.claude/
+# Local Claude settings stay private; the fleet skills (synced from lm) are tracked.
+.claude/*
+!.claude/skills/
 
 # mTLS material and runtime secrets issued by the hub — never commit these
 certs/
