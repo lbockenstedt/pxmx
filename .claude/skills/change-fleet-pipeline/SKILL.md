@@ -45,9 +45,9 @@ Do not use it for:
 | `workflows/promote-reusable.yml` | All promotion logic: VERSION pin + advance, `PROMOTE_SPLIT=1` unit split, PR intent body, parked-run release. Runs the **caller repo's** `.github/scripts/promote.sh`. |
 | `workflows/backmerge-reusable.yml` | Reverse direction (main→qa→dev), same `promote.sh`. |
 | `workflow-templates-fleet/{promote,backmerge}.yml` | Thin callers copied into every repo: triggers + permissions only. |
-| `workflows/fleet-rules-reusable.yml` + `fleet-rules.yml` | Checks out ab, runs `fleet_checks.py`, `ruff_new.py`, `check_twins.py`. lm calls it by path; the other repos call it `@main`. |
+| `workflows/fleet-rules-reusable.yml` | Checks out ab, runs `fleet_checks.py`, `ruff_new.py`, `check_twins.py`. Called as the `checks` job of every `ci.yml`, before `test`; lm calls it by path, the other repos `@main`. |
 | `workflows/branch-flow.yml` | `check-direction` (dev→qa→main only). |
-| `workflows/ci.yml` | `node --check` on WebUI JS, then one pytest per component. |
+| `workflows/ci.yml` | `checks` job first; then `test`: `.github/tests` + promotion self-test, `node --check` on WebUI JS, one pytest per component. |
 | `workflows/spoke-dispatch.yml` | Asks every spoke to re-run CI against a new lm/core. Report only. |
 | `scripts/promote.sh`, `promotion_selftest.sh`, `bump_version.py` | Byte-identical copies in every repo. |
 | `scripts/promote_fleet.sh` | Operator tool: dispatches `promote.yml` and merges the `promote/<src>-to-<tgt>` PRs. Never creates a PR. |
