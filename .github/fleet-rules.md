@@ -38,7 +38,11 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    fleet for the same pattern and fix every copy. When an issue comes back,
    read the git history of the earlier attempts before patching again.
 5. **Verify, don't assume.**
-   - Run the tests for what you changed.
+   - Before every push, run `../lm/.github/scripts/smoke.sh` from the repo
+     root. It runs the same checks and tests as CI, in the same order, and
+     stops at the first failure. GitHub CI is the backstop, not the first
+     place a failure shows up. Install it as a pre-push hook with
+     `smoke.sh --install-hook`.
    - After a deploy, check the live result: login works, the page renders,
      and the data shows up end to end in LM, NetBox, Zabbix and ClearPass.
    - An audit is not finished until the findings are fixed and verified.
@@ -169,6 +173,22 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
      failure).
    - Reconnect when a session expires.
    - Make anything pushed JSON-safe (datetimes, sets, bytes).
+8. **Keep reads and writes to the downstream system minimal.** NetBox,
+   Zabbix and other sinks are not a lookup database (rule 2); an unbounded
+   loop of calls to them has pegged a VM before.
+   - Read from the local cache; refresh lists in the background on a floor
+     of minutes, never per page view, per item or per cycle of a faster loop.
+     Don't pull a full list to answer a single lookup.
+   - Compare before writing: send only the fields that changed, and write
+     nothing when the data is the same. A second identical sync cycle must
+     make zero writes.
+   - Pick one value deterministically when sources disagree (for example,
+     the port that learned the fewest MACs). Never "first answer wins": the
+     field flips on every run and rewrites the record each time.
+   - Stamp timestamps such as `last_seen` at most daily, not on every pass.
+   - A feeder that adds or changes a sync path adds a test with a counting
+     fake client: the second cycle makes no writes, and a cached list is not
+     re-fetched inside its TTL.
 
 ## 5. Security and secrets
 
@@ -360,13 +380,14 @@ reviewers and the AB panel.
 
 | Check | Where | Rules |
 | :--- | :--- | :--- |
-| `fleet_checks.py` (vault wiring, storage format, new deps, hard-coded hosts, VERSION, docstrings and comments, SSRF, tenant scope and first-site fallbacks, JS syntax, WebUI ratchet, UUIDs, secret logging, blocking async, copies and dead code, docs) | `fleet-rules` workflow on every PR and dev push; AB on every fix and review | 2.2, 3.7, 4.1, 5.1–5.3, 6.1, 6.4, 7.1, 7.3, 8.2–8.4, 8.6, 9.2 |
-| `ruff_new.py` (new lint findings only) | `fleet-rules` workflow | 8.1, 8.4 |
-| `check_twins.py` (twin pairs, fleet-owned copies) | `fleet-rules` workflow | 8.5, 2.7 |
-| `pip-audit` (when requirements change; advisory) | `fleet-rules` workflow | 8.3 |
+| `fleet_checks.py` (vault wiring, storage format, new deps, hard-coded hosts, VERSION, docstrings and comments, SSRF, tenant scope and first-site fallbacks, JS syntax, WebUI ratchet, UUIDs, secret logging, blocking async, copies and dead code, docs) | `checks` job in `ci.yml` (runs before `test`) on every PR and dev push; AB on every fix and review | 2.2, 3.7, 4.1, 5.1–5.3, 6.1, 6.4, 7.1, 7.3, 8.2–8.4, 8.6, 9.2 |
+| `ruff_new.py` (new lint findings only) | `checks` job in `ci.yml` | 8.1, 8.4 |
+| `check_twins.py` (twin pairs, fleet-owned copies) | `checks` job in `ci.yml` | 8.5, 2.7 |
+| `pip-audit` (when requirements change; advisory) | `checks` job in `ci.yml` | 8.3 |
 | WebUI ratchet, secret hygiene and JS syntax tests | lm `ci.yml` | 7.1, 5.2 |
 | `check-direction` (branch flow), VERSION guard | `branch-flow` / `promote.yml` | 2.1, 2.2 |
 | PR intent statement | AB review panel | 2.4 |
+| Call-rate and NetBox churn health check (writes per hour, flapping fields, commands called far above their refresh interval) | AB hub health check | 4.8 |
 
 See `lm/docs/ci-checks.md` for what each check does and how to run it
 locally.
