@@ -14,11 +14,36 @@ on:
   repository_dispatch:
     types: [ lm-changed ]
 
+# A newer push to the same branch or PR makes the older run pointless. The
+# event name keeps an lm-changed dispatch from cancelling a dev push run.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Cheap checks first (about 20 s): fleet rules, new ruff errors, twin files
+  # (lm/docs/ci-checks.md). `test` waits for them, so a rule violation fails
+  # the run before the install and test steps start. Dev only: promotion PRs
+  # into qa/main carry commits that already passed here.
+  checks:
+    if: (github.event_name == 'push' && github.ref_name == 'dev') || github.base_ref == 'dev'
+    permissions:
+      contents: read
+    uses: lbockenstedt/lm/.github/workflows/fleet-rules-reusable.yml@main
+
   test:
+    # Run when checks passed or were skipped (qa/main PRs, lm-changed);
+    # the first step fails the job when checks failed.
+    if: ${{ !cancelled() }}
+    needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Stop early when an earlier job failed
+        if: contains(needs.*.result, 'failure')
+        run: |
+          echo "::error::A job this one needs failed (see 'checks'). Tests not run."
+          exit 1
       - uses: actions/checkout@v4
         with:
           # Empty (the default ref) except for an lm-changed dispatch.
@@ -36,7 +61,10 @@ jobs:
           # lm main normally; the exact lm commit for an lm-changed dispatch.
           ref: ${{ github.event.client_payload.lm_ref }}
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: '**/requirements*.txt'
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
