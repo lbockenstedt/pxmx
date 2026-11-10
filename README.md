@@ -4,6 +4,27 @@
 
 ---
 
+## Repository layout
+
+| Path | What it holds |
+| :--- | :--- |
+| `.claude/` | Fleet-owned skills, synced from lm; edit them in lm. |
+| `.github/` | CI (`workflows/ci.yml`), the thin `promote`/`backmerge` callers, promotion scripts and fleet-owned agents. |
+| `agent/` | The agent that runs on each Proxmox node: source, installer and network watchdog. |
+| `docs/` | This module's docs (copies of the canonical pages in `lm/docs`). |
+| `src/` | The spoke's Python source (entry point, engine, control plane). |
+| `tests/` | pytest suite; CI runs it in the `test` job. |
+| `AGENTS.md` | Orientation for people and AI agents; the fleet rules block is synced from lm. |
+| `ARCHITECTURE.md` | How the spoke and node agents fit together. |
+| `install_pxmx.sh` | Installer (idempotent; safe to re-run). |
+| `pxmx.Dockerfile` | Container build. |
+| `pytest.ini` | pytest settings. |
+| `README.md` | This file. |
+| `requirements-test.txt` | Extra test-only dependencies. |
+| `requirements.txt` | Runtime Python dependencies. |
+| `uninstall_pxmx.sh` | Uninstaller. |
+| `VERSION` | Bot-owned version; promotion bumps it. Never edit by hand. |
+
 ## Architecture
 
 `pxmx` operates on a two-tier coordinator and agent topology:
