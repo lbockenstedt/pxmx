@@ -552,6 +552,8 @@ def test_parse_cluster_resource_vms_filters_and_shapes():
     vms = pve_cmd_builder.parse_cluster_resource_vms(r, "c", {100: "dev"})
     assert len(vms) == 2
     by = {v["vmid"]: v for v in vms}
+    # Configured memory for the NetBox VM sync (newer lm builders add it).
+    assert by[100].pop("maxmem_bytes", 200) == 200
     assert by[100] == {
         "unique_id": "c/n1/100", "cluster": "c", "node": "n1", "vmid": 100,
         "type": "qemu", "name": "web", "status": "running", "template": 0,
