@@ -78,8 +78,6 @@ def _force_unbind_present(agent) -> list:
     be passed through without a reboot. Skips buses currently assigned to a VM.
     Best-effort — never raises. Shared by both the Clear Quarantine and Clear
     Exclusion actions (the physical release is the same for both)."""
-    # Imported lazily to avoid a circular import with usb_provision.
-    from . import usb_provision
     # Any failure is logged and treated as "nothing unbound".
     try:
         # Buses already assigned to a VM must not be yanked from it.
@@ -352,7 +350,6 @@ async def handle_cs_command(agent, action: str,
             # Clear the dmesg quarantine store (usb_quarantine.json, incl. the
             # 5-strike permanent flag) + force-release driver-bound dongles. Leaves
             # the destroy-fail exclusion list intact. No bus_path = clear all.
-            from . import usb_provision
             # Optional single bus; None clears every bus.
             bus = data.get("bus_path")
             # Clear the quarantine and physically release any driver-bound dongles.
@@ -414,8 +411,6 @@ async def handle_cs_command(agent, action: str,
             # 'assigned' to a VM that no longer holds the dongle: the "no eligible
             # dongles (assigned=[...])" stall) + force-release driver-bound dongles.
             # Leaves the quarantine (QT) list intact.
-            # Imported lazily to avoid circular imports.
-            from . import usb_provision, pve_cmds
             # Clear every bus exclusion, counting how many were cleared.
             excluded = usb_provision.clear_excluded_buses()
             # Release assignments whose VM no longer exists; failures are logged and ignored.
