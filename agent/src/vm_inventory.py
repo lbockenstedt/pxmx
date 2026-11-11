@@ -576,6 +576,8 @@ async def get_vm_list(agent) -> Dict[str, Any]:
             "ostype":    r.get("ostype", "") or "",
             "cpu":       round(r.get("cpu", 0) * 100, 1),
             "mem_bytes": r.get("mem") or r.get("maxmem", 0),
+            # Configured memory (mem_bytes above is live usage when running).
+            "maxmem_bytes": int(r.get("maxmem", 0) or 0),
             "uptime":    r.get("uptime", 0),
             # Provisioned capacity for the Hypervisor→NetBox VM sync. Both
             # /cluster/resources and the per-node /qemu + /lxc fallback rows
