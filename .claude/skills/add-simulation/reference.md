@@ -109,16 +109,21 @@ SAME edits in both.
 - If the field needs a new serializer behavior (like `'list'` did), that touched
   BOTH backends too — check whether your field type already exists.
 
-## 6 — Sim catalog `SIM_META` — REQUIRED (every sim)
-- ☐ Add `"<sim>": {"category": "failure"|"traffic", "multi_capable": …, "media": "any"|"wired"|"wireless"}`
-  to `SIM_META` in `cs/lm-spoke/src/sim_quota.py`, and the same key (no
-  `media`) in the hub twin `lm/core/src/simulations/sim_quota.py`. The
-  `SIM_META` entry in `lm/.github/twins.json` fails the push if the keys differ.
+## 6 — The sim list `sims.json` — REQUIRED (every sim)
+- ☐ Add `"<sim>": {"category": "failure"|"traffic", "multi_capable": true|false, "media": "any"|"wired"|"wireless"}`
+  to `lm/core/src/simulations/sims.json`. That is the ONE sim list: the hub
+  (`sim_quota`, `routes`) and the cs spoke (which runs lm core from /opt/lm)
+  import it as `SIM_META` from `sim_catalog.py`. There is no cs copy.
+- Ship the lm commit to main first; cs code importing a new sim needs it.
 - Everything below derives from it; do NOT edit these lists by hand:
   the Sim Quota dropdown (`available_sims` / `available_sims_from_ini`),
   `sim_config._SIM_TOGGLE_KEYS` and `SIM_FLAG_KEYS`,
   `simulation_engine._BEACON_CONFIG_KEYS`, and the hub's `_CS_SIM_FLAGS`
   (per-user override toggles, `routes.py`).
+- The client scripts and `sim-views.js` cannot import it. cs
+  `lm-spoke/tests/test_sim_list_coverage.py` checks each sim in it appears in
+  `simulation.sh/.ps1`, `common.sh/.ps1`, the dashboard flag tables, and
+  `CS_CONTROL_FLAGS` / `CS_ONOFF_KEYS`.
 - A Python primitive (`sim_primitives.PRIMITIVES`) is optional; only sims the
   spoke engine runs itself need one.
 
