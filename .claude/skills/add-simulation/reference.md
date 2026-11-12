@@ -81,6 +81,19 @@ for your sim kind.
 - `Send-Status`: add `<sim>` to the `active_simulations` `foreach ($name in @(…))`
   list AND the `config` hashtable (`<sim> = [string]$script:<sim>`).
 
+### ☐ `cs/clients/linux/dashboard.sh` (the client's left-panel monitor)
+- `refresh_config`: `<sim>=$(get_value "$simulation_id" '<sim>')`.
+- The `active_sims` fallback: `[[ "$<sim>" == "on" ]] && active_sims+=("<sim>")`.
+- `get_script_flag`: a `<sim>.sh) echo "$<sim>" ;;` case.
+- The `flag_labels` / `flag_values` arrays (same position in both).
+- Running dashboards reload themselves when update.sh changes the file; no
+  client restart is needed.
+
+### ☐ `cs/clients/windows/dashboard.ps1`
+- The `$config` hashtable (`<sim> = get_value $simulationId '<sim>'`), the
+  `foreach ($key in @(…))` list, and a `@{ Name = '<Label>'; Value = $config.<sim> }`
+  row in the flag table.
+
 ## 5 — UI (BOTH `sim-views.js` copies) — REQUIRED
 Files: `lm/WebUI/sim-views.js` AND `cs/lm-spoke/static/sim-views.js`. Make the
 SAME edits in both.
@@ -96,11 +109,23 @@ SAME edits in both.
 - If the field needs a new serializer behavior (like `'list'` did), that touched
   BOTH backends too — check whether your field type already exists.
 
-## 6 — Quota / placement engine (OPTIONAL — alert/quota sims only)
+## 6 — Sim catalog `SIM_META` — REQUIRED (every sim)
+- ☐ Add `"<sim>": {"category": "failure"|"traffic", "multi_capable": …, "media": "any"|"wired"|"wireless"}`
+  to `SIM_META` in `cs/lm-spoke/src/sim_quota.py`, and the same key (no
+  `media`) in the hub twin `lm/core/src/simulations/sim_quota.py`. The
+  `SIM_META` entry in `lm/.github/twins.json` fails the push if the keys differ.
+- Everything below derives from it; do NOT edit these lists by hand:
+  the Sim Quota dropdown (`available_sims` / `available_sims_from_ini`),
+  `sim_config._SIM_TOGGLE_KEYS` and `SIM_FLAG_KEYS`,
+  `simulation_engine._BEACON_CONFIG_KEYS`, and the hub's `_CS_SIM_FLAGS`
+  (per-user override toggles, `routes.py`).
+- A Python primitive (`sim_primitives.PRIMITIVES`) is optional; only sims the
+  spoke engine runs itself need one.
+
+## 6b — Quota / placement engine (OPTIONAL — alert/quota sims only)
 - ☐ Placement matrix (see memory `sim-placement-unified-model`): add the sim so
   the engine can assign it (defs + weighted rules).
-- ☐ `cs/lm-spoke/src/sim_quota.py` AND its twin
-  `lm/core/src/simulations/sim_quota.py`: if the sim consumes a quota, add to
+- ☐ Both `sim_quota.py` copies: if the sim consumes a quota, add to
   `SIM_QUOTA_KEYS`; keep the two files' key lists matched (dual-copy-guard §5).
 - ☐ Stacking/harvest: if the sim is shareable/stackable, add it to the relevant
   sets in `cs/lm-spoke/src/sim_quota_engine.py` (`randomizable_sims` ∩ the
