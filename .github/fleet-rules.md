@@ -43,6 +43,9 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
      stops at the first failure. GitHub CI is the backstop, not the first
      place a failure shows up. Install it as a pre-push hook with
      `smoke.sh --install-hook`.
+   - A local session (Copilot, Claude or any other tool) also runs the
+     `review` skill before every push to dev or onto a promotion branch, and
+     pushes only when both of AB's review panels approve.
    - After a deploy, check the live result: login works, the page renders,
      and the data shows up end to end in LM, NetBox, Zabbix and ClearPass.
    - An audit is not finished until the findings are fixed and verified.
