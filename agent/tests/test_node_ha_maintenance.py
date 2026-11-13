@@ -187,3 +187,101 @@ def test_unreadable_drain_record_still_counts_as_pending(monkeypatch, tmp_path):
     assert asyncio.run(pve_cmds._os_update_drain_pending()) is True
     monkeypatch.setattr(pve_cmds, "_MAINT_STATE", tmp_path / "missing.json")
     assert asyncio.run(pve_cmds._os_update_drain_pending()) is False
+
+
+# ── PXMX_NODE_REBOOT: reboot a node only while it is in HA maintenance ──────
+
+def _reboot_outputs(**over):
+    """pvesh outputs for the reboot tests: pve1 local and in maintenance, no guests."""
+    out = {"/cluster/status": (0, CLUSTER), "/cluster/ha/status/manager_status": (0, MANAGER),
+           "/nodes/pve1/qemu": (0, [{"vmid": 100, "status": "stopped"},
+                                    {"vmid": 9000, "status": "running", "template": 1}]),
+           "/nodes/pve1/lxc": (0, [])}
+    out.update(over)
+    return out
+
+
+def _no_local_reboot():
+    """A reboot_local stand-in that must never be called."""
+    async def _f():
+        raise AssertionError("local reboot must not run")
+    return _f
+
+
+def test_reboot_argv_is_the_api_reboot_for_that_node():
+    assert pve_cmds.node_reboot_argv("pve-2.lab") == [
+        "pvesh", "create", "/nodes/pve-2.lab/status", "--command", "reboot"]
+    try:
+        pve_cmds.node_reboot_argv("pve1/../x")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("node_reboot_argv accepted a bad name")
+
+
+def test_reboot_refused_when_node_is_not_in_maintenance(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pve_cmds, "_run", _fake_run(_reboot_outputs(), calls))
+    r = asyncio.run(pve_cmds.reboot_ha_node("pve2", _no_local_reboot()))
+    assert r["status"] == "ERROR" and "not in HA maintenance" in r["message"], r
+    assert not any(a[:2] == ["pvesh", "create"] for a in calls)
+
+
+def test_reboot_refused_when_ha_status_unreadable(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pve_cmds, "_run", _fake_run(
+        _reboot_outputs(**{"/cluster/ha/status/manager_status": (1, "")}), calls))
+    r = asyncio.run(pve_cmds.reboot_ha_node("pve1", _no_local_reboot()))
+    assert r["status"] == "ERROR" and "HA status" in r["message"], r
+
+
+def test_reboot_refused_while_guests_still_run(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pve_cmds, "_run", _fake_run(_reboot_outputs(**{
+        "/nodes/pve1/qemu": (0, [{"vmid": 101, "status": "running"}, {"vmid": 102, "status": "running"}]),
+        "/nodes/pve1/lxc": (0, [{"vmid": 200, "status": "running"}])}), calls))
+    r = asyncio.run(pve_cmds.reboot_ha_node("pve1", _no_local_reboot()))
+    assert r["status"] == "ERROR" and "3 guest(s) still running" in r["message"], r
+    assert r["running_guests"] == ["lxc:200", "qemu:101", "qemu:102"]
+
+
+def test_reboot_refused_when_guest_list_unreadable(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pve_cmds, "_run", _fake_run(
+        _reboot_outputs(**{"/nodes/pve1/lxc": (1, "")}), calls))
+    r = asyncio.run(pve_cmds.reboot_ha_node("pve1", _no_local_reboot()))
+    assert r["status"] == "ERROR" and "could not list the guests" in r["message"], r
+
+
+def test_reboot_of_this_host_uses_the_local_path(monkeypatch):
+    calls, local = [], []
+    monkeypatch.setattr(pve_cmds, "_run", _fake_run(_reboot_outputs(), calls))
+
+    async def _local():
+        local.append(1)
+        return {"status": "SUCCESS", "message": "reboot scheduled in 1 minute"}
+    r = asyncio.run(pve_cmds.reboot_ha_node("pve1", _local))
+    assert r["status"] == "SUCCESS" and r["node"] == "pve1" and local == [1], r
+    assert not any(a[:2] == ["pvesh", "create"] for a in calls)
+
+
+def test_reboot_of_another_node_uses_the_api(monkeypatch):
+    calls = []
+    manager = json.loads(json.dumps(MANAGER))
+    manager["manager_status"]["node_status"]["pve2"] = "maintenance"
+    monkeypatch.setattr(pve_cmds, "_run", _fake_run(_reboot_outputs(**{
+        "/cluster/ha/status/manager_status": (0, manager),
+        "/nodes/pve2/qemu": (0, []), "/nodes/pve2/lxc": (0, [])}), calls))
+    r = asyncio.run(pve_cmds.reboot_ha_node("pve2", _no_local_reboot()))
+    assert r["status"] == "SUCCESS", r
+    assert calls[-1] == ["pvesh", "create", "/nodes/pve2/status", "--command", "reboot"]
+
+
+def test_reboot_rejects_bad_or_unknown_nodes(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pve_cmds, "_run", _fake_run(_reboot_outputs(), calls))
+    assert asyncio.run(pve_cmds.reboot_ha_node("pve1;id", _no_local_reboot()))["status"] == "ERROR"
+    assert calls == []
+    r = asyncio.run(pve_cmds.reboot_ha_node("pve9", _no_local_reboot()))
+    assert r["status"] == "ERROR" and "not a member" in r["message"], r
+    assert not any(a[:2] == ["pvesh", "create"] for a in calls)
