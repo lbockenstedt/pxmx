@@ -109,6 +109,7 @@ Commands routed and processed by `src/proxmox_spoke.py`:
 | `PXMX_DRIVE_HEALTH` | Hub → Spoke → Agent | Queries physical drive telemetry, wear-leveling, and SMART health for a node (routed to the agent on that host), or for every server when no node is given (fans out to all agents). |
 | `PXMX_INSTALL_SSACLI` | Hub → Spoke → Agent | Triggers automated HPE SSACLI package installation on an HPE server node. |
 | `PXMX_CREATE_VM` | Hub → Spoke → Agent | Creates and configures a new QEMU virtual machine from an ISO image. |
+| `PXMX_NODE_MAINTENANCE` | Hub → Spoke (`SPOKE_RELAY`) → Agent | `{node, enable}`: runs `ha-manager crm-command node-maintenance enable\|disable <node>` (argv, no shell) for a member of the agent's cluster. The node name must match `^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$`. |
 | `INSTALL_CERT` | Hub → Spoke → Agent | Relays TLS certificate and private key to agent for local `pveproxy` installation. |
 | `VNC_START` | Hub → Spoke → Agent | Establishes authenticated noVNC console session, returning VNC ticket. |
 | `VNC_FRAME_DOWN` | Hub → Spoke → Agent | Relays browser input frames to node VNC session. |
@@ -148,6 +149,7 @@ Commands handled by `agent/src/agent.py` on the Proxmox host:
 | `PXMX_LIST_STORAGES` | `agent.py:list_node_storages` | Queries node storage configurations for image/disk allocations. |
 | `PXMX_DRIVE_HEALTH` | `drive_health.py` | Executes `smartctl` and `ssacli` drive audits and returns wear/alerting telemetry. |
 | `PXMX_INSTALL_SSACLI` | `drive_health.py:install_ssacli_if_needed` | Installs HPE Smart Storage Administrator tools on HPE hardware. |
+| `PXMX_NODE_MAINTENANCE` | `pve_cmds.py:set_ha_node_maintenance` | HA maintenance on/off for any node of this cluster (hub Hypervisors → Nodes **Maintenance** button). `GET_NODE_STATS` / telemetry also flag each node `maintenance: true\|false` from `/cluster/ha/status/manager_status`. |
 | `PXMX_CREATE_VM` | `agent.py` (`pvesh create`) | Creates a new QEMU VM from ISO with specified disk, memory, CPU, and network. |
 | `VNC_START` | `agent.py:_start_vnc_session` | Spawns `vncproxy` via `pvesh`, connects local WebSocket, and returns ticket. |
 | `VNC_FRAME_DOWN` | `agent.py` (Queue drain) | Relays incoming RFB frames from browser to the Proxmox VNC socket. |
