@@ -288,9 +288,10 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
      (templates, infrastructure VMs) can't be bulk-deleted.
 6. **Feedback.**
    - Use toasts, not confirmation pop-ups, for routine actions. The loading
-     toast sits bottom-right, above the footer.
+     toast sits bottom-right, above any footer.
    - Never show an error toast for a restart we caused.
-   - The footer is always visible, with the versions and the Update button.
+   - The versions and the Update button are always visible: in the footer,
+     or in the topbar for an app without one (AB).
    - Prefer tooltips (`title=`) to banners, and keep them in step with the
      docs.
 7. **Tables.** Table text doesn't wrap; columns size to their content.
