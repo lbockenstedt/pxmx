@@ -953,6 +953,147 @@ async def node_maintenance(action: str) -> Dict[str, Any]:
             "local_guests": local, "draining": draining, "restarted": restarted}
 
 
+# A Proxmox node name as the hub may send it (a hostname label, no shell metacharacters).
+_NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$")
+
+
+def valid_node_name(node: Any) -> bool:
+    """True when ``node`` is a string that looks like a Proxmox node name."""
+    return isinstance(node, str) and bool(_NODE_NAME_RE.fullmatch(node))
+
+
+def ha_maintenance_argv(node: str, enable: bool) -> List[str]:
+    """The ``ha-manager`` argv that puts ``node`` into (or takes it out of) HA
+    maintenance mode. Raises ValueError for a name that fails the node regex."""
+    if not valid_node_name(node):
+        raise ValueError(f"invalid node name {node!r}")
+    return ["ha-manager", "crm-command", "node-maintenance",
+            "enable" if enable else "disable", node]
+
+
+# HA manager status older than this means no CRM master is acting on it (HA
+# not configured, or a file left behind after HA resources were removed).
+# Proxmox itself calls a status older than 30 s "dead?".
+_HA_STATUS_MAX_AGE_S = 120
+
+
+def maintenance_nodes(status: Any, now: Optional[float] = None) -> Optional[Set[str]]:
+    """Node names in HA maintenance mode, from the JSON of
+    ``pvesh get /cluster/ha/status/manager_status`` (the API form of
+    ``ha-manager status``). A node counts when the CRM marks it
+    ``node_status: maintenance`` or its LRM runs in ``mode: maintenance``.
+    None (state unknown) unless the status shows an active CRM with HA
+    resources: a ``master_node``, a ``node_status`` map, a non-empty
+    ``service_status`` and a recent ``timestamp``."""
+    # Only an active CRM's status means anything.
+    if not isinstance(status, dict):
+        return None
+    ms = status.get("manager_status")
+    if not isinstance(ms, dict) or not ms.get("master_node") \
+            or not isinstance(ms.get("node_status"), dict) \
+            or not isinstance(ms.get("service_status"), dict) or not ms["service_status"]:
+        return None
+    try:
+        age = (time.time() if now is None else now) - float(ms.get("timestamp"))
+    except (TypeError, ValueError):
+        return None
+    if age > _HA_STATUS_MAX_AGE_S:
+        return None
+    # Nodes the CRM or their own LRM report in maintenance.
+    found = {str(n) for n, st in ms["node_status"].items() if st == "maintenance"}
+    lrm_status = status.get("lrm_status")
+    if isinstance(lrm_status, dict):
+        found |= {str(n) for n, lrm in lrm_status.items()
+                  if isinstance(lrm, dict) and lrm.get("mode") == "maintenance"}
+    return found
+
+
+async def ha_maintenance_nodes() -> Optional[Set[str]]:
+    """Node names currently in HA maintenance mode; None when that is unknown
+    (pvesh failed, or HA is not active on this cluster — see
+    :func:`maintenance_nodes`), so callers leave the flag unset."""
+    return maintenance_nodes(await _pvesh_json("/cluster/ha/status/manager_status", timeout=8))
+
+
+async def cluster_node_names() -> Optional[List[str]]:
+    """Names of every node in this host's Proxmox cluster (``/cluster/status``),
+    or ``/nodes`` on a host where that read fails. None when both reads fail,
+    so "membership unreadable" is not reported as "not a member"."""
+    rows = await _pvesh_json("/cluster/status")
+    names = [str(r.get("name")) for r in (rows if isinstance(rows, list) else [])
+             if isinstance(r, dict) and r.get("type") == "node" and r.get("name")]
+    if names:
+        return names
+    rows = await _pvesh_json("/nodes")
+    if not isinstance(rows, list):
+        return None
+    return [str(r.get("node")) for r in rows if isinstance(r, dict) and r.get("node")]
+
+
+async def _os_update_drain_pending() -> bool:
+    """True while this host is in an OS-update maintenance cycle started by
+    :func:`node_maintenance`: a guest drain is running, or the shutdown
+    record exists (guests waiting to be started again; also when that file
+    is unreadable, so the full disable still gets the chance to start them)."""
+    if _drain_task and not _drain_task.done():
+        return True
+    return await asyncio.to_thread(_MAINT_STATE.exists)
+
+
+async def set_ha_node_maintenance(node: Any, enable: Any) -> Dict[str, Any]:
+    """Run ``ha-manager crm-command node-maintenance enable|disable <node>`` for
+    any node of this host's cluster (the hub's Hypervisors → Nodes
+    "Maintenance" button). Unlike :func:`node_maintenance` this does not drain
+    non-HA guests: it only flips the HA flag, which the CRM acts on. The node
+    must pass the name regex AND be a member of this cluster; ``enable`` must
+    be a real bool.
+
+    Exiting maintenance on THIS host while an OS-update drain is pending goes
+    through :func:`node_maintenance` instead, so the drain is cancelled and the
+    guests it shut down are started again (a remote node's drain belongs to
+    that node's own agent; the OS-update flow always turns it off itself)."""
+    # Validate the request before anything goes near a process.
+    if not isinstance(enable, bool):
+        return {"status": "ERROR", "message": "enable must be true or false"}
+    if not valid_node_name(node):
+        return {"status": "ERROR", "message": "invalid node name"}
+    members = await cluster_node_names()
+    if members is None:
+        return {"status": "ERROR", "node": node,
+                "message": "could not read the Proxmox cluster member list (pvesh failed)"}
+    if node not in members:
+        return {"status": "ERROR", "node": node,
+                "message": f"node {node} is not a member of this Proxmox cluster"}
+    # This host leaving an OS-update cycle: full disable (cancel drain, restart
+    # guests). Checked before the HA test so guests restart even if HA is down.
+    if not enable and await _os_update_drain_pending() and node == await local_node_name():
+        res = await node_maintenance("disable")
+        if res.get("status") == "SUCCESS":
+            res["message"] = (f"{node}: maintenance mode disable requested; OS-update drain "
+                              f"cancelled, {len(res.get('restarted') or [])} guest(s) restarted")
+        return res
+    # HA must be active, or ha-manager would queue a command nobody acts on (until
+    # someone adds an HA resource, much later).
+    if await ha_maintenance_nodes() is None:
+        return {"status": "ERROR", "node": node,
+                "message": "HA is not active on this cluster (no HA resources configured, "
+                           "or the HA manager status can't be read)"}
+    # argv list, no shell: the node name is passed as one literal argument.
+    try:
+        rc, out, err = await _run(ha_maintenance_argv(node, enable), check=False, timeout=30)
+    except (PveError, OSError) as e:
+        return {"status": "ERROR", "node": node, "message": f"ha-manager failed: {e}"}
+    if rc != 0:
+        detail = (err or out).decode("utf-8", "replace").strip()[:300]
+        return {"status": "ERROR", "node": node,
+                "message": f"ha-manager node-maintenance {'enable' if enable else 'disable'} "
+                           f"failed: {detail or f'exit {rc}'}"}
+    logger.warning("HA maintenance %s requested for node %s",
+                   "enable" if enable else "disable", node)
+    return {"status": "SUCCESS", "node": node, "maintenance": enable,
+            "message": f"{node}: maintenance mode {'enable' if enable else 'disable'} requested"}
+
+
 async def list_qemu_vms_cluster() -> List[Tuple[int, str, str]]:
     """Every qemu VM across the cluster as ``(vmid, name, node)`` from
     ``/cluster/resources`` (each row carries the owning ``node``). Unlike
