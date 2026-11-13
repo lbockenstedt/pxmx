@@ -34,12 +34,25 @@ the exact patterns. This file is the shape + the rules.
    from the bucket, add to the `randomizable_sims` lists, add to the override
    apply list, add the dispatch gate (skip-if-already-running), and add the sim
    to `report_status`/`Send-Status` (active_simulations + config).
+   Also the client **dashboards** (the left-panel monitor): `dashboard.sh` and
+   `dashboard.ps1` keep their own flag reads and label lists. A sim missing
+   there runs but never shows on the client's dashboard.
 5. **UI — BOTH `sim-views.js` copies** (`lm/WebUI/` and `cs/lm-spoke/static/`):
    add the sim to the name/flag lists and add its config fields to the sim-conf
    editor arrays (right field `type` — `'list'` for multi-value).
-6. **Quota engine** — ONLY if the sim generates an alert / consumes quota: the
-   placement matrix, `sim_quota.py` + its hub twin `lm/core/src/simulations/
-   sim_quota.py`, and the alert linkage.
+6. **The sim list — REQUIRED for every sim.** Add the sim to
+   `lm/core/src/simulations/sims.json`. It is the ONE sim list: the hub and the
+   cs spoke both import it as `SIM_META` (via `sim_catalog.py`), and the Sim
+   Quota dropdown, the spoke's toggle/flag/beacon key lists and the hub's
+   per-user override flags all derive from it. Never add a sim to a separate
+   Python list. Ship the lm commit to main BEFORE the cs commits that use the
+   sim. A Python primitive is optional; client-script-only sims (e.g.
+   `www_discover`) are fine. The client scripts and UI cannot import the
+   list, so cs `tests/test_sim_list_coverage.py` fails the push when
+   `simulation.sh/.ps1`, `common.sh/.ps1`, the dashboards' flag tables or
+   `sim-views.js` (`CS_CONTROL_FLAGS`, `CS_ONOFF_KEYS`) miss a sim in it.
+   Quota extras ONLY if the sim generates an alert: the placement matrix,
+   `SIM_QUOTA_KEYS` and the alert linkage.
 7. **Docs** — `lm/docs/alert-generation.md` (how to fire the alert + levers).
 8. **Verify** — run the `dual-copy-guard` skill to confirm nothing drifted, then
    the standard commit/push per the terse-commit convention.
