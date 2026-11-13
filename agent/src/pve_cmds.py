@@ -1094,6 +1094,85 @@ async def set_ha_node_maintenance(node: Any, enable: Any) -> Dict[str, Any]:
             "message": f"{node}: maintenance mode {'enable' if enable else 'disable'} requested"}
 
 
+def node_reboot_argv(node: str) -> List[str]:
+    """``pvesh create /nodes/<node>/status --command reboot`` as an argv list
+    (the Proxmox API reboot, which pvesh forwards to that node). Raises
+    ValueError for a bad node name, so it can never reach a process."""
+    if not valid_node_name(node):
+        raise ValueError(f"invalid node name {node!r}")
+    return ["pvesh", "create", f"/nodes/{node}/status", "--command", "reboot"]
+
+
+async def running_guests_strict(node: str) -> Optional[List[str]]:
+    """Running, non-template guests on ``node`` as ``["qemu:101", ...]``; None
+    when either list can't be read, so a failed read never looks like "no
+    guests" to the reboot check."""
+    found: List[str] = []
+    for kind in ("qemu", "lxc"):
+        rows = await _pvesh_json(f"/nodes/{node}/{kind}")
+        if not isinstance(rows, list):
+            return None
+        found += [f"{kind}:{r.get('vmid')}" for r in rows
+                  if isinstance(r, dict) and r.get("status") == "running" and not r.get("template")]
+    return sorted(found)
+
+
+async def reboot_ha_node(node: Any, reboot_local) -> Dict[str, Any]:
+    """Reboot a cluster node that is in HA maintenance mode (the hub's
+    Hypervisors → Nodes "Reboot" button). Re-checks everything live, right
+    before rebooting, and refuses unless: the name is valid and a cluster
+    member, the HA status says the node is in maintenance, and no guest is
+    still running on it (the HA migration or a manual drain isn't finished).
+
+    This host is rebooted with ``reboot_local()`` (the agent's privileged
+    ``shutdown -r +1``, so the reply gets out first); another node through
+    the Proxmox API, ``pvesh create /nodes/<node>/status --command reboot``."""
+    # Validate the node.
+    if not valid_node_name(node):
+        return {"status": "ERROR", "message": "invalid node name"}
+    members = await cluster_node_names()
+    if members is None:
+        return {"status": "ERROR", "node": node,
+                "message": "could not read the Proxmox cluster member list (pvesh failed)"}
+    if node not in members:
+        return {"status": "ERROR", "node": node,
+                "message": f"node {node} is not a member of this Proxmox cluster"}
+    # It must be in HA maintenance mode right now.
+    in_maint = await ha_maintenance_nodes()
+    if in_maint is None:
+        return {"status": "ERROR", "node": node,
+                "message": "refusing to reboot: the HA status can't be read"}
+    if node not in in_maint:
+        return {"status": "ERROR", "node": node,
+                "message": f"refusing to reboot: {node} is not in HA maintenance mode"}
+    # No guest may still be running on it.
+    guests = await running_guests_strict(node)
+    if guests is None:
+        return {"status": "ERROR", "node": node,
+                "message": f"refusing to reboot: could not list the guests on {node}"}
+    if guests:
+        shown = ", ".join(guests[:10]) + (" …" if len(guests) > 10 else "")
+        return {"status": "ERROR", "node": node, "running_guests": guests,
+                "message": f"refusing to reboot: {len(guests)} guest(s) still running on "
+                           f"{node} ({shown}); wait for the migration to finish or shut them down"}
+    # Reboot: this host via the privileged local path, any other node via the API.
+    if node == await local_node_name():
+        res = await reboot_local()
+        res = res if isinstance(res, dict) else {"status": "ERROR", "message": "no result"}
+        res["node"] = node
+        return res
+    try:
+        rc, out, err = await _run(node_reboot_argv(node), check=False, timeout=60)
+    except (PveError, OSError) as e:
+        return {"status": "ERROR", "node": node, "message": f"reboot failed: {e}"}
+    if rc != 0:
+        detail = (err or out).decode("utf-8", "replace").strip()[:300]
+        return {"status": "ERROR", "node": node,
+                "message": f"reboot of {node} failed: {detail or f'exit {rc}'}"}
+    logger.warning("node %s reboot requested (in HA maintenance, no guests running)", node)
+    return {"status": "SUCCESS", "node": node, "message": f"{node}: reboot requested"}
+
+
 async def list_qemu_vms_cluster() -> List[Tuple[int, str, str]]:
     """Every qemu VM across the cluster as ``(vmid, name, node)`` from
     ``/cluster/resources`` (each row carries the owning ``node``). Unlike
