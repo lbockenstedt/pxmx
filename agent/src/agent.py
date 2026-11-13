@@ -219,6 +219,7 @@ logger = logging.getLogger("PxmxAgent")
 # Commands that send keepalive progress frames while running.
 _KEEPALIVE_CMDS = frozenset({
     "GET_VM_LIST", "GET_NODE_STATS", "GET_SYSTEM_STATS", "RUN_COMMAND",
+    "PXMX_NODE_MAINTENANCE",
 })
 # 50 MB circular-log cap for the standalone Proxmox agent. This box runs OFF the
 # hub (no lm/core on path), so it uses the inline configure_logging fallback
@@ -1243,6 +1244,24 @@ class ProxmoxAgent:
         return storages
 
     async def get_node_stats(self) -> Dict[str, Any]:
+        """Per-node stats (see _collect_node_stats), each node flagged with
+        ``maintenance`` from the cluster's HA status so the hub can show which
+        nodes are in HA maintenance mode — even when someone set it outside LM.
+        The flag is left off when the HA status can't be read."""
+        result = await self._collect_node_stats()
+        nodes = result.get("nodes") if isinstance(result, dict) else None
+        if nodes:
+            try:
+                in_maint = await pve_cmds.ha_maintenance_nodes()
+            except Exception as e:  # noqa: BLE001 — never sink the node stats
+                logger.debug("HA maintenance status unavailable: %r", e)
+                in_maint = None
+            if in_maint is not None:
+                for n in nodes:
+                    n["maintenance"] = str(n.get("node") or "") in in_maint
+        return result
+
+    async def _collect_node_stats(self) -> Dict[str, Any]:
         """Per-node stats via local pvesh — no API credentials required.
 
         Uses /cluster/resources (type=node) as primary source — same daemon that
@@ -2645,6 +2664,15 @@ class ProxmoxAgent:
                         try:
                             result = await pve_cmds.node_maintenance(
                                 str((data or {}).get("action") or "status"))
+                        except Exception as e:  # noqa: BLE001
+                            result = {"status": "ERROR", "message": str(e)}
+
+                    # HA maintenance on/off for any node of this cluster (the
+                    # hub's Hypervisors → Nodes "Maintenance" button).
+                    elif cmd_type == "PXMX_NODE_MAINTENANCE":
+                        try:
+                            result = await pve_cmds.set_ha_node_maintenance(
+                                (data or {}).get("node"), (data or {}).get("enable"))
                         except Exception as e:  # noqa: BLE001
                             result = {"status": "ERROR", "message": str(e)}
 
