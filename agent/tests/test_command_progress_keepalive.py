@@ -113,4 +113,4 @@ def test_keepalive_command_allowlist():
     backend (the ones the hub timed out on) — no more, no less."""
     assert _agent_mod._KEEPALIVE_CMDS == frozenset({
         "GET_VM_LIST", "GET_NODE_STATS", "GET_SYSTEM_STATS", "RUN_COMMAND",
-        "PXMX_NODE_MAINTENANCE"})
+        "PXMX_NODE_MAINTENANCE", "PXMX_NODE_REBOOT"})

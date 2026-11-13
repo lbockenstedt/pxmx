@@ -219,7 +219,7 @@ logger = logging.getLogger("PxmxAgent")
 # Commands that send keepalive progress frames while running.
 _KEEPALIVE_CMDS = frozenset({
     "GET_VM_LIST", "GET_NODE_STATS", "GET_SYSTEM_STATS", "RUN_COMMAND",
-    "PXMX_NODE_MAINTENANCE",
+    "PXMX_NODE_MAINTENANCE", "PXMX_NODE_REBOOT",
 })
 # 50 MB circular-log cap for the standalone Proxmox agent. This box runs OFF the
 # hub (no lm/core on path), so it uses the inline configure_logging fallback
@@ -2673,6 +2673,23 @@ class ProxmoxAgent:
                         try:
                             result = await pve_cmds.set_ha_node_maintenance(
                                 (data or {}).get("node"), (data or {}).get("enable"))
+                        except Exception as e:  # noqa: BLE001
+                            result = {"status": "ERROR", "message": str(e)}
+
+                    # Reboot a node that is in HA maintenance mode (pve_cmds re-checks it live).
+                    elif cmd_type == "PXMX_NODE_REBOOT":
+                        async def _reboot_this_host():
+                            """Reboot this host the way OS_REBOOT does, refused while provisioning runs."""
+                            from . import os_update
+                            if (usb_provision.current_prov_run().get("running")
+                                    or usb_provision.current_reclone_state().get("status") == "running"
+                                    or usb_provision.current_deleting_vmids()):
+                                return {"status": "ERROR",
+                                        "message": "refusing to reboot: provisioning work is running"}
+                            return await asyncio.to_thread(os_update.reboot_node)
+                        try:
+                            result = await pve_cmds.reboot_ha_node(
+                                (data or {}).get("node"), _reboot_this_host)
                         except Exception as e:  # noqa: BLE001
                             result = {"status": "ERROR", "message": str(e)}
 
