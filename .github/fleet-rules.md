@@ -256,8 +256,13 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
 5. **Onboarding.** A tenant onboards only its own devices. Approval is
    automatic only when tenant-id, tenant-name and PSK are all supplied;
    otherwise a tenant admin approves.
-6. **LM is the only front end.** Tenants never see backend tools such as
-   Zabbix.
+6. **LM is the front end for day-to-day work.** Everything users do every
+   day (viewing, searching, configuring, routine changes) is built into LM,
+   so nobody needs a backend tool such as Zabbix or Graylog for daily
+   operations. Tenants never see backend tools. An admin can still open the
+   source system directly, but only for troubleshooting, upgrades or a
+   specific task LM does not cover; a task that keeps sending admins there
+   is a gap to build into LM.
 7. **Hub settings are defaults.** A setting on the hub is the default for
    every spoke, and can be overridden per spoke.
 
