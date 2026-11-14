@@ -122,7 +122,7 @@ intent" parity still need a human.
 - CANONICAL: `.pipeline-templates/{bump_version.py,promote.sh,promote.yml,selftest.sh}`
   (in the workspace-root `nw` repo)
 - COPIES: in **every active repo** (`lm cs pxmx ab cppm ldap le netbox
-  nw opnsense qa kvm truenas tsa zabbix`; dns/dhcp are archived) as
+  nw opnsense qa kvm syslog truenas tsa zabbix`; dns/dhcp are archived) as
   `<repo>/.github/scripts/bump_version.py`, `<repo>/.github/scripts/promote.sh`,
   `<repo>/.github/scripts/promotion_selftest.sh` (from `selftest.sh`) and
   `<repo>/.github/workflows/promote.yml`.
@@ -136,7 +136,7 @@ intent" parity still need a human.
 - Edit the canonical, then re-run the distribute loop:
   ```bash
   cd /Users/lbockenstedt/vscode
-  for r in lm cs pxmx ab cppm ldap le netbox opnsense qa kvm truenas tsa zabbix .; do
+  for r in lm cs pxmx ab cppm ldap le netbox opnsense qa kvm syslog truenas tsa zabbix .; do
     cp .pipeline-templates/bump_version.py .pipeline-templates/promote.sh $r/.github/scripts/
     cp .pipeline-templates/selftest.sh $r/.github/scripts/promotion_selftest.sh
     cp .pipeline-templates/promote.yml  $r/.github/workflows/promote.yml
@@ -145,7 +145,7 @@ intent" parity still need a human.
   ```
 - Verify (drift sweep):
   ```bash
-  for r in lm cs pxmx ab cppm ldap le netbox opnsense qa kvm truenas tsa zabbix .; do
+  for r in lm cs pxmx ab cppm ldap le netbox opnsense qa kvm syslog truenas tsa zabbix .; do
     for f in scripts/bump_version.py scripts/promote.sh workflows/promote.yml; do
       c=.pipeline-templates/$(basename $f); [ "$(basename $f)" = promote.yml ] && c=.pipeline-templates/promote.yml
       cmp -s $c $r/.github/$f || echo "DRIFT: $r/.github/$f"
