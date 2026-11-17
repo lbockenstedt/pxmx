@@ -126,6 +126,17 @@ SAME edits in both.
   `CS_CONTROL_FLAGS` / `CS_ONOFF_KEYS`.
 - A Python primitive (`sim_primitives.PRIMITIVES`) is optional; only sims the
   spoke engine runs itself need one.
+- ☐ Dongle quarantine — decide for every `multi_capable: false` sim: do its
+  clients keep an IP while it runs? `_default_qt_exclude_sims()` in cs
+  `lm-spoke/src/sim_quota_engine.py` derives exclusive sims into the
+  exclusion set (no-IP by design, never shed as bad dongles).
+  - Keeps an IP (dns_fail, dns_latency, rogue_dns): add it to
+    `QT_EXCLUDE_NONISOLATING_SIMS` and a test asserting it is NOT in
+    `_default_qt_exclude_sims()`. Missing this broke CI after rogue_dns.
+  - No IP by design (dhcp_fail, assoc_fail, auth_fail): it is derived. Add
+    it only to the literal fallback `QT_EXCLUDE_SIMS_DEFAULT` (and the set in
+    cs `test_defaults_are_the_locked_decisions`; derived must equal fallback)
+    and test that it IS in `_default_qt_exclude_sims()`.
 
 ## 6b — Quota / placement engine (OPTIONAL — alert/quota sims only)
 - ☐ Placement matrix (see memory `sim-placement-unified-model`): add the sim so
