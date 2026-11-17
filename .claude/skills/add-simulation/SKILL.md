@@ -53,6 +53,13 @@ the exact patterns. This file is the shape + the rules.
    `sim-views.js` (`CS_CONTROL_FLAGS`, `CS_ONOFF_KEYS`) miss a sim in it.
    Quota extras ONLY if the sim generates an alert: the placement matrix,
    `SIM_QUOTA_KEYS` and the alert linkage.
+   **Dongle quarantine (every exclusive sim):** cs
+   `lm-spoke/src/sim_quota_engine.py` treats `multi_capable: false` sims as
+   no-IP by design. If the sim's clients KEEP an IP while it runs (dns_fail,
+   rogue_dns), add it to `QT_EXCLUDE_NONISOLATING_SIMS` plus a test that it is
+   not in `_default_qt_exclude_sims()`. If it stops clients getting an IP by
+   design (dhcp_fail, auth_fail), it is derived; only add it to the literal
+   fallback `QT_EXCLUDE_SIMS_DEFAULT` (tests require derived == fallback).
 7. **Docs** — `lm/docs/alert-generation.md` (how to fire the alert + levers).
 8. **Verify** — run the `dual-copy-guard` skill to confirm nothing drifted, then
    the standard commit/push per the terse-commit convention.
