@@ -127,10 +127,12 @@ example `<session folder>/files/review/<repo>`).
    `Retry` or a missing reply never qualifies), and every open finding is
    one that may wait under step 5. Promote it once CI passes, then run the
    live check on the outage and on what worked before the fix. Keep the fix
-   only if it helped and broke nothing that worked before; then fix the
+   only if a completed live check shows it helped and broke nothing that
+   worked before; then fix the
    follow-ups in a new commit and review that from step 1 in normal rounds,
-   and whatever is still broken remains an outage. If it did not help, or
-   it broke something that worked before, revert it at once (fleet rule
+   and whatever is still broken remains an outage. If it did not help,
+   it broke something that worked before, or the live check failed, was
+   incomplete or could not run, revert it at once (fleet rule
    3.9) unless the owner directs another mitigation. The revert undoes only
    that fix and needs only smoke.sh and CI: what it brings back was
    reviewed, or is an earlier outage fix kept after its live check.
