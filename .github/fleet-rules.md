@@ -35,8 +35,10 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    - Commit only your own changes; never sweep up someone else's edits.
    - Don't change the working directory unless asked.
 4. **Fix the class, not the instance.** After fixing a bug, search the whole
-   fleet for the same pattern and fix every copy. When an issue comes back,
-   read the git history of the earlier attempts before patching again.
+   fleet for the same pattern and fix every copy. The other copies go in
+   their own change (rule 8), not into a change that is under review. When
+   an issue comes back, read the git history of the earlier attempts before
+   patching again.
 5. **Verify, don't assume.**
    - Before every push, run `../lm/.github/scripts/smoke.sh` from the repo
      root. It runs the same checks and tests as CI, in the same order, and
@@ -85,6 +87,20 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    not change.
    Why: DNS and DHCP were empty for every tenant while the fix went
    through review rounds about corner cases the live data did not hit.
+8. **Keep a change small enough to review in one pass.** A change does what
+   its intent says, and no more. Its budget is about 15 source files and
+   1,500 added or changed source lines; tests, docs, comments and
+   docstrings don't count.
+   - Over the budget, split the change, or say in the PR intent why it
+     can't be split.
+   - Other copies of the same defect (rule 4) and unrelated clean-ups go in
+     their own change.
+   - The budget is a guide, not a gate. `fleet_checks.py` shows it as a
+     note in CI and in smoke.sh, and a reviewer raises it as a follow-up,
+     never as a reason to Reject.
+
+   Why: the NAC change grew during review from 6 files and 631 lines to 52
+   files and 5,199 lines, and took 16 rounds.
 
 ## 2. Git, branches and promotion
 
@@ -422,6 +438,7 @@ reviewers and the AB panel.
 | Check | Where | Rules |
 | :--- | :--- | :--- |
 | `fleet_checks.py` (vault wiring, storage format, new deps, hard-coded hosts, VERSION, docstrings and comments, SSRF, tenant scope and first-site fallbacks, JS syntax, WebUI ratchet, UUIDs, secret logging, blocking async, copies and dead code, docs) | `checks` job in `ci.yml` (runs before `test`) on every PR and dev push; AB on every fix and review | 2.2, 3.7, 4.1, 5.1–5.3, 6.1, 6.4, 7.1, 7.3, 8.2–8.4, 8.6, 9.2 |
+| `fleet_checks.py` review scope budget (a note; never blocks) | `checks` job in `ci.yml` and `smoke.sh`; not given to AB's reviews or fixes | 1.8 |
 | `ruff_new.py` (new lint findings only) | `checks` job in `ci.yml` | 8.1, 8.4 |
 | `check_twins.py` (twin pairs, fleet-owned copies) | `checks` job in `ci.yml` | 8.5, 2.7 |
 | `pip-audit` (when requirements change; advisory) | `checks` job in `ci.yml` | 8.3 |
