@@ -137,9 +137,11 @@ python ../ab/fleet_checks.py --base origin/dev --repo lbockenstedt/lm           
 - **The spoke logs the secret.** `UPDATE_CONFIG` logged nested appliance API
   keys in clear text — truenas `0c60732` made `_mask` recurse into lists.
 - **The reconnect projection drops fields.** `_INSTANCE_CONFIG_SOURCES` in
-  `main.py` must mirror `_NAC_PAYLOAD`/`_IPAM_PAYLOAD` in
+  `main.py` must mirror `_IPAM_PAYLOAD`/`_LDAP_PAYLOAD` in
   `routes/tenant_devices.py`. lm `e72faa04` fixed `verify_ssl` being lost on
   every reconnect; any vault-related field you add to one belongs in both.
+  NAC records have only the `"cppm"` projection, used by
+  `LabManagerHub.push_nac_config` for every save and reconnect.
 
 ## Done when
 

@@ -54,7 +54,8 @@ example `<session folder>/files/review/<repo>`).
 3. Run one reviewer per `panel1` entry in `reviewers`, all in parallel, each
    on exactly that entry's `model`. Never substitute a different model.
    Panel 2 runs only after panel 1 Approves (step 4), as in AB, so a change
-   panel 1 rejects does not pay for a second pass. The reviewer prompt is:
+   panel 1 rejects does not pay for a second pass (a live-outage fix is the
+   one exception, step 4). The reviewer prompt is:
 
    > Read `<prompt>` and do exactly what it says. The change is in the
    > git repo at `<repo path>`; read any file there to check a claim before
@@ -83,7 +84,11 @@ example `<session folder>/files/review/<repo>`).
    more, else it prints `Retry`. A panel with no replies fails.
    - Panel 1 `Approve` and panel 2 `pending` (no panel 2 reply yet): now run
      the `panel2` entries (step 3) and gate again.
-   - Panel 1 not `Approve`: panel 2 stays `skipped`; do not run it.
+   - Panel 1 not `Approve`: panel 2 stays `skipped`; do not run it. The one
+     exception is a fix for a live outage (fleet rule 1.7), which needs both
+     panels' findings: run the `panel2` entries anyway. The gate still
+     prints panel 2 as `skipped` and ignores its replies, so read them
+     yourself.
    - `Retry` is not a finding about the change: re-run only the failed
      reviewers (step 3) and gate again. It does not start a new round, and
      the change is not edited for it.
@@ -97,10 +102,18 @@ example `<session folder>/files/review/<repo>`).
    - Amend the commit, then go back to step 2.
    - If a reject is wrong, add the evidence to the commit message or a code
      comment rather than ignoring it. AB's reviewers will raise it too.
+   - On a fix for a live outage (fleet rule 1.7), read every critique from
+     both panels, `Approve` ones included, and sort each concrete finding.
+     A regression the fix brings in, a security hole or a cross-tenant leak
+     is still fixed first. A right finding about a corner case the live
+     data does not hit (check the live data; don't assume it) may wait:
+     record it under "Known follow-ups" in the commit message and as a
+     GitHub issue, then go to step 7.
 6. Stop rule (the same as AB's remediation; see `ab/docs/ab.md`). Score each
    round as (panels that approved, lowest panel confidence) and keep the best.
-   Keep going while rounds beat the best, but stop, do not push, and report
-   the remaining findings to the user when either:
+   Keep going while rounds beat the best, but stop, do not push (unless step
+   7's outage exception applies), and report the remaining findings to the
+   user when either:
    - 2 rounds in a row did not beat the best, or
    - 5 rounds have run.
    A backtest of 766 AB-reviewed PRs found none that first fully approved
@@ -108,7 +121,21 @@ example `<session folder>/files/review/<repo>`).
 
    If reviewers still fail after re-running them (`Retry`), stop and report that the reviewers could not
    run (model, auth or tool error), not a finding.
-7. Push only once the gate passes.
+7. Push only once the gate passes. The one exception is a fix for a live
+   outage (fleet rule 1.7). It may be pushed while the gate still fails
+   when smoke.sh passes, every seat of both panels gave a verdict (a
+   `Retry` or a missing reply never qualifies), and every open finding is
+   one that may wait under step 5. Promote it once CI passes, then run the
+   live check on the outage and on what worked before the fix. Keep the fix
+   only if a completed live check shows it helped and broke nothing that
+   worked before; then fix the
+   follow-ups in a new commit and review that from step 1 in normal rounds,
+   and whatever is still broken remains an outage. If it did not help,
+   it broke something that worked before, or the live check failed, was
+   incomplete or could not run, revert it at once (fleet rule
+   3.9) unless the owner directs another mitigation. The revert undoes only
+   that fix and needs only smoke.sh and CI: what it brings back was
+   reviewed, or is an earlier outage fix kept after its live check.
 
 ## Known differences from AB
 

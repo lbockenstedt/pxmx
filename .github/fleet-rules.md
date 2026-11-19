@@ -35,8 +35,10 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    - Commit only your own changes; never sweep up someone else's edits.
    - Don't change the working directory unless asked.
 4. **Fix the class, not the instance.** After fixing a bug, search the whole
-   fleet for the same pattern and fix every copy. When an issue comes back,
-   read the git history of the earlier attempts before patching again.
+   fleet for the same pattern and fix every copy. The other copies go in
+   their own change (rule 8), not into a change that is under review. When
+   an issue comes back, read the git history of the earlier attempts before
+   patching again.
 5. **Verify, don't assume.**
    - Before every push, run `../lm/.github/scripts/smoke.sh` from the repo
      root. It runs the same checks and tests as CI, in the same order, and
@@ -45,7 +47,8 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
      `smoke.sh --install-hook`.
    - A local session (Copilot, Claude or any other tool) also runs the
      `review` skill before every push to dev or onto a promotion branch, and
-     pushes only when both of AB's review panels approve.
+     pushes only when both of AB's review panels approve. The one exception
+     is a fix for a live outage (rule 7).
    - After a deploy, check the live result: login works, the page renders,
      and the data shows up end to end in LM, NetBox, Zabbix and ClearPass.
    - An audit is not finished until the findings are fixed and verified.
@@ -53,6 +56,51 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
      instead of guessing.
 6. **Commit trailer.** Commits made with an AI assistant end with
    `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`.
+7. **Outage fixes ship first; corner cases follow.** When production is
+   broken (a live function is down or wrong for users right now), a fix may
+   be pushed and promoted before both review panels approve, when all of
+   these hold:
+   - smoke.sh passes before the push, and CI passes before the promotion;
+   - both review panels have run on the fix and every reviewer gave a
+     verdict (panel 2 runs even when panel 1 rejects, and a reviewer that
+     could not run never counts as a pass);
+   - every finding the review still raises, in any reviewer's critique (an
+     Approve can carry findings too), is a corner case the live data does
+     not hit today (check the live data; don't assume it), not a
+     regression the fix brings in, and not a security hole or a
+     cross-tenant leak.
+
+   Before the push, record each open corner case under a "Known follow-ups"
+   heading in the commit message and as a GitHub issue in the repo. After
+   the deploy, run the live check (rule 5) on the outage and on what worked
+   before the fix. Keep the fix only if it helped and broke nothing that
+   worked before, confirmed by a completed live check; then fix the
+   follow-ups in a new change through the
+   normal two-panel review, and whatever is still broken remains an outage.
+   If it did not help, it broke something that worked before (DNS back
+   but login broken), or the live check failed, was incomplete or could
+   not run (inconclusive counts as not helped), revert it at once (rule 3.9) unless the owner directs
+   another mitigation. The revert undoes only that fix and needs only
+   smoke.sh and CI: what it brings back was reviewed, or is an earlier
+   outage fix kept after its live check. The exception is for a person or
+   a local session fixing a live outage; AB's own 0.90 bar (rule 10.3) does
+   not change.
+   Why: DNS and DHCP were empty for every tenant while the fix went
+   through review rounds about corner cases the live data did not hit.
+8. **Keep a change small enough to review in one pass.** A change does what
+   its intent says, and no more. Its budget is about 15 source files and
+   1,500 added or changed source lines; tests, docs, comments and
+   docstrings don't count.
+   - Over the budget, split the change, or say in the PR intent why it
+     can't be split.
+   - Other copies of the same defect (rule 4) and unrelated clean-ups go in
+     their own change.
+   - The budget is a guide, not a gate. `fleet_checks.py` shows it as a
+     note in CI and in smoke.sh, and a reviewer raises it as a follow-up,
+     never as a reason to Reject.
+
+   Why: the NAC change grew during review from 6 files and 631 lines to 52
+   files and 5,199 lines, and took 16 rounds.
 
 ## 2. Git, branches and promotion
 
@@ -390,6 +438,7 @@ reviewers and the AB panel.
 | Check | Where | Rules |
 | :--- | :--- | :--- |
 | `fleet_checks.py` (vault wiring, storage format, new deps, hard-coded hosts, VERSION, docstrings and comments, SSRF, tenant scope and first-site fallbacks, JS syntax, WebUI ratchet, UUIDs, secret logging, blocking async, copies and dead code, docs) | `checks` job in `ci.yml` (runs before `test`) on every PR and dev push; AB on every fix and review | 2.2, 3.7, 4.1, 5.1–5.3, 6.1, 6.4, 7.1, 7.3, 8.2–8.4, 8.6, 9.2 |
+| `fleet_checks.py` review scope budget (a note; never blocks) | `checks` job in `ci.yml` and `smoke.sh`; not given to AB's reviews or fixes | 1.8 |
 | `ruff_new.py` (new lint findings only) | `checks` job in `ci.yml` | 8.1, 8.4 |
 | `check_twins.py` (twin pairs, fleet-owned copies) | `checks` job in `ci.yml` | 8.5, 2.7 |
 | `pip-audit` (when requirements change; advisory) | `checks` job in `ci.yml` | 8.3 |
