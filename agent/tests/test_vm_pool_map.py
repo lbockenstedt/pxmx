@@ -13,7 +13,6 @@ is simply absent from the map (never sinks the rest).
 """
 import asyncio
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -32,13 +31,16 @@ def _run(c):
 class _Agent:
     """Fake agent whose _pvesh serves a scripted /pools listing + per-pool
     detail responses. ``detail_delay`` (seconds) is applied to every
-    /pools/{pid} detail call to simulate a slow/remote pmxcfs proxy."""
+    /pools/{pid} detail call to simulate a slow/remote pmxcfs proxy.
+    ``peak`` is the most detail calls that were in flight at once."""
 
     def __init__(self, listing, details=None, detail_delay=0.0):
         self._listing = listing
         self._details = details or {}
         self._detail_delay = detail_delay
         self.calls = []
+        self.in_flight = 0
+        self.peak = 0
 
     async def _pvesh(self, path):
         self.calls.append(path)
@@ -46,9 +48,14 @@ class _Agent:
             return self._listing
         # /pools/{pid}
         pid = path.split("/pools/", 1)[1]
-        if self._detail_delay:
-            await asyncio.sleep(self._detail_delay)
-        return self._details.get(pid, {})
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            if self._detail_delay:
+                await asyncio.sleep(self._detail_delay)
+            return self._details.get(pid, {})
+        finally:
+            self.in_flight -= 1
 
 
 def test_inline_members_need_no_detail_fetch():
@@ -76,20 +83,19 @@ def test_detail_fetch_when_members_absent():
 
 
 def test_detail_fetches_run_concurrently_not_serially():
-    # 5 pools each with a 0.3s detail delay. Serial → 1.5s; concurrent (cap 4)
-    # → ~0.6s (two waves). Assert well under the serial sum so a regression back
-    # to a serial loop fails loudly.
+    # 5 pools need a detail fetch and the cap is 4, so exactly 4 are in flight
+    # at once: a serial loop peaks at 1 and an uncapped fan-out at 5. Counting
+    # calls in flight, not wall-clock time, means a busy CI runner can't flip
+    # it (fleet rule 9.4).
     ids = [f"p{i}" for i in range(5)]
     agent = _Agent(
         [{"poolid": p} for p in ids],
         details={p: {"members": [{"vmid": 100 + i}]} for i, p in enumerate(ids)},
-        detail_delay=0.3,
+        detail_delay=0.05,
     )
-    t0 = time.time()
     out = _run(vm_inventory.vm_pool_map(agent))
-    elapsed = time.time() - t0
     assert out == {100 + i: p for i, p in enumerate(ids)}
-    assert elapsed < 1.2, f"detail fetches appear serial ({elapsed:.2f}s)"
+    assert agent.peak == 4, f"detail fetches not concurrent under the cap of 4 (peak {agent.peak})"
 
 
 def test_mixed_inline_and_detail():
