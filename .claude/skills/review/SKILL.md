@@ -61,16 +61,20 @@ example `<session folder>/files/review/<repo>`).
    > git repo at `<repo path>`; read any file there to check a claim before
    > rejecting on it. Reply with only the JSON object the prompt asks for.
 
-   - **Copilot:** a `code-review` agent with `model` set to the reviewer model.
-   - **Claude or any other tool:** run each reviewer with the Copilot CLI
-     from `<repo path>`, which reaches every provider AB uses, and save its
-     output as the reply, in the entry's `reply` file:
+   Every tool, Copilot included, runs each reviewer with the Copilot CLI
+   from `<repo path>`, which reaches every provider AB uses, and saves its
+   output as the reply, in the entry's `reply` file:
 
-         copilot -p "<reviewer prompt>" --model <model> -s --add-dir <dir> \
-             --allow-tool view --allow-tool grep --allow-tool glob \
-             > <reply>
+       copilot -p "<reviewer prompt>" --model <model> -s --add-dir <dir> \
+           --allow-tool view --allow-tool grep --allow-tool glob \
+           > <reply>
 
-     Your own sub-agents may run a seat only if they run that exact model.
+   The seat gets read-only tools and no shell: it reads and greps the code
+   but does not run it. The tests are smoke.sh's job (fleet rule 1.5), so
+   run smoke.sh before the review. Never run a seat as a `code-review`
+   agent or another sub-agent: those re-run the tests and re-read every
+   file each round. In NAC rounds 6 to 16 that cost about ten times as
+   much a round as read-only seats.
 4. Save each reply unedited in its entry's `reply` file (the script creates
    an empty `<dir>/votes/` each round). A reviewer that failed gets no file
    (delete an empty one); never write a vote for it. Then apply AB's own
@@ -95,9 +99,12 @@ example `<session folder>/files/review/<repo>`).
 5. Read every `Reject` critique, even when the gate passed (a panel can
    Approve on majority with a Reject in it). Once the gate passes, fix only
    real defects; record non-blocking notes as follow-ups for the user rather
-   than editing for them. For each `Reject` that is right:
-   - Fix the whole class of defect, not just the line cited: search the change
-     (and its twins) for every sibling instance.
+   than editing for them (fleet rule 1.9 says which findings block). For
+   each `Reject` that is right:
+   - Fix the whole class of defect in one pass, not just the line cited
+     (fleet rule 1.9): grep every call site in the change and its twins,
+     write the state matrix, and fix every cell. A fix that needs a new
+     mechanism gets a design review first.
    - Add a test that fails without the fix.
    - Amend the commit, then go back to step 2.
    - If a reject is wrong, add the evidence to the commit message or a code
