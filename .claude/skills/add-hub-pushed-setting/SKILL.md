@@ -70,9 +70,13 @@ Do not use it for:
 - **Client-Sim:** add the key to the payload built in
   `LabManagerHub.push_cs_hub_config(spoke_id)`.
 - **Per-instance fields:** add the field to the `_INSTANCE_CONFIG_SOURCES`
-  projection in `main.py` **and** to the matching `_NAC_PAYLOAD` /
-  `_IPAM_PAYLOAD` in `core/src/routes/tenant_devices.py`. The two must stay
-  identical.
+  projection in `main.py`. For IPAM and Directory, also add it to the
+  matching `_IPAM_PAYLOAD` / `_LDAP_PAYLOAD` in
+  `core/src/routes/tenant_devices.py` and the payload in the
+  `routes/nw.py` `_instance_crud` registration; they must stay identical.
+  NAC has one projection only: every NAC save, move, delete and reconnect
+  goes through `LabManagerHub.push_nac_config` /
+  `reconcile_nac_spokes`, which use the `"cppm"` entry.
 
 ### 4. Spoke: apply and persist
 
@@ -109,9 +113,10 @@ cd cs && /tmp/nbvenv/bin/python -m pytest -q lm-spoke/tests      # if the cs sid
 ## Common misses
 
 - **Reconnect push drops the field.** `verify_ssl` was in the save-time
-  payload (`_NAC_PAYLOAD`) but not in the `_INSTANCE_CONFIG_SOURCES`
-  projection, so every spoke restart re-enabled TLS verification — lm
-  `e72faa04` (+ `tests/test_cppm_reconnect_verify_ssl.py`).
+  NAC payload but not in the `_INSTANCE_CONFIG_SOURCES` projection, so
+  every spoke restart re-enabled TLS verification — lm `e72faa04`
+  (+ `tests/test_cppm_reconnect_verify_ssl.py`). NAC now has a single
+  projection (`push_nac_config`); IPAM and Directory still have two.
 - **A blank value changes type.** An empty `t1_exclude_hosts` was parsed as
   a vid:pid list and every hostname was dropped. It had to be fixed on both
   sides: lm `3579e815` (`_hub_config_list_value` in
