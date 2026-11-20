@@ -47,9 +47,8 @@ Recipe: the **`change-fleet-pipeline`** skill.
    failed diff.
 6. **Archived repos.** dhcp and dns are archived (read-only). Leave them out
    of every list.
-7. **Flaky checks.** A timing test that fails on a busy runner (e.g.
-   `test_cppm_device_enrich_speed.py`): re-run the failed job once. If it
-   fails again, treat it as real.
+7. **Flaky checks.** When a timing test fails on a busy runner, re-run the
+   failed job once. If it fails again, treat it as real.
 
 ## Tests
 
