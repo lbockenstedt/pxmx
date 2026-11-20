@@ -95,7 +95,8 @@ def test_detail_fetches_run_concurrently_not_serially():
     )
     out = _run(vm_inventory.vm_pool_map(agent))
     assert out == {100 + i: p for i, p in enumerate(ids)}
-    assert agent.peak == 4, f"detail fetches not concurrent under the cap of 4 (peak {agent.peak})"
+    assert agent.peak <= 4, f"detail fetches exceeded the cap of 4 (peak {agent.peak})"
+    assert agent.peak >= 4, f"detail fetches not concurrent under the cap of 4 (peak {agent.peak})"
 
 
 def test_mixed_inline_and_detail():
