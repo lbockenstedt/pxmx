@@ -142,15 +142,18 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    Separately, one request turned into about ten changes, five of them a
    chain of follow-ups.
 10. **Cloud AI is scarce: local models first, and a daily spend gate.**
-    - Use local or free models (the `local-*` agents, `ollama/*` models)
-      for every task they can do, even when they are slower.
+    - Use local or free models (the `local-*` agents, `ollama/*` and
+      `llamacpp/*` models) for every task they can do, even when they are
+      slower.
     - Before using a cloud model or starting a cloud sub-agent, check
       today's spend (`python3 .github/hooks/ai_budget.py status`) and
       confirm that no local option fits.
     - The daily gate stops runaway sessions; it is not a budget. At about
-      $100 of cloud AI in a local day, Copilot CLI refuses tool calls and
-      AB stops calling Copilot. In the last $25, new cloud sub-agents are
-      refused. The numbers are in `.github/ai-budget.json`.
+      $100 of cloud AI in a local day, Copilot CLI refuses the tool calls of
+      every session that used a cloud model that day, and AB stops calling
+      Copilot. A session on local models only keeps working. In the last
+      $25, new cloud sub-agents are refused. The numbers are in
+      `.github/ai-budget.json`.
     - Only a person reopens the gate: `ai_budget.py continue`, or Continue
       in AB. An agent that meets the gate stops and tells the user; it never
       reopens the gate, changes its state or works around it.
@@ -505,7 +508,7 @@ reviewers and the AB panel.
 | `check-direction` (branch flow), VERSION guard | `branch-flow` / `promote.yml` | 2.1, 2.2 |
 | PR intent statement | AB review panel | 2.4 |
 | Call-rate and NetBox churn health check (writes per hour, flapping fields, commands called far above their refresh interval) | AB hub health check | 4.8 |
-| AI spend gate (`.github/hooks/ai_budget.py`: past the daily gate, refuses tool calls; near it, refuses cloud sub-agents; always refuses an agent's reopen) | Copilot CLI hooks (`.github/hooks/fleet-hooks.json`) in a trusted folder; AB's LLM client | 1.10 |
+| AI spend gate (`.github/hooks/ai_budget.py`: past the daily gate, refuses tool calls of sessions that used a cloud model today; near it, refuses cloud sub-agents; always refuses an agent's reopen) | Copilot CLI hooks (`.github/hooks/fleet-hooks.json`) in a trusted folder; AB's LLM client | 1.10 |
 
 See `lm/docs/ci-checks.md` for what each check does and how to run it
 locally.

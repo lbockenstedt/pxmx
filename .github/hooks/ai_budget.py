@@ -5,8 +5,9 @@ The gate stops runaway sessions; it is not a budget. Copilot CLI runs this
 script from the hooks in .github/hooks/fleet-hooks.json:
 
     check     preToolUse: once today's cloud AI spend reaches the gate, refuse
-              every tool call except those an agent needs to stop. In the
-              last reserve_usd before the gate, refuse new cloud sub-agents.
+              every tool call except those an agent needs to stop, unless the
+              session has used only local models today. In the last
+              reserve_usd before the gate, refuse new cloud sub-agents.
               Always refuse an agent's attempt to reopen the gate.
     context   sessionStart and subagentStart: tell the agent today's spend
               and to prefer local models.
@@ -23,10 +24,10 @@ People run it from a terminal:
 
 Spend is read from Copilot CLI's own usage log ($COPILOT_HOME/session-store.db,
 assistant_usage_events.total_nano_aiu; 1e9 nano AIU = 1 AI credit = $0.01).
-It covers every CLI session and sub-agent on this machine, and local (Ollama)
-models cost nothing in it. The day is the local calendar day. The numbers
-come from .github/ai-budget.json. The only state written is this machine's
-reopened gate for today, in $COPILOT_HOME/ai-budget-state.json.
+It covers every CLI session and sub-agent on this machine, and local models
+(Ollama, llama.cpp) cost nothing in it. The day is the local calendar day.
+The numbers come from .github/ai-budget.json. The only state written is this
+machine's reopened gate for today, in $COPILOT_HOME/ai-budget-state.json.
 
 Fails open: with no usage log (another tool, or Copilot's cloud agent) or on
 any error, the hook prints nothing and exits 0, because Copilot refuses the
@@ -41,6 +42,7 @@ import os
 import re
 import sqlite3  # read-only: Copilot CLI's usage log; this script stores nothing in it
 import sys
+import time
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve()
@@ -52,6 +54,9 @@ SHELL_TOOLS = {"bash", "powershell", "write_bash"}
 READ_TOOLS = {"view", "grep", "glob"}
 # Tools that start more cloud model work.
 FANOUT_TOOLS = {"task", "run_dynamic_workflow"}
+# Copilot CLI model-name prefixes of the local model servers (Ollama and
+# llama.cpp's llama-server), from the provider names in ~/.copilot/providers.json.
+LOCAL_MODELS = ("ollama/", "llamacpp/")
 REOPEN = re.compile(r"ai_budget\.py['\"]?\s+continue\b")
 STATUS_ONLY = re.compile(r"^\s*python3?\s+\S*ai_budget\.py\s+status\s*$")
 REOPEN_REASON = ("Only a person can reopen the AI spend gate (fleet rule 1.10). Do not run it, "
@@ -101,6 +106,39 @@ def spent_today(since):
     return (row[0] or 0) / 1e11
 
 
+def local_session(session, since, wait_s=2.0):
+    """True when ``session`` has logged model calls since ``since`` and none cost anything.
+
+    Copilot CLI logs every model call under its session, sub-agents' calls
+    included, so a session on a cloud model, or one that started a cloud
+    sub-agent, shows spend. A model call is logged just before the tool calls
+    it asked for are checked (5 ms before, in a test), but that order is not
+    documented, so a session with no calls logged yet is re-read for up to
+    ``wait_s`` seconds. No session id, still no calls, or an unreadable log
+    count as cloud, which keeps the gate closed."""
+    if not session:
+        return False
+    deadline = time.monotonic() + wait_s
+    while True:
+        # Count the session's calls today and what they cost.
+        try:
+            con = usage_log()
+            if con is None:
+                return False
+            try:
+                calls, nano = con.execute("SELECT COUNT(*), SUM(total_nano_aiu) FROM assistant_usage_events "
+                                          "WHERE session_id = ? AND replace(created_at, ' ', 'T') >= ?",
+                                          (session, since)).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return False
+        # Local models cost nothing: their calls log no cost, or 0.
+        if calls or time.monotonic() >= deadline:
+            return calls > 0 and not nano
+        time.sleep(0.1)
+
+
 def gate_today(pol, day):
     """Today's gate: the fleet's, or higher when a person reopened it today."""
     try:
@@ -139,18 +177,22 @@ def status_call(tool, args):
 
 def cloud_fanout(tool, args):
     """True when a call starts more cloud model work: a sub-agent on a cloud
-    model, or a workflow. An ollama/* model or a local-* agent is local."""
+    model, or a workflow. An ollama/* or llamacpp/* model or a local-* agent
+    is local."""
     if tool not in FANOUT_TOOLS:
         return False
     args = args if isinstance(args, dict) else {}
     model = str(args.get("model") or "")
     if model:
-        return not model.startswith("ollama/")
+        return not model.startswith(LOCAL_MODELS)
     return tool != "task" or not str(args.get("agent_type") or "").startswith("local-")
 
 
-def decide(tool, args, spent, gate, reserve):
-    """The reason to refuse one tool call, or None to let it run."""
+def decide(tool, args, spent, gate, reserve, local=False):
+    """The reason to refuse one tool call, or None to let it run.
+
+    ``local``: the session has used only local models today, so it costs
+    nothing and keeps working past the gate, still without cloud sub-agents."""
     # Tool arguments may arrive as a JSON string.
     if isinstance(args, str):
         try:
@@ -159,24 +201,29 @@ def decide(tool, args, spent, gate, reserve):
             pass
     if reopen_attempt(tool, args):
         return REOPEN_REASON
-    if spent >= gate and tool not in STOP_TOOLS and not status_call(tool, args):
+    if spent >= gate and not local and tool not in STOP_TOOLS and not status_call(tool, args):
         return ("AI spend gate closed: $%.0f of cloud AI used today, gate $%.0f (fleet rule 1.10). "
                 "Stop now and tell the user. Only a person reopens it, by running: python3 %s continue"
                 % (spent, gate, SCRIPT))
     if cloud_fanout(tool, args) and spent + reserve >= gate:
         return ("Only $%.0f of cloud AI is left before today's gate of $%.0f (fleet rule 1.10), so no "
-                "new cloud sub-agents. Use a local-* agent or an ollama/* model, or finish without one."
-                % (max(gate - spent, 0), gate))
+                "new cloud sub-agents. Use a local-* agent or an ollama/* or llamacpp/* model, or finish "
+                "without one." % (max(gate - spent, 0), gate))
     return None
 
 
 def context_text(spent, gate):
-    """What an agent is told about the gate when a session or sub-agent starts."""
+    """What an agent is told about the gate when a session or sub-agent starts.
+
+    A session has no model calls logged when it starts, so a closed gate's
+    text covers both cloud and local sessions."""
     if spent >= gate:
-        return ("AI spend gate CLOSED: $%.0f of cloud AI used today, gate $%.0f. Tool calls are refused "
-                "until a person runs: python3 %s continue. Stop and tell the user." % (spent, gate, SCRIPT))
+        return ("AI spend gate CLOSED: $%.0f of cloud AI used today, gate $%.0f (fleet rule 1.10). A "
+                "session on a local model (ollama/*, llamacpp/*) keeps working but cannot start cloud "
+                "sub-agents. Other sessions' tool calls are refused until a person runs: python3 %s "
+                "continue; when one is refused, stop and tell the user." % (spent, gate, SCRIPT))
     return ("AI spend today: $%.0f of the $%.0f daily gate, $%.0f left (fleet rule 1.10). Use local "
-            "models (local-* agents, ollama/* models) for every task they can do, even when slower. "
+            "models (local-* agents, ollama/* and llamacpp/* models) for every task they can do, even when slower. "
             "Use a cloud model only when no local option fits; check first with: python3 %s status"
             % (spent, gate, gate - spent, SCRIPT))
 
@@ -196,7 +243,10 @@ def hook(cmd):
         if cmd == "context":
             print(json.dumps({"additionalContext": context_text(spent, gate)}))
             return 0
-        reason = decide(data.get("toolName"), data.get("toolArgs"), spent, gate, pol["reserve_usd"])
+        # Only a closed gate needs to know whether the session is local.
+        session = data.get("sessionId") or os.environ.get("COPILOT_AGENT_SESSION_ID")
+        local = spent >= gate and local_session(session, since)
+        reason = decide(data.get("toolName"), data.get("toolArgs"), spent, gate, pol["reserve_usd"], local)
         if reason:
             print(json.dumps({"permissionDecision": "deny", "permissionDecisionReason": reason}))
     except Exception:  # noqa: BLE001 -- fail open: a failing preToolUse hook refuses every call
