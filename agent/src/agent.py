@@ -2332,6 +2332,23 @@ class ProxmoxAgent:
             logger.warning(f"wss SSL context build failed: {e}; connecting without TLS")
             return None, "TLS disabled (context build failed)"
 
+    def _verified_frame(self, message: str) -> Optional[Dict[str, Any]]:
+        """Return the parsed body of a post-auth frame signed with our secret, else None.
+
+        The spoke (agent_hosting.send_to_agent) signs every frame it sends after
+        auth as ``<sig>.<body>``. An unsigned frame, a frame signed with another
+        key, or any frame while we hold no secret is an injection: it would
+        otherwise reach RUN_COMMAND / WRITE_FILE, which run as root. This mirrors
+        the spoke's own rule (BaseControlPlane drops unsigned frames).
+        """
+        # Split off the signature and verify it over the exact received bytes.
+        sig, body = split_frame(message)
+        if not sig or not self.secret or not self.signer.verify_bytes(body.encode(), sig):
+            logger.warning("Unsigned or invalid signature — dropping")
+            return None
+        # Parse only after the signature checks out.
+        return json.loads(body)
+
     async def _connect_once(self):
         """Make one connection to the spoke: authenticate (or wait for approval), then run the
         command/telemetry loops until the socket closes.
@@ -2462,11 +2479,9 @@ class ProxmoxAgent:
                 async for message in websocket:
                     # Wire form <sig>.<body>: verify the RECEIVED body bytes
                     # directly, parse once (matches the hub's new frame format).
-                    # Split off and check the signature; drop forged frames.
-                    sig, body = split_frame(message)
-                    msg_data = json.loads(body)
-                    if sig and not self.signer.verify_bytes(body.encode(), sig):
-                        logger.warning("Invalid signature — dropping")
+                    # Drop unsigned or forged frames (see _verified_frame).
+                    msg_data = self._verified_frame(message)
+                    if msg_data is None:
                         continue
 
                     # Unpack the command type, data and correlation id.
