@@ -114,8 +114,10 @@ def local_session(session, since, wait_s=2.0):
     sub-agent, shows spend. A model call is logged just before the tool calls
     it asked for are checked (5 ms before, in a test), but that order is not
     documented, so a session with no calls logged yet is re-read for up to
-    ``wait_s`` seconds. No session id, still no calls, or an unreadable log
-    count as cloud, which keeps the gate closed."""
+    ``wait_s`` seconds. A session whose calls so far are all free is re-read
+    for the same window too, so a paid call logged late is still seen; a paid
+    row at any point means cloud. No session id, still no calls, or an
+    unreadable log count as cloud, which keeps the gate closed."""
     if not session:
         return False
     deadline = time.monotonic() + wait_s
@@ -134,8 +136,13 @@ def local_session(session, since, wait_s=2.0):
         except sqlite3.Error:
             return False
         # Local models cost nothing: their calls log no cost, or 0.
-        if calls or time.monotonic() >= deadline:
-            return calls > 0 and not nano
+        # A paid row at any point means cloud. Free-only rows (or none) are
+        # re-read for the whole wait window, because the current call's row
+        # may not be logged yet; only then is the session called local.
+        if nano:
+            return False
+        if time.monotonic() >= deadline:
+            return calls > 0
         time.sleep(0.1)
 
 

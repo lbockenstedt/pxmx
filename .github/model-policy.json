@@ -1,0 +1,22 @@
+{
+  "_doc": "Which Copilot model and effort each role uses, and how the ladders climb. Fleet-owned: edit only in lm, synced to every repo by sync-fleet-files.yml. CLI sessions read it through scripts/copilot-setup/install.sh; AB is to read the same file (not wired yet), so one change here reaches every system. Evidence: lm/docs/agents-and-skills.md, 'The model policy'.",
+  "effort": "medium",
+  "coordinator": {
+    "_doc": "The interactive CLI session: plans, scopes, reviews diffs, runs tests, commits. It does not write code itself beyond edits of a few lines.",
+    "model": "claude-opus-5.5"
+  },
+  "coding": {
+    "_doc": "Cheapest rung first. Climb one rung only when the tests still fail, passing up the failing tests, not the failed attempt. The last rung is the coordinator (CLI) or AB's Opus-class last turn.",
+    "ladder": [
+      {"agent": "cloud-coder", "model": "claude-haiku-5.5"},
+      {"agent": "cloud-coder-plus", "model": "claude-sonnet-5.5"},
+      {"agent": null, "model": "claude-opus-5.5"}
+    ]
+  },
+  "review": {
+    "_doc": "PROPOSED, not yet applied to AB: a cheap first pass on each panel prompt in turn, then one frontier seat from a different vendor than the code's author, in sequence, stopping at the first Reject. AB's panel seats are still set by fix_engine's panel allowlist until the owner approves these models.",
+    "status": "proposed",
+    "first_pass": ["claude-sonnet-5.5"],
+    "frontier": {"anthropic_author": "gpt-5.6-sol", "other_author": "claude-opus-5.5"}
+  }
+}
