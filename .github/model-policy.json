@@ -1,12 +1,12 @@
 {
-  "_doc": "Which Copilot model and effort each role uses, and how the ladders climb. Fleet-owned: edit only in lm, synced to every repo by sync-fleet-files.yml. CLI sessions read it through scripts/copilot-setup/install.sh; AB's fix pipeline reads coding.ladder (FIX_MODEL_LADDER), so one change here reaches every system. Evidence: lm/docs/agents-and-skills.md, 'The model policy'.",
+  "_doc": "Which Copilot model and effort each role uses, and how the ladders climb. Fleet-owned: edit only in lm, synced to every repo by sync-fleet-files.yml. CLI sessions read it from the synced copy (the agent files pin its models; scripts/copilot-setup/install.sh only copies the coordinator settings); AB's fix pipeline reads coding.ladder (FIX_MODEL_LADDER), so one change here reaches every system. Evidence: lm/docs/agents-and-skills.md, 'The model policy'.",
   "effort": "medium",
   "coordinator": {
     "_doc": "The interactive CLI session: plans, scopes, reviews diffs, runs tests, commits. It does not write code itself beyond edits of a few lines.",
     "model": "claude-opus-5.5"
   },
   "coding": {
-    "_doc": "Cheapest rung first. Climb one rung only when the tests still fail, passing up the failing tests, not the failed attempt. The last rung is the coordinator (CLI) or AB's Opus-class last turn.",
+    "_doc": "Cheapest rung first. Climb one rung only when the tests still fail, passing up the failing tests, not the failed attempt. The last rung is the coordinator (CLI) or AB's Opus-class last turn. Reviewer findings are fixed on this ladder too, starting at rung 1 (rung 2 when it wrote the change), and each fix round is recorded (CLI: ledger --task fix; AB: fix_outcomes).",
     "ladder": [
       {"agent": "cloud-coder", "model": "claude-haiku-5.5"},
       {"agent": "cloud-coder-plus", "model": "claude-sonnet-5.5"},

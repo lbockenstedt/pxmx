@@ -30,6 +30,14 @@ rung first:
 Rules:
 - Climb one rung only when the tests still fail. Pass up the failing tests
   and the spec, not the failed attempt or its reasoning.
+- Review findings are fixed on the same ladder: a real defect a reviewer
+  finds (in a `Reject` or an `Approve`) goes to `cloud-coder` with the
+  critique (`cloud-coder-plus` when it wrote the
+  change), not to the coordinator, unless the fix is 5 lines or fewer or is in the
+  code rung 3 keeps (design, security, auth, tenant, credentials). Climb
+  one rung when the next review raises the same finding again, and record each
+  fix round as `--task fix` (see the `review` skill, step 5). AB does the
+  same in `fix_one_pr` and keeps its own per-model record (`fix_outcomes`).
 - Launch coding agents in **background** mode and keep coordinating
   meanwhile. Give each one absolute paths, the exact change and the test
   command; review its diff before building on it.
