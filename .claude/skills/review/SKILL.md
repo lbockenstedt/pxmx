@@ -31,11 +31,19 @@ example `<session folder>/files/review/<repo>`).
 1. Commit the change locally (do not push). Write the commit message as the
    PR intent: the problem, the fix, and the evidence for any contract the
    change relies on in another repo (reviewers cannot see other repos).
+   If the change will go up as a PR, also write its title and a body that
+   fills in `.github/pull_request_template.md` (fleet rule 2.4) to a file
+   now, so the panels review the PR's real description.
 2. Build the prompts. The script needs a Python venv with ab's requirements
    (`python3 -m venv ~/.venvs/ab && ~/.venvs/ab/bin/pip install -r <fleet>/ab/requirements.txt`):
 
        rm -rf <dir> && ~/.venvs/ab/bin/python <fleet>/ab/scripts/local_review.py \
-           <repo path> --base origin/<target> --out <dir>
+           <repo path> --base origin/<target> --out <dir> \
+           [--title "<PR title>" --body-file <PR body file>]
+
+   Pass `--title` and `--body-file` for a PR (step 1); without them the
+   last commit subject and the commit messages stand in for the
+   description.
 
    `<target>` is the branch the PR will merge into, so the diff is the one AB
    reviews: `dev` for a normal change, `qa` on `promote/dev-to-qa`, `main` on
@@ -191,6 +199,24 @@ example `<session folder>/files/review/<repo>`).
    3.9) unless the owner directs another mitigation. The revert undoes only
    that fix and needs only smoke.sh and CI: what it brings back was
    reviewed, or is an earlier outage fix kept after its live check.
+
+   **Let AB reuse this review (dev PRs only).** Once both frontier replies
+   Approve at 0.90 or more on a clean, committed head reviewed with the PR
+   title and template body (steps 1 and 2), run
+
+       ~/.venvs/ab/bin/python <fleet>/ab/scripts/local_review.py \
+           --attest <dir> --frontier <frontier model>
+
+   It writes `<dir>/pr-title.txt` and `<dir>/pr-body.md` (the reviewed
+   title and body plus an `ab-local-review` marker; exit 1 writes none).
+   Open the PR with exactly those, unedited:
+
+       gh pr create --base dev --title "$(cat <dir>/pr-title.txt)" \
+           --body-file <dir>/pr-body.md
+
+   AB then skips its paid panels for that head. Any new push, rebase,
+   retarget or title/body edit voids the marker and AB reviews as usual.
+   A direct push to dev (no PR) needs none of this.
 
 ## Known differences from AB
 
