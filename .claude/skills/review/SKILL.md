@@ -79,7 +79,30 @@ example `<session folder>/files/review/<repo>`).
 
        copilot -p "<reviewer prompt>" --model <model> -s --add-dir <dir> \
            --allow-tool view --allow-tool grep --allow-tool glob \
+           --usage-output-file <dir>/<panel>-<model>-<round>.usage.json \
            > <dir>/<panel>-<model>.out
+
+   The usage file holds the run's cost. Record every run in the model ledger
+   (the `model-ledger` skill), retries and runs with no verdict included,
+   passing that file so the cost of every review, and of every miss, is
+   known:
+
+       python3 <fleet>/lm/.claude/skills/model-ledger/localstat.py outcome \
+           --agent reviewer --model <model> --task review --repo <repo> \
+           --usage-file <dir>/<panel>-<model>-<round>.usage.json \
+           --result pass|fail [--reason ...] --note "<panel>: <verdict>, <why>"
+
+   The result is whether the verdict was right, not whether it found
+   something:
+   - `pass`: a Reject whose finding blocks under fleet rule 1.9, or an
+     Approve that held up (the frontier reviewer did not overturn it on a
+     blocking finding).
+   - `fail --reason wrong_answer`: a Reject only on a follow-up (rule 1.9:
+     not a reason to Reject), a Reject on a claim the code disproves, or an
+     Approve the frontier reviewer then rejected on a blocking finding.
+     Record a cheap reviewer's run once the frontier verdict is in.
+   - `fail --reason crash` (or `timeout` when it hit the time limit): a run
+     with no verdict. It still cost money, so it is still recorded.
 
    The reviewer gets read-only tools and no shell: it reads and greps the
    code but does not run it. The tests are smoke.sh's job (fleet rule 1.5),
