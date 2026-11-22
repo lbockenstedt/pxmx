@@ -65,12 +65,14 @@ example `<session folder>/files/review/<repo>`).
    > rejecting on it. Reply with only the JSON object the prompt asks for.
 
    Pick the model:
-   - Start on the first `review.ladder` model (cheap).
-   - Climb to the `review.frontier` model (`anthropic_author` when an
-     Anthropic model wrote the code, else `other_author`) only when the
-     cheap reply is disputed (a Reject you can show is wrong from the
-     files), has confidence below `review.climb_below`, or failed to run.
-     The frontier verdict stands; don't climb back down for that change.
+   - First the `review.ladder` model (cheap), as a filter. Fix its real
+     findings (step 5) and re-run it until it approves, or until its Reject
+     is shown wrong from the files.
+   - Then the `review.frontier` model (`anthropic_author` when an Anthropic
+     model wrote the code, else `other_author`). Its verdict is the panel's
+     final verdict. A frontier Reject that is right sends the change back to
+     step 5; after the fix, re-run the frontier model (the cheap pass is
+     optional then).
 
    Every tool, Copilot included, runs the reviewer with the Copilot CLI
    from `<repo path>` and saves its output in `<dir>/<panel>-<model>.out`:
@@ -85,11 +87,14 @@ example `<session folder>/files/review/<repo>`).
    `code-review` agent or another sub-agent: those re-run the tests and
    re-read every file each round. In NAC rounds 6 to 16 that cost about
    ten times as much a round as read-only reviewers.
-4. Read the JSON verdict at the end of the reply. A panel passes on
-   `Approve` with confidence of at least `review.climb_below` (0.80). A
-   reply with no verdict is a failed run, not a finding: run it once more
-   on the same model, then climb.
-   - Panel 1 passes: now run panel 2 (step 3) from the bottom of the ladder.
+4. Read the JSON verdict at the end of the reply. A panel passes only on
+   the frontier reviewer's `Approve` with confidence of at least
+   `review.pass_confidence` (0.90, AB's bar). A cheap reviewer's verdict
+   never passes a panel, however confident. A reply with no verdict is a
+   failed run, not a finding: run it once more on the same model. If the
+   cheap reviewer fails again, skip the filter and go to the frontier
+   reviewer.
+   - Panel 1 passes: now run panel 2 (step 3), cheap model first.
    - Panel 1 does not pass: do not run panel 2. The one exception is a fix
      for a live outage (fleet rule 1.7), which needs both panels' findings:
      run panel 2 anyway and read it yourself.

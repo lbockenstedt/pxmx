@@ -1,8 +1,9 @@
 {
-  "_about": "Daily gate on cloud AI spend (fleet rule 1.10): it stops runaway sessions and is not a budget; a person can reopen it. Read by .github/hooks/ai_budget.py (Copilot CLI) and AB. Edit only in lm. gate_usd: spend per local day that closes the gate. step_usd: how much more a person's 'continue' adds. reserve_usd: no new cloud sub-agents within this much of the gate. prices_usd_per_mtok: USD per 1M tokens, for AB, whose API replies carry token counts but no cost; refresh with 'python3 .github/hooks/ai_budget.py prices'. A model not listed is charged at the dearest listed price.",
+  "_about": "Daily gate on cloud AI spend (fleet rule 1.10): it stops runaway sessions and is not a budget; a person can reopen it. Read by .github/hooks/ai_budget.py (Copilot CLI) and AB. Edit only in lm. gate_usd: spend per local day that closes the gate. step_usd: how much more a person's 'continue' adds. reserve_usd: no new cloud sub-agents within this much of the gate. overrun_usd: past the gate only new work is refused (cloud sub-agents, workflows, write_agent messages, copilot -p runs) so work already running can finish; once spend reaches the gate plus overrun_usd, every tool call of a cloud session is refused (the runaway backstop). prices_usd_per_mtok: USD per 1M tokens, for AB, whose API replies carry token counts but no cost; refresh with 'python3 .github/hooks/ai_budget.py prices'. A model not listed is charged at the dearest listed price.",
   "gate_usd": 100,
   "step_usd": 100,
   "reserve_usd": 25,
+  "overrun_usd": 25,
   "prices_usd_per_mtok": {
     "claude-haiku-4.5": {"input": 1.0, "cache_read": 0.1, "output": 5.0},
     "claude-haiku-5.5": {"input": 0.1, "cache_read": 0.01, "output": 0.5},

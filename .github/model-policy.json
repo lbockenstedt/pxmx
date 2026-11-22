@@ -14,10 +14,10 @@
     ]
   },
   "review": {
-    "_doc": "ADOPTED for local sessions (review skill): each panel prompt goes to ONE reviewer at a time. Start on the cheapest rung; climb to the frontier seat (a different vendor from the code's author) only when the cheap verdict is disputed (a Reject the author shows is wrong with file evidence) or its confidence is below climb_below. The frontier verdict stands. AB's own panels still use fix_engine's panel allowlist until AB is changed to read this section.",
+    "_doc": "ADOPTED for local sessions (review skill): each panel prompt goes to ONE reviewer at a time. The cheap ladder model reviews first, as a filter: fix its real findings and re-run it until it approves (or its Reject is shown wrong from the files). Then the frontier model (a different vendor from the code's author) gives the final verdict, and only that verdict gates the push: Approve at pass_confidence or more. A cheap model's high confidence never passes a panel. AB's own panels still use fix_engine's panel allowlist until AB is changed to read this section.",
     "status": "adopted-local",
     "ladder": ["mai-code-2-flash"],
-    "climb_below": 0.80,
+    "pass_confidence": 0.90,
     "frontier": {"anthropic_author": "gpt-5.6-sol", "other_author": "claude-opus-5.5"}
   }
 }
