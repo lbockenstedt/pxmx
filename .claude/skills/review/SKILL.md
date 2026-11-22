@@ -6,8 +6,8 @@ description: >-
   For a local Copilot, Claude or other session: use it before every `git push`
   to dev in a fleet repo and before pushing a fix onto an open promotion
   branch. AB itself does not follow this skill; it runs the same panels on the
-  PR. The prompts, fleet rules, specialist agents, reviewer models and verdict
-  rule all come from AB's code, so this review changes when AB's does.
+  PR. The prompts, fleet rules and specialist agents come from AB's code; one
+  reviewer per panel climbs the review ladder in .github/model-policy.json.
 ---
 
 # Review before push
@@ -17,7 +17,8 @@ AB reviews every PR with two panels of reviewers from different providers:
 - **Panel 1, skeptical review:** correctness, regressions, intent vs. diff, and the fleet rules.
 - **Panel 2, state-logic review:** checks that no status conflates distinct states, and that every new line is reachable.
 
-This skill runs those same prompts locally, from any tool. Never write your
+This skill runs those same prompts locally, from any tool, with one
+reviewer per panel on a cost ladder instead of AB's seats. Never write your
 own version of them: `ab/scripts/local_review.py` builds the prompts by
 importing AB's `pr_review` and `fix_engine`.
 
@@ -51,53 +52,52 @@ example `<session folder>/files/review/<repo>`).
    - Anything else: a broken venv, checkout or arguments; read stderr.
    - `agents_error` not null: AB's specialist checklists did not load, so
      panel 1 would be missing them. Stop and fix that.
-3. Run one reviewer per `panel1` entry in `reviewers`, all in parallel, each
-   on exactly that entry's `model`. Never substitute a different model.
-   Panel 2 runs only after panel 1 Approves (step 4), as in AB, so a change
-   panel 1 rejects does not pay for a second pass (a live-outage fix is the
-   one exception, step 4). The reviewer prompt is:
+3. Run **one reviewer per panel**, climbing the review ladder in
+   `.github/model-policy.json` (`review`): the owner's rule is one reviewer
+   at a time, not a panel of seats. Use the `prompt` file of that panel's
+   entries in `reviewers` (`<dir>/panel1.txt` or `<dir>/panel2.txt`; every
+   seat of a panel shares it) and ignore the seats' models. Panel 2 runs only after panel 1 Approves (step 4), as in
+   AB, so a change panel 1 rejects does not pay for a second pass (a
+   live-outage fix is the one exception, step 4). The reviewer prompt is:
 
    > Read `<prompt>` and do exactly what it says. The change is in the
    > git repo at `<repo path>`; read any file there to check a claim before
    > rejecting on it. Reply with only the JSON object the prompt asks for.
 
-   Every tool, Copilot included, runs each reviewer with the Copilot CLI
-   from `<repo path>`, which reaches every provider AB uses, and saves its
-   output as the reply, in the entry's `reply` file:
+   Pick the model:
+   - Start on the first `review.ladder` model (cheap).
+   - Climb to the `review.frontier` model (`anthropic_author` when an
+     Anthropic model wrote the code, else `other_author`) only when the
+     cheap reply is disputed (a Reject you can show is wrong from the
+     files), has confidence below `review.climb_below`, or failed to run.
+     The frontier verdict stands; don't climb back down for that change.
+
+   Every tool, Copilot included, runs the reviewer with the Copilot CLI
+   from `<repo path>` and saves its output in `<dir>/<panel>-<model>.out`:
 
        copilot -p "<reviewer prompt>" --model <model> -s --add-dir <dir> \
            --allow-tool view --allow-tool grep --allow-tool glob \
-           > <reply>
+           > <dir>/<panel>-<model>.out
 
-   The seat gets read-only tools and no shell: it reads and greps the code
-   but does not run it. The tests are smoke.sh's job (fleet rule 1.5), so
-   run smoke.sh before the review. Never run a seat as a `code-review`
-   agent or another sub-agent: those re-run the tests and re-read every
-   file each round. In NAC rounds 6 to 16 that cost about ten times as
-   much a round as read-only seats.
-4. Save each reply unedited in its entry's `reply` file (the script creates
-   an empty `<dir>/votes/` each round). A reviewer that failed gets no file
-   (delete an empty one); never write a vote for it. Then apply AB's own
-   verdict rule (`fix_engine.panel_verdict`):
-
-       ~/.venvs/ab/bin/python <fleet>/ab/scripts/local_review.py --gate <dir>
-
-   Exit 0 means both panels Approve. As in AB, a seat in `reviewers.json`
-   with no reply, or a reply with no verdict, is a failed reviewer: the
-   panel then needs every other vote to Approve at an average of 0.80 or
-   more, else it prints `Retry`. A panel with no replies fails.
-   - Panel 1 `Approve` and panel 2 `pending` (no panel 2 reply yet): now run
-     the `panel2` entries (step 3) and gate again.
-   - Panel 1 not `Approve`: panel 2 stays `skipped`; do not run it. The one
-     exception is a fix for a live outage (fleet rule 1.7), which needs both
-     panels' findings: run the `panel2` entries anyway. The gate still
-     prints panel 2 as `skipped` and ignores its replies, so read them
-     yourself.
-   - `Retry` is not a finding about the change: re-run only the failed
-     reviewers (step 3) and gate again. It does not start a new round, and
-     the change is not edited for it.
-5. Read every `Reject` critique, even when the gate passed (a panel can
-   Approve on majority with a Reject in it). Once the gate passes, fix only
+   The reviewer gets read-only tools and no shell: it reads and greps the
+   code but does not run it. The tests are smoke.sh's job (fleet rule 1.5),
+   so run smoke.sh before the review. Never run a reviewer as a
+   `code-review` agent or another sub-agent: those re-run the tests and
+   re-read every file each round. In NAC rounds 6 to 16 that cost about
+   ten times as much a round as read-only reviewers.
+4. Read the JSON verdict at the end of the reply. A panel passes on
+   `Approve` with confidence of at least `review.climb_below` (0.80). A
+   reply with no verdict is a failed run, not a finding: run it once more
+   on the same model, then climb.
+   - Panel 1 passes: now run panel 2 (step 3) from the bottom of the ladder.
+   - Panel 1 does not pass: do not run panel 2. The one exception is a fix
+     for a live outage (fleet rule 1.7), which needs both panels' findings:
+     run panel 2 anyway and read it yourself.
+   - `local_review.py --gate` still applies AB's seat-by-seat rule
+     (`fix_engine.panel_verdict`) and so expects every seat's vote; it is
+     not used with the ladder.
+5. Read every `Reject` critique, and the critique of every `Approve` (it
+   can carry findings). Once both panels pass, fix only
    real defects; record non-blocking notes as follow-ups for the user rather
    than editing for them (fleet rule 1.9 says which findings block). For
    each `Reject` that is right:
@@ -126,12 +126,12 @@ example `<session folder>/files/review/<repo>`).
    A backtest of 766 AB-reviewed PRs found none that first fully approved
    after pass 5; later passes swung back and forth.
 
-   If reviewers still fail after re-running them (`Retry`), stop and report that the reviewers could not
+   If the frontier reviewer still fails after a re-run, stop and report that the reviewers could not
    run (model, auth or tool error), not a finding.
-7. Push only once the gate passes. The one exception is a fix for a live
-   outage (fleet rule 1.7). It may be pushed while the gate still fails
-   when smoke.sh passes, every seat of both panels gave a verdict (a
-   `Retry` or a missing reply never qualifies), and every open finding is
+7. Push only once both panels pass. The one exception is a fix for a live
+   outage (fleet rule 1.7). It may be pushed while a panel still fails
+   when smoke.sh passes, both panels' reviewers gave a verdict (a failed
+   run or a missing reply never qualifies), and every open finding is
    one that may wait under step 5. Promote it once CI passes, then run the
    live check on the outage and on what worked before the fix. Keep the fix
    only if a completed live check shows it helped and broke nothing that
@@ -158,8 +158,9 @@ the local panel can be stricter than AB, never more lenient.
   (`skeptical_issue_body`, `state_logic_issue_body`) and `ab/fix_engine.py`
   (`reviewer_prompt`). This skill and AB both pick the change up.
 - Change the fleet rules only in `lm/.github/fleet-rules.md`.
-- The gate is `fix_engine.panel_verdict`, which AB's `review_fix` also uses,
-  so a change to AB's verdict rule reaches this skill automatically.
+- The reviewer models and the climb rule come from the `review` section of
+  `lm/.github/model-policy.json`; change them there. AB's own panels still
+  seat several reviewers (`fix_engine.panel_verdict`) until AB reads it too.
 - This skill lives in lm with the other fleet skills and is synced to every
   repo's `.claude/skills/`, which both Copilot and Claude read. Edit it here
   only.

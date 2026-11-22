@@ -1,5 +1,5 @@
 {
-  "_doc": "Which Copilot model and effort each role uses, and how the ladders climb. Fleet-owned: edit only in lm, synced to every repo by sync-fleet-files.yml. CLI sessions read it through scripts/copilot-setup/install.sh; AB is to read the same file (not wired yet), so one change here reaches every system. Evidence: lm/docs/agents-and-skills.md, 'The model policy'.",
+  "_doc": "Which Copilot model and effort each role uses, and how the ladders climb. Fleet-owned: edit only in lm, synced to every repo by sync-fleet-files.yml. CLI sessions read it through scripts/copilot-setup/install.sh; AB's fix pipeline reads coding.ladder (FIX_MODEL_LADDER), so one change here reaches every system. Evidence: lm/docs/agents-and-skills.md, 'The model policy'.",
   "effort": "medium",
   "coordinator": {
     "_doc": "The interactive CLI session: plans, scopes, reviews diffs, runs tests, commits. It does not write code itself beyond edits of a few lines.",
@@ -14,9 +14,10 @@
     ]
   },
   "review": {
-    "_doc": "PROPOSED, not yet applied to AB: a cheap first pass on each panel prompt in turn, then one frontier seat from a different vendor than the code's author, in sequence, stopping at the first Reject. AB's panel seats are still set by fix_engine's panel allowlist until the owner approves these models.",
-    "status": "proposed",
-    "first_pass": ["claude-sonnet-5.5"],
+    "_doc": "ADOPTED for local sessions (review skill): each panel prompt goes to ONE reviewer at a time. Start on the cheapest rung; climb to the frontier seat (a different vendor from the code's author) only when the cheap verdict is disputed (a Reject the author shows is wrong with file evidence) or its confidence is below climb_below. The frontier verdict stands. AB's own panels still use fix_engine's panel allowlist until AB is changed to read this section.",
+    "status": "adopted-local",
+    "ladder": ["mai-code-2-flash"],
+    "climb_below": 0.80,
     "frontier": {"anthropic_author": "gpt-5.6-sol", "other_author": "claude-opus-5.5"}
   }
 }
