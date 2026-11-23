@@ -1,0 +1,23 @@
+{
+  "_doc": "Which Copilot model and effort each role uses, and how the ladders climb. Fleet-owned: edit only in lm, synced to every repo by sync-fleet-files.yml. CLI sessions read it from the synced copy (the agent files pin its models; scripts/copilot-setup/install.sh only copies the coordinator settings); AB's fix pipeline reads coding.ladder (FIX_MODEL_LADDER), so one change here reaches every system. Evidence: lm/docs/agents-and-skills.md, 'The model policy'.",
+  "effort": "medium",
+  "coordinator": {
+    "_doc": "The interactive CLI session: plans, scopes, reviews diffs, runs tests, commits. It does not write code itself beyond edits of a few lines.",
+    "model": "claude-opus-5.5"
+  },
+  "coding": {
+    "_doc": "Cheapest rung first. Climb one rung only when the tests still fail, passing up the failing tests, not the failed attempt. The last rung is the coordinator (CLI) or AB's Opus-class last turn. Reviewer findings are fixed on this ladder too, starting at rung 1 (rung 2 when it wrote the change), and each fix round is recorded (CLI: ledger --task fix; AB: fix_outcomes).",
+    "ladder": [
+      {"agent": "cloud-coder", "model": "claude-haiku-5.5"},
+      {"agent": "cloud-coder-plus", "model": "claude-sonnet-5.5"},
+      {"agent": null, "model": "claude-opus-5.5"}
+    ]
+  },
+  "review": {
+    "_doc": "ADOPTED for local sessions (review skill): each panel prompt goes to ONE reviewer at a time. The cheap ladder model reviews first, as a filter: fix its real findings and re-run it until it approves (or its Reject is shown wrong from the files). Then the frontier model (a different vendor from the code's author) gives the final verdict, and only that verdict gates the push: Approve at pass_confidence or more. A cheap model's high confidence never passes a panel. AB's own panels still use fix_engine's panel allowlist until AB is changed to read this section.",
+    "status": "adopted-local",
+    "ladder": ["mai-code-2-flash"],
+    "pass_confidence": 0.90,
+    "frontier": {"anthropic_author": "gpt-5.6-sol", "other_author": "claude-opus-5.5"}
+  }
+}
