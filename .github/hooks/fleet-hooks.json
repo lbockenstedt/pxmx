@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "python3 .github/hooks/ai_budget.py context || true",
+        "powershell": "python .github/hooks/ai_budget.py context; exit 0",
+        "cwd": ".",
+        "timeoutSec": 10
+      }
+    ],
+    "subagentStart": [
+      {
+        "type": "command",
+        "bash": "python3 .github/hooks/ai_budget.py context || true",
+        "powershell": "python .github/hooks/ai_budget.py context; exit 0",
+        "cwd": ".",
+        "timeoutSec": 10
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "python3 .github/hooks/ai_budget.py check || true",
+        "powershell": "python .github/hooks/ai_budget.py check; exit 0",
+        "cwd": ".",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}
