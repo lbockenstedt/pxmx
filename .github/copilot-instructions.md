@@ -82,6 +82,21 @@ result (cloud or local, pass or fail), record one outcome in the ledger:
   for that class. `localstat.py import-bench <cloudbench.jsonl>` loads
   benchmark runs into the same matrix.
 
+## Report the cloud spend after every request
+
+The user should always know what the work cost. For each request:
+
+- At the start, run `python3 .github/hooks/ai_budget.py status` and note the
+  day's total.
+- At the end, run it again and finish the reply with one line:
+  `Cloud spend: about $X for this request ($Y today of the $Z gate).` X is the
+  difference of the two totals. The total is for the whole machine, so say
+  "about" and mention it when other sessions ran at the same time.
+- Work that used only local models says `Cloud spend: $0.00 beyond the
+  coordinator`, still with the day's total.
+- If the status command is missing (a repo without the hooks), say the spend
+  could not be read rather than guessing.
+
 ## Review like AB before every push
 
 AB's review panels catch what a single local review misses (state
