@@ -78,12 +78,45 @@ FLEET_OWNED_RE='^(\.github/(fleet-rules\.md|ai-budget\.json|model-policy\.json|c
 # branch, so its copy must not win. A repo's own "<repo>-*" agent/hook/skill is not
 # lm's to overwrite, so it still stops for a human.
 fleet_conflicts() {
-  case "$SRC>$TGT" in dev\>qa|qa\>main|dev\>main) ;; *) return 0 ;; esac
+  fleet_forward || return 0
   local repo="${GITHUB_REPOSITORY:-}"; repo="${repo##*/}"
   [ -n "$repo" ] || repo="$(basename "$PWD")"
   git ls-files -u | awk '{print $4}' | sort -u | grep -E "$FLEET_OWNED_RE" \
     | grep -Ev "^(\.github/(agents|hooks)|\.claude/skills)/${repo}-" || true
 }
+# True on a forward promotion (dev -> qa, qa -> main), where the source is the newer side.
+fleet_forward() {
+  case "$SRC>$TGT" in dev\>qa|qa\>main|dev\>main) return 0 ;; *) return 1 ;; esac
+}
+
+# Resolve an AGENTS.md conflict that lies only in the fleet-rules block: the block is
+# replaced by a placeholder in all three versions, the rest is merged three-way, and
+# the source's block goes back in. Leaves the file conflicted when the rest conflicts.
+resolve_agents_md() {
+  local endpoint="$1" d; d="$(mktemp -d)"
+  git show ":1:AGENTS.md" > "$d/base" 2>/dev/null && git show ":2:AGENTS.md" > "$d/ours" 2>/dev/null \
+    && git show "$endpoint:AGENTS.md" > "$d/theirs" 2>/dev/null || { rm -rf "$d"; return 1; }
+  python3 - "$d" <<'PY' || { rm -rf "$d"; return 1; }
+import re, sys
+d = sys.argv[1]
+pat = re.compile(r"<!-- fleet-rules:begin.*?<!-- fleet-rules:end -->", re.S)
+for n in ("base", "ours", "theirs"):
+    t = open(f"{d}/{n}").read()
+    if not pat.search(t):
+        sys.exit(1)
+    open(f"{d}/{n}.stub", "w").write(pat.sub("@@FLEET_RULES_BLOCK@@", t, count=1))
+open(f"{d}/block", "w").write(pat.search(open(f"{d}/theirs").read()).group(0))
+PY
+  if git merge-file -p "$d/ours.stub" "$d/base.stub" "$d/theirs.stub" > "$d/merged"; then
+    python3 - "$d" <<'PY' && { cp "$d/out" AGENTS.md; git add AGENTS.md; }
+import sys
+d = sys.argv[1]
+open(f"{d}/out", "w").write(open(f"{d}/merged").read().replace("@@FLEET_RULES_BLOCK@@", open(f"{d}/block").read()))
+PY
+  fi
+  rm -rf "$d"
+}
+
 version_files() { git ls-tree -r --name-only "origin/$TGT" | grep -E '(^|/)VERSION$' || true; }
 
 git rev-parse --verify "origin/$TGT" >/dev/null 2>&1 || { echo "::error::target branch $TGT does not exist"; exit 1; }
@@ -142,6 +175,14 @@ stage_to() {
       rm -f "$f"
     fi
   done < <(fleet_conflicts)
+
+  # AGENTS.md is repo-owned except the block between the fleet-rules markers, which
+  # sync-fleet-files.yml rewrites on each branch separately. When the block is the
+  # only thing in conflict, take the source's block and keep the three-way merge of
+  # the rest; any conflict outside the block still stops for a human.
+  if fleet_forward && git ls-files -u | awk '{print $4}' | grep -qx AGENTS.md; then
+    resolve_agents_md "$endpoint" || true
+  fi
 
   if git ls-files -u | grep -q .; then
     # Diagnose, but do NOT decide. A conflict while EXTENDING a unit is

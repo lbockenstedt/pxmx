@@ -212,4 +212,21 @@ if [ -f "$TPL/../../.github/twins.json" ]; then
   done
 fi
 
+echo "== AGENTS.md: a conflict only in the fleet-rules block resolves; one outside it still stops =="
+mk() { printf 'repo facts: %s\n<!-- fleet-rules:begin (synced from lm/.github/fleet-rules.md -- edit there) -->\n%s\n<!-- fleet-rules:end -->\n' "$1" "$2"; }
+git merge --abort >/dev/null 2>&1 || true; git reset -q --hard
+git checkout -q -B qa origin/qa; mk base v0 > AGENTS.md; git add AGENTS.md; git commit -qm "agents base"; git push -q -f origin qa
+git checkout -q -B dev qa; mk base v-dev > AGENTS.md; git commit -qam "dev block"; git push -q -f origin dev
+git checkout -q qa; mk base v-qa > AGENTS.md; git commit -qam "qa block"; git push -q origin qa; git fetch -q origin
+if SRC=dev TGT=qa BR=promote/dev-to-qa bash "$TPL/promote.sh" >/dev/null 2>&1; then rc=ok; else rc=failed; fi
+chk "block-only conflict: promotion ran" "$rc" "ok"
+chk "block-only conflict: source block kept" "$(sed -n 3p AGENTS.md)" "v-dev"
+git merge --abort >/dev/null 2>&1 || true; git reset -q --hard
+git checkout -q -B qa origin/qa; mk base v0 > AGENTS.md; git commit -qam "agents base 2"; git push -q -f origin qa
+git checkout -q -B dev qa; mk dev-facts v-dev > AGENTS.md; git commit -qam "dev facts"; git push -q -f origin dev
+git checkout -q qa; mk qa-facts v-qa > AGENTS.md; git commit -qam "qa facts"; git push -q origin qa; git fetch -q origin
+out=$(SRC=dev TGT=qa BR=promote/dev-to-qa bash "$TPL/promote.sh" 2>&1 || true)
+case "$out" in *"merge conflict outside VERSION"*) echo "  PASS conflict outside the block still reported"; pass=$((pass+1));;
+  *) echo "  FAIL expected a conflict report, got: $out"; fail=$((fail+1));; esac
+
 echo; echo "RESULT: $pass passed, $fail failed"; rm -rf "$T"; [ "$fail" -eq 0 ]
