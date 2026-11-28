@@ -71,6 +71,19 @@ if [ -z "${PROMOTE_REEXEC:-}" ]; then
 fi
 trap '[ -n "${PROMOTE_TMPDIR:-}" ] && rm -rf "$PROMOTE_TMPDIR"' EXIT
 
+# Paths lm owns and syncs into every repo (twins.json "fleet": files and dirs).
+FLEET_OWNED_RE='^(\.github/(fleet-rules\.md|ai-budget\.json|model-policy\.json|copilot-instructions\.md|scripts/(promote\.sh|bump_version\.py|promotion_selftest\.sh))$|\.github/(agents|hooks)/|\.claude/skills/)'
+# Unmerged fleet-owned paths that are safe to resolve to the source copy. Only on a
+# forward promotion (dev -> qa, qa -> main): a back-merge's source is the older
+# branch, so its copy must not win. A repo's own "<repo>-*" agent/hook/skill is not
+# lm's to overwrite, so it still stops for a human.
+fleet_conflicts() {
+  case "$SRC>$TGT" in dev\>qa|qa\>main|dev\>main) ;; *) return 0 ;; esac
+  local repo="${GITHUB_REPOSITORY:-}"; repo="${repo##*/}"
+  [ -n "$repo" ] || repo="$(basename "$PWD")"
+  git ls-files -u | awk '{print $4}' | sort -u | grep -E "$FLEET_OWNED_RE" \
+    | grep -Ev "^(\.github/(agents|hooks)|\.claude/skills)/${repo}-" || true
+}
 version_files() { git ls-tree -r --name-only "origin/$TGT" | grep -E '(^|/)VERSION$' || true; }
 
 git rev-parse --verify "origin/$TGT" >/dev/null 2>&1 || { echo "::error::target branch $TGT does not exist"; exit 1; }
@@ -115,6 +128,21 @@ stage_to() {
     rm -f "$f"
   done < <(git diff --cached --name-only --diff-filter=A | grep -E '(^|/)VERSION$' || true)
 
+  # Fleet-owned files (twins.json "fleet") are copied by sync-fleet-files.yml onto dev
+  # AND qa/main separately, so the same file is often "added" on both sides and the
+  # merge reports add/add. lm owns them, the source branch holds the newer copy, and
+  # the sync would overwrite any other result, so take the source's version instead
+  # of stalling every promotion in the repo until a human resolves it.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if git cat-file -e "$endpoint:$f" 2>/dev/null; then
+      git checkout -q "$endpoint" -- "$f"
+    else
+      git rm -q --cached "$f" 2>/dev/null || true
+      rm -f "$f"
+    fi
+  done < <(fleet_conflicts)
+
   if git ls-files -u | grep -q .; then
     # Diagnose, but do NOT decide. A conflict while EXTENDING a unit is
     # recoverable -- the caller keeps the original unit -- while a conflict on
@@ -135,6 +163,9 @@ stage_to() {
 picked=""
 picked_idx=0
 conflicted=0
+# Index of the first unit that conflicted in isolation and was batched forward:
+# the picked endpoint carries it, so it is where the carried work starts.
+carry_from=""
 # The code returned by the LAST endpoint tried (the tip of $SRC when nothing
 # is picked). Only that one decides whether an unpicked run is a real
 # divergence: an early unit may conflict in isolation while the full merge is
@@ -167,6 +198,7 @@ for i in "${!units[@]}"; do
     # ("CONFLICT (content): Merge conflict in .github/workflows/promote.yml")
     # while `git merge origin/qa` into main succeeded by hand.
     conflicted=1
+    [ -n "$carry_from" ] || carry_from="$i"
     echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
          "batching it forward with the following unit(s)"
     continue
@@ -210,6 +242,14 @@ fi
 # over any later unit that touches a file this promotion already touches, and
 # carry them together. Units that touch nothing in common are still left
 # behind, so promotions stay small and reviewable.
+#
+# The oldest unit still names the promotion, and every carried unit is listed in
+# the units_carried output. Naming only one of them made the PR's stated intent
+# disagree with its diff, and the review panel rightly denied it (lm#1906).
+# Units batched forward after a conflict are carried too, so the oldest of
+# those names it when there is one.
+first_idx="${carry_from:-$picked_idx}"
+first="${units[$first_idx]}"
 if [ "$SPLIT" = "1" ]; then
   ext_idx="$picked_idx"
   changed="$(git diff --name-only "origin/$TGT...${units[$picked_idx]}" | sort -u)"
@@ -263,17 +303,36 @@ if [ "$SPLIT" = "1" ]; then
   fi
 fi
 
-# Identify the unit for the PR title/body. A merge commit names its PR in the
+# Identify a unit for the PR title/body. A merge commit names its PR in the
 # subject and carries the PR's own title on the first line of the body, which
 # is far more useful than "Merge pull request #123 from user/branch".
-unit_subject="$(git log -1 --format=%s "$picked")"
-unit_pr="$(printf '%s' "$unit_subject" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
-if [ -n "$unit_pr" ]; then
-  body_first="$(git log -1 --format=%b "$picked" | sed -n '/./{p;q;}')"
-  [ -n "$body_first" ] && unit_subject="$body_first"
-else
-  # Squash merges land as "feat: thing (#123)".
-  unit_pr="$(printf '%s' "$unit_subject" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
+# Prints "<pr>\x1f<subject>"; <pr> is empty for a direct push. Not a tab: read
+# folds whitespace separators, so an empty <pr> would swallow the subject.
+describe_unit() {
+  local subj pr body_first
+  subj="$(git log -1 --format=%s "$1")"
+  pr="$(printf '%s' "$subj" | sed -n 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p')"
+  if [ -n "$pr" ]; then
+    body_first="$(git log -1 --format=%b "$1" | sed -n '/./{p;q;}')"
+    [ -n "$body_first" ] && subj="$body_first"
+  else
+    # Squash merges land as "feat: thing (#123)".
+    pr="$(printf '%s' "$subj" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
+  fi
+  printf '%s\x1f%s\n' "$pr" "$subj"
+}
+
+# Name the OLDEST unit. When later units were carried with it, say so and list
+# every one: naming only one of them made the PR's stated intent cover a
+# fraction of its diff, and the review panel rejected it for exactly that.
+IFS=$'\x1f' read -r unit_pr unit_subject < <(describe_unit "$first")
+units_carried=""
+if [ "$picked_idx" -ne "$first_idx" ]; then
+  unit_subject="$unit_subject (+$(( picked_idx - first_idx )) more)"
+  for (( k = first_idx; k <= picked_idx; k++ )); do
+    IFS=$'\x1f' read -r k_pr k_subject < <(describe_unit "${units[$k]}")
+    units_carried+="- ${k_pr:+#$k_pr }$k_subject"$'\n'
+  done
 fi
 
 # Upper bound: the units behind this one are not re-examined here, and any of
@@ -291,8 +350,12 @@ if [ "$SPLIT" = "1" ]; then
     echo "unit_subject<<PROMOTE_EOF"
     echo "$unit_subject"
     echo "PROMOTE_EOF"
+    echo "units_carried<<PROMOTE_EOF"
+    printf '%s' "$units_carried"
+    echo "PROMOTE_EOF"
   } >> "$out"
   echo "Promoting the oldest of ${#units[@]} un-promoted unit(s): ${unit_pr:+#$unit_pr }$unit_subject"
+  [ -n "$units_carried" ] && printf 'Units carried together:\n%s' "$units_carried"
   echo "  up to $remaining further unit(s) will follow in later runs"
 fi
 
