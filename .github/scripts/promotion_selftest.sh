@@ -89,6 +89,47 @@ out=$(PROMOTE_SPLIT=1 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/p
 case "$out" in *"Nothing to promote"*) echo "  PASS queue drains when every unit is promoted"; pass=$((pass+1));;
   *) echo "  FAIL expected a drained queue, got: $out"; fail=$((fail+1));; esac
 
+echo "== a unit extended over later units names all of them =="
+# Unit 1 (PR #8) adds zeta; unit 2 (a direct push) fixes zeta. Unit 1 cannot be
+# promoted alone (its zeta is already superseded), so both travel together, and
+# the PR must still be named after the oldest unit while listing both.
+git checkout -q -B dev origin/dev
+git checkout -q -b unitZ
+echo "zeta" > zeta.py; git add zeta.py; git commit -qm "add zeta"
+git checkout -q dev
+git merge -q --no-ff unitZ -m "Merge pull request #8 from o/unitZ" -m "feat: add the zeta module"
+echo "zeta fixed" > zeta.py; git commit -qam "fix zeta"
+git push -q origin dev; git fetch -q origin
+GITHUB_OUTPUT="$T/ext.out" PROMOTE_SPLIT=1 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh >/dev/null
+chk "extended unit carries the later fix" "$(cat zeta.py)" "zeta fixed"
+chk "named after the oldest unit's PR"    "$(git log -1 --pretty=%s)" "promote: dev -> qa (#8)"
+chk "subject says more units ride along"  "$(sed -n '/^unit_subject<</{n;p;}' "$T/ext.out")" "feat: add the zeta module (+1 more)"
+chk "every carried unit is listed"        "$(sed -n '/^units_carried<</,/^PROMOTE_EOF/p' "$T/ext.out" | sed '1d;$d' | tr '\n' '|')" "- #8 feat: add the zeta module|- fix zeta|"
+git push -q origin promote/dev-to-qa:qa; git fetch -q origin
+
+echo "== units batched forward after a conflict are named too =="
+# qa gets a repair that dev's PR #9 predates, so unit 1 conflicts in isolation.
+# A back-merge (unit 2) resolves it, and the promotion carries both units: the
+# PR must be named after #9 and list both, not just the back-merge.
+git checkout -q -B qa origin/qa
+echo "eta repaired" > eta.py; git add eta.py; git commit -qm "repair eta on qa"; git push -q origin qa
+git checkout -q -B dev origin/dev
+git checkout -q -b unitE
+echo "eta dev" > eta.py; git add eta.py; git commit -qm "add eta"
+git checkout -q dev
+git merge -q --no-ff unitE -m "Merge pull request #9 from o/unitE" -m "feat: add the eta module"
+git fetch -q origin
+git merge -q --no-ff origin/qa -m "backmerge qa into dev" >/dev/null 2>&1 || true
+echo "eta dev" > eta.py; git checkout -q --ours VERSION; git add eta.py VERSION
+git commit -q --no-edit
+git push -q origin dev; git fetch -q origin
+GITHUB_OUTPUT="$T/conf.out" PROMOTE_SPLIT=1 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh >/dev/null 2>&1
+chk "batched unit carries the resolution" "$(cat eta.py)" "eta dev"
+chk "named after the conflicting PR"      "$(git log -1 --pretty=%s)" "promote: dev -> qa (#9)"
+chk "subject counts the batched unit"     "$(sed -n '/^unit_subject<</{n;p;}' "$T/conf.out")" "feat: add the eta module (+1 more)"
+chk "both batched units are listed"       "$(sed -n '/^units_carried<</,/^PROMOTE_EOF/p' "$T/conf.out" | sed '1d;$d' | tr '\n' '|')" "- #9 feat: add the eta module|- backmerge qa into dev|"
+git push -q origin promote/dev-to-qa:qa; git fetch -q origin
+
 echo "== batched mode is unchanged by the split option =="
 git checkout -q -B dev origin/dev
 echo "gamma" > gamma.py; git add gamma.py; git commit -qm "add gamma"
@@ -97,7 +138,6 @@ git push -q origin dev; git fetch -q origin
 SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh >/dev/null
 chk "batched takes every unit at once (gamma)" "$(cat gamma.py 2>/dev/null)" "gamma"
 chk "batched takes every unit at once (delta)" "$(cat delta.py 2>/dev/null)" "delta"
-git push -q origin promote/dev-to-qa:qa; git fetch -q origin
 
 echo "== the running script is immutable mid-promotion =="
 # stage_to checks out the TARGET branch into the working tree, which replaces
@@ -121,6 +161,72 @@ case "$(cat VERSION)" in
   SABOTAGED) chk "target's tooling cannot hijack the run" "hijacked" "clean" ;;
   *)         chk "target's tooling cannot hijack the run" "clean"    "clean" ;;
 esac
-chk "and it still promoted the oldest unit" "$(cat epsilon.py 2>/dev/null)" "epsilon"
+chk "and it still promoted the oldest unit" "$(cat gamma.py 2>/dev/null)" "gamma"
+
+echo "== fleet-owned file added on both sides does not stall the promotion =="
+# sync-fleet-files copies the file onto dev and onto qa separately: add/add.
+git checkout -q -B qa origin/qa; mkdir -p .github
+echo "fleet text on qa" > .github/copilot-instructions.md; git add .github/copilot-instructions.md; git commit -qm "sync on qa"; git push -q origin qa
+git checkout -q -B dev origin/dev
+echo "fleet text on dev" > .github/copilot-instructions.md; git add .github/copilot-instructions.md; git commit -qm "sync on dev"
+echo "zz" > zz.py; git add zz.py; git commit -qm "add zz"
+git push -q origin dev; git fetch -q origin
+SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh >/dev/null 2>&1 || true
+chk "fleet file resolved to the source copy" "$(cat .github/copilot-instructions.md 2>/dev/null)" "fleet text on dev"
+git push -q origin promote/dev-to-qa:qa; git fetch -q origin
+
+echo "== a conflict in a real source file still stops for a human =="
+git checkout -q -B qa origin/qa; echo "qa side" > real.py; git add real.py; git commit -qm "qa real"; git push -q origin qa
+git checkout -q -B dev origin/dev; echo "dev side" > real.py; git add real.py; git commit -qm "dev real"; git push -q origin dev; git fetch -q origin
+out=$(SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh 2>&1 || true)
+case "$out" in *"merge conflict outside VERSION"*) echo "  PASS real conflict still reported"; pass=$((pass+1));;
+  *) echo "  FAIL expected a conflict report, got: $out"; fail=$((fail+1));; esac
+
+echo "== a fleet-file conflict in the back-merge direction, or in a repo-owned agent, still stops =="
+git merge --abort >/dev/null 2>&1 || true; git reset -q --hard
+git checkout -q -B qa origin/qa; mkdir -p .github/agents; echo "qa agent" > .github/agents/$(basename "$PWD")-x.agent.md; echo "qa fleet" > .github/ai-budget.json; echo "qa" > .github/ai-budget.json.bak
+git add .github; git commit -qm "qa owned"; git push -q origin qa
+git checkout -q -B dev origin/dev; mkdir -p .github/agents; echo "dev agent" > .github/agents/$(basename "$PWD")-x.agent.md; echo "dev fleet" > .github/ai-budget.json; echo "dev" > .github/ai-budget.json.bak
+git add .github; git commit -qm "dev owned"; git push -q origin dev; git fetch -q origin
+out=$(GITHUB_REPOSITORY="o/$(basename "$PWD")" SRC=dev TGT=qa BR=promote/dev-to-qa bash .github/scripts/promote.sh 2>&1 || true)
+case "$out" in *"-x.agent.md"*"ai-budget.json.bak"*) echo "  PASS repo-owned agent and look-alike file conflicts still reported"; pass=$((pass+1));;
+  *) echo "  FAIL expected a conflict report, got: $out"; fail=$((fail+1));; esac
+out=$(SRC=qa TGT=dev BR=backmerge/qa-to-dev bash .github/scripts/promote.sh 2>&1 || true)
+case "$out" in *"ai-budget.json"*"ai-budget.json.bak"*) echo "  PASS back-merge fleet conflict still reported"; pass=$((pass+1));;
+  *) echo "  FAIL expected a conflict report, got: $out"; fail=$((fail+1));; esac
+
+echo "== a promotion script added on both sides resolves to the source copy, and lm syncs all three =="
+git merge --abort >/dev/null 2>&1 || true; git reset -q --hard
+F=.github/scripts/promotion_selftest.sh
+git checkout -q -B qa origin/qa; echo "qa script" > $F; git add $F; git commit -qm "qa script"; git push -q origin qa
+# Earlier sections left unrelated conflicts between dev and qa; start dev from qa.
+git checkout -q -B dev origin/qa~1; echo "dev script" > $F; git add $F; git commit -qm "dev script"; git push -q -f origin dev; git fetch -q origin
+# Run the real promoter, not the clone's file, which is the one in conflict.
+if SRC=dev TGT=qa BR=promote/dev-to-qa bash "$TPL/promote.sh" >/dev/null 2>&1; then rc=ok; else rc=failed; fi
+chk "the promotion ran to completion" "$rc" "ok"
+chk "the script resolved to the source copy" "$(cat $F 2>/dev/null)" "dev script"
+if [ -f "$TPL/../../.github/twins.json" ]; then
+  for f in promote.sh bump_version.py promotion_selftest.sh; do
+    grep -q "\"\.github/scripts/$f\"" "$TPL/../../.github/twins.json" && grep -q "'\.github/scripts/$f'" "$TPL/../../.github/workflows/sync-fleet-files.yml" \
+      && { echo "  PASS $f is in the fleet sync"; pass=$((pass+1)); } || { echo "  FAIL $f missing from twins.json or the sync trigger"; fail=$((fail+1)); }
+  done
+fi
+
+echo "== AGENTS.md: a conflict only in the fleet-rules block resolves; one outside it still stops =="
+mk() { printf 'repo facts: %s\n<!-- fleet-rules:begin (synced from lm/.github/fleet-rules.md -- edit there) -->\n%s\n<!-- fleet-rules:end -->\n' "$1" "$2"; }
+git merge --abort >/dev/null 2>&1 || true; git reset -q --hard
+git checkout -q -B qa origin/qa; mk base v0 > AGENTS.md; git add AGENTS.md; git commit -qm "agents base"; git push -q -f origin qa
+git checkout -q -B dev qa; mk base v-dev > AGENTS.md; git commit -qam "dev block"; git push -q -f origin dev
+git checkout -q qa; mk base v-qa > AGENTS.md; git commit -qam "qa block"; git push -q origin qa; git fetch -q origin
+if SRC=dev TGT=qa BR=promote/dev-to-qa bash "$TPL/promote.sh" >/dev/null 2>&1; then rc=ok; else rc=failed; fi
+chk "block-only conflict: promotion ran" "$rc" "ok"
+chk "block-only conflict: source block kept" "$(sed -n 3p AGENTS.md)" "v-dev"
+git merge --abort >/dev/null 2>&1 || true; git reset -q --hard
+git checkout -q -B qa origin/qa; mk base v0 > AGENTS.md; git commit -qam "agents base 2"; git push -q -f origin qa
+git checkout -q -B dev qa; mk dev-facts v-dev > AGENTS.md; git commit -qam "dev facts"; git push -q -f origin dev
+git checkout -q qa; mk qa-facts v-qa > AGENTS.md; git commit -qam "qa facts"; git push -q origin qa; git fetch -q origin
+out=$(SRC=dev TGT=qa BR=promote/dev-to-qa bash "$TPL/promote.sh" 2>&1 || true)
+case "$out" in *"merge conflict outside VERSION"*) echo "  PASS conflict outside the block still reported"; pass=$((pass+1));;
+  *) echo "  FAIL expected a conflict report, got: $out"; fail=$((fail+1));; esac
 
 echo; echo "RESULT: $pass passed, $fail failed"; rm -rf "$T"; [ "$fail" -eq 0 ]
